@@ -1,0 +1,33 @@
+[package]
+name = "citadel-quic"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+description = "CitadelPQVPN M0 PoC — гибридный постквантовый QUIC-хендшейк (X25519MLKEM768) на quinn + rustls/aws-lc-rs"
+
+[dependencies]
+anyhow = "1"
+arc-swap = "1"
+blake3 = "1"
+bytes = "1"
+hex = "0.4"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "net", "sync", "io-util"] }
+quinn = { version = "0.11", default-features = false, features = ["runtime-tokio", "rustls-aws-lc-rs", "log"] }
+rustls = { version = "0.23", default-features = false, features = ["aws_lc_rs", "std"] }
+# M7 PQ-auth: ML-DSA-65 (FIPS 204) подпись — unstable API aws-lc-rs (уже тянется через rustls)
+aws-lc-rs = { version = "1.17", features = ["unstable"] }
+rcgen = "0.13"
+rand = "0.8"
+libc = "0.2"
+citadel-obfs = { path = "../citadel-obfs" }
+citadel-masque = { path = "../citadel-masque" }
+citadel-tun = { path = "../citadel-tun" }
+citadel-token = { path = "../citadel-token" }
+
+[[bin]]
+name = "citadel-m0"
+path = "src/main.rs"
+
+[[bin]]
+name = "citadel-m1"
+path = "src/bin/citadel-m1.rs"

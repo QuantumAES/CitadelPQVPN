@@ -1,0 +1,10 @@
+[workspace]
+resolver = "2"
+members = ["crates/citadel-obfs", "crates/citadel-masque", "crates/citadel-tun", "crates/citadel-token", "crates/citadel-quic"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+repository = "https://github.com/QuantumAES/CitadelPQVPN"
+description = "Постквантовый консьюмерский VPN: гибридный PQ-QUIC + obfs L1 + анонимные токены"
