@@ -1,0 +1,33 @@
+# --- Rust ---
+/target
+**/*.rs.bk
+*.pdb
+
+# --- Python (.venv для tools/obfs_ref.py + cmake под aws-lc-rs) ---
+.venv/
+__pycache__/
+*.py[cod]
+*$py.class
+
+# --- Docker: бинари копируются сюда run-demo.sh и пересобираются (не версионируем) ---
+docker/citadel-m1
+docker/citadel-token
+docker/citadel-m0
+docker/veil-*
+docker/.env
+
+# --- Сгенерированные секреты/материал (локальные копии вне Docker-тома) ---
+*.pin
+*.mldsa
+*.psk
+issuer.pub
+issuer.key
+/tokens
+docker/tokens
+
+# --- ОС / редакторы ---
+.DS_Store
+*.swp
+*~
+.idea/
+.vscode/

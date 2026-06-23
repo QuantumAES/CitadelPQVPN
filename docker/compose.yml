@@ -1,0 +1,69 @@
+name: citadel-pq
+
+services:
+  # Издатель (биллинг, M5 split): long-running TCP-сервис слепого подписания токенов.
+  # Держит sk; публикует issuer.pub в общий том; клиент получает токены интерактивно.
+  issuer:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: citadel-pq:latest
+    container_name: citadel-issuer
+    entrypoint: ["/usr/local/bin/entrypoint-issuer.sh"]
+    volumes: ["pinshare:/shared"]
+    networks: ["Citadelnet"]
+    restart: unless-stopped
+    healthcheck:                       # готов, когда RSA-ключ сгенерирован и issuer.pub опубликован
+      test: ["CMD-SHELL", "test -f /shared/issuer.pub"]
+      interval: 2s
+      timeout: 2s
+      retries: 20
+      start_period: 5s
+
+  exit:
+    image: citadel-pq:latest
+    container_name: citadel-exit
+    depends_on:
+      issuer: { condition: service_healthy }   # нужен issuer.pub для верификации токенов
+    entrypoint: ["/usr/local/bin/entrypoint-exit.sh"]
+    cap_add: ["NET_ADMIN"]
+    devices: ["/dev/net/tun:/dev/net/tun"]
+    sysctls: ["net.ipv4.ip_forward=1"]
+    volumes: ["pinshare:/shared"]      # exit пишет pin (F1), читает issuer.pub (M4/M5)
+    networks: ["Citadelnet"]
+
+  # Второй exit (M5 multi-server): идентичен exit, свой self-signed cert/pin → exit2.pin.
+  exit2:
+    image: citadel-pq:latest
+    container_name: citadel-exit2
+    depends_on:
+      issuer: { condition: service_healthy }
+    entrypoint: ["/usr/local/bin/entrypoint-exit.sh"]
+    environment:
+      Citadel_PIN_FILE: /shared/exit2.pin       # свой pin-файл (клиент пиннит per-host)
+      Citadel_MLDSA_PUB_FILE: /shared/exit2.mldsa  # M7: свой ML-DSA-65 pub (per-host)
+    cap_add: ["NET_ADMIN"]
+    devices: ["/dev/net/tun:/dev/net/tun"]
+    sysctls: ["net.ipv4.ip_forward=1"]
+    volumes: ["pinshare:/shared"]
+    networks: ["Citadelnet"]
+
+  client:
+    image: citadel-pq:latest
+    container_name: citadel-client
+    depends_on:
+      exit: { condition: service_started }
+      exit2: { condition: service_started }
+      issuer: { condition: service_healthy }   # клиент получает токены от издателя по TCP
+    entrypoint: ["/usr/local/bin/entrypoint-client.sh"]
+    cap_add: ["NET_ADMIN"]
+    devices: ["/dev/net/tun:/dev/net/tun"]
+    volumes: ["pinshare:/shared"]      # client читает pin (F1)
+    networks: ["Citadelnet"]
+
+networks:
+  Citadelnet:
+    driver: bridge
+
+volumes:
+  pinshare:
