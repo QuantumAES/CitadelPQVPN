@@ -87,11 +87,8 @@ fn run_issuer() -> Result<()> {
 fn serve_client(mut conn: TcpStream, sk_der: &[u8]) -> Result<()> {
     let peer = conn.peer_addr().ok();
     let mut n = 0u32;
-    loop {
-        let blind_msg = match read_frame(&mut conn) {
-            Ok(b) => b,
-            Err(_) => break, // клиент закрыл соединение
-        };
+    // клиент закрыл соединение → read_frame вернёт Err → выходим из цикла
+    while let Ok(blind_msg) = read_frame(&mut conn) {
         let blind_sig = citadel_token::issuer_blind_sign(sk_der, &blind_msg)?;
         write_frame(&mut conn, &blind_sig)?;
         n += 1;

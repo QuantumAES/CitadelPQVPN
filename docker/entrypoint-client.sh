@@ -69,7 +69,8 @@ echo "===================================================================="
 echo "  ТЕСТ 4 (M3 / STRIDE F3) — obfs L1: проба БЕЗ PSK"
 echo "  ожидаем: exit молчит на не-obfs трафик (probe-resistance, анти-DPI)"
 echo "===================================================================="
-Citadel_ROLE=probe Citadel_CONNECT=exit:4433 citadel-m1 || true
+# по IP (как ТЕСТ 8): hostname не резолвится — основной туннель уже включил F6 DNS fail-closed
+Citadel_ROLE=probe Citadel_CONNECT="${EXIT_IP}:4433" citadel-m1 || true
 
 echo
 echo "===================================================================="
@@ -134,6 +135,7 @@ echo "  ТЕСТ 10 (M4) — миграция соединения: rebind ис�
 echo "  клиент через 6с меняет UDP-сокет (эмуляция WiFi↔LTE/NAT-rebind) — туннель должен пережить"
 echo "===================================================================="
 kill "$M1" 2>/dev/null || true
+wait "$M1" 2>/dev/null || true   # дождаться смерти → закрыть сессию клиента на exit
 sleep 1
 sed -i '1d' /shared/tokens 2>/dev/null || true   # свежий токен (прошлый spent)
 rm -f /tmp/Citadel-ready
@@ -160,6 +162,7 @@ echo "  ТЕСТ 11 (M4) — TCP/443-fallback при блокировке UDP"
 echo "  блокируем исходящий UDP к exit:4433 → клиент должен уйти в obfs-over-TCP"
 echo "===================================================================="
 kill "$M1B" 2>/dev/null || true
+wait "$M1B" 2>/dev/null || true   # дождаться смерти → закрыть сессию клиента на exit
 sleep 1
 iptables -A OUTPUT -p udp --dport 4433 -j DROP   # эмуляция UDP-цензуры (QUIC/UDP недоступен)
 rm -f /tmp/Citadel-ready
@@ -175,7 +178,7 @@ done
 if [ -f /tmp/Citadel-ready ]; then
     sleep 2
     ok=0
-    for _ in 1 2 3 4; do
+    for _ in $(seq 1 10); do
         ping -c 2 -W 3 1.1.1.1 >/dev/null 2>&1 && { ok=1; break; }
         sleep 1
     done
@@ -185,12 +188,17 @@ else
     echo "  [!] TCP-fallback не поднялся вовремя"
 fi
 
+# восстановить UDP к exit:4433 — иначе DROP из ТЕСТ 11 протекает в T12/T14 и форсит
+# obfs-TCP вместо тестируемого QUIC-пути (давало ложные ~флаки failover/agility)
+iptables -D OUTPUT -p udp --dport 4433 -j DROP 2>/dev/null || true
+
 echo
 echo "===================================================================="
 echo "  ТЕСТ 12 (M5) — multi-server failover: первый exit мёртв → берётся следующий"
 echo "  список: нероутируемый адрес + живой exit; клиент должен пропустить мёртвый"
 echo "===================================================================="
 kill "$M1C" 2>/dev/null || true
+wait "$M1C" 2>/dev/null || true   # дождаться смерти → закрыть сессию клиента на exit (иначе её pump крадёт ответные пакеты)
 sleep 1
 sed -i '1d' /shared/tokens 2>/dev/null || true   # свежий токен
 rm -f /tmp/Citadel-ready
@@ -198,8 +206,11 @@ Citadel_SERVERS="10.255.255.1:4433 ${EXIT_IP}:4433" Citadel_PIN="$(cat /shared/e
 M1D=$!
 for _ in $(seq 1 60); do [ -f /tmp/Citadel-ready ] && break; kill -0 "$M1D" 2>/dev/null || break; sleep 0.5; done
 if [ -f /tmp/Citadel-ready ]; then
-    sleep 1
-    ping -c 2 -W 3 1.1.1.1 >/dev/null 2>&1 \
+    # стартовые пинги «дренируют» застрявшие TUN-читатели мёртвых сессий на exit
+    # (shared exit-TUN: поток убитого клиента крадёт 1–2 ответных пакета) → щедрый retry
+    sleep 2
+    ok=0; for _ in $(seq 1 10); do ping -c 2 -W 3 1.1.1.1 >/dev/null 2>&1 && { ok=1; break; }; sleep 1; done
+    [ "$ok" = 1 ] \
         && echo "  OK ✔ failover: клиент пропустил мёртвый exit и подключился к живому (см. лог 'ВЫБРАН exit')" \
         || echo "  [~] failover поднялся, ping не прошёл"
 else
@@ -220,6 +231,7 @@ echo "  ТЕСТ 14 (M6) — crypto-agility: смена KX-suite (classical) neg
 echo "  exit принимает 'all' (PQ+classical); клиент просит classical → negotiate без смены сервера"
 echo "===================================================================="
 kill "$M1D" 2>/dev/null || true
+wait "$M1D" 2>/dev/null || true   # дождаться смерти → закрыть сессию клиента на exit
 sleep 1
 sed -i '1d' /shared/tokens 2>/dev/null || true   # свежий токен
 rm -f /tmp/Citadel-ready
@@ -227,8 +239,8 @@ Citadel_SERVERS="${EXIT_IP}:4433" Citadel_PIN="$(cat /shared/exit.pin)" Citadel_
 M1E=$!
 for _ in $(seq 1 50); do [ -f /tmp/Citadel-ready ] && break; kill -0 "$M1E" 2>/dev/null || break; sleep 0.5; done
 if [ -f /tmp/Citadel-ready ]; then
-    sleep 1
-    ok=0; for _ in 1 2 3 4; do ping -c 2 -W 3 1.1.1.1 >/dev/null 2>&1 && { ok=1; break; }; sleep 1; done
+    sleep 2
+    ok=0; for _ in $(seq 1 10); do ping -c 2 -W 3 1.1.1.1 >/dev/null 2>&1 && { ok=1; break; }; sleep 1; done
     [ "$ok" = 1 ] \
         && echo "  OK ✔ туннель на classical KX (X25519) к PQ-capable exit — agility/negotiate (см. лог 'KX=')" \
         || echo "  [~] поднялся, ping не прошёл"

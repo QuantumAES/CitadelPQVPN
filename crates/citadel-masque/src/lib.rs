@@ -549,7 +549,7 @@ mod fuzz {
             let len = (xs(&mut s) % 1500) as usize;
             let mut b: Vec<u8> = (0..len).map(|_| (xs(&mut s) >> 33) as u8).collect();
             // иногда «похоже на IPv4» (version=4, ihl=5) — чтобы парсеры шли глубже
-            if !b.is_empty() && xs(&mut s) % 2 == 0 {
+            if !b.is_empty() && xs(&mut s).is_multiple_of(2) {
                 b[0] = 0x45;
             }
             let _ = varint::decode(&b);

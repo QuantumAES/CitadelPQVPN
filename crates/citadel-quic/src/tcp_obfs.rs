@@ -52,7 +52,7 @@ pub async fn read_record<R: AsyncReadExt + Unpin>(
     let mut lenb = [0u8; 2];
     r.read_exact(&mut lenb).await?;
     let len = u16::from_be_bytes(lenb) as usize;
-    if len < citadel_obfs::HDR_LEN + citadel_obfs::TAG_LEN || len > MAX_RECORD {
+    if !(citadel_obfs::HDR_LEN + citadel_obfs::TAG_LEN..=MAX_RECORD).contains(&len) {
         return Err(io::Error::new(io::ErrorKind::InvalidData, "плохая длина record"));
     }
     let mut buf = vec![0u8; len];

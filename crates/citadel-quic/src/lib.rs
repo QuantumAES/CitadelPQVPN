@@ -14,9 +14,13 @@ use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer, Serve
 use rustls::{DigitallySignedStruct, SignatureScheme};
 
 mod obfs_socket;
+pub mod client;
+pub mod config;
+pub mod dataplane;
 pub mod pqauth;
 pub mod ratelimit;
 pub mod tcp_obfs;
+pub mod vpn;
 pub use obfs_socket::{client_endpoint_obfs, server_endpoint_obfs};
 
 pub const ALPN: &[u8] = b"Citadel-pq";

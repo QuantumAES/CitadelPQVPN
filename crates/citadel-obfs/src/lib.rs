@@ -259,8 +259,8 @@ mod tests {
     // Те же входы, что в tools/obfs_ref.py
     fn psk() -> [u8; 32] {
         let mut p = [0u8; 32];
-        for i in 0..32 {
-            p[i] = i as u8;
+        for (i, slot) in p.iter_mut().enumerate() {
+            *slot = i as u8;
         }
         p
     }
@@ -459,7 +459,7 @@ mod tests {
     /// Chaff: seal → open → parse_inner распознаёт TYPE_PAD, полезной нагрузки нет.
     #[test]
     fn chaff_roundtrip_typed_empty_payload() {
-        let inner = build_chaff(&vec![0u8; 200]);
+        let inner = build_chaff(&[0u8; 200]);
         let pkt = seal(&psk(), &CSID, 9, &arr12("0102030405060708090a0b0c"), &inner);
         let o = open(&psk(), &pkt).unwrap();
         assert_eq!(parse_inner(&o.inner), Some((TYPE_PAD, &[][..])));

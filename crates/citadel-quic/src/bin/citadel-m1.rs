@@ -14,17 +14,19 @@
 //!           Citadel_PIN=<hex> | Citadel_PIN_DIR=<dir с <host>.pin> | Citadel_PIN_FILE=<один pin>
 
 use std::collections::HashSet;
-use std::net::SocketAddr;
 use std::process::Command;
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use anyhow::{anyhow, Context, Result};
 use rand::RngCore;
-use citadel_masque::{capsule, datagram, ip};
-use citadel_quic::ratelimit::{RateCfg, TokenBucket};
+use citadel_masque::capsule;
+use citadel_quic::config::{parse_pin, ClientConfig, PinMode};
+use citadel_quic::dataplane::{pump, Tunnel};
+use citadel_quic::ratelimit::RateCfg;
 use citadel_quic::tcp_obfs::TcpObfs;
+use citadel_quic::vpn::VpnController;
 use citadel_tun::Tun;
 
 // Пул адресов exit для клиентов: 10.7.0.{2,3,...}/24.
@@ -35,7 +37,7 @@ async fn main() -> Result<()> {
     let role = std::env::var("Citadel_ROLE").unwrap_or_default();
     match role.as_str() {
         "server" => run_server(open_tun()?).await,
-        "client" => run_client(open_tun()?).await,
+        "client" => run_client().await,
         "probe" => run_probe().await,
         "auth-probe" => run_auth_probe().await,
         other => Err(anyhow!("Citadel_ROLE должен быть server|client|probe|auth-probe, а не {other:?}")),
@@ -49,21 +51,13 @@ fn open_tun() -> Result<Arc<Tun>> {
     Ok(tun)
 }
 
-/// L1-obfs PSK из env Citadel_OBFS_PSK (64 hex = 32 байта, иначе BLAKE3-derive из строки).
+/// L1-obfs PSK из env `Citadel_OBFS_PSK` (делегирует в `config::parse_obfs_psk`).
+/// Используется серверной и probe-ролями; клиентский путь берёт `ClientConfig::obfs_psk`.
 fn obfs_psk() -> Option<[u8; 32]> {
-    let v = std::env::var("Citadel_OBFS_PSK").ok()?;
-    let v = v.trim();
-    if v.is_empty() {
-        return None;
-    }
-    if v.len() == 64 {
-        if let Ok(bytes) = hex::decode(v) {
-            if let Ok(a) = bytes.try_into() {
-                return Some(a);
-            }
-        }
-    }
-    Some(blake3::derive_key("CitadelPQVPN/obfs/v1/psk", v.as_bytes()))
+    std::env::var("Citadel_OBFS_PSK")
+        .ok()
+        .as_deref()
+        .and_then(citadel_quic::config::parse_obfs_psk)
 }
 
 /// F4: сброс привилегий до nobody (def 65534) после привилегированной настройки сети.
@@ -148,15 +142,7 @@ fn setup_dns_leak_protection(ifname: &str, dns: &str) {
 }
 
 // ----------------------------- pin (F1) -----------------------------
-fn parse_pin(s: &str) -> Option<[u8; 32]> {
-    hex::decode(s.trim()).ok().and_then(|v| v.try_into().ok())
-}
-
-enum PinMode {
-    Pinned([u8; 32]),
-    Waiting, // pinning настроен, но pin ещё не доступен (ждём, пока exit его запишет)
-    NoPin,   // pinning не настроен (PoC-режим)
-}
+// parse_pin + PinMode вынесены в citadel_quic::config (C0.3); read_pin_for ниже — для auth-probe.
 
 /// Pin сервера `host`: `Citadel_PIN` (общий hex) > `Citadel_PIN_DIR/<host>.pin` (multi-server,
 /// per-exit) > `Citadel_PIN_FILE` (один файл, legacy single-server). Нет настройки → NoPin (PoC).
@@ -177,201 +163,11 @@ fn read_pin_for(host: &str) -> PinMode {
     }
 }
 
-/// Хост-часть `host:port` (для pin-файла и TCP-fallback цели).
-fn host_of(server: &str) -> &str {
-    server.rsplit_once(':').map(|(h, _)| h).unwrap_or(server)
-}
-
-/// Список exit-серверов: `Citadel_SERVERS` (через пробел/`;`/`,`) или один `Citadel_CONNECT`.
-/// Перемешан для балансировки нагрузки; клиент идёт по нему failover'ом (M5 multi-server).
-fn client_servers() -> Result<Vec<String>> {
-    let mut servers: Vec<String> = match std::env::var("Citadel_SERVERS") {
-        Ok(s) => s
-            .split([' ', ';', ','])
-            .map(str::trim)
-            .filter(|x| !x.is_empty())
-            .map(String::from)
-            .collect(),
-        Err(_) => vec![std::env::var("Citadel_CONNECT")
-            .context("ни Citadel_SERVERS, ни Citadel_CONNECT не заданы")?],
-    };
-    use rand::seq::SliceRandom;
-    servers.shuffle(&mut rand::thread_rng());
-    Ok(servers)
-}
-
-/// ML-DSA-65 pk выбранного exit для PQ-auth (M7): `Citadel_MLDSA_PUB` (файл) или
-/// `Citadel_PIN_DIR/<host>.mldsa`. `None` → PQ-auth не запрашивается (только Ed25519+pin).
-fn read_mldsa_pk(host: &str) -> Option<Vec<u8>> {
-    if let Ok(f) = std::env::var("Citadel_MLDSA_PUB") {
-        return std::fs::read(f).ok();
-    }
-    if let Ok(dir) = std::env::var("Citadel_PIN_DIR") {
-        return std::fs::read(format!("{dir}/{host}.mldsa")).ok();
-    }
-    None
-}
-
-// ----------------- абстракция транспорта: QUIC или obfs-over-TCP (M4 fallback) -----------------
-/// Туннель данных: основной — PQ-QUIC; fallback — obfs-over-TCP (когда UDP/QUIC заблокирован).
-/// Унифицирует control-обмен (токен→адрес) и datagram-перекачку, чтобы `pump` не знал транспорт.
-enum Tunnel {
-    Quic(quinn::Connection),
-    Tcp(TcpObfs),
-}
-
-impl Tunnel {
-    fn peer(&self) -> SocketAddr {
-        match self {
-            Tunnel::Quic(c) => c.remote_address(),
-            Tunnel::Tcp(t) => t.peer(),
-        }
-    }
-
-    fn kind(&self) -> &'static str {
-        match self {
-            Tunnel::Quic(_) => "QUIC/UDP",
-            Tunnel::Tcp(_) => "obfs-TCP",
-        }
-    }
-
-    fn close(&self, code: u32, reason: &[u8]) {
-        if let Tunnel::Quic(c) = self {
-            c.close(code.into(), reason);
-        }
-        // TCP закрывается при drop
-    }
-
-    /// Клиент: послать один control-запрос и получить ответ (reliable message).
-    async fn control_client(&mut self, req: &[u8]) -> Result<Vec<u8>> {
-        match self {
-            Tunnel::Quic(conn) => {
-                let (mut send, mut recv) = conn.open_bi().await?;
-                send.write_all(req).await?;
-                send.finish()?;
-                Ok(recv.read_to_end(4096).await?)
-            }
-            Tunnel::Tcp(t) => {
-                t.send_msg(req).await?;
-                Ok(t.recv_msg().await?)
-            }
-        }
-    }
-
-    /// Сервер: принять один control-запрос, обработать `handle` и ответить.
-    async fn control_server<F>(&mut self, handle: F) -> Result<()>
-    where
-        F: FnOnce(&[u8]) -> Result<Vec<u8>>,
-    {
-        match self {
-            Tunnel::Quic(conn) => {
-                let (mut send, mut recv) = conn.accept_bi().await?;
-                let req = recv.read_to_end(8192).await?;
-                let resp = handle(&req)?;
-                send.write_all(&resp).await?;
-                send.finish()?;
-                Ok(())
-            }
-            Tunnel::Tcp(t) => {
-                let req = t.recv_msg().await?;
-                let resp = handle(&req)?;
-                t.send_msg(&resp).await?;
-                Ok(())
-            }
-        }
-    }
-}
-
-/// Обработка входящего (от клиента) пакета на exit: egress-фильтр (F2) + rate-limit (F7).
-/// `accept` → `true` пропустить в TUN, `false` дропнуть. Состояние bucket/счётчики — per-connection.
-struct Inbound {
-    egress_filter: bool,
-    bucket: Option<TokenBucket>,
-    dropped: u64,
-    dropped_bytes: u64,
-}
-
-impl Inbound {
-    fn new(egress_filter: bool, rate_limit: Option<RateCfg>) -> Self {
-        Self {
-            egress_filter,
-            bucket: rate_limit.map(|c| TokenBucket::new(c, Instant::now())),
-            dropped: 0,
-            dropped_bytes: 0,
-        }
-    }
-
-    fn accept(&mut self, pkt: &[u8]) -> bool {
-        if self.egress_filter {
-            if let Some(v) = ip::parse_ipv4(pkt) {
-                if ip::is_blocked_dst(v.dst) {
-                    eprintln!(
-                        "[exit] F2: заблокирован inner-dst {}.{}.{}.{}",
-                        v.dst[0], v.dst[1], v.dst[2], v.dst[3]
-                    );
-                    return false;
-                }
-            }
-        }
-        if let Some(b) = self.bucket.as_mut() {
-            if !b.allow(TokenBucket::packet_cost(pkt.len()), Instant::now()) {
-                self.dropped += 1;
-                self.dropped_bytes += pkt.len() as u64;
-                if self.dropped == 1 || self.dropped % 50 == 0 {
-                    eprintln!(
-                        "[exit] F7: rate-limit — дропнуто {} пакетов / {} б (клиент превысил лимит)",
-                        self.dropped, self.dropped_bytes
-                    );
-                }
-                return false;
-            }
-        }
-        true
-    }
-}
-
-// ----------------- капсульный обмен адресами (M2) -----------------
-// Control-stream: [varint(token_len) ‖ token] ‖ ADDRESS_REQUEST → ADDRESS_ASSIGN.
-async fn client_request_address(
-    tunnel: &mut Tunnel,
-    token: &[u8],
-    mldsa_pk: Option<&[u8]>,
-    cert_pin: [u8; 32],
-) -> Result<capsule::AssignedV4> {
-    // M7 PQ-auth: nonce(32) для привязки подписи сервера; далее токен + ADDRESS_REQUEST
-    let mut nonce = [0u8; 32];
-    rand::thread_rng().fill_bytes(&mut nonce);
-    let req = capsule::AssignedV4 { request_id: 1, addr: [0, 0, 0, 0], prefix: 0 };
-    let mut out = nonce.to_vec();
-    out.extend_from_slice(&citadel_masque::varint::to_vec(token.len() as u64));
-    out.extend_from_slice(token);
-    out.extend_from_slice(&capsule::encode_address_request_v4(&req));
-
-    let buf = tunnel.control_client(&out).await?;
-    // ответ: varint(sig_len) ‖ ML-DSA-sig ‖ ADDRESS_ASSIGN
-    let (sig_len, m) =
-        citadel_masque::varint::decode(&buf).ok_or_else(|| anyhow!("нет sig-префикса"))?;
-    let sig_end = m + sig_len as usize;
-    if buf.len() < sig_end {
-        return Err(anyhow!("обрезанная PQ-подпись"));
-    }
-    let sig = &buf[m..sig_end];
-    let rest = &buf[sig_end..];
-
-    // M7: проверяем ML-DSA-65 подпись сервера, если его pk провижирован (гибрид с Ed25519+pin)
-    if let Some(pk) = mldsa_pk {
-        if !citadel_quic::pqauth::verify_binding(pk, &nonce, &cert_pin, sig) {
-            return Err(anyhow!("PQ-auth: ML-DSA подпись сервера НЕ прошла — возможен MITM"));
-        }
-        eprintln!("[citadel-m1:client] PQ-auth ✔ ML-DSA-65 подпись сервера верна (гибрид Ed25519+ML-DSA)");
-    }
-
-    let (t, val, _) = capsule::decode(rest).ok_or_else(|| anyhow!("битая капсула в ответе"))?;
-    if t != capsule::ADDRESS_ASSIGN {
-        return Err(anyhow!("ожидался ADDRESS_ASSIGN, получен type={t}"));
-    }
-    capsule::decode_assigned_v4(val).ok_or_else(|| anyhow!("битое тело ADDRESS_ASSIGN"))
-}
+// Клиентская оркестрация вынесена из бинаря в citadel_quic::{config,dataplane,client}:
+//   C0.2 — Tunnel/Inbound/pump → dataplane;
+//   C0.3 — client_servers/read_mldsa_pk/parse_pin/PinMode/load_token → config;
+//   C0.4 — host_of/connect_server/try_quic_connect/client_request_address → client.
+// В бинаре остаются серверная роль, probe/auth-probe и Linux NetConfigurator (ip/iptables/DNS).
 
 async fn server_assign_address(
     tunnel: &mut Tunnel,
@@ -435,14 +231,7 @@ async fn server_assign_address(
         .await
 }
 
-fn load_token() -> Vec<u8> {
-    std::env::var("Citadel_TOKENS")
-        .ok()
-        .and_then(|p| std::fs::read_to_string(p).ok())
-        .and_then(|s| s.lines().next().map(|l| l.trim().to_string()))
-        .and_then(|l| hex::decode(l).ok())
-        .unwrap_or_default()
-}
+// load_token вынесён в ClientConfig::from_env (C0.3).
 
 // ------------------------------- роли -------------------------------
 async fn run_server(tun: Arc<Tun>) -> Result<()> {
@@ -594,157 +383,47 @@ async fn handle_client(
     }
 }
 
-async fn run_client(tun: Arc<Tun>) -> Result<()> {
-    let ifname = tun.name().to_string();
-    run("ip", &["link", "set", &ifname, "mtu", &mtu(), "up"]); // адрес — позже, из капсулы
-
-    let server_name = std::env::var("Citadel_SERVER_NAME").unwrap_or_else(|_| "Citadel.exit".into());
-    let psk = obfs_psk();
-    let servers = client_servers()?;
-    eprintln!("[citadel-m1:client] exit-серверы (перемешаны): {}", servers.join(", "));
-
-    // M5 multi-server: идём по списку failover'ом — первый поднявшийся exit (QUIC или TCP-fallback).
-    let mut tunnel = None;
-    let mut chosen = String::new();
-    for server in &servers {
-        match connect_server(server, &server_name, psk, servers.len() > 1).await {
-            Ok(Some(t)) => {
-                eprintln!("[citadel-m1:client] ВЫБРАН exit {server} (транспорт {})", t.kind());
-                tunnel = Some(t);
-                chosen = server.clone();
-                break;
-            }
-            Ok(None) => eprintln!("[citadel-m1:client] exit {server} недоступен — пробую следующий"),
-            Err(e) => eprintln!("[citadel-m1:client] exit {server}: {e} — пробую следующий"),
-        }
-    }
-    let mut tunnel = tunnel
-        .ok_or_else(|| anyhow!("ни один exit недоступен: {}", servers.join(", ")))?;
-
-    // M7 PQ-auth: pin (Ed25519-cert) + ML-DSA-65 pk выбранного exit (если провижированы)
-    let host = host_of(&chosen);
-    let cert_pin = match read_pin_for(host) {
-        PinMode::Pinned(p) => p,
-        _ => [0u8; 32],
-    };
-    let mldsa_pk = read_mldsa_pk(host);
-    if mldsa_pk.is_some() {
-        eprintln!("[citadel-m1:client] PQ-auth (M7): буду проверять ML-DSA-65 подпись exit {host}");
-    }
-
-    // M2+M4/M5: предъявляем анонимный токен и получаем адрес капсулой
-    let token = load_token();
-    if token.is_empty() {
-        eprintln!("[citadel-m1:client] WARN: токен (Citadel_TOKENS) не задан — exit может отказать");
-    } else {
-        eprintln!("[citadel-m1:client] предъявляю анонимный токен ({} б)", token.len());
-    }
-    let a = client_request_address(&mut tunnel, &token, mldsa_pk.as_deref(), cert_pin).await?;
-    let cidr = format!("{}.{}.{}.{}/{}", a.addr[0], a.addr[1], a.addr[2], a.addr[3], a.prefix);
-    run("ip", &["addr", "add", &cidr, "dev", &ifname]);
-    eprintln!("[citadel-m1:client] назначен адрес {cidr} (ADDRESS_ASSIGN, транспорт {})", tunnel.kind());
-    if let Ok(routes) = std::env::var("Citadel_ROUTES") {
-        for r in routes.split_whitespace() {
-            run("ip", &["route", "replace", r, "dev", &ifname]);
-        }
-        eprintln!("[citadel-m1:client] маршруты в туннель: {routes}");
-    }
-
-    if let Ok(dns) = std::env::var("Citadel_DNS") {
-        setup_dns_leak_protection(&ifname, &dns); // F6
-    }
-
-    drop_privileges()?; // F4: адрес/маршруты/DNS настроены — root больше не нужен
-
-    let _ = std::fs::write("/tmp/Citadel-ready", b"1");
-    pump(tunnel, tun, false, None).await // клиент себя не лимитирует (F7 — забота exit)
+async fn run_client() -> Result<()> {
+    let cfg = ClientConfig::from_env()?;
+    let tun_name = std::env::var("Citadel_TUN").unwrap_or_else(|_| "Citadel0".into());
+    // VpnController сам делает establish → provider.configure(назначенный адрес) → data-plane.
+    VpnController::new()
+        .connect(cfg, Arc::new(LinuxTunProvider { tun_name }))
+        .await
 }
 
-/// Подключиться к ОДНОМУ exit'у: основной путь PQ-QUIC, при недоступности — obfs-over-TCP fallback
-/// (M4, порт `Citadel_TCP_PORT`, по умолчанию 443). `None` — exit недоступен → вызывающий пробует
-/// следующий из списка (M5 failover).
-async fn connect_server(
-    server: &str,
-    server_name: &str,
-    psk: Option<[u8; 32]>,
-    multi: bool,
-) -> Result<Option<Tunnel>> {
-    let host = host_of(server);
-    let addr = match tokio::net::lookup_host(server).await.map(|mut it| it.next()) {
-        Ok(Some(a)) => a,
-        _ => return Ok(None),
-    };
-    // failover/fallback хотят быстрый QUIC-timeout; один сервер без fallback — ждём дольше.
-    let attempts = if multi || psk.is_some() { 5 } else { 60 };
-    if let Some(conn) = try_quic_connect(server, addr, server_name, attempts, host).await? {
-        eprintln!("[citadel-m1:client] PQ-туннель (QUIC/UDP) к {server} ✔");
-        return Ok(Some(Tunnel::Quic(conn)));
-    }
-    if let Some(psk) = psk {
-        let tcp_port = std::env::var("Citadel_TCP_PORT").unwrap_or_else(|_| "443".into());
-        let tcp_target = format!("{host}:{tcp_port}");
-        if let Ok(Some(taddr)) = tokio::net::lookup_host(&tcp_target).await.map(|mut it| it.next()) {
-            eprintln!("[citadel-m1:client] QUIC к {server} недоступен → obfs-TCP к {tcp_target}");
-            // таймаут: мёртвый host иначе висит на TCP connect (~минуты) и ломает failover
-            if let Ok(Ok(tcp)) =
-                tokio::time::timeout(Duration::from_secs(3), TcpObfs::connect(taddr, psk)).await
-            {
-                eprintln!("[citadel-m1:client] obfs-TCP туннель к {tcp_target} ✔");
-                return Ok(Some(Tunnel::Tcp(tcp)));
-            }
-        }
-    }
-    Ok(None)
+/// Linux-`TunProvider`: ПОСЛЕ установления адреса создаёт `/dev/net/tun`, настраивает
+/// MTU/адрес/маршруты/DNS (F6), сбрасывает привилегии (F4) и отдаёт пакетный I/O. На Android
+/// этот слой заменит обёртка над `VpnService.Builder` (трек C3) — порядок «адрес → TUN» тот же.
+struct LinuxTunProvider {
+    tun_name: String,
 }
 
-/// Попытаться поднять PQ-QUIC к одному серверу. `None` — не удалось за `attempts` попыток
-/// (UDP/QUIC заблокирован или exit недоступен). Pin берётся per-host (`read_pin_for`).
-async fn try_quic_connect(
-    connect: &str,
-    addr: SocketAddr,
-    server_name: &str,
-    attempts: u32,
-    pin_host: &str,
-) -> Result<Option<quinn::Connection>> {
-    let ep = match obfs_psk() {
-        Some(psk) => citadel_quic::client_endpoint_obfs(psk)?,
-        None => quinn::Endpoint::client("0.0.0.0:0".parse()?)?,
-    };
-    eprintln!(
-        "[citadel-m1:client] QUIC: пробую {connect} ({addr}), server_name={server_name}, KX={}",
-        citadel_quic::kx_suite_name(&std::env::var("Citadel_KX").unwrap_or_default())
-    );
-    let mut logged_pin = false;
-    for attempt in 1..=attempts {
-        let cfg = match read_pin_for(pin_host) {
-            PinMode::Pinned(p) => {
-                if !logged_pin {
-                    eprintln!("[citadel-m1:client] pinning {pin_host}: {}", hex::encode(p));
-                    logged_pin = true;
-                }
-                citadel_quic::client_config_pinned(citadel_quic::kx_groups_from_env(), p)?
+impl citadel_quic::vpn::TunProvider for LinuxTunProvider {
+    fn configure(&self, p: &citadel_quic::vpn::TunParams) -> Result<Arc<dyn citadel_tun::TunIo>> {
+        let tun = Arc::new(Tun::create(&self.tun_name).context("открыть TUN (нужен CAP_NET_ADMIN)")?);
+        let ifname = tun.name().to_string();
+        eprintln!("[Citadel-m1] TUN '{ifname}' открыт");
+        run("ip", &["link", "set", &ifname, "mtu", &p.mtu, "up"]);
+        let cidr = format!("{}.{}.{}.{}/{}", p.addr[0], p.addr[1], p.addr[2], p.addr[3], p.prefix);
+        run("ip", &["addr", "add", &cidr, "dev", &ifname]);
+        eprintln!("[citadel-m1:client] назначен адрес {cidr} dev {ifname}");
+        if !p.routes.is_empty() {
+            for r in p.routes.split_whitespace() {
+                run("ip", &["route", "replace", r, "dev", &ifname]);
             }
-            PinMode::NoPin => {
-                if !logged_pin {
-                    eprintln!("[citadel-m1:client] WARN: pin не настроен — принимаю любой серт (PoC)");
-                    logged_pin = true;
-                }
-                citadel_quic::client_config(citadel_quic::kx_groups_from_env())?
-            }
-            PinMode::Waiting => {
-                tokio::time::sleep(Duration::from_millis(500)).await;
-                continue;
-            }
-        };
-        match tokio::time::timeout(Duration::from_secs(3), ep.connect_with(cfg, addr, server_name)?).await {
-            Ok(Ok(c)) => return Ok(Some(c)),
-            Ok(Err(e)) => eprintln!("[citadel-m1:client] QUIC попытка {attempt}: {e}"),
-            Err(_) => eprintln!("[citadel-m1:client] QUIC попытка {attempt}: таймаут (exit/UDP недоступен?)"),
+            eprintln!("[citadel-m1:client] маршруты в туннель: {}", p.routes);
         }
-        tokio::time::sleep(Duration::from_secs(1)).await;
+        if let Some(dns) = &p.dns {
+            setup_dns_leak_protection(&ifname, dns); // F6
+        }
+        drop_privileges()?; // F4: адрес/маршруты/DNS настроены — root больше не нужен
+        let _ = std::fs::write("/tmp/Citadel-ready", b"1");
+        Ok(tun)
     }
-    Ok(None)
 }
+
+// connect_server / try_quic_connect вынесены в citadel_quic::client (C0.4).
 
 /// probe-режим (негативный тест F3): шлём не-PSK датаграммы на exit и ждём ответ.
 /// При включённой obfs exit молчит → probe-resistance.
@@ -758,7 +437,7 @@ async fn run_probe() -> Result<()> {
     sock.connect(addr).await?;
     eprintln!("[probe] шлю не-PSK датаграммы на {connect} ({addr})…");
     let mut junk = vec![0xc0u8, 0, 0, 0, 1]; // похоже на начало QUIC long header v1
-    junk.extend(std::iter::repeat(0x41).take(1195));
+    junk.extend(std::iter::repeat_n(0x41, 1195));
     for _ in 0..5 {
         let _ = sock.send(&junk).await;
         tokio::time::sleep(Duration::from_millis(150)).await;
@@ -783,7 +462,7 @@ async fn run_auth_probe() -> Result<()> {
         Some(p) => citadel_quic::client_endpoint_obfs(p)?,
         None => quinn::Endpoint::client("0.0.0.0:0".parse()?)?,
     };
-    let cfg = match read_pin_for(host_of(&connect)) {
+    let cfg = match read_pin_for(citadel_quic::client::host_of(&connect)) {
         PinMode::Pinned(p) => citadel_quic::client_config_pinned(citadel_quic::kx_groups_from_env(), p)?,
         _ => citadel_quic::client_config(citadel_quic::kx_groups_from_env())?,
     };
@@ -814,107 +493,4 @@ async fn run_auth_probe() -> Result<()> {
     Ok(())
 }
 
-/// Двунаправленная перекачка TUN ⇄ QUIC DATAGRAM. `egress_filter` (на exit) дропает
-/// inner-пакеты во внутренние/служебные сети (F2). `rate_limit` (на exit) ограничивает
-/// входящее от клиента направление token-bucket'ом (F7 / D3); `None` → без лимита.
-async fn pump(
-    tunnel: Tunnel,
-    tun: Arc<Tun>,
-    egress_filter: bool,
-    rate_limit: Option<RateCfg>,
-) -> Result<()> {
-    use tokio::sync::mpsc;
-    let (tun_to_net_tx, mut tun_to_net_rx) = mpsc::channel::<Vec<u8>>(1024);
-    let (net_to_tun_tx, mut net_to_tun_rx) = mpsc::channel::<Vec<u8>>(1024);
-
-    // TUN → сеть (блокирующее чтение TUN в отдельном потоке)
-    {
-        let tun = tun.clone();
-        std::thread::spawn(move || {
-            let mut buf = vec![0u8; 65536];
-            loop {
-                match tun.recv(&mut buf) {
-                    Ok(n) if n > 0 => {
-                        if tun_to_net_tx.blocking_send(buf[..n].to_vec()).is_err() {
-                            break;
-                        }
-                    }
-                    Ok(_) => {}
-                    Err(_) => break,
-                }
-            }
-        });
-    }
-    // сеть → TUN
-    {
-        let tun = tun.clone();
-        std::thread::spawn(move || {
-            while let Some(pkt) = net_to_tun_rx.blocking_recv() {
-                let _ = tun.send(&pkt);
-            }
-        });
-    }
-
-    match tunnel {
-        Tunnel::Quic(conn) => {
-            let send_conn = conn.clone();
-            let sender = tokio::spawn(async move {
-                while let Some(pkt) = tun_to_net_rx.recv().await {
-                    let dg = datagram::encode(datagram::CTX_RAW_IP, &pkt);
-                    if let Err(e) = send_conn.send_datagram(bytes::Bytes::from(dg)) {
-                        eprintln!("[pump] датаграмма отброшена ({} б): {e}", pkt.len());
-                    }
-                }
-            });
-            let recv_conn = conn.clone();
-            let receiver = tokio::spawn(async move {
-                let mut inb = Inbound::new(egress_filter, rate_limit);
-                loop {
-                    match recv_conn.read_datagram().await {
-                        Ok(dg) => {
-                            if let Some((datagram::CTX_RAW_IP, pkt)) = datagram::decode(&dg) {
-                                if inb.accept(pkt) && net_to_tun_tx.send(pkt.to_vec()).await.is_err() {
-                                    break;
-                                }
-                            }
-                        }
-                        Err(e) => {
-                            eprintln!("[pump] соединение закрыто: {e}");
-                            break;
-                        }
-                    }
-                }
-            });
-            let _ = tokio::try_join!(sender, receiver);
-        }
-        Tunnel::Tcp(tcp) => {
-            let (mut tx, mut rx) = tcp.into_split();
-            let sender = tokio::spawn(async move {
-                while let Some(pkt) = tun_to_net_rx.recv().await {
-                    if let Err(e) = tx.send_packet(&pkt).await {
-                        eprintln!("[pump:tcp] отправка не удалась ({} б): {e}", pkt.len());
-                        break;
-                    }
-                }
-            });
-            let receiver = tokio::spawn(async move {
-                let mut inb = Inbound::new(egress_filter, rate_limit);
-                loop {
-                    match rx.recv_packet().await {
-                        Ok(pkt) => {
-                            if inb.accept(&pkt) && net_to_tun_tx.send(pkt).await.is_err() {
-                                break;
-                            }
-                        }
-                        Err(e) => {
-                            eprintln!("[pump:tcp] соединение закрыто: {e}");
-                            break;
-                        }
-                    }
-                }
-            });
-            let _ = tokio::try_join!(sender, receiver);
-        }
-    }
-    Ok(())
-}
+// `pump` (data plane TUN ⇄ транспорт) вынесен в `citadel_quic::dataplane` (C0.2).

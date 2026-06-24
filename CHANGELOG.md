@@ -2,6 +2,38 @@
 
 Формат — [Keep a Changelog](https://keepachangelog.com/ru/1.1.0/); версии по [SemVer](https://semver.org/lang/ru/).
 
+## [Unreleased]
+
+Фундамент клиентского приложения (треки **C0–C1**, см. `docs/CLIENT-ARCH.md`): движок
+выделен во встраиваемую библиотеку и добавлен формат клиентских кред.
+**70 unit-тестов, Docker 15/15, `clippy --workspace --all-targets -D warnings` чисто.**
+
+### Добавлено
+- **C0 — ядро-как-библиотека.** Движок вынесен из бинаря `citadel-m1` в библиотечные модули
+  `citadel_quic::{config,dataplane,client,vpn}`:
+  - `TunIo`-трейт (абстракция туннеля) + `Tun::from_raw_fd` — платформенный TUN инъектируется
+    (Android `VpnService` fd и т.п.);
+  - `ClientConfig` + `from_env()` — движок конфигурируется структурой, не окружением;
+  - `establish_session` / `run_data_plane` — разделение «адрес → TUN» (порядок для мобильных ОС);
+  - `VpnController` (`connect`/`disconnect`/`subscribe()` события `Connecting/Up/Down`) + трейт
+    `TunProvider` (платформа туннеля за абстракцией);
+  - крейт **`citadel-client`** (`cdylib`/`staticlib`) — FFI-вуаль для GUI; кросс-собирается под
+    `aarch64-linux-android` (aws-lc-rs + PQ-крипта под Android NDK — риск R1 снят).
+- **C1 — формат кредов** (`citadel_client::creds`):
+  - `CredentialBundle` — полный набор кред (CBOR, файл `.citadelconf`);
+  - `CredentialLink` — компактная `citadel://`-ссылка/QR: большие публичные ключи → обязательства
+    `H(pub)` (CRQC-safe bootstrap), секреты инлайн; генерация QR (`to_qr_svg`) — компактная
+    ссылка влезает в QR версии 18 (545 B против ~2.4 КБ полного бандла);
+  - `to_client_config()` — `CredentialBundle` → `ClientConfig` (`PinSource::Bytes`/`MldsaSource::Bytes`).
+- **Инфраструктура разработки:** `tools/setup-dev-env.sh` — идемпотентный установщик окружения
+  (rustup, Android NDK/SDK, Flutter, кросс-таргеты); `tools/requirements.txt`.
+
+### Изменено
+- `pump` (data-plane) работает поверх `Arc<dyn TunIo>` вместо конкретного `Tun`.
+- Весь workspace приведён к чистоте `clippy --all-targets -D warnings` на тулчейне Rust 1.96.
+- Docker-демо (`entrypoint-client.sh`): устранены флаки оркестрации (probe по IP под DNS-lock;
+  снятие UDP-блока после TCP-fallback теста; `wait` предшественника + retry в тестах с рестартом).
+
 ## [0.1.0] — 2026-06-22
 
 Первый публичный **PoC-релиз**. Вся дорожная карта `SPEC.md §12` (M0–M7) закрыта на уровне

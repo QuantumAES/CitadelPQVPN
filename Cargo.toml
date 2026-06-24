@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/citadel-obfs", "crates/citadel-masque", "crates/citadel-tun", "crates/citadel-token", "crates/citadel-quic"]
+members = ["crates/citadel-obfs", "crates/citadel-masque", "crates/citadel-tun", "crates/citadel-token", "crates/citadel-quic", "crates/citadel-client"]
 
 [workspace.package]
 version = "0.1.0"
