@@ -15,7 +15,7 @@
 
 use std::collections::HashSet;
 use std::process::Command;
-use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::atomic::{AtomicU16, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -29,8 +29,26 @@ use citadel_quic::tcp_obfs::TcpObfs;
 use citadel_quic::vpn::VpnController;
 use citadel_tun::Tun;
 
-// Пул адресов exit для клиентов: 10.7.0.{2,3,...}/24.
-static ADDR_POOL: AtomicU8 = AtomicU8::new(2);
+// Пул адресов exit для клиентов: база/префикс из Citadel_TUN_ADDR; счётчик u16 заполняет
+// весь диапазон (для /16 — 10.7.0.2 … 10.7.255.253), чтобы адреса не кончались на реконнектах.
+static ADDR_POOL: AtomicU16 = AtomicU16::new(2);
+
+/// (первые два октета сети, префикс) из Citadel_TUN_ADDR (default 10.7.0.1/24).
+fn tun_net() -> ([u8; 2], u8) {
+    let s = std::env::var("Citadel_TUN_ADDR").unwrap_or_else(|_| "10.7.0.1/24".into());
+    let mut parts = s.splitn(2, '/');
+    let ip = parts.next().unwrap_or("10.7.0.1");
+    let prefix = parts.next().and_then(|p| p.parse().ok()).unwrap_or(24u8);
+    let o: Vec<u8> = ip.split('.').filter_map(|x| x.parse().ok()).collect();
+    ([o.first().copied().unwrap_or(10), o.get(1).copied().unwrap_or(7)], prefix)
+}
+
+/// Следующий клиентский адрес из пула + префикс сети.
+fn next_client_addr() -> ([u8; 4], u8) {
+    let (base, prefix) = tun_net();
+    let n = ADDR_POOL.fetch_add(1, Ordering::Relaxed);
+    ([base[0], base[1], (n >> 8) as u8, (n & 0xff) as u8], prefix)
+}
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -124,7 +142,13 @@ fn server_setup_net(ifname: &str) {
     run("iptables", &["-t", "nat", "-A", "POSTROUTING", "-s", &nat, "-o", &eg, "-j", "MASQUERADE"]);
     run("iptables", &["-A", "FORWARD", "-i", ifname, "-o", &eg, "-j", "ACCEPT"]);
     run("iptables", &["-A", "FORWARD", "-i", &eg, "-o", ifname, "-m", "state", "--state", "RELATED,ESTABLISHED", "-j", "ACCEPT"]);
-    eprintln!("[net] server: ip_forward + MASQUERADE через '{eg}' (src {nat})");
+    // MSS-clamp: ограничить TCP-сегменты под PMTU туннеля. Без него крупные ответные
+    // сегменты (TLS ServerHello/cert) не влезают в QUIC-датаграмму и теряются — PMTUD
+    // блэкхолится через NAT/туннель: ICMP/ping ходит, а TCP/HTTPS виснет. Клампим на SYN
+    // в обе стороны; `--clamp-mss-to-pmtu` берёт MTU исходящего интерфейса (для трафика
+    // в туннель = MTU туннеля), т.е. адаптивно под Citadel_MTU.
+    run("iptables", &["-t", "mangle", "-A", "FORWARD", "-p", "tcp", "--tcp-flags", "SYN,RST", "SYN", "-j", "TCPMSS", "--clamp-mss-to-pmtu"]);
+    eprintln!("[net] server: ip_forward + MASQUERADE + MSS-clamp через '{eg}' (src {nat})");
 }
 
 /// F6 (I3): DNS только через туннель + fail-closed на прочий :53 (анти-leak).
@@ -313,12 +337,12 @@ async fn run_server(tun: Arc<Tun>) -> Result<()> {
                 match listener.accept().await {
                     Ok((stream, _)) => match TcpObfs::wrap(stream, psk) {
                         Ok(tcp) => {
-                            let octet = ADDR_POOL.fetch_add(1, Ordering::Relaxed);
-                            let addr = [10, 7, 0, octet];
+                            let (addr, prefix) = next_client_addr();
                             tokio::spawn(handle_client(
                                 Tunnel::Tcp(tcp),
                                 tun.clone(),
                                 addr,
+                                prefix,
                                 issuer_pk.clone(),
                                 spent.clone(),
                                 rate_limit,
@@ -346,9 +370,8 @@ async fn run_server(tun: Arc<Tun>) -> Result<()> {
         tokio::spawn(async move {
             match incoming.await {
                 Ok(conn) => {
-                    let octet = ADDR_POOL.fetch_add(1, Ordering::Relaxed);
-                    let addr = [10, 7, 0, octet];
-                    handle_client(Tunnel::Quic(conn), tun, addr, issuer_pk, spent, rate_limit, signer, pin).await;
+                    let (addr, prefix) = next_client_addr();
+                    handle_client(Tunnel::Quic(conn), tun, addr, prefix, issuer_pk, spent, rate_limit, signer, pin).await;
                 }
                 Err(e) => eprintln!("[citadel-m1:server] хендшейк не удался: {e}"),
             }
@@ -363,6 +386,7 @@ async fn handle_client(
     mut tunnel: Tunnel,
     tun: Arc<Tun>,
     addr: [u8; 4],
+    prefix: u8,
     issuer_pk: Arc<Option<Vec<u8>>>,
     spent: Arc<Mutex<HashSet<[u8; 32]>>>,
     rate_limit: Option<RateCfg>,
@@ -371,13 +395,13 @@ async fn handle_client(
 ) {
     eprintln!("[citadel-m1:server] клиент {} ({}) подключён", tunnel.peer(), tunnel.kind());
     if let Err(e) =
-        server_assign_address(&mut tunnel, addr, 24, issuer_pk.as_deref(), &spent, (*signer).as_ref(), cert_pin).await
+        server_assign_address(&mut tunnel, addr, prefix, issuer_pk.as_deref(), &spent, (*signer).as_ref(), cert_pin).await
     {
         eprintln!("[citadel-m1:server] отказ в доступе: {e}");
         tunnel.close(1, b"auth-failed");
         return;
     }
-    eprintln!("[citadel-m1:server] выдан {}.{}.{}.{}/24", addr[0], addr[1], addr[2], addr[3]);
+    eprintln!("[citadel-m1:server] выдан {}.{}.{}.{}/{}", addr[0], addr[1], addr[2], addr[3], prefix);
     if let Err(e) = pump(tunnel, tun, true, rate_limit).await {
         eprintln!("[citadel-m1:server] pump завершён: {e}");
     }

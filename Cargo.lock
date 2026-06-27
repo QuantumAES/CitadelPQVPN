@@ -256,13 +256,27 @@ name = "citadel-client"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "aws-lc-rs",
  "base64",
  "ciborium",
  "citadel-quic",
+ "citadel-tun",
+ "libc",
  "qrcode",
+ "sendfd",
  "serde",
  "serde_bytes",
  "sha2",
+]
+
+[[package]]
+name = "citadel-helper"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "citadel-tun",
+ "libc",
+ "sendfd",
 ]
 
 [[package]]
@@ -1167,6 +1181,15 @@ name = "semver"
 version = "1.0.28"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8a7852d02fc848982e0c167ef163aaff9cd91dc640ba85e263cb1ce46fae51cd"
+
+[[package]]
+name = "sendfd"
+version = "0.4.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b183bfd5b1bc64ab0c1ef3ee06b008a9ef1b68a7d3a99ba566fbfe7a7c6d745b"
+dependencies = [
+ "libc",
+]
 
 [[package]]
 name = "serde"

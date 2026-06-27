@@ -4,9 +4,10 @@
 
 ## [Unreleased]
 
-Фундамент клиентского приложения (треки **C0–C1**, см. `docs/CLIENT-ARCH.md`): движок
-выделен во встраиваемую библиотеку и добавлен формат клиентских кред.
-**70 unit-тестов, Docker 15/15, `clippy --workspace --all-targets -D warnings` чисто.**
+Клиентское приложение (треки **C0–C2**, см. `docs/CLIENT-ARCH.md`): движок выделен во
+встраиваемую библиотеку, добавлены формат клиентских кред и десктоп-клиент с GUI,
+привилегированным TUN и зашифрованным хранилищем профилей.
+**80 unit-тестов, Docker 15/15, `clippy --workspace --all-targets -D warnings` чисто.**
 
 ### Добавлено
 - **C0 — ядро-как-библиотека.** Движок вынесен из бинаря `citadel-m1` в библиотечные модули
@@ -25,11 +26,29 @@
     `H(pub)` (CRQC-safe bootstrap), секреты инлайн; генерация QR (`to_qr_svg`) — компактная
     ссылка влезает в QR версии 18 (545 B против ~2.4 КБ полного бандла);
   - `to_client_config()` — `CredentialBundle` → `ClientConfig` (`PinSource::Bytes`/`MldsaSource::Bytes`).
+- **C2 — десктоп-клиент (Linux):** GUI на Flutter + flutter_rust_bridge поверх `citadel-client`.
+  - **Привилегии через polkit:** `citadel-helper` (root по `pkexec`) создаёт TUN + настраивает
+    адрес/маршруты/DNS и передаёт fd приложению по `SCM_RIGHTS`; непривилегированный GUI крутит
+    data-plane (`GuiTunProvider`). Polkit-политика + `tools/install-desktop.sh`.
+  - **GUI** (connection-centric): подключение по `citadel://`-ссылке/профилю, поток событий
+    состояния (карточка статуса с таймером сессии), мультипрофильность, диалог переключения.
+  - **Vault** (`citadel_client::vault`) — зашифрованное хранилище профилей: мастер-пароль →
+    PBKDF2-HMAC-SHA256 → AES-256-GCM (aws-lc-rs, кроссится под Android); профиль сохраняется
+    после первого успешного подключения; выбор/удаление/смена пароля.
+  - **Тестовый стенд:** QEMU/KVM VM (`tools/qemu-testvm.sh` — Debian-13/xfce/startx, 9p-шара,
+    общий буфер обмена через spice-vdagent) + token-less E2E-exit с публикацией портов
+    (`docker/compose.e2e.yml`, `run-e2e-exit.sh`) + генератор ссылок (`examples/linkgen.rs`).
 - **Инфраструктура разработки:** `tools/setup-dev-env.sh` — идемпотентный установщик окружения
   (rustup, Android NDK/SDK, Flutter, кросс-таргеты); `tools/requirements.txt`.
 
 ### Изменено
 - `pump` (data-plane) работает поверх `Arc<dyn TunIo>` вместо конкретного `Tun`.
+- `pump`: **отменяемый TUN-reader** (`poll` + stop-флаг) — на disconnect интерфейс/fd корректно
+  закрываются (чинит «не переподключается до перезапуска»); попутно закрыта серверная гонка
+  чтения общего TUN при multi-client.
+- Exit: **MSS-clamp** (`TCPMSS --clamp-mss-to-pmtu`) — анти-PMTUD-блэкхол, иначе TCP/HTTPS сквозь
+  туннель виснет (ICMP идёт). Пул адресов конфигурируем из `Citadel_TUN_ADDR` (база/префикс,
+  готов к /16).
 - Весь workspace приведён к чистоте `clippy --all-targets -D warnings` на тулчейне Rust 1.96.
 - Docker-демо (`entrypoint-client.sh`): устранены флаки оркестрации (probe по IP под DNS-lock;
   снятие UDP-блока после TCP-fallback теста; `wait` предшественника + retry в тестах с рестартом).

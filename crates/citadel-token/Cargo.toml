@@ -8,7 +8,7 @@ description = "CitadelPQVPN — анонимные токены (blind RSA, RFC 
 [dependencies]
 anyhow = "1"
 rand = "0.8"
-blind-rsa-signatures = "0.15"
+blind-rsa-signatures = "=0.15.0"   # =0.15.0: 0.15.1+ ломается (derive_more glob → PartialEq ambiguous, E0659)
 hex = "0.4"
 
 [dev-dependencies]

@@ -8,12 +8,21 @@
 //! C0.6: каркас + cdylib + кросс-сборка под Android. Де-риск R1 (aws-lc-rs под NDK) пройден —
 //! `cargo ndk -t arm64-v8a build` собирает ядро с PQ-криптой под aarch64-linux-android.
 
+pub mod api;
 pub mod creds;
+pub mod vault;
+#[cfg(target_os = "linux")]
+pub mod gui_tun;
 
 // Поверхность движка для FFI/UI: один крейт, чтобы биндинг-генератор видел всё в одном месте.
-pub use citadel_quic::config::{ClientConfig, MldsaSource, PinMode, PinSource};
+pub use citadel_quic::config::{
+    parse_obfs_psk, parse_pin, ClientConfig, MldsaSource, PinMode, PinSource,
+};
 pub use citadel_quic::vpn::{TunParams, TunProvider, VpnController, VpnEvent, VpnState};
 pub use creds::{CredentialBundle, CredentialLink, BUNDLE_VERSION};
+pub use vault::{Profile, Vault};
+#[cfg(target_os = "linux")]
+pub use gui_tun::GuiTunProvider;
 
 /// Версия ядра (about-экран UI / диагностика).
 pub fn version() -> &'static str {

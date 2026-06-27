@@ -229,6 +229,26 @@ impl CredentialLink {
             .min_dimensions(256, 256)
             .build())
     }
+
+    /// Преобразовать компактную ссылку в `ClientConfig` для подключения. pin берётся из
+    /// инлайн-`cert_pin`, obfs_psk инлайн. `mldsa = None` — в ссылке только обязательство
+    /// `H(pub)`, поэтому PQ-auth (ML-DSA) пропускается, пока полный pub не дотянут по каналу
+    /// (commitment-fetch — deferred). `token` пуст (добывается отдельно, C5).
+    pub fn to_client_config(&self) -> ClientConfig {
+        ClientConfig {
+            servers: self.servers.clone(),
+            server_name: self.server_name.clone(),
+            obfs_psk: self.obfs_psk,
+            kx_suite: self.kx_suite.clone(),
+            tcp_port: self.tcp_port.clone().unwrap_or_else(|| "443".into()),
+            routes: self.routes.clone(),
+            dns: self.dns.clone(),
+            mtu: "1280".into(),
+            token: Vec::new(),
+            pin: self.cert_pin.map_or(PinSource::None, PinSource::Bytes),
+            mldsa: MldsaSource::None,
+        }
+    }
 }
 
 #[cfg(test)]

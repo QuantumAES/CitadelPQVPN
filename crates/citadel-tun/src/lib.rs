@@ -23,6 +23,13 @@ pub trait TunIo: Send + Sync + 'static {
     fn recv(&self, buf: &mut [u8]) -> std::io::Result<usize>;
     /// Пишет один IP-пакет. Возвращает число записанных байт.
     fn send(&self, pkt: &[u8]) -> std::io::Result<usize>;
+    /// Сырой fd туннеля (Unix) — для прерываемого `poll`-чтения в data-plane: позволяет
+    /// reader'у выходить по сигналу отмены, а не висеть в блокирующем `recv`, держа
+    /// `Arc<dyn TunIo>` (иначе TUN-fd/интерфейс не закрывается → утечка). `None` —
+    /// реализация не на основе fd (тогда reader не прерывается через poll).
+    fn raw_fd(&self) -> Option<i32> {
+        None
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -124,6 +131,17 @@ mod imp {
         }
         fn send(&self, pkt: &[u8]) -> io::Result<usize> {
             Tun::send(self, pkt)
+        }
+        fn raw_fd(&self) -> Option<i32> {
+            Some(self.file.as_raw_fd())
+        }
+    }
+
+    /// Доступ к fd туннеля — нужен, чтобы передать его другому процессу через SCM_RIGHTS
+    /// (привилегированный `citadel-helper` → непривилегированный GUI, трек C2.3).
+    impl AsRawFd for Tun {
+        fn as_raw_fd(&self) -> RawFd {
+            self.file.as_raw_fd()
         }
     }
 

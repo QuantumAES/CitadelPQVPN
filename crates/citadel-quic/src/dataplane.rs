@@ -147,27 +147,22 @@ pub async fn pump(
     egress_filter: bool,
     rate_limit: Option<RateCfg>,
 ) -> Result<()> {
+    use std::sync::atomic::AtomicBool;
     use tokio::sync::mpsc;
     let (tun_to_net_tx, mut tun_to_net_rx) = mpsc::channel::<Vec<u8>>(1024);
     let (net_to_tun_tx, mut net_to_tun_rx) = mpsc::channel::<Vec<u8>>(1024);
 
-    // TUN → сеть (блокирующее чтение TUN в отдельном потоке)
+    // Сигнал остановки reader-потока TUN. Ставится при отмене pump (disconnect: future
+    // дропается → CancelGuard) ИЛИ при закрытии транспорта (receiver-задача). Без него
+    // блокирующий reader зависал бы в recv, держа клон Arc<dyn TunIo> → TUN-fd не
+    // закрывается (утечка реконнекта на клиенте + гонка multi-client на exit).
+    let stop = Arc::new(AtomicBool::new(false));
+
+    // TUN → сеть: прерываемое чтение (poll fd + stop) в отдельном потоке.
     {
         let tun = tun.clone();
-        std::thread::spawn(move || {
-            let mut buf = vec![0u8; 65536];
-            loop {
-                match tun.recv(&mut buf) {
-                    Ok(n) if n > 0 => {
-                        if tun_to_net_tx.blocking_send(buf[..n].to_vec()).is_err() {
-                            break;
-                        }
-                    }
-                    Ok(_) => {}
-                    Err(_) => break,
-                }
-            }
-        });
+        let stop = stop.clone();
+        std::thread::spawn(move || tun_reader_loop(tun, stop, tun_to_net_tx));
     }
     // сеть → TUN
     {
@@ -177,6 +172,23 @@ pub async fn pump(
                 let _ = tun.send(&pkt);
             }
         });
+    }
+
+    // Гард: при дропе future pump (отмена через select! в VpnController) ставит stop
+    // (reader выйдет ≤ poll-таймаута) и аборт async-задач (освобождают conn и
+    // net_to_tun_tx → writer-поток выходит) → все клоны Arc<dyn TunIo> отпускаются →
+    // TUN закрывается, helper ловит EOF и сворачивает сеть.
+    struct CancelGuard {
+        stop: Arc<AtomicBool>,
+        aborts: Vec<tokio::task::AbortHandle>,
+    }
+    impl Drop for CancelGuard {
+        fn drop(&mut self) {
+            self.stop.store(true, std::sync::atomic::Ordering::Release);
+            for a in &self.aborts {
+                a.abort();
+            }
+        }
     }
 
     match tunnel {
@@ -191,6 +203,7 @@ pub async fn pump(
                 }
             });
             let recv_conn = conn.clone();
+            let recv_stop = stop.clone();
             let receiver = tokio::spawn(async move {
                 let mut inb = Inbound::new(egress_filter, rate_limit);
                 loop {
@@ -208,7 +221,15 @@ pub async fn pump(
                         }
                     }
                 }
+                // транспорт закрыт → разбудить reader, чтобы pump завершился (важно на exit,
+                // где future pump не отменяется снаружи, а ждётся до конца — иначе reader-поток
+                // зависал бы в recv на общем TUN, воруя пакеты у новых клиентов).
+                recv_stop.store(true, std::sync::atomic::Ordering::Release);
             });
+            let _guard = CancelGuard {
+                stop,
+                aborts: vec![sender.abort_handle(), receiver.abort_handle()],
+            };
             let _ = tokio::try_join!(sender, receiver);
         }
         Tunnel::Tcp(tcp) => {
@@ -221,6 +242,7 @@ pub async fn pump(
                     }
                 }
             });
+            let recv_stop = stop.clone();
             let receiver = tokio::spawn(async move {
                 let mut inb = Inbound::new(egress_filter, rate_limit);
                 loop {
@@ -236,9 +258,83 @@ pub async fn pump(
                         }
                     }
                 }
+                recv_stop.store(true, std::sync::atomic::Ordering::Release);
             });
+            let _guard = CancelGuard {
+                stop,
+                aborts: vec![sender.abort_handle(), receiver.abort_handle()],
+            };
             let _ = tokio::try_join!(sender, receiver);
         }
     }
     Ok(())
+}
+
+/// Reader-петля TUN→сеть: прерываемое блокирующее чтение. На Unix — `poll` с коротким
+/// таймаутом, чтобы периодически проверять `stop` (отмена pump / закрытие транспорта) и
+/// выходить, освобождая `Arc<dyn TunIo>` — иначе поток завис бы в `recv`, удерживая TUN-fd
+/// открытым (утечка интерфейса). Без fd (`raw_fd()==None`) — обычное блокирующее чтение
+/// (прервётся по ошибке recv или закрытию канала-приёмника).
+fn tun_reader_loop(
+    tun: Arc<dyn TunIo>,
+    stop: Arc<std::sync::atomic::AtomicBool>,
+    tx: tokio::sync::mpsc::Sender<Vec<u8>>,
+) {
+    use std::sync::atomic::Ordering;
+    let mut buf = vec![0u8; 65536];
+
+    #[cfg(unix)]
+    if let Some(fd) = tun.raw_fd() {
+        // неблокирующий fd + poll(timeout): просыпаемся на пакет ИЛИ каждые 200мс на stop.
+        // SAFETY: fd валиден, пока жив tun (держим Arc); fcntl/poll без side-effects на память.
+        unsafe {
+            let fl = libc::fcntl(fd, libc::F_GETFL);
+            if fl >= 0 {
+                libc::fcntl(fd, libc::F_SETFL, fl | libc::O_NONBLOCK);
+            }
+        }
+        let mut pfd = libc::pollfd { fd, events: libc::POLLIN, revents: 0 };
+        while !stop.load(Ordering::Acquire) {
+            // SAFETY: &mut на один валидный pollfd; таймаут 200мс.
+            let r = unsafe { libc::poll(&mut pfd, 1, 200) };
+            if r < 0 {
+                if std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted {
+                    continue;
+                }
+                break;
+            }
+            if r == 0 {
+                continue; // таймаут → перепроверить stop
+            }
+            if pfd.revents & libc::POLLIN != 0 {
+                match tun.recv(&mut buf) {
+                    Ok(n) if n > 0 => {
+                        if tx.blocking_send(buf[..n].to_vec()).is_err() {
+                            break;
+                        }
+                    }
+                    Ok(_) => {}
+                    Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
+                    Err(_) => break,
+                }
+            }
+            if pfd.revents & (libc::POLLERR | libc::POLLHUP | libc::POLLNVAL) != 0 {
+                break; // fd закрыт/ошибка
+            }
+        }
+        return;
+    }
+
+    // fallback: без fd — обычное блокирующее чтение (прервётся по ошибке/закрытию канала).
+    loop {
+        match tun.recv(&mut buf) {
+            Ok(n) if n > 0 => {
+                if tx.blocking_send(buf[..n].to_vec()).is_err() {
+                    break;
+                }
+            }
+            Ok(_) => {}
+            Err(_) => break,
+        }
+    }
 }
