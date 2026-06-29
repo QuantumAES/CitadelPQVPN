@@ -305,8 +305,12 @@ class _HomePageState extends State<HomePage> {
             try {
               await onSubmit(pw.text);
               if (dctx.mounted) Navigator.pop(dctx, true);
-            } catch (_) {
-              setLocal(() => err = 'Неверный пароль');
+            } catch (e) {
+              // При создании «неверного пароля» не бывает — показываем реальную ошибку
+              // (например, недоступный каталог), иначе бы маскировали её под пароль.
+              setLocal(() => err = confirm
+                  ? 'Не удалось создать: ${_short(e)}'
+                  : 'Неверный пароль');
             }
           }
 
@@ -360,6 +364,12 @@ class _HomePageState extends State<HomePage> {
     if (!mounted) return;
     ScaffoldMessenger.of(context)
         .showSnackBar(SnackBar(content: Text(msg)));
+  }
+
+  /// Короткое читабельное представление FFI-ошибки для inline-показа в диалоге.
+  static String _short(Object e) {
+    final s = e.toString().replaceAll('\n', ' ').trim();
+    return s.length > 120 ? '${s.substring(0, 117)}…' : s;
   }
 }
 

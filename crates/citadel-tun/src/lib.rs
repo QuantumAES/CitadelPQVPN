@@ -32,7 +32,7 @@ pub trait TunIo: Send + Sync + 'static {
     }
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "android"))]
 mod imp {
     use std::fs::{File, OpenOptions};
     use std::io::{self, Read, Write};
@@ -76,7 +76,8 @@ mod imp {
             }
 
             // SAFETY: fd валиден (только что открыт), req — корректный &mut на ifreq.
-            let rc = unsafe { libc::ioctl(file.as_raw_fd(), TUNSETIFF, &mut req as *mut IfReq) };
+            // на bionic (Android) ioctl request — c_int, на glibc — c_ulong: `as _` подберёт тип
+            let rc = unsafe { libc::ioctl(file.as_raw_fd(), TUNSETIFF as _, &mut req as *mut IfReq) };
             if rc < 0 {
                 return Err(io::Error::last_os_error());
             }
@@ -191,5 +192,5 @@ mod imp {
     }
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "android"))]
 pub use imp::{has_privileges, Tun};

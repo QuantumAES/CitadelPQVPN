@@ -15,7 +15,10 @@ use flutter_rust_bridge::frb;
 
 use crate::frb_generated::StreamSink;
 
-use citadel_client::{CredentialLink, GuiTunProvider, Profile, TunProvider, Vault, VpnController, VpnEvent, VpnState};
+use citadel_client::{
+    establish_session, run_data_plane, tun_from_fd, CredentialLink, GuiTunProvider, Profile,
+    Session, TunProvider, Vault, VpnController, VpnEvent, VpnState,
+};
 
 /// Версия PQ-VPN-ядра (about-экран).
 #[frb(sync)]
@@ -61,6 +64,17 @@ pub struct LinkSummaryDto {
     pub has_obfs: bool,
 }
 
+/// Параметры назначенного туннеля для Android `VpnService.Builder` (фаза 1 → фаза 2).
+pub struct TunSetupDto {
+    pub addr: String,
+    pub prefix: u32,
+    pub mtu: String,
+    pub routes: String,
+    pub dns: String,
+    pub exit: String,
+    pub transport: String,
+}
+
 // ───────────────────────────── глобальное состояние ─────────────────────────────
 
 static RT: OnceLock<tokio::runtime::Runtime> = OnceLock::new();
@@ -74,14 +88,34 @@ fn rt() -> &'static tokio::runtime::Runtime {
 }
 static ACTIVE: Mutex<Option<Arc<VpnController>>> = Mutex::new(None);
 static VAULT: Mutex<Option<Vault>> = Mutex::new(None);
+/// Установленная сессия (сеть готова, TUN ещё нет) между фазами Android-подключения.
+static ANDROID_SESSION: Mutex<Option<Session>> = Mutex::new(None);
+/// Хэндл задачи Android data-plane — для остановки (abort → pump сворачивается, fd закрывается).
+static ANDROID_DP: Mutex<Option<tokio::task::AbortHandle>> = Mutex::new(None);
+/// Базовый каталог данных, заданный платформой (Android: app filesDir). На десктопе не ставится —
+/// там путь резолвится из XDG/HOME. Без него на Android cwd=`/` (песочница не writable) и vault не создать.
+static DATA_DIR: OnceLock<PathBuf> = OnceLock::new();
 
-/// Путь файла хранилища: `$XDG_CONFIG_HOME|~/.config/citadel-pqvpn/vault.bin`.
+/// Каталог данных, заданный платформой (Android передаёт filesDir через [`set_data_dir`]).
+/// Если задан — хранилище кладём прямо в него (он уже приватный и writable, без подпапки `.config`).
+/// Иначе (десктоп) — `$XDG_CONFIG_HOME|~/.config/citadel-pqvpn`.
 fn vault_path() -> PathBuf {
+    if let Some(dir) = DATA_DIR.get() {
+        return dir.join("vault.bin");
+    }
     let base = std::env::var_os("XDG_CONFIG_HOME")
         .map(PathBuf::from)
         .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".config")))
         .unwrap_or_else(|| PathBuf::from("."));
     base.join("citadel-pqvpn").join("vault.bin")
+}
+
+/// Задать каталог данных приложения (вызывается из Dart на старте, до любых vault-операций).
+/// На Android — `getApplicationSupportDirectory()`; на десктопе можно не вызывать. Идемпотентно:
+/// первый успешный вызов фиксирует путь (повторные молча игнорируются).
+#[frb(sync)]
+pub fn set_data_dir(dir: String) {
+    let _ = DATA_DIR.set(PathBuf::from(dir));
 }
 
 fn profile_to_dto(p: &Profile) -> ProfileDto {
@@ -263,6 +297,95 @@ pub fn vpn_connect_profile(id: String, sink: StreamSink<VpnEventDto>) -> Result<
             .ok_or_else(|| anyhow!("профиль не найден"))?
     };
     start_connect(&uri, Some(id), sink)
+}
+
+// ─────────────────────────── Android: двухфазное подключение ───────────────────────────
+// TUN-fd даёт VpnService (не polkit-helper), поэтому используем split движка:
+// establish (сеть, без TUN) → Dart строит TUN через VpnService.Builder → fd → data-plane.
+
+fn state_dto(s: &str) -> VpnEventDto {
+    VpnEventDto {
+        kind: "state".into(),
+        state: s.into(),
+        exit: String::new(),
+        transport: String::new(),
+        cidr: String::new(),
+        error: String::new(),
+    }
+}
+
+async fn do_android_establish(uri: &str) -> Result<TunSetupDto> {
+    let cfg = CredentialLink::from_uri(uri)?.to_client_config();
+    let session = establish_session(&cfg).await?;
+    let a = session.addr;
+    let dto = TunSetupDto {
+        addr: format!("{}.{}.{}.{}", a[0], a[1], a[2], a[3]),
+        prefix: session.prefix as u32,
+        mtu: cfg.mtu.clone(),
+        routes: cfg.routes.clone(),
+        dns: cfg.dns.clone().unwrap_or_default(),
+        exit: session.chosen.clone(),
+        transport: session.transport().to_string(),
+    };
+    *ANDROID_SESSION.lock().unwrap() = Some(session);
+    Ok(dto)
+}
+
+/// Фаза 1 (сырая ссылка): установить сессию (PQ-хендшейк + адрес, БЕЗ TUN). Вернуть параметры
+/// для `VpnService.Builder`. Сессия удерживается до фазы 2.
+pub async fn android_establish(link: String) -> Result<TunSetupDto> {
+    do_android_establish(&link).await
+}
+
+/// Фаза 1 (сохранённый профиль): ссылка достаётся из vault, не покидает ядро.
+pub async fn android_establish_profile(id: String) -> Result<TunSetupDto> {
+    let uri = {
+        let g = VAULT.lock().unwrap();
+        let v = g.as_ref().ok_or_else(|| anyhow!("хранилище заблокировано"))?;
+        v.list()
+            .into_iter()
+            .find(|p| p.id == id)
+            .map(|p| p.uri)
+            .ok_or_else(|| anyhow!("профиль не найден"))?
+    };
+    do_android_establish(&uri).await
+}
+
+/// Фаза 2: Dart получил TUN-fd от `VpnService.establish()` → запустить data-plane, стримить
+/// события. Останов — со стороны Dart (stopService закрывает fd → reader завершает pump).
+pub fn android_run_data_plane(fd: i32, sink: StreamSink<VpnEventDto>) -> Result<()> {
+    let session = ANDROID_SESSION
+        .lock()
+        .unwrap()
+        .take()
+        .ok_or_else(|| anyhow!("нет установленной сессии — сначала android_establish"))?;
+    let connected = VpnEventDto {
+        kind: "connected".into(),
+        state: String::new(),
+        exit: session.chosen.clone(),
+        transport: session.transport().to_string(),
+        cidr: session.cidr(),
+        error: String::new(),
+    };
+    let _ = sink.add(connected);
+    let _ = sink.add(state_dto("up"));
+    // SAFETY: fd получен от VpnService.establish() (detachFd) — владеем им единолично.
+    let tun = unsafe { tun_from_fd(fd) };
+    let h = rt().spawn(async move {
+        let _ = run_data_plane(session, tun).await;
+        let _ = sink.add(state_dto("down"));
+    });
+    *ANDROID_DP.lock().unwrap() = Some(h.abort_handle());
+    Ok(())
+}
+
+/// Остановить Android data-plane (Dart зовёт при stopService). Аборт задачи → pump-CancelGuard
+/// закрывает TUN-fd → интерфейс VpnService гаснет.
+#[frb(sync)]
+pub fn android_disconnect() {
+    if let Some(h) = ANDROID_DP.lock().unwrap().take() {
+        h.abort();
+    }
 }
 
 /// Разорвать активную сессию (если есть).

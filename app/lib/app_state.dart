@@ -1,7 +1,9 @@
 import 'dart:async';
+import 'dart:io';
 
 import 'package:flutter/foundation.dart';
 
+import 'package:app/android_vpn.dart';
 import 'package:app/src/rust/api/citadel.dart';
 
 /// Человекочитаемая фаза подключения (UI ветвится по ней, не по сырым строкам ядра).
@@ -79,13 +81,59 @@ class AppState extends ChangeNotifier {
 
   // ─────────────────────────── vpn ───────────────────────────
 
-  void connectProfile(String id) =>
+  void connectProfile(String id) {
+    if (Platform.isAndroid) {
+      _androidConnect(profileId: id);
+    } else {
       _listen(vpnConnectProfile(id: id), profileId: id);
+    }
+  }
 
   /// Пробное подключение по сырой ссылке; при успехе (событие `up`) — сохранить в vault.
   void addAndConnect(String name, String uri) {
     _pendingSave = (name: name, uri: uri);
-    _listen(vpnConnect(link: uri), profileId: null);
+    if (Platform.isAndroid) {
+      _androidConnect(link: uri);
+    } else {
+      _listen(vpnConnect(link: uri), profileId: null);
+    }
+  }
+
+  /// Android: двухфазно — establish (сеть) → VpnService строит TUN → run_data_plane.
+  Future<void> _androidConnect({String? profileId, String? link}) async {
+    _sub?.cancel();
+    phase = VpnPhase.connecting;
+    activeProfileId = profileId;
+    exit = transport = cidr = errorMsg = '';
+    since = null;
+    notifyListeners();
+    try {
+      if (!await AndroidVpn.prepare()) {
+        phase = VpnPhase.error;
+        errorMsg = 'Нет разрешения на VPN';
+        notifyListeners();
+        return;
+      }
+      await AndroidVpn.startService();
+      final setup = profileId != null
+          ? await androidEstablishProfile(id: profileId)
+          : await androidEstablish(link: link!);
+      final fd = await AndroidVpn.establishTun(setup);
+      if (fd < 0) {
+        phase = VpnPhase.error;
+        errorMsg = 'VpnService не выдал TUN-fd';
+        notifyListeners();
+        await AndroidVpn.stopService();
+        return;
+      }
+      _listen(androidRunDataPlane(fd: fd), profileId: profileId);
+    } catch (e) {
+      phase = VpnPhase.error;
+      errorMsg = '$e';
+      since = null;
+      notifyListeners();
+      await AndroidVpn.stopService();
+    }
   }
 
   void _listen(Stream<VpnEventDto> stream, {String? profileId}) {
@@ -150,7 +198,12 @@ class AppState extends ChangeNotifier {
   }
 
   void disconnect() {
-    vpnDisconnect();
+    if (Platform.isAndroid) {
+      androidDisconnect(); // abort data-plane → fd закрывается → TUN гаснет
+      AndroidVpn.stopService();
+    } else {
+      vpnDisconnect();
+    }
     _sub?.cancel();
     _sub = null;
     _pendingSave = null;

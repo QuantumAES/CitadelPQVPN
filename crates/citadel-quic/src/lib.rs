@@ -18,10 +18,12 @@ pub mod client;
 pub mod config;
 pub mod dataplane;
 pub mod pqauth;
+pub mod protect;
 pub mod ratelimit;
 pub mod tcp_obfs;
 pub mod vpn;
 pub use obfs_socket::{client_endpoint_obfs, server_endpoint_obfs};
+pub use protect::{clear_socket_protector, set_socket_protector, SocketProtector};
 
 pub const ALPN: &[u8] = b"Citadel-pq";
 

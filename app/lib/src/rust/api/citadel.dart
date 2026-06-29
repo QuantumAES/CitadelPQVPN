@@ -6,10 +6,16 @@
 import '../frb_generated.dart';
 import 'package:flutter_rust_bridge/flutter_rust_bridge_for_generated.dart';
 
-// These functions are ignored because they are not marked as `pub`: `profile_to_dto`, `rt`, `start_connect`, `to_dto`, `vault_path`
+// These functions are ignored because they are not marked as `pub`: `do_android_establish`, `profile_to_dto`, `rt`, `start_connect`, `state_dto`, `to_dto`, `vault_path`
 
 /// Версия PQ-VPN-ядра (about-экран).
 String coreVersion() => RustLib.instance.api.crateApiCitadelCoreVersion();
+
+/// Задать каталог данных приложения (вызывается из Dart на старте, до любых vault-операций).
+/// На Android — `getApplicationSupportDirectory()`; на десктопе можно не вызывать. Идемпотентно:
+/// первый успешный вызов фиксирует путь (повторные молча игнорируются).
+void setDataDir({required String dir}) =>
+    RustLib.instance.api.crateApiCitadelSetDataDir(dir: dir);
 
 /// Существует ли файл хранилища (UI: разблокировать vs первый запуск).
 bool vaultExists() => RustLib.instance.api.crateApiCitadelVaultExists();
@@ -57,6 +63,25 @@ Stream<VpnEventDto> vpnConnect({required String link}) =>
 /// Подключить по сохранённому профилю (ссылка достаётся из vault, не покидает ядро).
 Stream<VpnEventDto> vpnConnectProfile({required String id}) =>
     RustLib.instance.api.crateApiCitadelVpnConnectProfile(id: id);
+
+/// Фаза 1 (сырая ссылка): установить сессию (PQ-хендшейк + адрес, БЕЗ TUN). Вернуть параметры
+/// для `VpnService.Builder`. Сессия удерживается до фазы 2.
+Future<TunSetupDto> androidEstablish({required String link}) =>
+    RustLib.instance.api.crateApiCitadelAndroidEstablish(link: link);
+
+/// Фаза 1 (сохранённый профиль): ссылка достаётся из vault, не покидает ядро.
+Future<TunSetupDto> androidEstablishProfile({required String id}) =>
+    RustLib.instance.api.crateApiCitadelAndroidEstablishProfile(id: id);
+
+/// Фаза 2: Dart получил TUN-fd от `VpnService.establish()` → запустить data-plane, стримить
+/// события. Останов — со стороны Dart (stopService закрывает fd → reader завершает pump).
+Stream<VpnEventDto> androidRunDataPlane({required int fd}) =>
+    RustLib.instance.api.crateApiCitadelAndroidRunDataPlane(fd: fd);
+
+/// Остановить Android data-plane (Dart зовёт при stopService). Аборт задачи → pump-CancelGuard
+/// закрывает TUN-fd → интерфейс VpnService гаснет.
+void androidDisconnect() =>
+    RustLib.instance.api.crateApiCitadelAndroidDisconnect();
 
 /// Разорвать активную сессию (если есть).
 void vpnDisconnect() => RustLib.instance.api.crateApiCitadelVpnDisconnect();
@@ -150,6 +175,50 @@ class ProfileDto {
           hasPqAuth == other.hasPqAuth &&
           hasObfs == other.hasObfs &&
           lastExit == other.lastExit;
+}
+
+/// Параметры назначенного туннеля для Android `VpnService.Builder` (фаза 1 → фаза 2).
+class TunSetupDto {
+  final String addr;
+  final int prefix;
+  final String mtu;
+  final String routes;
+  final String dns;
+  final String exit;
+  final String transport;
+
+  const TunSetupDto({
+    required this.addr,
+    required this.prefix,
+    required this.mtu,
+    required this.routes,
+    required this.dns,
+    required this.exit,
+    required this.transport,
+  });
+
+  @override
+  int get hashCode =>
+      addr.hashCode ^
+      prefix.hashCode ^
+      mtu.hashCode ^
+      routes.hashCode ^
+      dns.hashCode ^
+      exit.hashCode ^
+      transport.hashCode;
+
+  @override
+  bool operator ==(Object other) =>
+      identical(this, other) ||
+      other is TunSetupDto &&
+          runtimeType == other.runtimeType &&
+          addr == other.addr &&
+          prefix == other.prefix &&
+          mtu == other.mtu &&
+          routes == other.routes &&
+          dns == other.dns &&
+          exit == other.exit &&
+          transport == other.transport;
 }
 
 /// Событие VPN-сессии для UI. `kind`: `state` | `connected` | `error`.

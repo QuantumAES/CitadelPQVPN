@@ -21,8 +21,9 @@ aws-lc-rs = "1.17"          # vault: PBKDF2-HMAC-SHA256 + AES-256-GCM (то же
 qrcode = { version = "0.14", default-features = false, features = ["svg"] }  # генерация QR (без image-crate)
 citadel-tun = { path = "../citadel-tun" }   # GuiTunProvider: Tun::from_raw_fd (Linux-desktop)
 
-# Linux-desktop: приём TUN-fd от citadel-helper по SCM_RIGHTS (на Android TUN даёт VpnService).
-[target.'cfg(target_os = "linux")'.dependencies]
+# SCM_RIGHTS для GuiTunProvider (Linux-desktop). На Android gui_tun компилируется, но не
+# используется (TUN даёт VpnService) — dep нужен, чтобы frb_generated.rs собрался под android.
+[target.'cfg(any(target_os = "linux", target_os = "android"))'.dependencies]
 sendfd = "0.4"
 
 [dev-dependencies]

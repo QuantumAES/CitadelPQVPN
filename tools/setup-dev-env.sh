@@ -30,8 +30,8 @@ set -euo pipefail
 
 # ---- пинуемые версии (можно переопределить через env перед запуском) ---------
 NDK_VERSION="${NDK_VERSION:-27.2.12479018}"        # LTS NDK r27
-ANDROID_PLATFORM="${ANDROID_PLATFORM:-android-35}"
-ANDROID_BUILD_TOOLS="${ANDROID_BUILD_TOOLS:-35.0.0}"
+ANDROID_PLATFORM="${ANDROID_PLATFORM:-android-36}"   # Flutter 3.44 требует SDK 36
+ANDROID_BUILD_TOOLS="${ANDROID_BUILD_TOOLS:-36.0.0}"
 CMDLINE_TOOLS_BUILD="${CMDLINE_TOOLS_BUILD:-11076708}"  # commandlinetools-linux-<build>_latest.zip
 FLUTTER_CHANNEL="${FLUTTER_CHANNEL:-stable}"
 RUST_NIGHTLY="${RUST_NIGHTLY:-nightly}"            # для cargo-fuzz (M6 future)

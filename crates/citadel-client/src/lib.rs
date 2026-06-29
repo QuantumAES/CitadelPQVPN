@@ -11,22 +11,40 @@
 pub mod api;
 pub mod creds;
 pub mod vault;
-#[cfg(target_os = "linux")]
+// gui_tun компилируется и на Android (unix SCM_RIGHTS/UnixSocket), но там НЕ используется —
+// мобильный путь идёт через VpnService (android_establish/run_data_plane). Нужно, чтобы
+// frb_generated.rs (ссылается на vpn_connect → GuiTunProvider) собирался под android.
+#[cfg(any(target_os = "linux", target_os = "android"))]
 pub mod gui_tun;
 
 // Поверхность движка для FFI/UI: один крейт, чтобы биндинг-генератор видел всё в одном месте.
 pub use citadel_quic::config::{
     parse_obfs_psk, parse_pin, ClientConfig, MldsaSource, PinMode, PinSource,
 };
+pub use citadel_quic::client::{establish_session, run_data_plane, Session};
+pub use citadel_quic::protect::{clear_socket_protector, set_socket_protector, SocketProtector};
 pub use citadel_quic::vpn::{TunParams, TunProvider, VpnController, VpnEvent, VpnState};
+pub use citadel_tun::TunIo;
 pub use creds::{CredentialBundle, CredentialLink, BUNDLE_VERSION};
 pub use vault::{Profile, Vault};
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "android"))]
 pub use gui_tun::GuiTunProvider;
 
 /// Версия ядра (about-экран UI / диагностика).
 pub fn version() -> &'static str {
     env!("CARGO_PKG_VERSION")
+}
+
+/// Обернуть TUN-fd в [`TunIo`] для `run_data_plane`. Источник fd:
+/// Android — `VpnService.establish()` (`ParcelFileDescriptor.detachFd()`), Linux — citadel-helper.
+///
+/// # Safety
+/// `fd` должен быть валидным открытым TUN-дескриптором, которым не владеет никто другой
+/// (берётся владение, закроется при дропе).
+#[cfg(any(target_os = "linux", target_os = "android"))]
+pub unsafe fn tun_from_fd(fd: i32) -> std::sync::Arc<dyn TunIo> {
+    // SAFETY: контракт делегирован вызывающему (см. # Safety).
+    std::sync::Arc::new(citadel_tun::Tun::from_raw_fd(fd))
 }
 
 /// C-ABI якорь: подтверждает, что `cdylib` экспортирует символы (smoke для FFI-линковки).

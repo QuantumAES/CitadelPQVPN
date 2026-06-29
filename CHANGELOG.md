@@ -4,10 +4,11 @@
 
 ## [Unreleased]
 
-Клиентское приложение (треки **C0–C2**, см. `docs/CLIENT-ARCH.md`): движок выделен во
-встраиваемую библиотеку, добавлены формат клиентских кред и десктоп-клиент с GUI,
-привилегированным TUN и зашифрованным хранилищем профилей.
-**80 unit-тестов, Docker 15/15, `clippy --workspace --all-targets -D warnings` чисто.**
+Клиентское приложение (треки **C0–C3**, см. `docs/CLIENT-ARCH.md`): движок выделен во
+встраиваемую библиотеку, добавлены формат клиентских кред, десктоп-клиент (Linux) с GUI,
+привилегированным TUN и зашифрованным хранилищем профилей, и Android-клиент через `VpnService`.
+**81 unit-тест, Docker 15/15, `clippy --workspace --all-targets -D warnings` чисто; APK собирается,
+Android-коннект подтверждён на эмуляторе (клиенту выдан адрес из пула exit).**
 
 ### Добавлено
 - **C0 — ядро-как-библиотека.** Движок вынесен из бинаря `citadel-m1` в библиотечные модули
@@ -38,6 +39,15 @@
   - **Тестовый стенд:** QEMU/KVM VM (`tools/qemu-testvm.sh` — Debian-13/xfce/startx, 9p-шара,
     общий буфер обмена через spice-vdagent) + token-less E2E-exit с публикацией портов
     (`docker/compose.e2e.yml`, `run-e2e-exit.sh`) + генератор ссылок (`examples/linkgen.rs`).
+- **C3 — Android-клиент (`VpnService`):** мобильный путь поверх того же движка/FFI.
+  - Двухфазное подключение (мобильный порядок «адрес → TUN»): `android_establish` (PQ-хендшейк
+    + назначение адреса, без TUN) → Kotlin `VpnService.Builder.establish()` → fd → Rust
+    `android_run_data_plane` (data-plane + поток событий). `citadel_tun::Tun` (fd-путь) расширен
+    на Android.
+  - **Анти-петля `protect()`:** хук `citadel_quic::protect` (`SocketProtector` / `protect_socket`)
+    в движке + JNI-мост (`android_jni.rs` ↔ `CitadelVpnService.protectFd`) — исходящие сокеты
+    движка исключаются из собственного туннеля.
+  - `CitadelVpnService` (foreground) + MethodChannel + Dart-ветка `Platform.isAndroid` в UI.
 - **Инфраструктура разработки:** `tools/setup-dev-env.sh` — идемпотентный установщик окружения
   (rustup, Android NDK/SDK, Flutter, кросс-таргеты); `tools/requirements.txt`.
 
@@ -50,8 +60,20 @@
   туннель виснет (ICMP идёт). Пул адресов конфигурируем из `Citadel_TUN_ADDR` (база/префикс,
   готов к /16).
 - Весь workspace приведён к чистоте `clippy --all-targets -D warnings` на тулчейне Rust 1.96.
+- `citadel-tun`/`citadel-client` компилируются и под `target_os = "android"` (fd-путь TUN,
+  `gui_tun`/`sendfd`; `ioctl`-request `c_int`/`c_ulong` для bionic/glibc).
+- cargokit/rust_builder адаптированы под Gradle 9.1 / AGP 9.0.1 (инжект `ExecOperations` вместо
+  удалённого `Project.exec()`, rustup-тулчейн в PATH сборки, `compileSdk` 36).
 - Docker-демо (`entrypoint-client.sh`): устранены флаки оркестрации (probe по IP под DNS-lock;
   снятие UDP-блока после TCP-fallback теста; `wait` предшественника + retry в тестах с рестартом).
+
+### Исправлено
+- **Android: создание хранилища падало ложным «Неверный пароль».** Путь vault резолвился из
+  `XDG_CONFIG_HOME`/`HOME`, которых в песочнице Android нет → файл уходил в недоступную для записи
+  директорию, `Vault::create` падал, а диалог трактовал любую ошибку как неверный пароль. Каталог
+  данных теперь задаёт платформа (`set_data_dir` ← `getApplicationSupportDirectory()`, Android
+  `filesDir`); десктоп по-прежнему использует `XDG`/`HOME`. Диалог создания хранилища показывает
+  реальную причину ошибки вместо «неверного пароля».
 
 ## [0.1.0] — 2026-06-22
 

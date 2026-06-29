@@ -2,6 +2,11 @@
 
 set -e
 
+# CitadelPQVPN patch: гарантируем rustup-тулчейн. Gradle-сборка неинтерактивна → ~/.bashrc НЕ
+# добавляет ~/.cargo/bin в PATH, и cargo резолвится в системный rustc 1.85 (слишком старый для
+# зависимостей). Префиксуем rustup-cargo (1.96 + cargo-ndk) явно.
+export PATH="$HOME/.cargo/bin:$PATH"
+
 BASEDIR=$(dirname "$0")
 
 mkdir -p "$CARGOKIT_TOOL_TEMP_DIR"
