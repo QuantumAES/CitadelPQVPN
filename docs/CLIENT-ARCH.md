@@ -172,7 +172,7 @@ impl VpnController {
 
 Поток:
 1. SSH-коннект (пароль или ключ), TOFU по host-key.
-2. `uname -m` → выбор арки; проверка наличия Docker (нет → подсказка установки, не молчим).
+2. `uname -m` → выбор арки; проверка Docker — **нет → авто-установка** (официальный `get.docker.com` под root; Debian/Ubuntu — наша база, надёжно; RHEL/прочие — best-effort + внятный фолбэк, не молчим).
 3. **Сервер сам тянет бинарь** с GitHub Release (`curl` на хосте — не льём 70 МБ через SSH). Фолбэк без egress: админ-приложение качает один раз, кэширует, стримит через sftp.
 4. Проверка `sha256` + подписи → `/opt/citadel/bin/citadel-m1`.
 5. **Генерация серверных ключей** (на хосте или локально с заливкой): self-signed cert + pin (F1), ML-DSA-65 keypair (M7), issuer RSA-2048 (M5), obfs PSK.
@@ -278,10 +278,11 @@ CitadelPQVPN/
 | **C0** | **Ядро-как-библиотека** (критич. путь): движок из `bin/citadel-m1` → модуль `citadel_quic::{config,dataplane,client}` (NB: **не** отдельный крейт на этом шаге — иначе цикл с серверным бинарём, живущим в `citadel-quic`; крейт `citadel-client` появляется на FFI-под-шаге как тонкая вуаль); `TunIo`-трейт; `ClientConfig`; `Session`/`establish_session`/`run_data_plane`; `VpnController`+события; `citadel-tun::from_raw_fd`; FFI (UniFFI + frb); smoke-сборка `cdylib` под Android (R1) | — |
 | **C1** | **Формат кредов**: `citadel://` + CBOR + base64url, `.citadelconf`, QR encode/decode (дизайн обязательств §9.3), `ConfigManager`; замер QR (R4) | C0 |
 | **C2** | **User-mode на Linux** (быстрый E2E): Flutter-скелет + frb + Linux-TUN (polkit-helper); Connect/Disconnect/Status поверх текущей docker-демки | C0, C1 |
-| **C3** | **Платформенные TUN**: Android `VpnService` → Windows WinTUN → macOS NEPacketTunnel (R2, R3) | C2 |
-| **C4** | **Admin-deploy**: `russh` → docker-оркестрация, серверный keygen, чтение pin/pubkeys, минт бандла + QR; CI multi-arch Release | C0, C1 |
-| **C5** | **Двухслойная идентичность**: epoch-ключи в `citadel-token`, issuer client-registry + Ed25519-auth + revoke, `TokenAgent` авто-рефреш | C4 |
-| **C6** | **Секреты/полировка/упаковка**: `SecretStore` (keychain), kill-switch, apk/msix/dmg/AppImage/deb, подпись + нотаризация macOS | C2–C5 |
+| **C3** | **Платформенные TUN**: Android `VpnService` **✅** → Windows WinTUN → macOS NEPacketTunnel (R2, R3) | C2 |
+| **C4** | **Admin-deploy**: `russh` SSH → **bootstrap Docker** (авто-установка, не просто проверка) → серверный keygen → рендер `compose`/entrypoints → `docker compose up` → чтение pin/pubkeys → **базовый минт доступа** (`citadel://`+QR на клиента). Dev-путь (sftp/bind-mount локального бинаря) до CI-Release (§8.1, под-шаг C4.5) | C0, C1 |
+| **C5** | **Идентичность и доступ**: двухслойная (epoch-ключи в `citadel-token` + issuer client-registry + Ed25519-auth), admin **«выдать / отозвать» клиента**, `TokenAgent` авто-рефреш | C4 |
+| **C6** | **Упаковка/секреты**: `SecretStore` (keychain), apk/msix/dmg/AppImage/deb, подпись + нотаризация macOS | C2–C5 |
+| **C7** | **Сетевой контроль User-mode**: **split-tunnel** — *per-app* (Android `VpnService.addAllowed/DisallowedApplication`; десктоп позже: Linux cgroup/netns, Win WFP, macOS NE) + *per-domain* (клиентский DNS-перехватчик: DoH-резолв → динамические маршруты домен→IP); **killswitch** (fail-closed; расширение F6 + VpnService always-on/lockdown); **DNSSEC + DoH** (та же DNS-подсистема, что и per-domain). Android+Linux первыми | C3 |
 
 ---
 

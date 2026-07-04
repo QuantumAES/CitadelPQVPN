@@ -16,6 +16,10 @@ pub mod vault;
 // frb_generated.rs (ссылается на vpn_connect → GuiTunProvider) собирался под android.
 #[cfg(any(target_os = "linux", target_os = "android"))]
 pub mod gui_tun;
+// AdminDeployer (C4): SSH-деплой сервера. Admin — десктоп-функция, на мобильных деплоя нет →
+// гейт not(mobile) (исключает russh из APK). См. deploy.rs / Cargo.toml.
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
+pub mod deploy;
 
 // Поверхность движка для FFI/UI: один крейт, чтобы биндинг-генератор видел всё в одном месте.
 pub use citadel_quic::config::{
@@ -29,6 +33,11 @@ pub use creds::{CredentialBundle, CredentialLink, BUNDLE_VERSION};
 pub use vault::{Profile, Vault};
 #[cfg(any(target_os = "linux", target_os = "android"))]
 pub use gui_tun::GuiTunProvider;
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
+pub use deploy::{
+    AdminDeployer, CommandOutput, DeployConfig, HostKeyDecision, HostKeyVerifier, MemoryTofu,
+    ServerArch, SshAuth, DEPLOY_DIR,
+};
 
 /// Версия ядра (about-экран UI / диагностика).
 pub fn version() -> &'static str {

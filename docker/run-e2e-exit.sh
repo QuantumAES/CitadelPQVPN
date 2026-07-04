@@ -29,7 +29,7 @@ echo "[e2e] exit поднят (4433/udp + 443/tcp опубликованы), pin
 echo
 
 echo "=== citadel://-ссылка для GUI (вставь в приложение во VM) ==="
-cargo run -q -p citadel-client --example linkgen -- \
+cargo run -q -p citadel-client --bin citadel-linkgen -- \
   --servers "$VM_HOST:4433" --psk "$PSK" --pin "$PIN" --kx all --tcp-port 443 --routes "$ROUTES"
 
 echo

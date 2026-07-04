@@ -3,6 +3,9 @@
 **/*.rs.bk
 *.pdb
 
+# --- Артефакты релиза (tools/mk-release.sh) ---
+/dist
+
 # --- Python (.venv для tools/obfs_ref.py + cmake под aws-lc-rs) ---
 .venv/
 __pycache__/
@@ -24,6 +27,11 @@ issuer.pub
 issuer.key
 /tokens
 docker/tokens
+
+# --- Релизный minisign-ключ подписи: СЕКРЕТ никогда не в git (коммитим только *.pub) ---
+citadel-release.key
+packaging/release/*.key
+.citadel/
 
 # --- ОС / редакторы ---
 .DS_Store

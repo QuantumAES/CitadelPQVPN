@@ -4,11 +4,12 @@
 
 ## [Unreleased]
 
-Клиентское приложение (треки **C0–C3**, см. `docs/CLIENT-ARCH.md`): движок выделен во
+Клиентское приложение (треки **C0–C4**, см. `docs/CLIENT-ARCH.md`): движок выделен во
 встраиваемую библиотеку, добавлены формат клиентских кред, десктоп-клиент (Linux) с GUI,
-привилегированным TUN и зашифрованным хранилищем профилей, и Android-клиент через `VpnService`.
-**81 unit-тест, Docker 15/15, `clippy --workspace --all-targets -D warnings` чисто; APK собирается,
-Android-коннект подтверждён на эмуляторе (клиенту выдан адрес из пула exit).**
+привилегированным TUN и зашифрованным хранилищем профилей, Android-клиент через `VpnService`
+и разворачивание exit-сервера подписанным скриптом-инсталлером (admin, supply-chain через minisign).
+**90 unit-тестов, Docker 15/15, `clippy --workspace --all-targets -D warnings` чисто; APK собирается,
+Android-коннект подтверждён на эмуляторе, exit развёрнут инсталлером на боевом VDS.**
 
 ### Добавлено
 - **C0 — ядро-как-библиотека.** Движок вынесен из бинаря `citadel-m1` в библиотечные модули
@@ -38,7 +39,7 @@ Android-коннект подтверждён на эмуляторе (клие�
     после первого успешного подключения; выбор/удаление/смена пароля.
   - **Тестовый стенд:** QEMU/KVM VM (`tools/qemu-testvm.sh` — Debian-13/xfce/startx, 9p-шара,
     общий буфер обмена через spice-vdagent) + token-less E2E-exit с публикацией портов
-    (`docker/compose.e2e.yml`, `run-e2e-exit.sh`) + генератор ссылок (`examples/linkgen.rs`).
+    (`docker/compose.e2e.yml`, `run-e2e-exit.sh`) + генератор ссылок (бинарь `citadel-linkgen`).
 - **C3 — Android-клиент (`VpnService`):** мобильный путь поверх того же движка/FFI.
   - Двухфазное подключение (мобильный порядок «адрес → TUN»): `android_establish` (PQ-хендшейк
     + назначение адреса, без TUN) → Kotlin `VpnService.Builder.establish()` → fd → Rust
@@ -48,6 +49,13 @@ Android-коннект подтверждён на эмуляторе (клие�
     в движке + JNI-мост (`android_jni.rs` ↔ `CitadelVpnService.protectFd`) — исходящие сокеты
     движка исключаются из собственного туннеля.
   - `CitadelVpnService` (foreground) + MethodChannel + Dart-ветка `Platform.isAndroid` в UI.
+- **C4 — Admin-deploy (разворачивание сервера скриптом):** первая установка exit — standalone
+  bootstrap на сервере (без GUI): авто-Docker (с проверкой запущенности демона) → скачивание
+  **подписанного** бинаря с GitHub Release + проверка `minisign` и SHA-256 (supply-chain) →
+  серверный keygen → `docker compose up` → печать админской `citadel://`. Инструменты:
+  `tools/{gen-release-key,mk-release,publish-release,install-citadel-server}.sh`, бинарь
+  `citadel-linkgen` (генерация ссылки на сервере). `citadel-client` получил модуль `deploy`
+  (`AdminDeployer` на `russh` — задел под GUI-remote-deploy, десктоп-only). Подтверждено на боевом VDS.
 - **Инфраструктура разработки:** `tools/setup-dev-env.sh` — идемпотентный установщик окружения
   (rustup, Android NDK/SDK, Flutter, кросс-таргеты); `tools/requirements.txt`.
 
@@ -66,6 +74,8 @@ Android-коннект подтверждён на эмуляторе (клие�
   удалённого `Project.exec()`, rustup-тулчейн в PATH сборки, `compileSdk` 36).
 - Docker-демо (`entrypoint-client.sh`): устранены флаки оркестрации (probe по IP под DNS-lock;
   снятие UDP-блока после TCP-fallback теста; `wait` предшественника + retry в тестах с рестартом).
+- **Клиент:** профиль сохраняется в хранилище **сразу при добавлении** (раньше — только после
+  первого успешного подключения → терялся при неудаче); ненужный конфиг удаляется вручную.
 
 ### Исправлено
 - **Android: создание хранилища падало ложным «Неверный пароль».** Путь vault резолвился из

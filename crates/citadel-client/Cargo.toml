@@ -26,5 +26,14 @@ citadel-tun = { path = "../citadel-tun" }   # GuiTunProvider: Tun::from_raw_fd (
 [target.'cfg(any(target_os = "linux", target_os = "android"))'.dependencies]
 sendfd = "0.4"
 
+# AdminDeployer (C4): SSH-деплой сервера. russh — чистый Rust (backend aws-lc-rs, тот же, что в
+# движке), без OpenSSL-C → не ломает мобильную сборку единым ядром. Admin — десктоп-функция, на
+# мобильных (Android/iOS) деплоя нет, поэтому гейт not(mobile): экономит сборку APK от russh.
+[target.'cfg(not(any(target_os = "android", target_os = "ios")))'.dependencies]
+russh = "0.61"
+
 [dev-dependencies]
 libc = "0.2"
+# Интеграционный тест AdminDeployer гоняет in-process russh-сервер (self-contained, без внешнего
+# sshd). dev-deps под android не собираются (cargo ndk --lib их не трогает), гейт не нужен.
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "time"] }

@@ -33,7 +33,6 @@ class AppState extends ChangeNotifier {
   DateTime? since;
 
   StreamSubscription<VpnEventDto>? _sub;
-  ({String name, String uri})? _pendingSave;
 
   bool get isBusy => phase == VpnPhase.connecting || phase == VpnPhase.up;
 
@@ -89,11 +88,21 @@ class AppState extends ChangeNotifier {
     }
   }
 
-  /// Пробное подключение по сырой ссылке; при успехе (событие `up`) — сохранить в vault.
+  /// Добавить профиль и подключиться. Профиль сохраняется в vault **сразу** (а не по успеху
+  /// коннекта) — конфиг не теряется при неудаче; ненужный пользователь удалит сам.
   void addAndConnect(String name, String uri) {
-    _pendingSave = (name: name, uri: uri);
+    String? id;
+    try {
+      id = vaultAdd(name: name, uri: uri).id;
+      _reloadProfiles();
+      notifyListeners();
+    } catch (_) {
+      // vault недоступен — деградируем на пробный коннект по сырой ссылке
+    }
     if (Platform.isAndroid) {
-      _androidConnect(link: uri);
+      _androidConnect(profileId: id, link: id == null ? uri : null);
+    } else if (id != null) {
+      _listen(vpnConnectProfile(id: id), profileId: id);
     } else {
       _listen(vpnConnect(link: uri), profileId: null);
     }
@@ -175,25 +184,10 @@ class AppState extends ChangeNotifier {
       case 'up':
         phase = VpnPhase.up;
         since ??= DateTime.now();
-        _savePendingIfAny();
       case 'down':
       case 'idle':
         if (phase != VpnPhase.error) phase = VpnPhase.off;
         since = null;
-    }
-  }
-
-  /// На первом `up` пробного коннекта — сохранить профиль и «привязать» сессию к нему.
-  void _savePendingIfAny() {
-    final pend = _pendingSave;
-    if (pend == null) return;
-    _pendingSave = null;
-    try {
-      final p = vaultAdd(name: pend.name, uri: pend.uri);
-      activeProfileId = p.id;
-      _reloadProfiles();
-    } catch (_) {
-      // сохранение не критично для уже поднятого туннеля — профиль просто не осядет
     }
   }
 
@@ -206,7 +200,6 @@ class AppState extends ChangeNotifier {
     }
     _sub?.cancel();
     _sub = null;
-    _pendingSave = null;
     phase = VpnPhase.off;
     activeProfileId = null;
     exit = transport = cidr = '';
