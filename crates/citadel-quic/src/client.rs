@@ -139,6 +139,13 @@ fn require_pin_or_insecure(mode: &PinMode, allow_insecure_no_pin: bool) -> Resul
 /// **Без TUN и без сетевой настройки** — только транспорт и назначенный адрес.
 pub async fn establish_session(cfg: &ClientConfig) -> Result<Session> {
     eprintln!("[citadel-m1:client] exit-серверы (перемешаны): {}", cfg.servers.join(", "));
+    // S1.1/M4: не-PQ suite (classical/all) не гарантирует анти-HNDL — предупреждаем явно.
+    if !crate::kx_is_pq(&cfg.kx_suite) {
+        eprintln!(
+            "[citadel-m1:client] ⚠ KX={} — сессия может быть НЕ пост-квантовой (нет защиты от Harvest-Now-Decrypt-Later); безопасный дефолт — pq",
+            crate::kx_suite_name(&cfg.kx_suite)
+        );
+    }
 
     // M5 multi-server: идём по списку failover'ом — первый поднявшийся exit (QUIC или TCP-fallback).
     // Копим причины отказа по каждому exit — уходят в итоговую ошибку (видно в UI/лог-панели на

@@ -60,6 +60,14 @@ pub fn kx_suite_name(suite: &str) -> &'static str {
     }
 }
 
+/// S1.1/M4: гарантирует ли suite пост-квантовую сессию. Только `pq`/пусто: клиент предлагает
+/// ТОЛЬКО гибридную группу → согласуется гибрид либо хендшейк падает (понизить нельзя).
+/// `classical` — точно не PQ; `all` — PQ-предпочтительно, но при не-PQ сервере тихо
+/// откатывается на X25519 → НЕ гарантия. Прод-клиент/сервер должны быть `pq` (анти-HNDL).
+pub fn kx_is_pq(suite: &str) -> bool {
+    matches!(suite.trim(), "" | "pq")
+}
+
 /// KX-suite из env `Citadel_KX` (`pq`|`classical`|`all`), по умолчанию `pq`.
 pub fn kx_groups_from_env() -> Vec<&'static dyn SupportedKxGroup> {
     kx_groups_for(&std::env::var("Citadel_KX").unwrap_or_default())
@@ -265,5 +273,8 @@ mod tests {
         assert!(kx_suite_name("pq").contains("MLKEM"));
         assert!(kx_suite_name("classical").contains("X25519"));
         assert!(kx_suite_name("all").contains("negotiate"));
+        // S1.1/M4: только pq/пусто гарантируют PQ; classical/all — нет.
+        assert!(kx_is_pq("pq") && kx_is_pq(""));
+        assert!(!kx_is_pq("classical") && !kx_is_pq("all"));
     }
 }

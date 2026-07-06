@@ -122,7 +122,7 @@ export Citadel_NAT_SRC=10.7.0.0/16
 export Citadel_PIN_FILE=/shared/exit.pin
 export Citadel_OBFS_PSK="${Citadel_OBFS_PSK:-}"
 export Citadel_TCP_LISTEN=0.0.0.0:443
-export Citadel_KX=all
+export Citadel_KX=pq   # S1.1/M4: PQ-only (анти-HNDL) — classical не принимаем; миграция сьютов = явный override
 rm -f /shared/exit.pin
 echo "[citadel-exit] token-less; listen 4433/udp + 443/tcp"
 exec citadel-m1
@@ -171,7 +171,7 @@ fi
 
 LINK="$("$DIR/bin/citadel-linkgen" \
   --servers "$SERVER_HOST:$UDP_PORT" --psk "$PSK" --pin "$PIN" \
-  --kx all --tcp-port "$TCP_PORT" --routes "$ROUTES" 2>/dev/null)" \
+  --kx pq --tcp-port "$TCP_PORT" --routes "$ROUTES" 2>/dev/null)" \
   || die "citadel-linkgen не сгенерировал ссылку"
 
 umask 077
