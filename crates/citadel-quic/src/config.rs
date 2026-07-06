@@ -58,6 +58,9 @@ pub struct ClientConfig {
     pub pin: PinSource,
     /// Источник ML-DSA pub (M7).
     pub mldsa: MldsaSource,
+    /// S0.1/H2: разрешить QUIC БЕЗ серт-pin (AcceptAnyServerCert = MITM-открыто). Только
+    /// dev/PoC (env `Citadel_INSECURE_NO_PIN=1`); прод — `false` (fail-closed).
+    pub allow_insecure_no_pin: bool,
 }
 
 /// Pin из hex (ровно 32 байта).
@@ -139,6 +142,9 @@ impl ClientConfig {
             token,
             pin,
             mldsa,
+            allow_insecure_no_pin: std::env::var("Citadel_INSECURE_NO_PIN")
+                .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+                .unwrap_or(false),
         })
     }
 
@@ -210,6 +216,7 @@ mod tests {
             token: vec![],
             pin,
             mldsa: MldsaSource::None,
+            allow_insecure_no_pin: false,
         };
         assert!(matches!(mk(PinSource::None).pin_for("h"), PinMode::NoPin));
         let p = [3u8; 32];
@@ -232,6 +239,7 @@ mod tests {
             token: vec![],
             pin: PinSource::None,
             mldsa: MldsaSource::Bytes(vec![1, 2, 3]),
+            allow_insecure_no_pin: false,
         };
         assert_eq!(cfg.mldsa_for("any"), Some(vec![1, 2, 3]));
     }

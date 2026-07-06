@@ -266,6 +266,20 @@ fi
 
 echo
 echo "===================================================================="
+echo "  ТЕСТ 16 (S0.1/H2) — БЕЗ серт-pin клиент ОТКАЗЫВАЕТ (fail-closed, не MITM-режим)"
+echo "  (раньше AcceptAnyServerCert молча принимал любой серт → MITM; теперь — жёсткий отказ)"
+echo "===================================================================="
+# env -u снимает Citadel_PIN* (PIN_DIR экспортирован глобально) → PinSource::None → NoPin → отказ
+out=$(env -u Citadel_PIN_DIR -u Citadel_PIN -u Citadel_PIN_FILE \
+      Citadel_TUN=Citadel2 Citadel_SERVERS="${EXIT_IP}:4433" timeout 15 citadel-m1 2>&1 || true)
+if echo "$out" | grep -qi "fail-closed"; then
+    echo "  OK ✔ без pin клиент отказал (fail-closed), а не принял любой серт"
+else
+    echo "  [!] без pin клиент НЕ отказал (fail-open?) ✗"
+fi
+
+echo
+echo "===================================================================="
 echo "  Готово. M1-M7 + STRIDE F1-F7: pinning, egress, obfs L1, drop-priv, DNS-leak, rate-limit,"
 echo "  миграция, TCP-fallback, split-issuance, multi-server, obfs-кеш, fuzzing, crypto-agility, PQ-auth."
 echo "===================================================================="

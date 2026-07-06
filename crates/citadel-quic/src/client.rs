@@ -128,6 +128,19 @@ pub fn port_of(server: &str) -> &str {
     server.rsplit_once(':').map(|(_, p)| p).unwrap_or("4433")
 }
 
+/// S0.1/H2 fail-closed: без активного серт-pin QUIC поднимать нельзя (AcceptAnyServerCert =
+/// открытый MITM). Отказ, кроме явного dev-флага `allow_insecure_no_pin`. `Waiting` (pin-источник
+/// задан, файл ещё не готов) — не отказ: вызывающий подождёт/переберёт.
+fn require_pin_or_insecure(mode: &PinMode, allow_insecure_no_pin: bool) -> Result<()> {
+    if matches!(mode, PinMode::NoPin) && !allow_insecure_no_pin {
+        return Err(anyhow!(
+            "серт-pin не настроен — отказ (fail-closed, S0.1/H2). Провижинь pin или задай \
+             Citadel_INSECURE_NO_PIN=1 для dev/PoC"
+        ));
+    }
+    Ok(())
+}
+
 /// Поднять сессию: failover по списку exit'ов (M5) + control-обмен (токен→адрес, PQ-auth M7).
 /// **Без TUN и без сетевой настройки** — только транспорт и назначенный адрес.
 pub async fn establish_session(cfg: &ClientConfig) -> Result<Session> {
@@ -168,11 +181,22 @@ pub async fn establish_session(cfg: &ClientConfig) -> Result<Session> {
 
     // M7 PQ-auth: pin (Ed25519-cert) + ML-DSA-65 pk выбранного exit (если провижированы)
     let host = host_of(&chosen);
+    let mldsa_pk = cfg.mldsa_for(host);
+    // S0.1/H2: cert_pin для ML-DSA-привязки = АКТИВНЫЙ pin. При Pinned rustls уже заставил живой
+    // серт совпасть с pin ⇒ привязка идёт к живой сессии. Без активного pin привязывать не к чему
+    // (иначе подпись над константой [0;32] — бесполезна против MITM) → отказ.
     let cert_pin = match cfg.pin_for(host) {
         PinMode::Pinned(p) => p,
-        _ => [0u8; 32],
+        _ => {
+            if mldsa_pk.is_some() {
+                return Err(anyhow!(
+                    "PQ-auth: ML-DSA pk провижирован для {host}, но серт-pin не активен — \
+                     отказ (fail-closed, S0.1/H2)"
+                ));
+            }
+            [0u8; 32]
+        }
     };
-    let mldsa_pk = cfg.mldsa_for(host);
     if mldsa_pk.is_some() {
         eprintln!("[citadel-m1:client] PQ-auth (M7): буду проверять ML-DSA-65 подпись exit {host}");
     }
@@ -251,6 +275,9 @@ pub(crate) async fn try_quic_connect(
         cfg.server_name,
         crate::kx_suite_name(&cfg.kx_suite)
     );
+    // S0.1/H2: без активного pin — fail-closed (кроме явного insecure-флага). NoPin статичен
+    // (PinSource::None), в Pinned по ходу цикла не превратится → проверяем один раз до цикла.
+    require_pin_or_insecure(&cfg.pin_for(pin_host), cfg.allow_insecure_no_pin)?;
     let mut logged_pin = false;
     for attempt in 1..=attempts {
         let qcfg = match cfg.pin_for(pin_host) {
@@ -262,8 +289,9 @@ pub(crate) async fn try_quic_connect(
                 crate::client_config_pinned(crate::kx_groups_for(&cfg.kx_suite), p)?
             }
             PinMode::NoPin => {
+                // сюда попадаем только при allow_insecure_no_pin=true (иначе отказ выше)
                 if !logged_pin {
-                    eprintln!("[citadel-m1:client] WARN: pin не настроен — принимаю любой серт (PoC)");
+                    eprintln!("[citadel-m1:client] ⚠ INSECURE: pin не настроен — принимаю ЛЮБОЙ серт, MITM-открыто (только dev)");
                     logged_pin = true;
                 }
                 crate::client_config(crate::kx_groups_for(&cfg.kx_suite))?
@@ -324,4 +352,18 @@ async fn client_request_address(
         return Err(anyhow!("ожидался ADDRESS_ASSIGN, получен type={t}"));
     }
     capsule::decode_assigned_v4(val).ok_or_else(|| anyhow!("битое тело ADDRESS_ASSIGN"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// S0.1/H2: без pin — отказ (fail-closed), кроме явного insecure-флага; Pinned/Waiting — ок.
+    #[test]
+    fn fail_closed_requires_pin() {
+        assert!(require_pin_or_insecure(&PinMode::Pinned([0u8; 32]), false).is_ok());
+        assert!(require_pin_or_insecure(&PinMode::Waiting, false).is_ok()); // ждёт pin, не fail-open
+        assert!(require_pin_or_insecure(&PinMode::NoPin, false).is_err()); // ключевое: отказ
+        assert!(require_pin_or_insecure(&PinMode::NoPin, true).is_ok()); // dev override
+    }
 }
