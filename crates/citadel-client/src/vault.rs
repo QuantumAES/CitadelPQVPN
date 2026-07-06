@@ -21,6 +21,7 @@ use aws_lc_rs::aead::{Aad, LessSafeKey, Nonce, UnboundKey, AES_256_GCM, NONCE_LE
 use aws_lc_rs::rand::{SecureRandom, SystemRandom};
 use aws_lc_rs::pbkdf2;
 use serde::{Deserialize, Serialize};
+use zeroize::Zeroize;
 
 use crate::creds::CredentialLink;
 
@@ -61,6 +62,16 @@ pub struct Vault {
     salt: [u8; SALT_LEN],
     iters: u32,
     data: VaultData,
+}
+
+impl Drop for Vault {
+    /// S1.3/M7: при закрытии хранилища затираем расшифрованные профили (uri несёт pin/psk/seed).
+    /// Производный ключ (`LessSafeKey`) чистит aws-lc-rs; `save` уже перезаписал plaintext шифртекстом.
+    fn drop(&mut self) {
+        for p in &mut self.data.profiles {
+            p.uri.zeroize();
+        }
+    }
 }
 
 impl Vault {
@@ -112,6 +123,7 @@ impl Vault {
             .map_err(|_| anyhow!("неверный мастер-пароль или повреждённое хранилище"))?;
         let data: VaultData =
             ciborium::from_reader(&plain[..]).context("разобрать профили (CBOR)")?;
+        in_out.zeroize(); // S1.3/M7: затереть расшифрованный plaintext профилей (секреты)
         Ok(Vault { path, key, salt, iters, data })
     }
 
@@ -209,6 +221,7 @@ fn derive_key(passphrase: &str, salt: &[u8], iters: u32) -> Result<LessSafeKey> 
     let mut key = [0u8; KEY_LEN];
     pbkdf2::derive(pbkdf2::PBKDF2_HMAC_SHA256, iters, salt, passphrase.as_bytes(), &mut key);
     let unbound = UnboundKey::new(&AES_256_GCM, &key).map_err(|_| anyhow!("ключ AEAD"))?;
+    key.zeroize(); // S1.3/M7: затереть сырой производный ключ (UnboundKey уже скопировал его)
     Ok(LessSafeKey::new(unbound))
 }
 

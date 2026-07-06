@@ -63,6 +63,19 @@ pub struct ClientConfig {
     pub allow_insecure_no_pin: bool,
 }
 
+impl Drop for ClientConfig {
+    /// S1.3/M7: затираем секреты конфига при дропе (obfs PSK, токен). Copy-поля pin/mldsa —
+    /// публичные обязательства, не секрет. NB: PSK копируется и в obfs-слой (Sealer/Opener) —
+    /// его затирание там — отдельный слой (частичное покрытие).
+    fn drop(&mut self) {
+        use zeroize::Zeroize;
+        if let Some(psk) = self.obfs_psk.as_mut() {
+            psk.zeroize();
+        }
+        self.token.zeroize();
+    }
+}
+
 /// Pin из hex (ровно 32 байта).
 pub fn parse_pin(s: &str) -> Option<[u8; 32]> {
     hex::decode(s.trim()).ok().and_then(|v| v.try_into().ok())

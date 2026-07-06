@@ -54,6 +54,19 @@ pub struct CredentialBundle {
     pub dns: Option<String>,
 }
 
+impl Drop for CredentialBundle {
+    /// S1.3/M7: затираем инлайн-секреты (obfs PSK, Layer-1 seed) при дропе бандла.
+    fn drop(&mut self) {
+        use zeroize::Zeroize;
+        if let Some(p) = self.obfs_psk.as_mut() {
+            p.zeroize();
+        }
+        if let Some(s) = self.client_seed.as_mut() {
+            s.zeroize();
+        }
+    }
+}
+
 impl CredentialBundle {
     /// Сериализовать в CBOR.
     pub fn to_cbor(&self) -> Result<Vec<u8>> {
@@ -156,6 +169,19 @@ pub struct CredentialLink {
     pub client_seed: Option<[u8; 32]>,
     pub routes: String,
     pub dns: Option<String>,
+}
+
+impl Drop for CredentialLink {
+    /// S1.3/M7: затираем инлайн-секреты (obfs PSK, Layer-1 seed) при дропе ссылки.
+    fn drop(&mut self) {
+        use zeroize::Zeroize;
+        if let Some(p) = self.obfs_psk.as_mut() {
+            p.zeroize();
+        }
+        if let Some(s) = self.client_seed.as_mut() {
+            s.zeroize();
+        }
+    }
 }
 
 impl CredentialLink {
