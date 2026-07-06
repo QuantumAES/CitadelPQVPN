@@ -1,0 +1,57 @@
+name: CI
+
+# Gate 0 (docs/SECURITY-ROADMAP.md §2): страховка security-трека — воркспейс-тесты,
+# clippy -D warnings и docker-харнес прогоняются на каждый push/PR. Без зелёного CI
+# security-фиксы не мёржатся (регрессии в 40+ юнит и 15 e2e-тестах иначе неизбежны).
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # Быстрый обязательный гейт: собрать/протестировать движковый воркспейс (crates/*) и
+  # прогнать clippy как ошибку. app/rust (FRB-мост) — отдельный крейт с flutter_rust_bridge,
+  # вне этого воркспейса; его сборка требует Flutter и выносится в отдельный workflow позже.
+  test:
+    name: workspace test + clippy (rust 1.96)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.96.0
+          components: clippy
+      - name: apt deps (cmake/clang для aws-lc-rs)
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends cmake clang
+      - uses: Swatinem/rust-cache@v2
+      - name: clippy (-D warnings)
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      - name: test
+        run: cargo test --workspace --locked
+
+  # Полный e2e: собрать бинарь на хосте, поднять docker-compose (2×exit + client + issuer),
+  # прогнать 15 тестов (ping/HTTP через PQ-QUIC, pinning, egress, obfs, drop-priv, DNS-leak,
+  # токены, rate-limit, миграция, TCP-fallback, failover, split, crypto-agility, PQ-auth).
+  # Требует модуль tun на раннере; отделён от обязательного гейта (не на каждый PR).
+  demo:
+    name: docker e2e harness (15 тестов)
+    runs-on: ubuntu-latest
+    needs: test
+    if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.96.0
+      - name: apt deps
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends cmake clang zstd
+      - uses: Swatinem/rust-cache@v2
+      - name: enable tun
+        run: sudo modprobe tun && ls -l /dev/net/tun
+      - name: run demo harness
+        run: bash docker/run-demo.sh

@@ -39,3 +39,7 @@ packaging/release/*.key
 *~
 .idea/
 .vscode/
+
+# --- Временные/мусорные ---
+*.tmp
+*.kate-swp
