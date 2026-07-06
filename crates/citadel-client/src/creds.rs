@@ -71,6 +71,9 @@ impl CredentialBundle {
                 b.version
             );
         }
+        // S1.2/M1: dns/routes уходят в root-контекст (resolv.conf/ip route) — отклоняем инъекции.
+        citadel_quic::config::validate_net_fields(b.dns.as_deref(), &b.routes)
+            .context("бандл: невалидные dns/routes")?;
         Ok(b)
     }
 
@@ -204,6 +207,9 @@ impl CredentialLink {
                 link.version
             );
         }
+        // S1.2/M1: dns/routes уходят в root-контекст (resolv.conf/ip route) — отклоняем инъекции.
+        citadel_quic::config::validate_net_fields(link.dns.as_deref(), &link.routes)
+            .context("ссылка: невалидные dns/routes")?;
         Ok(link)
     }
 
@@ -355,6 +361,16 @@ mod tests {
     #[test]
     fn from_uri_rejects_bad_prefix() {
         assert!(CredentialLink::from_uri("https://evil/x").is_err());
+    }
+
+    /// S1.2/M1: ссылка с инъекцией перевода строки в dns отклоняется при импорте (иначе
+    /// root-helper записал бы произвольный resolv.conf).
+    #[test]
+    fn from_uri_rejects_dns_injection() {
+        let mut b = sample();
+        b.dns = Some("1.1.1.1\nnameserver 6.6.6.6".into());
+        let uri = CredentialLink::from_bundle(&b).to_uri().unwrap();
+        assert!(CredentialLink::from_uri(&uri).is_err());
     }
 
     #[test]

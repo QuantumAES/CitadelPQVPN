@@ -21,7 +21,7 @@ use std::os::fd::AsRawFd;
 use std::os::unix::net::UnixStream;
 use std::process::Command;
 
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 use citadel_tun::Tun;
 use sendfd::SendWithFd;
 
@@ -48,17 +48,68 @@ fn parse_args() -> Result<Args> {
         i += 2;
     }
     let get = |k: &str| map.get(k).cloned();
+    // S1.2/M1: helper — root (pkexec) от НЕпривилегированного приложения. Валидируем ВСЕ входы
+    // (в т.ч. из импортированной citadel://-ссылки) здесь, на границе привилегий: битая/вредоносная
+    // строка не должна инъектировать произвольное в ip/iptables/resolv.conf или удалить чужой iface.
     let addr = get("--addr").context("нужен --addr A.B.C.D")?;
+    if !is_ip(&addr) {
+        bail!("--addr не IP-адрес: {addr:?}");
+    }
     let prefix = get("--prefix").unwrap_or_else(|| "24".into());
+    if prefix.parse::<u8>().map(|n| n > 32).unwrap_or(true) {
+        bail!("--prefix вне 0..=32: {prefix:?}");
+    }
+    let tun = get("--tun").unwrap_or_else(|| "citadel0".into());
+    if !tun.strip_prefix("citadel").is_some_and(|r| r.chars().all(|c| c.is_ascii_digit())) {
+        bail!("--tun должен быть citadel<N> (не даём удалить чужой интерфейс): {tun:?}");
+    }
+    let mtu = get("--mtu").unwrap_or_else(|| "1280".into());
+    if mtu.parse::<u32>().is_err() {
+        bail!("--mtu не число: {mtu:?}");
+    }
+    let routes = get("--routes").unwrap_or_default();
+    for r in routes.split_whitespace() {
+        if !is_cidr(r) {
+            bail!("--routes: невалидный CIDR {r:?}");
+        }
+    }
+    let dns = get("--dns");
+    if let Some(d) = &dns {
+        if !is_ip(d) {
+            bail!("--dns не IP-адрес: {d:?} (защита от инъекции в resolv.conf)");
+        }
+    }
+    let exit_ips = get("--exit-ips").unwrap_or_default();
+    for e in exit_ips.split_whitespace() {
+        if !is_ip(e) {
+            bail!("--exit-ips: невалидный IP {e:?}");
+        }
+    }
     Ok(Args {
         sock: get("--sock").context("нужен --sock <path>")?,
-        tun: get("--tun").unwrap_or_else(|| "citadel0".into()),
+        tun,
         cidr: format!("{addr}/{prefix}"),
-        mtu: get("--mtu").unwrap_or_else(|| "1280".into()),
-        routes: get("--routes").unwrap_or_default(),
-        dns: get("--dns"),
-        exit_ips: get("--exit-ips").unwrap_or_default(),
+        mtu,
+        routes,
+        dns,
+        exit_ips,
     })
+}
+
+/// S1.2/M1: `s` — один IP-адрес (v4/v6). Отсекает перевод строки/мусор (анти-инъекция).
+fn is_ip(s: &str) -> bool {
+    s.parse::<std::net::IpAddr>().is_ok()
+}
+
+/// S1.2/M1: `s` — валидный CIDR `IP/prefix` или голый IP (=host-route).
+fn is_cidr(s: &str) -> bool {
+    match s.split_once('/') {
+        Some((a, p)) => {
+            let Ok(ip) = a.parse::<std::net::IpAddr>() else { return false };
+            p.parse::<u8>().map(|n| n <= if ip.is_ipv4() { 32 } else { 128 }).unwrap_or(false)
+        }
+        None => is_ip(s),
+    }
 }
 
 fn ip(args: &[&str]) {
@@ -176,6 +227,15 @@ mod tests {
     use sendfd::RecvWithFd;
     use std::io::Write as _; // Read приходит из super::* (main импортит std::io::Read)
     use std::os::fd::FromRawFd;
+
+    #[test]
+    fn ip_cidr_validation() {
+        assert!(is_ip("1.1.1.1") && is_ip("2606:4700:4700::1111"));
+        assert!(!is_ip("1.1.1.1\nnameserver 6.6.6.6")); // инъекция перевода строки → отказ
+        assert!(!is_ip("not-ip"));
+        assert!(is_cidr("10.0.0.0/8") && is_cidr("1.1.1.1"));
+        assert!(!is_cidr("1.1.1.1/40") && !is_cidr("junk"));
+    }
 
     /// SCM_RIGHTS round-trip БЕЗ root/TUN: передаём read-конец pipe через socketpair и
     /// убеждаемся, что принятый fd указывает на ту же трубу (механизм передачи fd работает).

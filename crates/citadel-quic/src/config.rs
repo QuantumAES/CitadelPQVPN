@@ -84,6 +84,39 @@ pub fn parse_obfs_psk(v: &str) -> Option<[u8; 32]> {
     Some(blake3::derive_key("CitadelPQVPN/obfs/v1/psk", v.as_bytes()))
 }
 
+/// S1.2/M1: `dns` обязан быть одним IP (иначе — инъекция в `/etc/resolv.conf` через root-helper).
+pub fn is_ip(s: &str) -> bool {
+    s.trim().parse::<std::net::IpAddr>().is_ok()
+}
+
+/// S1.2/M1: токен маршрута — валидный CIDR `IP/prefix` или голый IP (=host-route).
+pub fn is_cidr(s: &str) -> bool {
+    let s = s.trim();
+    match s.split_once('/') {
+        Some((a, p)) => {
+            let Ok(ip) = a.parse::<std::net::IpAddr>() else { return false };
+            p.parse::<u8>().map(|n| n <= if ip.is_ipv4() { 32 } else { 128 }).unwrap_or(false)
+        }
+        None => is_ip(s),
+    }
+}
+
+/// S1.2/M1: проверить net-поля (dns/routes) перед тем, как они уйдут в привилегированный контекст
+/// (resolv.conf, `ip route`). Вызывается при импорте бандла/ссылки/env — отсекает инъекции.
+pub fn validate_net_fields(dns: Option<&str>, routes: &str) -> Result<()> {
+    if let Some(d) = dns {
+        if !d.trim().is_empty() && !is_ip(d) {
+            anyhow::bail!("dns не является IP-адресом: {d:?} (защита от инъекции в resolv.conf)");
+        }
+    }
+    for r in routes.split_whitespace() {
+        if !is_cidr(r) {
+            anyhow::bail!("маршрут не является валидным CIDR: {r:?}");
+        }
+    }
+    Ok(())
+}
+
 impl ClientConfig {
     /// Построить из окружения `Citadel_*` (контракт бинаря/Docker).
     pub fn from_env() -> Result<Self> {
@@ -127,6 +160,11 @@ impl ClientConfig {
             .and_then(|l| hex::decode(l).ok())
             .unwrap_or_default();
 
+        // S1.2/M1: dns/routes попадают в root-контекст (resolv.conf, ip route) → валидируем.
+        let routes = std::env::var("Citadel_ROUTES").unwrap_or_default();
+        let dns = std::env::var("Citadel_DNS").ok();
+        validate_net_fields(dns.as_deref(), &routes).context("Citadel_ROUTES/Citadel_DNS")?;
+
         Ok(Self {
             servers,
             server_name: std::env::var("Citadel_SERVER_NAME").unwrap_or_else(|_| "Citadel.exit".into()),
@@ -136,8 +174,8 @@ impl ClientConfig {
                 .and_then(parse_obfs_psk),
             kx_suite: std::env::var("Citadel_KX").unwrap_or_default(),
             tcp_port: std::env::var("Citadel_TCP_PORT").unwrap_or_else(|_| "443".into()),
-            routes: std::env::var("Citadel_ROUTES").unwrap_or_default(),
-            dns: std::env::var("Citadel_DNS").ok(),
+            routes,
+            dns,
             mtu: std::env::var("Citadel_MTU").unwrap_or_else(|_| "1280".into()),
             token,
             pin,
@@ -242,5 +280,18 @@ mod tests {
             allow_insecure_no_pin: false,
         };
         assert_eq!(cfg.mldsa_for("any"), Some(vec![1, 2, 3]));
+    }
+
+    #[test]
+    fn net_field_validation() {
+        assert!(validate_net_fields(Some("1.1.1.1"), "0.0.0.0/0 10.0.0.0/8").is_ok());
+        assert!(validate_net_fields(None, "").is_ok());
+        // инъекция перевода строки в dns → отказ (иначе — произвольный resolv.conf от root)
+        assert!(validate_net_fields(Some("1.1.1.1\nnameserver 6.6.6.6"), "").is_err());
+        assert!(validate_net_fields(Some("not-an-ip"), "").is_err());
+        assert!(validate_net_fields(None, "1.1.1.1/33").is_err()); // префикс >32
+        assert!(validate_net_fields(None, "garbage").is_err());
+        assert!(is_cidr("10.0.0.0/8") && is_cidr("1.1.1.1")); // CIDR и голый IP
+        assert!(!is_cidr("1.1.1.1/40"));
     }
 }
