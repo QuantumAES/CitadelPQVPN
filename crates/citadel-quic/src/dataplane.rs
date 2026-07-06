@@ -86,19 +86,20 @@ impl Tunnel {
     }
 }
 
-/// Обработка входящего (от клиента) пакета на exit: egress-фильтр (F2) + rate-limit (F7).
-/// `accept` → `true` пропустить в TUN, `false` дропнуть. Состояние bucket/счётчики — per-connection.
+/// Обработка входящего (от клиента) пакета на exit: анти-спуфинг + egress-фильтр (S0.2/F2) +
+/// rate-limit (F7). `accept` → `true` пропустить в TUN, `false` дропнуть. Per-connection.
 pub struct Inbound {
-    egress_filter: bool,
+    /// `Some(назначенный клиенту адрес)` → exit-режим (анти-спуфинг+egress); `None` → клиент.
+    egress: Option<[u8; 4]>,
     bucket: Option<TokenBucket>,
     dropped: u64,
     dropped_bytes: u64,
 }
 
 impl Inbound {
-    pub fn new(egress_filter: bool, rate_limit: Option<RateCfg>) -> Self {
+    pub fn new(egress: Option<[u8; 4]>, rate_limit: Option<RateCfg>) -> Self {
         Self {
-            egress_filter,
+            egress,
             bucket: rate_limit.map(|c| TokenBucket::new(c, Instant::now())),
             dropped: 0,
             dropped_bytes: 0,
@@ -106,13 +107,33 @@ impl Inbound {
     }
 
     pub fn accept(&mut self, pkt: &[u8]) -> bool {
-        if self.egress_filter {
-            if let Some(v) = ip::parse_ipv4(pkt) {
-                if ip::is_blocked_dst(v.dst) {
-                    eprintln!(
-                        "[exit] F2: заблокирован inner-dst {}.{}.{}.{}",
-                        v.dst[0], v.dst[1], v.dst[2], v.dst[3]
-                    );
+        if let Some(expected_src) = self.egress {
+            match ip::parse_ipv4(pkt) {
+                Some(v) => {
+                    // S0.2/H3: анти-спуфинг — inner-src обязан быть адресом, назначенным ЭТОМУ
+                    // клиенту (легитимный стек ОС ставит src = адрес TUN). Иначе exit форвардил
+                    // бы пакет со спуфнутым источником (DoS-reflection / подмена другого клиента).
+                    if v.src != expected_src {
+                        eprintln!(
+                            "[exit] S0.2: дроп спуфинг inner-src {}.{}.{}.{} (ожидался {}.{}.{}.{})",
+                            v.src[0], v.src[1], v.src[2], v.src[3],
+                            expected_src[0], expected_src[1], expected_src[2], expected_src[3]
+                        );
+                        return false;
+                    }
+                    // F2: не форвардить во внутренние/служебные сети (metadata/RFC1918/loopback/…)
+                    if ip::is_blocked_dst(v.dst) {
+                        eprintln!(
+                            "[exit] F2: заблокирован inner-dst {}.{}.{}.{}",
+                            v.dst[0], v.dst[1], v.dst[2], v.dst[3]
+                        );
+                        return false;
+                    }
+                }
+                None => {
+                    // S0.2/H3: не-IPv4 (IPv6/мусор) is_blocked_dst не покрывает → default-deny
+                    // (не fail-open). Туннель назначает только IPv4; v6 внутри пока не поддержан.
+                    eprintln!("[exit] S0.2: дроп не-IPv4 inner-пакета (default-deny)");
                     return false;
                 }
             }
@@ -135,16 +156,16 @@ impl Inbound {
 }
 
 /// Двунаправленная перекачка TUN ⇄ транспорт (QUIC DATAGRAM либо obfs-TCP record).
-/// `egress_filter` (на exit) дропает inner-пакеты во внутренние/служебные сети (F2).
-/// `rate_limit` (на exit) ограничивает входящее от клиента направление token-bucket'ом
-/// (F7 / D3); `None` → без лимита.
+/// `egress = Some(назначенный клиенту адрес)` включает egress-политику exit: анти-спуфинг
+/// inner-src (S0.2/H3), default-deny не-IPv4 и F2 (дроп во внутренние/служебные сети); `None`
+/// (клиент) — без фильтра. `rate_limit` (на exit) ограничивает входящее token-bucket'ом (F7/D3).
 ///
 /// TUN читается/пишется через `TunIo` — блокирующие recv/send изолированы в отдельных
 /// потоках и мостятся в async каналами (платформа туннеля движку не важна).
 pub async fn pump(
     tunnel: Tunnel,
     tun: Arc<dyn TunIo>,
-    egress_filter: bool,
+    egress: Option<[u8; 4]>,
     rate_limit: Option<RateCfg>,
 ) -> Result<()> {
     use std::sync::atomic::AtomicBool;
@@ -205,7 +226,7 @@ pub async fn pump(
             let recv_conn = conn.clone();
             let recv_stop = stop.clone();
             let receiver = tokio::spawn(async move {
-                let mut inb = Inbound::new(egress_filter, rate_limit);
+                let mut inb = Inbound::new(egress, rate_limit);
                 loop {
                     match recv_conn.read_datagram().await {
                         Ok(dg) => {
@@ -244,7 +265,7 @@ pub async fn pump(
             });
             let recv_stop = stop.clone();
             let receiver = tokio::spawn(async move {
-                let mut inb = Inbound::new(egress_filter, rate_limit);
+                let mut inb = Inbound::new(egress, rate_limit);
                 loop {
                     match rx.recv_packet().await {
                         Ok(pkt) => {
@@ -336,5 +357,32 @@ fn tun_reader_loop(
             Ok(_) => {}
             Err(_) => break,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use citadel_masque::ip;
+
+    fn ipv4(src: [u8; 4], dst: [u8; 4]) -> Vec<u8> {
+        ip::build_ipv4(17, src, dst, &[0u8; 4]) // UDP, тело неважно для фильтра
+    }
+
+    /// S0.2/H3: exit-режим (`Some(assigned)`) — пропускает только src==назначенный на публичный
+    /// dst; дропает спуфнутый src, приватный dst (F2) и не-IPv4 (default-deny). Клиент (`None`) — без фильтра.
+    #[test]
+    fn inbound_antispoof_egress_and_ipv6_deny() {
+        let assigned = [10, 7, 0, 5];
+        let mut exit = Inbound::new(Some(assigned), None);
+        assert!(exit.accept(&ipv4(assigned, [1, 1, 1, 1])), "легитимный src+публичный dst — пропуск");
+        assert!(!exit.accept(&ipv4([9, 9, 9, 9], [1, 1, 1, 1])), "спуфнутый src — дроп");
+        assert!(!exit.accept(&ipv4(assigned, [10, 0, 0, 1])), "приватный dst (F2) — дроп");
+        assert!(!exit.accept(&[0x60, 0, 0, 0, 0, 0]), "IPv6 (версия 6) — default-deny");
+        assert!(!exit.accept(&[0xff]), "мусор/обрезок — default-deny");
+
+        // клиентский режим: фильтра нет — пропускаем даже «спуфнутый» и приватный
+        let mut client = Inbound::new(None, None);
+        assert!(client.accept(&ipv4([9, 9, 9, 9], [10, 0, 0, 1])));
     }
 }

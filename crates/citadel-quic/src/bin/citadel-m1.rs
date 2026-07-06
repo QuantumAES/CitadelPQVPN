@@ -140,8 +140,12 @@ fn server_setup_net(ifname: &str) {
     let nat = std::env::var("Citadel_NAT_SRC").unwrap_or_else(|_| "10.7.0.0/24".into());
     let eg = detect_egress();
     run("iptables", &["-t", "nat", "-A", "POSTROUTING", "-s", &nat, "-o", &eg, "-j", "MASQUERADE"]);
-    run("iptables", &["-A", "FORWARD", "-i", ifname, "-o", &eg, "-j", "ACCEPT"]);
+    // S0.2/H3: форвардим ТОЛЬКО из пула клиентских адресов; прочий inner-src (спуфинг) — DROP.
+    // Ядровый дубль app-layer анти-спуфинга в Inbound (defense-in-depth) + reverse-path фильтр.
+    run("iptables", &["-A", "FORWARD", "-i", ifname, "-s", &nat, "-o", &eg, "-j", "ACCEPT"]);
     run("iptables", &["-A", "FORWARD", "-i", &eg, "-o", ifname, "-m", "state", "--state", "RELATED,ESTABLISHED", "-j", "ACCEPT"]);
+    run("iptables", &["-A", "FORWARD", "-i", ifname, "!", "-s", &nat, "-j", "DROP"]);
+    let _ = std::fs::write("/proc/sys/net/ipv4/conf/all/rp_filter", b"1");
     // MSS-clamp: ограничить TCP-сегменты под PMTU туннеля. Без него крупные ответные
     // сегменты (TLS ServerHello/cert) не влезают в QUIC-датаграмму и теряются — PMTUD
     // блэкхолится через NAT/туннель: ICMP/ping ходит, а TCP/HTTPS виснет. Клампим на SYN
@@ -402,7 +406,7 @@ async fn handle_client(
         return;
     }
     eprintln!("[citadel-m1:server] выдан {}.{}.{}.{}/{}", addr[0], addr[1], addr[2], addr[3], prefix);
-    if let Err(e) = pump(tunnel, tun, true, rate_limit).await {
+    if let Err(e) = pump(tunnel, tun, Some(addr), rate_limit).await {
         eprintln!("[citadel-m1:server] pump завершён: {e}");
     }
 }
