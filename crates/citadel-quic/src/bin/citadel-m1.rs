@@ -25,7 +25,6 @@ use citadel_masque::capsule;
 use citadel_quic::config::{parse_pin, ClientConfig, PinMode};
 use citadel_quic::dataplane::{pump, Tunnel};
 use citadel_quic::ratelimit::RateCfg;
-use citadel_quic::tcp_obfs::TcpObfs;
 use citadel_quic::vpn::VpnController;
 use citadel_tun::Tun;
 
@@ -277,6 +276,8 @@ async fn run_server(tun: Arc<Tun>) -> Result<()> {
         let _ = std::fs::write(&path, hex::encode(pin));
         eprintln!("[Citadel-m1:server] pin сертификата → {path}: {}", hex::encode(pin));
     }
+    // S0.3/H1: клон серверного QUIC-конфига (тот же серт/pin!) для endpoint'ов поверх obfs-TCP.
+    let tcp_server_cfg = cfg.clone();
     let ep = match obfs_psk() {
         Some(psk) => {
             eprintln!("[Citadel-m1:server] obfs L1 включён (probe-resistance + анти-DPI)");
@@ -330,7 +331,8 @@ async fn run_server(tun: Arc<Tun>) -> Result<()> {
 
     drop_privileges()?; // F4: дальше root не нужен (TUN/NAT/сокеты уже настроены)
 
-    // TCP-fallback acceptor: те же assign+pump, что и QUIC, но транспорт — obfs-over-TCP.
+    // TCP-fallback acceptor (S0.3/H1): каждый accept'нутый obfs-TCP стрим → свой quinn-Endpoint
+    // (single-conn); клиент делает обычный PQ-QUIC хендшейк поверх TCP. Та же крипта/pin/токены.
     if let (Some(listener), Some(psk)) = (tcp_listener, obfs_psk()) {
         let tun = tun.clone();
         let issuer_pk = issuer_pk.clone();
@@ -339,23 +341,34 @@ async fn run_server(tun: Arc<Tun>) -> Result<()> {
         tokio::spawn(async move {
             loop {
                 match listener.accept().await {
-                    Ok((stream, _)) => match TcpObfs::wrap(stream, psk) {
-                        Ok(tcp) => {
-                            let (addr, prefix) = next_client_addr();
-                            tokio::spawn(handle_client(
-                                Tunnel::Tcp(tcp),
-                                tun.clone(),
-                                addr,
-                                prefix,
-                                issuer_pk.clone(),
-                                spent.clone(),
-                                rate_limit,
-                                signer.clone(),
-                                pin,
-                            ));
-                        }
-                        Err(e) => eprintln!("[citadel-m1:server] TCP wrap: {e}"),
-                    },
+                    Ok((stream, _)) => {
+                        let (tun, issuer_pk, spent, signer, scfg) = (
+                            tun.clone(),
+                            issuer_pk.clone(),
+                            spent.clone(),
+                            signer.clone(),
+                            tcp_server_cfg.clone(),
+                        );
+                        tokio::spawn(async move {
+                            let ep = match citadel_quic::server_endpoint_obfs_tcp(stream, scfg, psk) {
+                                Ok(ep) => ep,
+                                Err(e) => {
+                                    eprintln!("[citadel-m1:server] obfs-TCP endpoint: {e}");
+                                    return;
+                                }
+                            };
+                            if let Some(incoming) = ep.accept().await {
+                                match incoming.await {
+                                    Ok(conn) => {
+                                        let (addr, prefix) = next_client_addr();
+                                        handle_client(Tunnel::new(conn, true), tun, addr, prefix, issuer_pk, spent, rate_limit, signer, pin).await;
+                                    }
+                                    Err(e) => eprintln!("[citadel-m1:server] obfs-TCP хендшейк: {e}"),
+                                }
+                            }
+                            // ep жив до конца handle_client (в scope) → соединение не рвётся
+                        });
+                    }
                     Err(e) => {
                         eprintln!("[citadel-m1:server] TCP accept: {e}");
                         break;
@@ -375,7 +388,7 @@ async fn run_server(tun: Arc<Tun>) -> Result<()> {
             match incoming.await {
                 Ok(conn) => {
                     let (addr, prefix) = next_client_addr();
-                    handle_client(Tunnel::Quic(conn), tun, addr, prefix, issuer_pk, spent, rate_limit, signer, pin).await;
+                    handle_client(Tunnel::new(conn, false), tun, addr, prefix, issuer_pk, spent, rate_limit, signer, pin).await;
                 }
                 Err(e) => eprintln!("[citadel-m1:server] хендшейк не удался: {e}"),
             }

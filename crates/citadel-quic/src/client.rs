@@ -22,7 +22,7 @@ use citadel_tun::TunIo;
 
 use crate::config::{ClientConfig, PinMode};
 use crate::dataplane::{pump, Tunnel};
-use crate::tcp_obfs::TcpObfs;
+use tokio::net::TcpStream;
 
 /// Установленная клиентская сессия: поднятый транспорт + назначенный сервером адрес.
 /// Сетевую настройку интерфейса делает вызывающий (Linux `NetConfigurator`, Android
@@ -54,10 +54,7 @@ impl Session {
     /// клампит TUN MTU под это значение — иначе полноразмерные пакеты дропаются в `pump`
     /// («datagram too large») и трафик не идёт.
     pub fn quic_datagram_mtu(&self) -> Option<usize> {
-        match &self.tunnel {
-            Tunnel::Quic(c) => c.max_datagram_size().map(|m| m.saturating_sub(1)),
-            Tunnel::Tcp(_) => None,
-        }
+        self.tunnel.conn().max_datagram_size().map(|m| m.saturating_sub(1))
     }
     /// Назначенный адрес в форме CIDR (например, `"10.7.0.3/24"`).
     pub fn cidr(&self) -> String {
@@ -81,10 +78,7 @@ impl Session {
         qname: &str,
         timeout: Duration,
     ) -> Result<Option<Vec<[u8; 4]>>> {
-        let conn = match &self.tunnel {
-            Tunnel::Quic(c) => c,
-            Tunnel::Tcp(_) => return Ok(None),
-        };
+        let conn = self.tunnel.conn();
         let id: u16 = rand::random();
         let sport: u16 = 20000 + (rand::random::<u16>() % 20000);
         let query = ip::build_dns_query(id, qname, 1); // A-запись
@@ -236,24 +230,47 @@ async fn connect_server(server: &str, cfg: &ClientConfig) -> Result<Option<Tunne
     let attempts = if multi || cfg.obfs_psk.is_some() { 5 } else { 60 };
     if let Some(conn) = try_quic_connect(server, addr, cfg, attempts, host).await? {
         eprintln!("[citadel-m1:client] PQ-туннель (QUIC/UDP) к {server} ✔");
-        return Ok(Some(Tunnel::Quic(conn)));
+        return Ok(Some(Tunnel::new(conn, false)));
     }
+    // S0.3/H1: fallback — PQ-QUIC ПОВЕРХ obfs-TCP (не «голый» PSK). Та же TLS/pin/KX/токены.
     if let Some(psk) = cfg.obfs_psk {
         let tcp_target = format!("{host}:{}", cfg.tcp_port);
         if let Ok(Some(taddr)) = tokio::net::lookup_host(&tcp_target).await.map(|mut it| it.next()) {
-            eprintln!("[citadel-m1:client] QUIC к {server} недоступен → obfs-TCP к {tcp_target}");
-            // таймаут: мёртвый host иначе висит на TCP connect (~минуты) и ломает failover.
-            // 8с (не 3с) — запас под высокий RTT мобильных сетей (частый Android-путь, когда
-            // UDP/QUIC режется и остаётся только obfs-TCP:443).
-            if let Ok(Ok(tcp)) =
-                tokio::time::timeout(Duration::from_secs(8), TcpObfs::connect(taddr, psk)).await
-            {
-                eprintln!("[citadel-m1:client] obfs-TCP туннель к {tcp_target} ✔");
-                return Ok(Some(Tunnel::Tcp(tcp)));
+            eprintln!("[citadel-m1:client] QUIC/UDP к {server} недоступен → PQ-QUIC поверх obfs-TCP к {tcp_target}");
+            // таймаут: мёртвый host иначе висит на connect (~минуты) и ломает failover. 8с — запас
+            // под высокий RTT мобильных сетей (частый Android-путь при заблокированном UDP).
+            match tokio::time::timeout(Duration::from_secs(8), quic_over_tcp_connect(taddr, psk, cfg, host)).await {
+                Ok(Ok(conn)) => {
+                    eprintln!("[citadel-m1:client] PQ-туннель (QUIC/obfs-TCP) к {tcp_target} ✔");
+                    return Ok(Some(Tunnel::new(conn, true)));
+                }
+                Ok(Err(e)) => eprintln!("[citadel-m1:client] obfs-TCP не удался: {e}"),
+                Err(_) => eprintln!("[citadel-m1:client] obfs-TCP: таймаут"),
             }
         }
     }
     Ok(None)
+}
+
+/// S0.3/H1: PQ-QUIC поверх obfs-TCP к exit (fallback при заблокированном UDP). Та же TLS-1.3/
+/// hybrid-KEX/pin-логика, что и UDP-путь (`try_quic_connect`) — просто транспорт по TCP.
+/// Fail-closed по pin (S0.1): без активного pin — отказ.
+async fn quic_over_tcp_connect(
+    taddr: SocketAddr,
+    psk: [u8; 32],
+    cfg: &ClientConfig,
+    pin_host: &str,
+) -> Result<quinn::Connection> {
+    require_pin_or_insecure(&cfg.pin_for(pin_host), cfg.allow_insecure_no_pin)?;
+    let tcp = TcpStream::connect(taddr).await?;
+    let ep = crate::client_endpoint_obfs_tcp(tcp, psk)?;
+    let qcfg = match cfg.pin_for(pin_host) {
+        PinMode::Pinned(p) => crate::client_config_pinned(crate::kx_groups_for(&cfg.kx_suite), p)?,
+        PinMode::NoPin => crate::client_config(crate::kx_groups_for(&cfg.kx_suite))?, // только при insecure-флаге
+        PinMode::Waiting => return Err(anyhow!("pin ещё не готов (файл не записан)")),
+    };
+    let conn = ep.connect_with(qcfg, taddr, &cfg.server_name)?.await?;
+    Ok(conn)
 }
 
 /// Попытаться поднять PQ-QUIC к одному серверу. `None` — не удалось за `attempts` попыток

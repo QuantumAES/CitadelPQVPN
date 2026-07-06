@@ -16,50 +16,47 @@ use citadel_masque::{datagram, ip};
 use citadel_tun::TunIo;
 
 use crate::ratelimit::{RateCfg, TokenBucket};
-use crate::tcp_obfs::TcpObfs;
 
-/// Транспорт туннеля: основной PQ-QUIC либо obfs-over-TCP fallback (M4).
-pub enum Tunnel {
-    Quic(quinn::Connection),
-    Tcp(TcpObfs),
+/// Транспорт туннеля: **всегда** PQ-QUIC (TLS 1.3 + гибридный KEX). Обычно поверх UDP; при
+/// заблокированном UDP — поверх obfs-TCP (S0.3/H1), но крипта/control/data-plane идентичны.
+/// `over_tcp` — только лейбл для логов (само соединение о транспорте под ним не знает).
+pub struct Tunnel {
+    conn: quinn::Connection,
+    over_tcp: bool,
 }
 
 impl Tunnel {
+    pub fn new(conn: quinn::Connection, over_tcp: bool) -> Self {
+        Self { conn, over_tcp }
+    }
+
+    /// Доступ к QUIC-соединению (датаграммы/стримы) для вызывающих вне этого модуля.
+    pub fn conn(&self) -> &quinn::Connection {
+        &self.conn
+    }
+
     pub fn peer(&self) -> SocketAddr {
-        match self {
-            Tunnel::Quic(c) => c.remote_address(),
-            Tunnel::Tcp(t) => t.peer(),
-        }
+        self.conn.remote_address()
     }
 
     pub fn kind(&self) -> &'static str {
-        match self {
-            Tunnel::Quic(_) => "QUIC/UDP",
-            Tunnel::Tcp(_) => "obfs-TCP",
+        if self.over_tcp {
+            "QUIC/obfs-TCP"
+        } else {
+            "QUIC/UDP"
         }
     }
 
     pub fn close(&self, code: u32, reason: &[u8]) {
-        if let Tunnel::Quic(c) = self {
-            c.close(code.into(), reason);
-        }
-        // TCP закрывается при drop
+        self.conn.close(code.into(), reason);
     }
 
-    /// Клиент: послать один control-запрос и получить ответ (reliable message).
+    /// Клиент: послать один control-запрос и получить ответ (reliable QUIC bi-stream).
     pub async fn control_client(&mut self, req: &[u8]) -> Result<Vec<u8>> {
-        match self {
-            Tunnel::Quic(conn) => {
-                let (mut send, mut recv) = conn.open_bi().await?;
-                send.write_all(req).await?;
-                send.finish()?;
-                Ok(recv.read_to_end(4096).await?)
-            }
-            Tunnel::Tcp(t) => {
-                t.send_msg(req).await?;
-                Ok(t.recv_msg().await?)
-            }
-        }
+        let (mut send, mut recv) = self.conn.open_bi().await?;
+        send.write_all(req).await?;
+        send.finish()?;
+        Ok(recv.read_to_end(4096).await?)
     }
 
     /// Сервер: принять один control-запрос, обработать `handle` и ответить.
@@ -67,22 +64,12 @@ impl Tunnel {
     where
         F: FnOnce(&[u8]) -> Result<Vec<u8>>,
     {
-        match self {
-            Tunnel::Quic(conn) => {
-                let (mut send, mut recv) = conn.accept_bi().await?;
-                let req = recv.read_to_end(8192).await?;
-                let resp = handle(&req)?;
-                send.write_all(&resp).await?;
-                send.finish()?;
-                Ok(())
-            }
-            Tunnel::Tcp(t) => {
-                let req = t.recv_msg().await?;
-                let resp = handle(&req)?;
-                t.send_msg(&resp).await?;
-                Ok(())
-            }
-        }
+        let (mut send, mut recv) = self.conn.accept_bi().await?;
+        let req = recv.read_to_end(8192).await?;
+        let resp = handle(&req)?;
+        send.write_all(&resp).await?;
+        send.finish()?;
+        Ok(())
     }
 }
 
@@ -212,82 +199,46 @@ pub async fn pump(
         }
     }
 
-    match tunnel {
-        Tunnel::Quic(conn) => {
-            let send_conn = conn.clone();
-            let sender = tokio::spawn(async move {
-                while let Some(pkt) = tun_to_net_rx.recv().await {
-                    let dg = datagram::encode(datagram::CTX_RAW_IP, &pkt);
-                    if let Err(e) = send_conn.send_datagram(bytes::Bytes::from(dg)) {
-                        eprintln!("[pump] датаграмма отброшена ({} б): {e}", pkt.len());
-                    }
-                }
-            });
-            let recv_conn = conn.clone();
-            let recv_stop = stop.clone();
-            let receiver = tokio::spawn(async move {
-                let mut inb = Inbound::new(egress, rate_limit);
-                loop {
-                    match recv_conn.read_datagram().await {
-                        Ok(dg) => {
-                            if let Some((datagram::CTX_RAW_IP, pkt)) = datagram::decode(&dg) {
-                                if inb.accept(pkt) && net_to_tun_tx.send(pkt.to_vec()).await.is_err() {
-                                    break;
-                                }
-                            }
-                        }
-                        Err(e) => {
-                            eprintln!("[pump] соединение закрыто: {e}");
+    // S0.3/H1: единый транспорт — всегда quinn::Connection (поверх UDP или obfs-TCP). Раньше
+    // здесь была вторая ветка «голого» obfs-TCP datagram-протокола; теперь TCP несёт тот же QUIC.
+    let Tunnel { conn, .. } = tunnel;
+    let send_conn = conn.clone();
+    let sender = tokio::spawn(async move {
+        while let Some(pkt) = tun_to_net_rx.recv().await {
+            let dg = datagram::encode(datagram::CTX_RAW_IP, &pkt);
+            if let Err(e) = send_conn.send_datagram(bytes::Bytes::from(dg)) {
+                eprintln!("[pump] датаграмма отброшена ({} б): {e}", pkt.len());
+            }
+        }
+    });
+    let recv_conn = conn.clone();
+    let recv_stop = stop.clone();
+    let receiver = tokio::spawn(async move {
+        let mut inb = Inbound::new(egress, rate_limit);
+        loop {
+            match recv_conn.read_datagram().await {
+                Ok(dg) => {
+                    if let Some((datagram::CTX_RAW_IP, pkt)) = datagram::decode(&dg) {
+                        if inb.accept(pkt) && net_to_tun_tx.send(pkt.to_vec()).await.is_err() {
                             break;
                         }
                     }
                 }
-                // транспорт закрыт → разбудить reader, чтобы pump завершился (важно на exit,
-                // где future pump не отменяется снаружи, а ждётся до конца — иначе reader-поток
-                // зависал бы в recv на общем TUN, воруя пакеты у новых клиентов).
-                recv_stop.store(true, std::sync::atomic::Ordering::Release);
-            });
-            let _guard = CancelGuard {
-                stop,
-                aborts: vec![sender.abort_handle(), receiver.abort_handle()],
-            };
-            let _ = tokio::try_join!(sender, receiver);
-        }
-        Tunnel::Tcp(tcp) => {
-            let (mut tx, mut rx) = tcp.into_split();
-            let sender = tokio::spawn(async move {
-                while let Some(pkt) = tun_to_net_rx.recv().await {
-                    if let Err(e) = tx.send_packet(&pkt).await {
-                        eprintln!("[pump:tcp] отправка не удалась ({} б): {e}", pkt.len());
-                        break;
-                    }
+                Err(e) => {
+                    eprintln!("[pump] соединение закрыто: {e}");
+                    break;
                 }
-            });
-            let recv_stop = stop.clone();
-            let receiver = tokio::spawn(async move {
-                let mut inb = Inbound::new(egress, rate_limit);
-                loop {
-                    match rx.recv_packet().await {
-                        Ok(pkt) => {
-                            if inb.accept(&pkt) && net_to_tun_tx.send(pkt).await.is_err() {
-                                break;
-                            }
-                        }
-                        Err(e) => {
-                            eprintln!("[pump:tcp] соединение закрыто: {e}");
-                            break;
-                        }
-                    }
-                }
-                recv_stop.store(true, std::sync::atomic::Ordering::Release);
-            });
-            let _guard = CancelGuard {
-                stop,
-                aborts: vec![sender.abort_handle(), receiver.abort_handle()],
-            };
-            let _ = tokio::try_join!(sender, receiver);
+            }
         }
-    }
+        // транспорт закрыт → разбудить reader, чтобы pump завершился (важно на exit, где future
+        // pump ждётся до конца — иначе reader-поток зависал бы в recv на общем TUN).
+        recv_stop.store(true, std::sync::atomic::Ordering::Release);
+    });
+    let _guard = CancelGuard {
+        stop,
+        aborts: vec![sender.abort_handle(), receiver.abort_handle()],
+    };
+    let _ = tokio::try_join!(sender, receiver);
     Ok(())
 }
 
