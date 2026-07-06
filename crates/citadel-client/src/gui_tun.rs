@@ -63,6 +63,10 @@ impl TunProvider for GuiTunProvider {
         if let Some(dns) = &p.dns {
             cmd.args(["--dns", dns]);
         }
+        // bypass-маршрут: exit'ы не должны маршрутизироваться в туннель (анти-петля при full-tunnel)
+        if !p.exit_ips.is_empty() {
+            cmd.args(["--exit-ips", &p.exit_ips.join(" ")]);
+        }
         let mut child = cmd.spawn().context("запустить pkexec citadel-helper")?;
 
         // ждём подключения хелпера (после polkit-auth); ловим отмену/ошибку pkexec

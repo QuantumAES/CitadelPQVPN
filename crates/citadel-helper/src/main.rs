@@ -35,6 +35,8 @@ struct Args {
     mtu: String,
     routes: String,
     dns: Option<String>,
+    /// IP exit'ов (через пробел) для bypass-маршрута — исключить из туннеля (анти-петля).
+    exit_ips: String,
 }
 
 fn parse_args() -> Result<Args> {
@@ -55,11 +57,23 @@ fn parse_args() -> Result<Args> {
         mtu: get("--mtu").unwrap_or_else(|| "1280".into()),
         routes: get("--routes").unwrap_or_default(),
         dns: get("--dns"),
+        exit_ips: get("--exit-ips").unwrap_or_default(),
     })
 }
 
 fn ip(args: &[&str]) {
     let _ = Command::new("ip").args(args).status();
+}
+
+/// Текущий default-маршрут `(gateway, dev)` ДО подмены туннелем. Нужен для bypass-маршрутов
+/// к exit'ам (иначе full-tunnel заворачивает пакеты к exit обратно в туннель → петля).
+fn default_route() -> Option<(String, String)> {
+    let out = Command::new("ip").args(["route", "show", "default"]).output().ok()?;
+    let text = String::from_utf8_lossy(&out.stdout);
+    let toks: Vec<String> = text.lines().next()?.split_whitespace().map(String::from).collect();
+    let via = toks.iter().position(|t| t == "via")?;
+    let dev = toks.iter().position(|t| t == "dev")?;
+    Some((toks.get(via + 1)?.clone(), toks.get(dev + 1)?.clone()))
 }
 fn iptables(args: &[&str]) {
     let _ = Command::new("iptables").args(args).status();
@@ -94,8 +108,36 @@ fn main() -> Result<()> {
     let ifn = tun.name().to_string();
     ip(&["link", "set", &ifn, "mtu", &args.mtu, "up"]);
     ip(&["addr", "add", &args.cidr, "dev", &ifn]);
+
+    // bypass-маршруты к exit'ам ДО применения routes: собственный QUIC/obfs-трафик клиента к
+    // exit должен идти физическим шлюзом, а не в citadel0 — иначе при full-tunnel (0.0.0.0/0)
+    // пакеты к exit заворачиваются в туннель (петля) и egress встаёт. Захватываем шлюз ДО того,
+    // как routes подменят default. Только IPv4 (деплой v4); IPv6-exit пропускаем.
+    let mut bypass: Vec<String> = Vec::new();
+    if args.exit_ips.split_whitespace().next().is_some() {
+        match default_route() {
+            Some((gw, dev)) => {
+                for eip in args.exit_ips.split_whitespace().filter(|e| !e.contains(':')) {
+                    ip(&["route", "replace", &format!("{eip}/32"), "via", &gw, "dev", &dev]);
+                    bypass.push(eip.to_string());
+                }
+                eprintln!("[helper] bypass exit'ов {:?} via {gw} dev {dev}", bypass);
+            }
+            None => eprintln!("[helper] WARN: нет default-route — bypass к exit не добавлен (риск петли)"),
+        }
+    }
+
     for r in args.routes.split_whitespace() {
-        ip(&["route", "replace", r, "dev", &ifn]);
+        if r == "0.0.0.0/0" {
+            // full-tunnel БЕЗ клоббера физического default: две /1-половины перекрывают default
+            // (более специфичны), но `default via GW dev <phys>` остаётся — он нужен как nexthop
+            // для bypass-маршрутов к exit И для восстановления связи после disconnect (иначе
+            // `replace 0.0.0.0/0 dev citadel0` затирал бы физический default безвозвратно).
+            ip(&["route", "replace", "0.0.0.0/1", "dev", &ifn]);
+            ip(&["route", "replace", "128.0.0.0/1", "dev", &ifn]);
+        } else {
+            ip(&["route", "replace", r, "dev", &ifn]);
+        }
     }
     if let Some(dns) = &args.dns {
         setup_dns(&ifn, dns);
@@ -119,6 +161,9 @@ fn main() -> Result<()> {
     }
     if args.dns.is_some() {
         teardown_dns(&ifn);
+    }
+    for eip in &bypass {
+        ip(&["route", "del", &format!("{eip}/32")]);
     }
     // TUN-интерфейс исчезает сам, когда приложение закрывает свой (переданный) fd.
     eprintln!("[helper] disconnect — сеть свёрнута, выход");

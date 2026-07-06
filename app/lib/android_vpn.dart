@@ -11,6 +11,20 @@ class AndroidVpn {
 
   static bool get isAndroid => Platform.isAndroid;
 
+  /// Колбэк из native при смене underlying-сети (WiFi↔LTE/toggle) — форсировать реконнект.
+  static void Function()? onNetworkChanged;
+  static bool _handlerSet = false;
+
+  /// Подписать канал на вызовы native→Dart (`onNetworkChanged`). Идемпотентно; звать один раз.
+  static void ensureHandler() {
+    if (_handlerSet) return;
+    _handlerSet = true;
+    _ch.setMethodCallHandler((call) async {
+      if (call.method == 'onNetworkChanged') onNetworkChanged?.call();
+      return null;
+    });
+  }
+
   /// Системный консент VpnService (показывается один раз). `true` — разрешено.
   static Future<bool> prepare() async =>
       (await _ch.invokeMethod<bool>('prepare')) ?? false;

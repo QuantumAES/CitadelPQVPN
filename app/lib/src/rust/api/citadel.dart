@@ -6,7 +6,7 @@
 import '../frb_generated.dart';
 import 'package:flutter_rust_bridge/flutter_rust_bridge_for_generated.dart';
 
-// These functions are ignored because they are not marked as `pub`: `do_android_establish`, `profile_to_dto`, `rt`, `start_connect`, `state_dto`, `to_dto`, `vault_path`
+// These functions are ignored because they are not marked as `pub`: `cfg_from`, `do_android_establish`, `profile_to_dto`, `rt`, `start_connect`, `state_dto`, `to_dto`, `vault_path`
 
 /// Версия PQ-VPN-ядра (about-экран).
 String coreVersion() => RustLib.instance.api.crateApiCitadelCoreVersion();
@@ -85,6 +85,39 @@ void androidDisconnect() =>
 
 /// Разорвать активную сессию (если есть).
 void vpnDisconnect() => RustLib.instance.api.crateApiCitadelVpnDisconnect();
+
+/// Прогнать тест-кейсы подключения к exit'у профиля/ссылки, стримя результат по шагам
+/// (DNS → QUIC/UDP → TCP → establish → egress). Диагностика идёт тем же путём, что реальный
+/// коннект, поэтому показывает, где именно рвётся связь. Не трогает активную сессию.
+Stream<DiagLineDto> runDiagnostics({String? profileId, String? link}) => RustLib
+    .instance
+    .api
+    .crateApiCitadelRunDiagnostics(profileId: profileId, link: link);
+
+/// Один шаг прогона диагностики для UI.
+class DiagLineDto {
+  final String step;
+  final bool ok;
+  final String detail;
+
+  const DiagLineDto({
+    required this.step,
+    required this.ok,
+    required this.detail,
+  });
+
+  @override
+  int get hashCode => step.hashCode ^ ok.hashCode ^ detail.hashCode;
+
+  @override
+  bool operator ==(Object other) =>
+      identical(this, other) ||
+      other is DiagLineDto &&
+          runtimeType == other.runtimeType &&
+          step == other.step &&
+          ok == other.ok &&
+          detail == other.detail;
+}
 
 /// Превью разобранной `citadel://`-ссылки (экран добавления профиля).
 class LinkSummaryDto {

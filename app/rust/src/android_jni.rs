@@ -7,7 +7,7 @@
 
 use std::sync::{Arc, OnceLock};
 
-use jni::objects::{JObject, JValue};
+use jni::objects::{JObject, JString, JValue};
 use jni::{JNIEnv, JavaVM};
 
 use citadel_client::{clear_socket_protector, set_socket_protector, SocketProtector};
@@ -34,7 +34,28 @@ impl SocketProtector for JniProtector {
                 return false;
             }
         };
-        match env.call_method(self.service.as_obj(), "protectFd", "(I)Z", &[JValue::Int(fd)]) {
+        let res = env.call_method(self.service.as_obj(), "protectFd", "(I)Z", &[JValue::Int(fd)]);
+        // ВАЖНО: очистить любое ожидающее Java-исключение ДО дропа guard'а (detach потока с
+        // висящим исключением → ART вызывает abort() «JNI DETECTED ERROR», процесс падает).
+        // Заодно ИЗВЛЕКАЕМ текст исключения в панель (не только logcat через describe) — нужно
+        // понять, ПОЧЕМУ protect() бросает (иначе сокет не защищён → петля → нет интернета).
+        if env.exception_check().unwrap_or(false) {
+            let thrown = env.exception_occurred();
+            let _ = env.exception_clear(); // очистить ДО любых других JNI-вызовов
+            if let Ok(ex) = thrown {
+                match env.call_method(&ex, "toString", "()Ljava/lang/String;", &[]) {
+                    Ok(v) => match v.l() {
+                        Ok(obj) => match env.get_string(&JString::from(obj)) {
+                            Ok(s) => eprintln!("[jni] protectFd бросил: {}", s.to_string_lossy()),
+                            Err(e) => eprintln!("[jni] protectFd бросил (не прочитать текст): {e}"),
+                        },
+                        Err(e) => eprintln!("[jni] protectFd бросил (нет объекта): {e}"),
+                    },
+                    Err(e) => eprintln!("[jni] protectFd бросил (toString не вызвать): {e}"),
+                }
+            }
+        }
+        match res {
             Ok(v) => v.z().unwrap_or(false),
             Err(e) => {
                 eprintln!("[jni] VpnService.protectFd: {e}");

@@ -6,7 +6,9 @@
 //! и слушает [`VpnController::subscribe`]. Платформа туннеля скрыта за `TunProvider`
 //! (Linux `/dev/net/tun`, Android `VpnService.Builder`) — см. docs/CLIENT-ARCH.md §4.
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use anyhow::Result;
 use tokio::sync::{broadcast, Notify};
@@ -15,6 +17,11 @@ use citadel_tun::TunIo;
 
 use crate::client::{establish_session, run_data_plane};
 use crate::config::ClientConfig;
+
+/// Стартовый интервал backoff между попытками восстановления соединения.
+const RECONNECT_BACKOFF_START: Duration = Duration::from_secs(1);
+/// Потолок backoff (после ряда неудач ретраим не реже, чем раз в 30с).
+const RECONNECT_BACKOFF_MAX: Duration = Duration::from_secs(30);
 
 /// Состояние VPN-сессии.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -50,6 +57,10 @@ pub struct TunParams {
     pub mtu: String,
     pub routes: String,
     pub dns: Option<String>,
+    /// IP-адреса exit'ов для bypass-маршрута (Linux): собственные пакеты клиента к exit НЕ должны
+    /// уходить в туннель при full-tunnel (`0.0.0.0/0`), иначе — петля маршрутизации и egress встаёт.
+    /// На Android не используется (там `VpnService.protect()` исключает сокет из туннеля).
+    pub exit_ips: Vec<String>,
 }
 
 /// Платформенный провайдер туннеля: по назначенному адресу строит/конфигурирует TUN и
@@ -67,6 +78,9 @@ pub struct VpnController {
     state: Mutex<VpnState>,
     events: broadcast::Sender<VpnEvent>,
     shutdown: Notify,
+    /// Пользователь запросил разрыв — глушит авто-реконнект. Persistent-флаг (не только `Notify`)
+    /// закрывает гонку: disconnect между итерациями цикла не теряется.
+    stopped: AtomicBool,
 }
 
 impl Default for VpnController {
@@ -82,6 +96,7 @@ impl VpnController {
             state: Mutex::new(VpnState::Idle),
             events,
             shutdown: Notify::new(),
+            stopped: AtomicBool::new(false),
         }
     }
 
@@ -104,60 +119,166 @@ impl VpnController {
         let _ = self.events.send(e);
     }
 
-    /// Поднять VPN: `establish` → `provider.configure(назначенный_адрес)` → `data_plane`.
-    /// Блокирует до завершения сессии (разрыв транспорта, ошибка или `disconnect`). Для
-    /// фонового запуска — `tokio::spawn` с `Arc<VpnController>`. События — через `subscribe`.
+    /// Поднять VPN и **держать соединение живым**, пока пользователь не позовёт `disconnect`.
+    ///
+    /// Первичный коннект: `establish` → `provider.configure` → `data_plane`. При неудаче
+    /// первичного коннекта — сразу ошибка (пользователь должен увидеть причину: битый конфиг,
+    /// недоступный exit и т.п.). После того как соединение **хотя бы раз поднялось**, при разрыве
+    /// транспорта (или падении data-plane) — **авто-реконнект с прогрессивным backoff**
+    /// (1→2→4→…→30с, сброс после успеха), пока `disconnect` не остановит. Мягкие смены пути
+    /// (WiFi↔LTE/NAT-rebind) прозрачны на уровне QUIC-миграции и сюда не доходят.
+    ///
+    /// Для фонового запуска — `tokio::spawn` с `Arc<VpnController>`. События — через `subscribe`.
     pub async fn connect(&self, cfg: ClientConfig, provider: Arc<dyn TunProvider>) -> Result<()> {
+        self.stopped.store(false, Ordering::SeqCst);
         self.set_state(VpnState::Connecting);
-        let session = match establish_session(&cfg).await {
-            Ok(s) => s,
-            Err(e) => {
-                self.emit(VpnEvent::Error(e.to_string()));
-                self.set_state(VpnState::Down);
-                return Err(e);
-            }
-        };
-        self.emit(VpnEvent::Connected {
-            exit: session.chosen.clone(),
-            transport: session.transport().to_string(),
-            cidr: session.cidr(),
-        });
+        let mut backoff = RECONNECT_BACKOFF_START;
+        let mut ever_up = false;
 
-        // Конфигурируем туннель ПОД назначенный адрес (на Android — VpnService.Builder).
-        let params = TunParams {
-            addr: session.addr,
-            prefix: session.prefix,
-            mtu: cfg.mtu.clone(),
-            routes: cfg.routes.clone(),
-            dns: cfg.dns.clone(),
-        };
-        let tun = match provider.configure(&params) {
-            Ok(t) => t,
-            Err(e) => {
-                self.emit(VpnEvent::Error(e.to_string()));
+        loop {
+            if self.stopped.load(Ordering::SeqCst) {
                 self.set_state(VpnState::Down);
-                return Err(e);
+                return Ok(());
             }
-        };
 
-        self.set_state(VpnState::Up);
-        // data-plane крутится до разрыва транспорта ИЛИ до disconnect (тогда future data-plane
-        // дропается → транспорт (QUIC/TCP) закрывается при drop).
-        let r = tokio::select! {
-            r = run_data_plane(session, tun) => r,
-            _ = self.shutdown.notified() => {
-                eprintln!("[vpn] disconnect — закрываю сессию");
-                Ok(())
+            // ── establish ──
+            let session = match establish_session(&cfg).await {
+                Ok(s) => s,
+                Err(e) => {
+                    if !ever_up {
+                        // первичный коннект — показываем ошибку и выходим (не крутим ретраи)
+                        self.emit(VpnEvent::Error(e.to_string()));
+                        self.set_state(VpnState::Down);
+                        return Err(e);
+                    }
+                    eprintln!("[vpn] реконнект: establish не удался: {e} — ретрай через {:?}", backoff);
+                    self.set_state(VpnState::Migrating);
+                    if self.sleep_or_stop(backoff).await {
+                        self.set_state(VpnState::Down);
+                        return Ok(());
+                    }
+                    backoff = next_backoff(backoff);
+                    continue;
+                }
+            };
+            self.emit(VpnEvent::Connected {
+                exit: session.chosen.clone(),
+                transport: session.transport().to_string(),
+                cidr: session.cidr(),
+            });
+
+            // Собрать IP всех сконфигурированных exit'ов (+ фактический peer) для bypass-маршрута:
+            // при full-tunnel исключаем их из туннеля, иначе собственный QUIC/obfs-трафик к exit
+            // заворачивается обратно в citadel0 → петля, egress встаёт (см. TunParams::exit_ips).
+            let mut exit_ips = std::collections::BTreeSet::new();
+            exit_ips.insert(session.peer_addr().ip().to_string());
+            for s in &cfg.servers {
+                if let Ok(addrs) = tokio::net::lookup_host(s).await {
+                    for a in addrs {
+                        exit_ips.insert(a.ip().to_string());
+                    }
+                }
             }
-        };
-        self.set_state(VpnState::Down);
-        r
+
+            // Конфигурируем туннель ПОД назначенный адрес (на Android — VpnService.Builder).
+            // На реконнекте адрес может смениться — TUN пере-конфигурируется под новый; polkit с
+            // auth_admin_keep не переспрашивает пароль в пределах сессии.
+            let params = TunParams {
+                addr: session.addr,
+                prefix: session.prefix,
+                mtu: clamp_tun_mtu(&cfg.mtu, session.quic_datagram_mtu()),
+                routes: cfg.routes.clone(),
+                dns: cfg.dns.clone(),
+                exit_ips: exit_ips.into_iter().collect(),
+            };
+            let tun = match provider.configure(&params) {
+                Ok(t) => t,
+                Err(e) => {
+                    if !ever_up {
+                        self.emit(VpnEvent::Error(e.to_string()));
+                        self.set_state(VpnState::Down);
+                        return Err(e);
+                    }
+                    eprintln!("[vpn] реконнект: configure TUN не удался: {e} — ретрай через {:?}", backoff);
+                    self.set_state(VpnState::Migrating);
+                    if self.sleep_or_stop(backoff).await {
+                        self.set_state(VpnState::Down);
+                        return Ok(());
+                    }
+                    backoff = next_backoff(backoff);
+                    continue;
+                }
+            };
+
+            self.set_state(VpnState::Up);
+            ever_up = true;
+            backoff = RECONNECT_BACKOFF_START; // успех — сбрасываем backoff
+
+            // data-plane крутится до разрыва транспорта ИЛИ до disconnect (тогда future data-plane
+            // дропается → транспорт (QUIC/TCP) закрывается при drop, TUN сворачивается).
+            let r = tokio::select! {
+                r = run_data_plane(session, tun) => r,
+                _ = self.shutdown.notified() => {
+                    eprintln!("[vpn] disconnect — закрываю сессию");
+                    self.set_state(VpnState::Down);
+                    return Ok(());
+                }
+            };
+            if self.stopped.load(Ordering::SeqCst) {
+                self.set_state(VpnState::Down);
+                return Ok(());
+            }
+
+            // Транспорт упал сам (не пользователь) → авто-реконнект.
+            match r {
+                Ok(()) => eprintln!("[vpn] транспорт закрылся — восстанавливаю соединение"),
+                Err(e) => eprintln!("[vpn] data-plane упал: {e} — восстанавливаю соединение"),
+            }
+            self.set_state(VpnState::Migrating);
+            if self.sleep_or_stop(backoff).await {
+                self.set_state(VpnState::Down);
+                return Ok(());
+            }
+            backoff = next_backoff(backoff);
+        }
     }
 
-    /// Запросить разрыв активной сессии (будит `connect`, который роняет транспорт).
-    /// Безопасно в любом состоянии (нет активной сессии → no-op).
+    /// Подождать `d` ИЛИ пробуждение по `disconnect`. `true` — пользователь остановил (прервать
+    /// реконнект); `false` — таймаут истёк, продолжаем попытки.
+    async fn sleep_or_stop(&self, d: Duration) -> bool {
+        if self.stopped.load(Ordering::SeqCst) {
+            return true;
+        }
+        tokio::select! {
+            _ = tokio::time::sleep(d) => self.stopped.load(Ordering::SeqCst),
+            _ = self.shutdown.notified() => true,
+        }
+    }
+
+    /// Запросить разрыв активной сессии и остановить авто-реконнект (persistent-флаг + будим
+    /// `connect`). Безопасно в любом состоянии (нет активной сессии → no-op).
     pub fn disconnect(&self) {
+        self.stopped.store(true, Ordering::SeqCst);
         self.shutdown.notify_waiters();
+    }
+}
+
+/// Следующий backoff: удвоение с потолком [`RECONNECT_BACKOFF_MAX`].
+fn next_backoff(cur: Duration) -> Duration {
+    (cur * 2).min(RECONNECT_BACKOFF_MAX)
+}
+
+/// Ужать `cfg_mtu` под бюджет QUIC-датаграммы (`budget` от [`crate::client::Session::quic_datagram_mtu`]):
+/// если сконфигурированный MTU больше бюджета — вернуть бюджет (иначе полноразмерные пакеты
+/// дропаются в pump «datagram too large»). `None` (obfs-TCP) или MTU ≤ бюджета — оставить как есть.
+pub fn clamp_tun_mtu(cfg_mtu: &str, budget: Option<usize>) -> String {
+    let cur: usize = cfg_mtu.parse().unwrap_or(1280);
+    match budget {
+        Some(b) if cur > b => {
+            eprintln!("[vpn] TUN MTU {cur} > бюджет QUIC-датаграммы {b} — ужимаю до {b}");
+            b.to_string()
+        }
+        _ => cfg_mtu.to_string(),
     }
 }
 
@@ -185,5 +306,27 @@ mod tests {
         let c = VpnController::new();
         c.disconnect(); // не паникует, no-op без активной сессии
         assert_eq!(c.state(), VpnState::Idle);
+    }
+
+    #[test]
+    fn backoff_doubles_and_caps() {
+        let mut b = RECONNECT_BACKOFF_START;
+        assert_eq!(b, Duration::from_secs(1));
+        b = next_backoff(b);
+        assert_eq!(b, Duration::from_secs(2));
+        b = next_backoff(b);
+        assert_eq!(b, Duration::from_secs(4));
+        for _ in 0..10 {
+            b = next_backoff(b); // упирается в потолок, не растёт бесконечно
+        }
+        assert_eq!(b, RECONNECT_BACKOFF_MAX);
+    }
+
+    #[tokio::test]
+    async fn sleep_or_stop_returns_immediately_when_stopped() {
+        let c = VpnController::new();
+        c.disconnect(); // ставит stopped
+        // не ждёт 10с — сразу true (реконнект прерывается пользовательским disconnect)
+        assert!(c.sleep_or_stop(Duration::from_secs(10)).await);
     }
 }

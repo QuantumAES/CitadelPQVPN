@@ -16,8 +16,8 @@ use flutter_rust_bridge::frb;
 use crate::frb_generated::StreamSink;
 
 use citadel_client::{
-    establish_session, run_data_plane, tun_from_fd, CredentialLink, GuiTunProvider, Profile,
-    Session, TunProvider, Vault, VpnController, VpnEvent, VpnState,
+    establish_session, run_data_plane, tun_from_fd, ClientConfig, CredentialLink, GuiTunProvider,
+    Profile, Session, TunProvider, Vault, VpnController, VpnEvent, VpnState,
 };
 
 /// Версия PQ-VPN-ядра (about-экран).
@@ -318,10 +318,13 @@ async fn do_android_establish(uri: &str) -> Result<TunSetupDto> {
     let cfg = CredentialLink::from_uri(uri)?.to_client_config();
     let session = establish_session(&cfg).await?;
     let a = session.addr;
+    // Клампим MTU под бюджет QUIC-датаграммы (иначе полноразмерные пакеты дропаются «datagram
+    // too large»). VpnService.Builder примет это как MTU интерфейса.
+    let mtu = citadel_client::clamp_tun_mtu(&cfg.mtu, session.quic_datagram_mtu());
     let dto = TunSetupDto {
         addr: format!("{}.{}.{}.{}", a[0], a[1], a[2], a[3]),
         prefix: session.prefix as u32,
-        mtu: cfg.mtu.clone(),
+        mtu,
         routes: cfg.routes.clone(),
         dns: cfg.dns.clone().unwrap_or_default(),
         exit: session.chosen.clone(),
@@ -394,4 +397,50 @@ pub fn vpn_disconnect() {
     if let Some(c) = ACTIVE.lock().unwrap().take() {
         c.disconnect();
     }
+}
+
+// ───────────────────────────── диагностика (задача 3) ─────────────────────────────
+
+/// Один шаг прогона диагностики для UI.
+pub struct DiagLineDto {
+    pub step: String,
+    pub ok: bool,
+    pub detail: String,
+}
+
+/// Собрать `ClientConfig` из сохранённого профиля (по id) или из сырой `citadel://`-ссылки.
+fn cfg_from(profile_id: Option<String>, link: Option<String>) -> Result<ClientConfig> {
+    let uri = match (profile_id, link) {
+        (Some(id), _) => {
+            let g = VAULT.lock().unwrap();
+            let v = g.as_ref().ok_or_else(|| anyhow!("хранилище заблокировано"))?;
+            v.list()
+                .into_iter()
+                .find(|p| p.id == id)
+                .map(|p| p.uri)
+                .ok_or_else(|| anyhow!("профиль не найден"))?
+        }
+        (None, Some(l)) => l,
+        (None, None) => return Err(anyhow!("нужен profile_id или link")),
+    };
+    Ok(CredentialLink::from_uri(&uri)?.to_client_config())
+}
+
+/// Прогнать тест-кейсы подключения к exit'у профиля/ссылки, стримя результат по шагам
+/// (DNS → QUIC/UDP → TCP → establish → egress). Диагностика идёт тем же путём, что реальный
+/// коннект, поэтому показывает, где именно рвётся связь. Не трогает активную сессию.
+pub fn run_diagnostics(
+    profile_id: Option<String>,
+    link: Option<String>,
+    sink: StreamSink<DiagLineDto>,
+) -> Result<()> {
+    let cfg = cfg_from(profile_id, link)?;
+    rt().spawn(async move {
+        citadel_client::run_diagnostics(&cfg, |s| {
+            let _ = sink.add(DiagLineDto { step: s.name, ok: s.ok, detail: s.detail });
+        })
+        .await;
+        // sink закроется при дропе (функция вернулась) → Dart увидит конец стрима
+    });
+    Ok(())
 }

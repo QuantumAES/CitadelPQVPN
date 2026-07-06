@@ -32,7 +32,7 @@ gh auth status >/dev/null 2>&1 || die "gh не авторизован: gh auth l
 
 # ── обязательные артефакты ──
 [[ -f "$DIST/sha256sums" && -f "$DIST/sha256sums.minisig" ]] || die "нет sha256sums(.minisig) в $DIST"
-shopt -s nullglob; zst=("$DIST"/*.zst); shopt -u nullglob
+shopt -s nullglob; zst=("$DIST"/*.zst); apk=("$DIST"/*.apk); shopt -u nullglob
 ((${#zst[@]})) || die "в $DIST нет *.zst — пере-собери mk-release.sh"
 
 # ── ПЕРЕ-ПРОВЕРКА перед публикацией ──
@@ -52,13 +52,32 @@ fi
 PRE=(); case "$TAG" in *-pre*|*-rc*|*-beta*|*-alpha*) PRE=(--prerelease) ;; esac
 
 INSTALLER_SHA="$(sha256sum "$INSTALLER" | cut -d' ' -f1)"
-assets=("${zst[@]}" "$DIST/sha256sums" "$DIST/sha256sums.minisig" "$INSTALLER")
+assets=("${zst[@]}" "${apk[@]}" "$DIST/sha256sums" "$DIST/sha256sums.minisig" "$INSTALLER")
+
+# ── клиентские артефакты (если собраны mk-client-release.sh) — для notes ──
+APK_NAME=""; LINUX_NAME=""
+for f in "${apk[@]}"; do APK_NAME="$(basename "$f")"; done
+shopt -s nullglob
+for f in "$DIST"/citadel-desktop-linux-*.tar.zst; do LINUX_NAME="$(basename "$f")"; done
+shopt -u nullglob
+CLIENTS_BLOCK=""
+if [[ -n "$APK_NAME" || -n "$LINUX_NAME" ]]; then
+  CLIENTS_BLOCK="$(cat <<EOF
+
+Клиенты:
+${APK_NAME:+    Android: $APK_NAME (fat APK; разреши установку из неизвестных источников).}
+${LINUX_NAME:+    Linux:   $LINUX_NAME — распакуй и поставь:}
+${LINUX_NAME:+        tar --zstd -xf $LINUX_NAME && cd citadel-desktop-linux-* && ./install.sh}
+EOF
+)"
+fi
 
 # ── notes (без backtick'ов: код-блоки 4 пробелами; heredoc раскрывает $… ) ──
 notes="$(cat <<EOF
-CitadelPQVPN $TAG — подписанные бинари exit-сервера.
+CitadelPQVPN $TAG — подписанные бинари exit-сервера + клиенты (Android/Linux).
+$CLIENTS_BLOCK
 
-Развёртывание (на СЕРВЕРЕ, root):
+Развёртывание СЕРВЕРА (root):
 
     curl -fsSLO https://github.com/$REPO/releases/download/$TAG/install-citadel-server.sh
     CITADEL_VERSION=$TAG bash install-citadel-server.sh

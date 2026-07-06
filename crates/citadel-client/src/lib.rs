@@ -26,8 +26,11 @@ pub use citadel_quic::config::{
     parse_obfs_psk, parse_pin, ClientConfig, MldsaSource, PinMode, PinSource,
 };
 pub use citadel_quic::client::{establish_session, run_data_plane, Session};
+pub use citadel_quic::diag::{run_diagnostics, DiagStep};
 pub use citadel_quic::protect::{clear_socket_protector, set_socket_protector, SocketProtector};
-pub use citadel_quic::vpn::{TunParams, TunProvider, VpnController, VpnEvent, VpnState};
+pub use citadel_quic::vpn::{
+    clamp_tun_mtu, TunParams, TunProvider, VpnController, VpnEvent, VpnState,
+};
 pub use citadel_tun::TunIo;
 pub use creds::{CredentialBundle, CredentialLink, BUNDLE_VERSION};
 pub use vault::{Profile, Vault};

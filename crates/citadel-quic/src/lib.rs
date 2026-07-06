@@ -17,6 +17,7 @@ mod obfs_socket;
 pub mod client;
 pub mod config;
 pub mod dataplane;
+pub mod diag;
 pub mod pqauth;
 pub mod protect;
 pub mod ratelimit;
@@ -82,7 +83,10 @@ fn transport() -> Arc<quinn::TransportConfig> {
     tc.datagram_receive_buffer_size(Some(1 << 20));
     tc.datagram_send_buffer_size(1 << 20);
     tc.keep_alive_interval(Some(Duration::from_secs(5)));
-    tc.max_idle_timeout(Some(Duration::from_secs(30).try_into().unwrap()));
+    // 15с (не 30): быстрее детектим мёртвое соединение при смене сети (WiFi↔LTE/toggle) → быстрее
+    // авто-реконнект. Эффективный idle = min(client, server) ⇒ снижение только на клиенте уже
+    // даёт 15с без передеплоя сервера. Keepalive 5с ⇒ 2 пропущенных ⇒ close.
+    tc.max_idle_timeout(Some(Duration::from_secs(15).try_into().unwrap()));
     // Фиксируем MTU: запас под obfs-оверхед L1 (M3), без агрессивного discovery до 1500.
     tc.initial_mtu(1200);
     tc.mtu_discovery_config(None);

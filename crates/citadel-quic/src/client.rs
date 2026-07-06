@@ -17,7 +17,7 @@ use std::time::Duration;
 use anyhow::{anyhow, Result};
 use rand::RngCore;
 
-use citadel_masque::capsule;
+use citadel_masque::{capsule, datagram, ip};
 use citadel_tun::TunIo;
 
 use crate::config::{ClientConfig, PinMode};
@@ -42,12 +42,79 @@ impl Session {
     pub fn transport(&self) -> &'static str {
         self.tunnel.kind()
     }
+    /// Фактический адрес exit'а, с которым говорит транспорт (для bypass-маршрута на Linux —
+    /// исключить собственные пакеты к exit из full-tunnel, иначе петля маршрутизации).
+    pub fn peer_addr(&self) -> SocketAddr {
+        self.tunnel.peer()
+    }
+
+    /// Максимальный размер inner-IP-пакета (TUN MTU), влезающий в одну QUIC-датаграмму:
+    /// `max_datagram_size` − 1 байт на context-varint (CTX_RAW_IP=0). `None` для obfs-TCP
+    /// (record-фрейминг несёт любой размер) или если датаграммы недоступны. Вызывающий
+    /// клампит TUN MTU под это значение — иначе полноразмерные пакеты дропаются в `pump`
+    /// («datagram too large») и трафик не идёт.
+    pub fn quic_datagram_mtu(&self) -> Option<usize> {
+        match &self.tunnel {
+            Tunnel::Quic(c) => c.max_datagram_size().map(|m| m.saturating_sub(1)),
+            Tunnel::Tcp(_) => None,
+        }
+    }
     /// Назначенный адрес в форме CIDR (например, `"10.7.0.3/24"`).
     pub fn cidr(&self) -> String {
         format!(
             "{}.{}.{}.{}/{}",
             self.addr[0], self.addr[1], self.addr[2], self.addr[3], self.prefix
         )
+    }
+
+    /// Диагностическая **egress-проба** (только QUIC-транспорт): собирает DNS-запрос A-записи
+    /// `qname` к резолверу `resolver`, отправляет сырым IPv4/UDP-пакетом прямо в туннель
+    /// (минуя ОС-роутинг и TUN) и ждёт ответ. Так проверяется, что exit реально форвардит и
+    /// NAT'ит наружу — **без** поднятия TUN/маршрутов/root, поэтому изолирует «сервер egress
+    /// сломан» от «клиентский роутинг сломан» (петля на full-tunnel и т.п.).
+    ///
+    /// `Ok(Some(addrs))` — резолвер ответил (egress+NAT работают); `Ok(None)` — транспорт
+    /// obfs-TCP (проба не поддержана); `Err` — таймаут/ошибка отправки.
+    pub async fn egress_dns_probe(
+        &self,
+        resolver: [u8; 4],
+        qname: &str,
+        timeout: Duration,
+    ) -> Result<Option<Vec<[u8; 4]>>> {
+        let conn = match &self.tunnel {
+            Tunnel::Quic(c) => c,
+            Tunnel::Tcp(_) => return Ok(None),
+        };
+        let id: u16 = rand::random();
+        let sport: u16 = 20000 + (rand::random::<u16>() % 20000);
+        let query = ip::build_dns_query(id, qname, 1); // A-запись
+        let pkt = ip::build_udp4(self.addr, sport, resolver, 53, &query);
+        let dg = datagram::encode(datagram::CTX_RAW_IP, &pkt);
+        conn.send_datagram(bytes::Bytes::from(dg))
+            .map_err(|e| anyhow!("egress-проба: не отправить датаграмму: {e}"))?;
+
+        let deadline = tokio::time::Instant::now() + timeout;
+        loop {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if remaining.is_zero() {
+                return Err(anyhow!("egress-проба: нет DNS-ответа за {}с (exit не форвардит?)", timeout.as_secs()));
+            }
+            let dg = match tokio::time::timeout(remaining, conn.read_datagram()).await {
+                Ok(Ok(dg)) => dg,
+                Ok(Err(e)) => return Err(anyhow!("egress-проба: транспорт закрыт: {e}")),
+                Err(_) => return Err(anyhow!("egress-проба: нет DNS-ответа за {}с (exit не форвардит?)", timeout.as_secs())),
+            };
+            let Some((datagram::CTX_RAW_IP, inner)) = datagram::decode(&dg) else { continue };
+            let Some(u) = ip::parse_udp4(inner) else { continue };
+            if u.src != resolver || u.dport != sport {
+                continue; // не наш ответ
+            }
+            if let Some((rid, _an, addrs)) = ip::parse_dns_response(u.payload) {
+                if rid == id {
+                    return Ok(Some(addrs));
+                }
+            }
+        }
     }
 }
 
@@ -56,14 +123,22 @@ pub fn host_of(server: &str) -> &str {
     server.rsplit_once(':').map(|(h, _)| h).unwrap_or(server)
 }
 
+/// Порт-часть `host:port` (для диагностических сообщений); по умолчанию `4433`.
+pub fn port_of(server: &str) -> &str {
+    server.rsplit_once(':').map(|(_, p)| p).unwrap_or("4433")
+}
+
 /// Поднять сессию: failover по списку exit'ов (M5) + control-обмен (токен→адрес, PQ-auth M7).
 /// **Без TUN и без сетевой настройки** — только транспорт и назначенный адрес.
 pub async fn establish_session(cfg: &ClientConfig) -> Result<Session> {
     eprintln!("[citadel-m1:client] exit-серверы (перемешаны): {}", cfg.servers.join(", "));
 
     // M5 multi-server: идём по списку failover'ом — первый поднявшийся exit (QUIC или TCP-fallback).
+    // Копим причины отказа по каждому exit — уходят в итоговую ошибку (видно в UI/лог-панели на
+    // Android, где per-attempt eprintln иначе не разглядеть).
     let mut tunnel = None;
     let mut chosen = String::new();
+    let mut reasons: Vec<String> = Vec::new();
     for server in &cfg.servers {
         match connect_server(server, cfg).await {
             Ok(Some(t)) => {
@@ -72,12 +147,24 @@ pub async fn establish_session(cfg: &ClientConfig) -> Result<Session> {
                 chosen = server.clone();
                 break;
             }
-            Ok(None) => eprintln!("[citadel-m1:client] exit {server} недоступен — пробую следующий"),
-            Err(e) => eprintln!("[citadel-m1:client] exit {server}: {e} — пробую следующий"),
+            Ok(None) => {
+                let why = if cfg.obfs_psk.is_some() {
+                    format!("{server}: QUIC/UDP:{} и obfs-TCP:{} недоступны", port_of(server), cfg.tcp_port)
+                } else {
+                    format!("{server}: QUIC/UDP:{} недоступен (obfs-fallback не настроен)", port_of(server))
+                };
+                eprintln!("[citadel-m1:client] {why} — пробую следующий");
+                reasons.push(why);
+            }
+            Err(e) => {
+                let why = format!("{server}: {e}");
+                eprintln!("[citadel-m1:client] {why} — пробую следующий");
+                reasons.push(why);
+            }
         }
     }
     let mut tunnel = tunnel
-        .ok_or_else(|| anyhow!("ни один exit недоступен: {}", cfg.servers.join(", ")))?;
+        .ok_or_else(|| anyhow!("ни один exit недоступен:\n{}", reasons.join("\n")))?;
 
     // M7 PQ-auth: pin (Ed25519-cert) + ML-DSA-65 pk выбранного exit (если провижированы)
     let host = host_of(&chosen);
@@ -131,9 +218,11 @@ async fn connect_server(server: &str, cfg: &ClientConfig) -> Result<Option<Tunne
         let tcp_target = format!("{host}:{}", cfg.tcp_port);
         if let Ok(Some(taddr)) = tokio::net::lookup_host(&tcp_target).await.map(|mut it| it.next()) {
             eprintln!("[citadel-m1:client] QUIC к {server} недоступен → obfs-TCP к {tcp_target}");
-            // таймаут: мёртвый host иначе висит на TCP connect (~минуты) и ломает failover
+            // таймаут: мёртвый host иначе висит на TCP connect (~минуты) и ломает failover.
+            // 8с (не 3с) — запас под высокий RTT мобильных сетей (частый Android-путь, когда
+            // UDP/QUIC режется и остаётся только obfs-TCP:443).
             if let Ok(Ok(tcp)) =
-                tokio::time::timeout(Duration::from_secs(3), TcpObfs::connect(taddr, psk)).await
+                tokio::time::timeout(Duration::from_secs(8), TcpObfs::connect(taddr, psk)).await
             {
                 eprintln!("[citadel-m1:client] obfs-TCP туннель к {tcp_target} ✔");
                 return Ok(Some(Tunnel::Tcp(tcp)));
@@ -145,7 +234,8 @@ async fn connect_server(server: &str, cfg: &ClientConfig) -> Result<Option<Tunne
 
 /// Попытаться поднять PQ-QUIC к одному серверу. `None` — не удалось за `attempts` попыток
 /// (UDP/QUIC заблокирован или exit недоступен). Pin берётся per-host (`cfg.pin_for`).
-async fn try_quic_connect(
+/// `pub(crate)` — переиспользуется диагностикой ([`crate::diag`]) как быстрая проба.
+pub(crate) async fn try_quic_connect(
     connect: &str,
     addr: SocketAddr,
     cfg: &ClientConfig,

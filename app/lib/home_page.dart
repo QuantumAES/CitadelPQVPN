@@ -4,6 +4,7 @@ import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 
 import 'package:app/app_state.dart';
+import 'package:app/debug_panel.dart';
 import 'package:app/src/rust/api/citadel.dart';
 
 class HomePage extends StatefulWidget {
@@ -132,6 +133,10 @@ class _HomePageState extends State<HomePage> {
             padding: const EdgeInsets.fromLTRB(16, 16, 16, 96),
             children: [
               _StatusCard(state: s, onDisconnect: s.disconnect),
+              if (s.debugEnabled) ...[
+                const SizedBox(height: 16),
+                _DebugSection(state: s),
+              ],
               const SizedBox(height: 20),
               if (s.profiles.isEmpty)
                 _EmptyProfiles(onAdd: _addProfile)
@@ -196,6 +201,16 @@ class _HomePageState extends State<HomePage> {
                 },
               ),
             ],
+            SwitchListTile(
+              secondary: const Icon(Icons.bug_report_outlined),
+              title: const Text('Режим отладки'),
+              subtitle: const Text('Журнал ядра и диагностика подключения'),
+              value: s.debugEnabled,
+              onChanged: (_) {
+                s.toggleDebug();
+                Navigator.pop(sheetCtx);
+              },
+            ),
             ListTile(
               leading: const Icon(Icons.info_outline),
               title: const Text('О приложении'),
@@ -370,6 +385,106 @@ class _HomePageState extends State<HomePage> {
   static String _short(Object e) {
     final s = e.toString().replaceAll('\n', ' ').trim();
     return s.length > 120 ? '${s.substring(0, 117)}…' : s;
+  }
+}
+
+// ═══════════════════════════ секция отладки ═══════════════════════════
+
+class _DebugSection extends StatefulWidget {
+  const _DebugSection({required this.state});
+  final AppState state;
+
+  @override
+  State<_DebugSection> createState() => _DebugSectionState();
+}
+
+class _DebugSectionState extends State<_DebugSection> {
+  final List<String> _diag = [];
+  StreamSubscription<DiagLineDto>? _sub;
+  bool _running = false;
+
+  AppState get s => widget.state;
+
+  /// Профиль для диагностики: активный, иначе первый в списке.
+  String? get _targetId =>
+      s.activeProfileId ?? (s.profiles.isNotEmpty ? s.profiles.first.id : null);
+
+  void _run() {
+    final id = _targetId;
+    if (id == null) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('Нет профиля для диагностики')),
+      );
+      return;
+    }
+    _sub?.cancel();
+    setState(() {
+      _diag
+        ..clear()
+        ..add('▶ Пробное подключение для диагностики (отдельная сессия, не основной туннель)…');
+      _running = true;
+    });
+    _sub = runDiagnostics(profileId: id).listen(
+      (l) {
+        if (!mounted) return;
+        setState(() => _diag.add('${l.ok ? '✔' : '✗'} ${l.step} — ${l.detail}'));
+      },
+      onDone: () {
+        if (mounted) setState(() => _running = false);
+      },
+      onError: (Object e) {
+        if (mounted) {
+          setState(() {
+            _running = false;
+            _diag.add('✗ Диагностика прервана: $e');
+          });
+        }
+      },
+    );
+  }
+
+  @override
+  void dispose() {
+    _sub?.cancel();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.stretch,
+      children: [
+        Row(
+          children: [
+            Expanded(
+              child: FilledButton.tonalIcon(
+                onPressed: _running ? null : _run,
+                icon: _running
+                    ? const SizedBox(
+                        width: 16,
+                        height: 16,
+                        child: CircularProgressIndicator(strokeWidth: 2),
+                      )
+                    : const Icon(Icons.fact_check_outlined),
+                label: Text(_running ? 'Проверка…' : 'Диагностика подключения'),
+              ),
+            ),
+          ],
+        ),
+        if (_diag.isNotEmpty) ...[
+          const SizedBox(height: 12),
+          MonoLogView(
+            title: 'Диагностика',
+            icon: Icons.checklist_rtl,
+            lines: _diag,
+            height: 200,
+            onClear: () => setState(() => _diag.clear()),
+          ),
+        ],
+        const SizedBox(height: 12),
+        const DebugLogPanel(),
+      ],
+    );
   }
 }
 

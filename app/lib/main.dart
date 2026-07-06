@@ -6,6 +6,7 @@ import 'package:path_provider/path_provider.dart';
 import 'package:app/app_state.dart';
 import 'package:app/home_page.dart';
 import 'package:app/src/rust/api/citadel.dart';
+import 'package:app/src/rust/api/diag.dart';
 import 'package:app/src/rust/frb_generated.dart';
 
 Future<void> main() async {
@@ -14,10 +15,15 @@ Future<void> main() async {
   // На Android cwd=`/` (песочница не writable) и нет XDG/HOME — путь хранилища должна
   // задать платформа (приватный filesDir). На десктопе путь резолвится из XDG/HOME, и
   // трогать его нельзя: это сменило бы расположение уже существующих vault'ов.
+  // Лог-файл задаём ДО startLogCapture, чтобы подхватить лог упавшей прошлой сессии.
   if (Platform.isAndroid) {
     final dir = await getApplicationSupportDirectory();
     setDataDir(dir: dir.path);
+    setLogFile(path: '${dir.path}/citadel.log');
   }
+  // Захват stderr движка → debug-панель приложения (иначе eprintln! ядра теряется, особенно
+  // на Android). Идемпотентно; должно быть до первых vpn-операций.
+  startLogCapture();
   runApp(const CitadelApp());
 }
 

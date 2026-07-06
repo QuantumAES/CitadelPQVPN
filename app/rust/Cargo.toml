@@ -10,8 +10,12 @@ crate-type = ["cdylib", "staticlib"]
 flutter_rust_bridge = "=2.12.0"
 citadel-client = { path = "../../crates/citadel-client" }
 anyhow = "1"
-# tokio-runtime для движка (quinn/TLS); features добираются унификацией с citadel-quic.
-tokio = { version = "1", features = ["rt-multi-thread"] }
+# tokio-runtime для движка (quinn/TLS); "sync" — для broadcast-шины debug-логов (api::diag).
+tokio = { version = "1", features = ["rt-multi-thread", "sync"] }
+
+# api::diag — захват process-stderr (dup2/pipe) для debug-логов в UI. Unix-only (Linux+Android).
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
 
 # Android: JNI-мост Rust→VpnService.protect() (анти-петля, C3.3).
 [target.'cfg(target_os = "android")'.dependencies]

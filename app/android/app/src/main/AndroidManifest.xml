@@ -1,5 +1,9 @@
 <manifest xmlns:android="http://schemas.android.com/apk/res/android">
     <!-- CitadelPQVPN (C3): VPN-туннель через foreground-сервис -->
+    <!-- INTERNET — обязателен в release-манифесте: без него создание AF_INET-сокета падает
+         с EACCES (os error 13), и коннект к exit невозможен. В debug/profile-манифестах его
+         добавляет шаблон Flutter, но release собирается из main — там он ДОЛЖЕН быть явно. -->
+    <uses-permission android:name="android.permission.INTERNET"/>
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE"/>
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_SYSTEM_EXEMPTED"/>
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS"/>
