@@ -196,11 +196,64 @@ fn read_pin_for(host: &str) -> PinMode {
 //   C0.4 — host_of/connect_server/try_quic_connect/client_request_address → client.
 // В бинаре остаются серверная роль, probe/auth-probe и Linux NetConfigurator (ip/iptables/DNS).
 
+/// C5.1: как exit проверяет анонимный токен. `Epoch` читает pub'ы текущей±прошлой эпохи из dir и
+/// верифицирует под ними (токен «гаснет» к концу эпохи → отзыв по времени, M6). `Legacy` — единый
+/// pub (не-epoch, back-compat). `Disabled` — токены выключены (`Citadel_ISSUER_PUB` не задан).
+enum IssuerAuth {
+    Disabled,
+    Legacy(Vec<u8>),
+    Epoch { dir: String, epoch_secs: u64 },
+}
+
+impl IssuerAuth {
+    fn from_env() -> Self {
+        let Ok(pub_path) = std::env::var("Citadel_ISSUER_PUB") else {
+            return IssuerAuth::Disabled;
+        };
+        match std::env::var("Citadel_EPOCH_SECS").ok().and_then(|s| s.parse::<u64>().ok()) {
+            Some(epoch_secs) => {
+                let dir = std::path::Path::new(&pub_path)
+                    .parent()
+                    .map(|p| p.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| ".".into());
+                IssuerAuth::Epoch { dir, epoch_secs }
+            }
+            None => match std::fs::read(&pub_path) {
+                Ok(pk) => IssuerAuth::Legacy(pk),
+                Err(_) => IssuerAuth::Disabled,
+            },
+        }
+    }
+
+    fn enabled(&self) -> bool {
+        !matches!(self, IssuerAuth::Disabled)
+    }
+
+    /// Проверить токен → nonce (для учёта double-spend) или None (невалиден/чужая эпоха).
+    fn verify(&self, token: &[u8]) -> Option<[u8; 32]> {
+        match self {
+            IssuerAuth::Disabled => None,
+            IssuerAuth::Legacy(pk) => citadel_token::verify_token(pk, token),
+            IssuerAuth::Epoch { dir, epoch_secs } => {
+                let e = citadel_token::current_epoch(*epoch_secs);
+                // current + prev (grace на границе эпохи / скью часов); старее — не принимаем.
+                let pubs: Vec<Vec<u8>> = [e, e.wrapping_sub(1)]
+                    .iter()
+                    .filter_map(|ep| {
+                        std::fs::read(format!("{dir}/{}", citadel_token::epoch_pub_name(*ep))).ok()
+                    })
+                    .collect();
+                citadel_token::verify_token_multi(&pubs, token)
+            }
+        }
+    }
+}
+
 async fn server_assign_address(
     tunnel: &mut Tunnel,
     addr: [u8; 4],
     prefix: u8,
-    issuer_pk: Option<&[u8]>,
+    issuer: &IssuerAuth,
     spent: &Mutex<HashSet<[u8; 32]>>,
     signer: Option<&citadel_quic::pqauth::ServerSigner>,
     cert_pin: [u8; 32],
@@ -223,9 +276,9 @@ async fn server_assign_address(
             let token = &body[n..tok_end];
             let rest = &body[tok_end..];
 
-            // F-M4: per-user аутентификация анонимным токеном (если издатель сконфигурирован)
-            if let Some(pk) = issuer_pk {
-                match citadel_token::verify_token(pk, token) {
+            // F-M4/C5.1: per-user auth анонимным epoch-scoped токеном (если издатель задан)
+            if issuer.enabled() {
+                match issuer.verify(token) {
                     Some(tn) => {
                         let fresh = spent.lock().unwrap().insert(tn);
                         if !fresh {
@@ -287,9 +340,9 @@ async fn run_server(tun: Arc<Tun>) -> Result<()> {
     };
     eprintln!("[Citadel-m1:server] слушаю {listen} (KX=X25519MLKEM768)");
 
-    let issuer_pk = Arc::new(std::env::var("Citadel_ISSUER_PUB").ok().and_then(|p| std::fs::read(p).ok()));
-    if issuer_pk.is_some() {
-        eprintln!("[Citadel-m1:server] per-user токены включены (issuer pub загружен)");
+    let issuer_auth = Arc::new(IssuerAuth::from_env());
+    if issuer_auth.enabled() {
+        eprintln!("[Citadel-m1:server] per-user epoch-токены включены (C5.1)");
     }
     let spent: Arc<Mutex<HashSet<[u8; 32]>>> = Arc::new(Mutex::new(HashSet::new()));
 
@@ -335,16 +388,16 @@ async fn run_server(tun: Arc<Tun>) -> Result<()> {
     // (single-conn); клиент делает обычный PQ-QUIC хендшейк поверх TCP. Та же крипта/pin/токены.
     if let (Some(listener), Some(psk)) = (tcp_listener, obfs_psk()) {
         let tun = tun.clone();
-        let issuer_pk = issuer_pk.clone();
+        let issuer_auth = issuer_auth.clone();
         let spent = spent.clone();
         let signer = signer.clone();
         tokio::spawn(async move {
             loop {
                 match listener.accept().await {
                     Ok((stream, _)) => {
-                        let (tun, issuer_pk, spent, signer, scfg) = (
+                        let (tun, issuer_auth, spent, signer, scfg) = (
                             tun.clone(),
-                            issuer_pk.clone(),
+                            issuer_auth.clone(),
                             spent.clone(),
                             signer.clone(),
                             tcp_server_cfg.clone(),
@@ -361,7 +414,7 @@ async fn run_server(tun: Arc<Tun>) -> Result<()> {
                                 match incoming.await {
                                     Ok(conn) => {
                                         let (addr, prefix) = next_client_addr();
-                                        handle_client(Tunnel::new(conn, true), tun, addr, prefix, issuer_pk, spent, rate_limit, signer, pin).await;
+                                        handle_client(Tunnel::new(conn, true), tun, addr, prefix, issuer_auth, spent, rate_limit, signer, pin).await;
                                     }
                                     Err(e) => eprintln!("[citadel-m1:server] obfs-TCP хендшейк: {e}"),
                                 }
@@ -381,14 +434,14 @@ async fn run_server(tun: Arc<Tun>) -> Result<()> {
     // QUIC accept loop (основной транспорт)
     while let Some(incoming) = ep.accept().await {
         let tun = tun.clone();
-        let issuer_pk = issuer_pk.clone();
+        let issuer_auth = issuer_auth.clone();
         let spent = spent.clone();
         let signer = signer.clone();
         tokio::spawn(async move {
             match incoming.await {
                 Ok(conn) => {
                     let (addr, prefix) = next_client_addr();
-                    handle_client(Tunnel::new(conn, false), tun, addr, prefix, issuer_pk, spent, rate_limit, signer, pin).await;
+                    handle_client(Tunnel::new(conn, false), tun, addr, prefix, issuer_auth, spent, rate_limit, signer, pin).await;
                 }
                 Err(e) => eprintln!("[citadel-m1:server] хендшейк не удался: {e}"),
             }
@@ -404,7 +457,7 @@ async fn handle_client(
     tun: Arc<Tun>,
     addr: [u8; 4],
     prefix: u8,
-    issuer_pk: Arc<Option<Vec<u8>>>,
+    issuer_auth: Arc<IssuerAuth>,
     spent: Arc<Mutex<HashSet<[u8; 32]>>>,
     rate_limit: Option<RateCfg>,
     signer: Arc<Option<citadel_quic::pqauth::ServerSigner>>,
@@ -412,7 +465,7 @@ async fn handle_client(
 ) {
     eprintln!("[citadel-m1:server] клиент {} ({}) подключён", tunnel.peer(), tunnel.kind());
     if let Err(e) =
-        server_assign_address(&mut tunnel, addr, prefix, issuer_pk.as_deref(), &spent, (*signer).as_ref(), cert_pin).await
+        server_assign_address(&mut tunnel, addr, prefix, &issuer_auth, &spent, (*signer).as_ref(), cert_pin).await
     {
         eprintln!("[citadel-m1:server] отказ в доступе: {e}");
         tunnel.close(1, b"auth-failed");

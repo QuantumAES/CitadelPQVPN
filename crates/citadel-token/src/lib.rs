@@ -20,6 +20,30 @@ use rand::RngCore;
 pub const NONCE_LEN: usize = 32;
 pub const RAND_LEN: usize = 32;
 
+/// C5.1: номер текущей эпохи = unix-время / длина эпохи (сек). Токены Layer-2 скоупятся на эпоху —
+/// exit проверяет их ТОЛЬКО ключом текущей (± прошлой, grace) эпохи, поэтому токен «гаснет» к концу
+/// эпохи автоматически (отзыв по времени). Отзыв при компрометации — issuer перестаёт подписывать
+/// такому клиенту, эффект ≤ длины эпохи. Требует слабой синхронизации часов issuer↔exit.
+pub fn current_epoch(epoch_secs: u64) -> u64 {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    now / epoch_secs.max(1) // max(1): защита от деления на ноль при кривом конфиге
+}
+
+/// C5.1: имя файла pub издателя для эпохи. Issuer публикует `issuer-<epoch>.pub`; exit читает
+/// current(±prev). Старые pub'ы остаются на диске для grace, но exit их уже не запрашивает.
+pub fn epoch_pub_name(epoch: u64) -> String {
+    format!("issuer-{epoch}.pub")
+}
+
+/// C5.1: проверить токен против нескольких pub'ов издателя (эпохи current±prev — grace на границе
+/// эпохи и при скью часов issuer↔exit). Возвращает nonce при успехе под ЛЮБЫМ pub; иначе None.
+pub fn verify_token_multi(pubs: &[Vec<u8>], token: &[u8]) -> Option<[u8; NONCE_LEN]> {
+    pubs.iter().find_map(|pk| verify_token(pk, token))
+}
+
 // ===================== интерактивный issuance по ролям (M5, issuer↔exit split) =====================
 // Разделение: КЛИЕНТ держит nonce + секреты ослепления и делает finalize; ИЗДАТЕЛЬ держит только
 // секретный ключ и подписывает ослеплённое сообщение ВСЛЕПУЮ (не видит nonce/токен) → unlinkability,
@@ -129,6 +153,27 @@ pub fn verify_token(pk_der: &[u8], token: &[u8]) -> Option<[u8; NONCE_LEN]> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn epoch_basics() {
+        assert!(current_epoch(3600) > 0); // после 1970 эпоха положительна
+        assert_eq!(current_epoch(u64::MAX), 0); // эпоха длиннее возраста unix → 0
+        let _ = current_epoch(0); // div-by-zero защита (max(1)) — не паникует
+    }
+
+    /// C5.1/M6: токен эпохи A НЕ принимается ключом эпохи B (epoch-scoping = отзыв по времени);
+    /// проходит под своим ключом и в grace-наборе [prev, cur].
+    #[test]
+    fn epoch_scoping_cross_key_rejected() {
+        let a = issue_batch(1, 2048).unwrap();
+        let b = issue_batch(1, 2048).unwrap();
+        let tok = &a.tokens[0];
+        assert!(verify_token(&b.pk_der, tok).is_none(), "ключ чужой эпохи не должен принять");
+        assert!(verify_token(&a.pk_der, tok).is_some());
+        assert!(verify_token_multi(std::slice::from_ref(&b.pk_der), tok).is_none());
+        assert!(verify_token_multi(&[b.pk_der.clone(), a.pk_der.clone()], tok).is_some()); // grace prev+cur
+        assert!(verify_token_multi(&[], tok).is_none());
+    }
 
     #[test]
     fn issue_and_verify() {

@@ -11,7 +11,7 @@
 
 use std::io::{self, Read, Write};
 use std::net::{TcpListener, TcpStream};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use anyhow::{Context, Result};
 
@@ -55,25 +55,66 @@ fn main() -> Result<()> {
     }
 }
 
-/// Издатель (биллинг): держит sk, подписывает ослеплённые сообщения вслепую по TCP.
+/// C5.1: ключ издателя на ТЕКУЩУЮ эпоху (`(epoch, pk_der, sk_der)`) под Mutex — фоновая ротация
+/// меняет его при смене эпохи. Токены становятся epoch-scoped: exit примет их только ключом
+/// текущей±прошлой эпохи → «гаснут» к концу эпохи (отзыв по времени, M6).
+type EpochKey = (u64, Vec<u8>, Vec<u8>);
+
+/// Опубликовать pub эпохи (`issuer-<epoch>.pub`) + `issuer.pub` (= current, back-compat не-epoch exit).
+fn publish_epoch_pub(dir: &str, epoch: u64, pk: &[u8]) -> Result<()> {
+    std::fs::write(format!("{dir}/{}", citadel_token::epoch_pub_name(epoch)), pk)
+        .with_context(|| format!("публикация pub эпохи {epoch}"))?;
+    std::fs::write(format!("{dir}/issuer.pub"), pk).context("issuer.pub (back-compat = current)")?;
+    Ok(())
+}
+
+/// Издатель (биллинг): держит sk текущей эпохи, слепо подписывает по TCP; ротирует ключ по эпохам.
 fn run_issuer() -> Result<()> {
     let bits = 2048;
-    let (pk_der, sk_der) = citadel_token::issuer_keypair(bits)?;
+    let epoch_secs: u64 =
+        std::env::var("Citadel_EPOCH_SECS").ok().and_then(|s| s.parse().ok()).unwrap_or(3600);
     let dir = token_dir();
-    std::fs::write(format!("{dir}/issuer.pub"), &pk_der).context("запись issuer.pub")?;
-    eprintln!("[issuer] ключ сгенерирован; issuer.pub ({} б) → {dir} (sk остаётся в процессе)", pk_der.len());
+
+    let e = citadel_token::current_epoch(epoch_secs);
+    eprintln!("[issuer] эпоха {e} (длина {epoch_secs}с); генерирую ключ (RSA-{bits}, ~10с)…");
+    let (pk, sk) = citadel_token::issuer_keypair(bits)?;
+    publish_epoch_pub(&dir, e, &pk)?;
+    eprintln!("[issuer] эпоха {e}: pub опубликован → {dir} (sk остаётся в процессе)");
+    let state: Arc<Mutex<EpochKey>> = Arc::new(Mutex::new((e, pk, sk)));
+
+    // Фоновая ротация: при смене эпохи генерим новый ключ и публикуем (keygen ВНЕ лока, чтобы
+    // не блокировать подписание; прошлый pub оставляем на диске для grace на exit).
+    {
+        let state = state.clone();
+        let dir = dir.clone();
+        std::thread::spawn(move || loop {
+            std::thread::sleep(std::time::Duration::from_secs((epoch_secs / 4).clamp(5, 30)));
+            let ce = citadel_token::current_epoch(epoch_secs);
+            if ce == state.lock().unwrap().0 {
+                continue;
+            }
+            eprintln!("[issuer] эпоха сменилась → {ce}; ротация ключа…");
+            match citadel_token::issuer_keypair(bits) {
+                Ok((npk, nsk)) => {
+                    if publish_epoch_pub(&dir, ce, &npk).is_ok() {
+                        *state.lock().unwrap() = (ce, npk, nsk);
+                        eprintln!("[issuer] эпоха {ce}: ключ ротирован, pub опубликован");
+                    }
+                }
+                Err(err) => eprintln!("[issuer] keygen при ротации не удался: {err}"),
+            }
+        });
+    }
 
     let listen = std::env::var("Citadel_TOKEN_LISTEN").unwrap_or_else(|_| "0.0.0.0:7000".into());
     let listener = TcpListener::bind(&listen).with_context(|| format!("bind {listen}"))?;
-    eprintln!("[issuer] слепое подписание на {listen} (blind RSA-{bits})");
-
-    let sk = Arc::new(sk_der);
+    eprintln!("[issuer] слепое подписание на {listen} (blind RSA-{bits}, epoch-scoped)");
     for conn in listener.incoming() {
         match conn {
             Ok(stream) => {
-                let sk = sk.clone();
+                let state = state.clone();
                 std::thread::spawn(move || {
-                    if let Err(e) = serve_client(stream, &sk) {
+                    if let Err(e) = serve_client(stream, &state) {
                         eprintln!("[issuer] соединение завершено: {e}");
                     }
                 });
@@ -84,12 +125,14 @@ fn run_issuer() -> Result<()> {
     Ok(())
 }
 
-fn serve_client(mut conn: TcpStream, sk_der: &[u8]) -> Result<()> {
+fn serve_client(mut conn: TcpStream, state: &Mutex<EpochKey>) -> Result<()> {
     let peer = conn.peer_addr().ok();
     let mut n = 0u32;
     // клиент закрыл соединение → read_frame вернёт Err → выходим из цикла
     while let Ok(blind_msg) = read_frame(&mut conn) {
-        let blind_sig = citadel_token::issuer_blind_sign(sk_der, &blind_msg)?;
+        // sk текущей эпохи (клонируем, чтобы не держать лок во время RSA-подписи)
+        let sk = state.lock().unwrap().2.clone();
+        let blind_sig = citadel_token::issuer_blind_sign(&sk, &blind_msg)?;
         write_frame(&mut conn, &blind_sig)?;
         n += 1;
     }

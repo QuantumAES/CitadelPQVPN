@@ -11,6 +11,7 @@ export Citadel_NAT_SRC=10.7.0.0/24
 export Citadel_PIN_FILE=${Citadel_PIN_FILE:-/shared/exit.pin}   # exit2 переопределяет (multi-server, M5)
 export Citadel_OBFS_PSK=$(cat /shared/obfs.psk)   # общий PSK сгенерирован издателем (не хардкод)
 export Citadel_ISSUER_PUB=/shared/issuer.pub   # F-M4: проверка анонимных токенов
+export Citadel_EPOCH_SECS=3600   # C5.1: epoch-scoped — exit читает issuer-<epoch>.pub (current±prev)
 export Citadel_RATE_LIMIT=131072   # F7/D3: 128 KiB/с на клиента (анти-абуз/исчерпание ресурсов)
 export Citadel_RATE_BURST=262144   # допустимый всплеск 256 KiB
 export Citadel_TCP_LISTEN=0.0.0.0:443   # M4: obfs-over-TCP fallback (когда UDP/QUIC заблокирован)
