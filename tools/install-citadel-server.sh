@@ -101,7 +101,8 @@ PSK="$(cat "$PSK_FILE")"
 
 # ─── 5. образ + entrypoint + compose ───
 cat > "$DIR/etc/Dockerfile" <<'EOF'
-FROM debian:trixie-slim
+# S1.5: digest-pin базового образа (OCI index, мульти-арч) — supply-chain/воспроизводимость
+FROM debian:trixie-slim@sha256:28de0877c2189802884ccd20f15ee41c203573bd87bb6b883f5f46362d24c5c2
 RUN apt-get update && apt-get install -y --no-install-recommends \
         iproute2 iptables iputils-ping curl ca-certificates dnsutils \
     && rm -rf /var/lib/apt/lists/*
@@ -137,6 +138,8 @@ services:
     image: citadel-exit:$VERSION
     container_name: citadel-exit
     entrypoint: ["/usr/local/bin/entrypoint-exit.sh"]
+    read_only: true                    # S1.5: неизменяемый rootfs (пишем только в /shared + tmpfs)
+    tmpfs: ["/tmp", "/run"]             # /run — xtables.lock (iptables); /tmp — runtime-scratch
     cap_add: ["NET_ADMIN"]
     security_opt: ["no-new-privileges:true"]
     devices: ["/dev/net/tun:/dev/net/tun"]

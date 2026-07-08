@@ -26,6 +26,8 @@ services:
     depends_on:
       issuer: { condition: service_healthy }   # нужен issuer.pub для верификации токенов
     entrypoint: ["/usr/local/bin/entrypoint-exit.sh"]
+    read_only: true                    # S1.5: неизменяемый rootfs (пишем только в /shared + tmpfs)
+    tmpfs: ["/tmp", "/run"]             # /run — xtables.lock (iptables); /tmp — runtime-scratch
     cap_add: ["NET_ADMIN"]
     devices: ["/dev/net/tun:/dev/net/tun"]
     sysctls: ["net.ipv4.ip_forward=1"]
@@ -42,6 +44,8 @@ services:
     environment:
       Citadel_PIN_FILE: /shared/exit2.pin       # свой pin-файл (клиент пиннит per-host)
       Citadel_MLDSA_PUB_FILE: /shared/exit2.mldsa  # M7: свой ML-DSA-65 pub (per-host)
+    read_only: true                    # S1.5: неизменяемый rootfs
+    tmpfs: ["/tmp", "/run"]
     cap_add: ["NET_ADMIN"]
     devices: ["/dev/net/tun:/dev/net/tun"]
     sysctls: ["net.ipv4.ip_forward=1"]
