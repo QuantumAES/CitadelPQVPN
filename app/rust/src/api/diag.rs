@@ -27,7 +27,9 @@ use crate::frb_generated::StreamSink;
 /// так виден лог/паника прошлой (упавшей) сессии без adb/logcat.
 static LOG_FILE: Mutex<Option<PathBuf>> = Mutex::new(None);
 
-/// Задать файл персиста лога (Dart зовёт до `start_log_capture`, на Android — `<filesDir>/citadel.log`).
+/// Задать путь файла-персиста лога. NB (S1.4/M8): сам файловый персист по умолчанию ВЫКЛЮЧЕН
+/// (приватность — лог несёт серверы/адреса/время); файл пишется ТОЛЬКО при `Citadel_DEBUG_LOG`,
+/// иначе лог живёт лишь в in-memory ring. Путь задаётся заранее, чтобы дебаг-режим знал, куда писать.
 #[frb(sync)]
 pub fn set_log_file(path: String) {
     *LOG_FILE.lock().unwrap() = Some(PathBuf::from(path));
@@ -67,9 +69,12 @@ fn push_line(line: String) {
         }
         r.push_back(line.clone());
     }
-    if let Some(path) = LOG_FILE.lock().unwrap().as_ref() {
-        if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
-            let _ = writeln!(f, "{line}");
+    // S1.4/M8: файл-персист только при явном опте (Citadel_DEBUG_LOG); по умолчанию — ring-only.
+    if PERSIST.load(Ordering::Relaxed) {
+        if let Some(path) = LOG_FILE.lock().unwrap().as_ref() {
+            if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
+                let _ = writeln!(f, "{line}");
+            }
         }
     }
     let _ = bus().tx.send(line); // Err только если нет подписчиков — игнор
@@ -78,6 +83,10 @@ fn push_line(line: String) {
 /// Подхватить лог предыдущего (возможно упавшего) запуска в ring и обрезать файл под новую сессию.
 /// Зовётся из `start_log_capture` до первых новых строк.
 fn load_prev_log_history() {
+    // S1.4/M8: без персиста (дефолт) файл не читаем и не создаём — никакого следа на диске.
+    if !PERSIST.load(Ordering::SeqCst) {
+        return;
+    }
     let path = match LOG_FILE.lock().unwrap().clone() {
         Some(p) => p,
         None => return,
@@ -109,6 +118,9 @@ fn push_line_mem(line: String) {
 }
 
 static CAPTURE_STARTED: AtomicBool = AtomicBool::new(false);
+/// S1.4/M8: включён ли файловый персист лога. По умолчанию НЕТ (только in-memory ring) — иначе
+/// на диске остаётся форензик-след коннектов (против no-logs). Опт-ин: env `Citadel_DEBUG_LOG`.
+static PERSIST: AtomicBool = AtomicBool::new(false);
 
 /// Один раз подменить stderr на pipe и начать раздачу строк в UI. Идемпотентно; зовётся из
 /// `main.dart` сразу после `RustLib.init()`. На не-unix — no-op.
@@ -119,8 +131,13 @@ pub fn start_log_capture() {
         if CAPTURE_STARTED.swap(true, Ordering::SeqCst) {
             return; // уже запущен
         }
+        // S1.4/M8: файловый персист лога — OPT-IN. По умолчанию только in-memory ring (гаснет с
+        // процессом, следа на диске нет). Включаем персист ТОЛЬКО по явному Citadel_DEBUG_LOG.
+        if std::env::var("Citadel_DEBUG_LOG").is_ok() {
+            PERSIST.store(true, Ordering::SeqCst);
+        }
         let _ = bus(); // материализуем шину до первых writer'ов
-        load_prev_log_history(); // лог прошлой (упавшей) сессии → в панель
+        load_prev_log_history(); // (только при персисте) лог прошлой упавшей сессии → в панель
         // SAFETY: одноразовая подмена fd 2 под защитой CAPTURE_STARTED; читатель дренирует pipe.
         unsafe { spawn_stderr_capture() };
         // Паника ядра → в stderr (уже захвачен) ДО возможного abort: сообщение и место видны
