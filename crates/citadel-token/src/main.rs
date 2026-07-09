@@ -115,8 +115,143 @@ fn merge_registry(existing: &str, pubs: &[[u8; 32]], valid_until: u64) -> String
     out
 }
 
+// ===================== C5.5: admin-CLI управления реестром =====================
+
+/// `citadel-token registry <add|add-seed|revoke|list> …` — оффлайн-правка Layer-1 реестра админом
+/// (замена ручного `sed` из installer'а). Каталог реестра — `Citadel_TOKEN_DIR` (том issuer'а).
+/// Issuer перечитывает реестр на КАЖДЫЙ auth ⇒ add/revoke действуют со следующего коннекта
+/// (отзыв — ≤ длины эпохи). Запись атомарна (temp+rename) — конкурентный читатель-issuer видит
+/// старый ИЛИ новый файл, не частичный.
+fn run_registry(args: &[String]) -> Result<()> {
+    let path = registry_path(&token_dir());
+    match args.get(2).map(String::as_str) {
+        Some("add") => {
+            let pk = parse_hex32(args.get(3), "pub (client_id, 64 hex)")?;
+            let vu = parse_valid_until(args.get(4).map(String::as_str))?;
+            let cur = std::fs::read_to_string(&path).unwrap_or_default();
+            atomic_write(&path, &registry_apply_add(&cur, &pk, vu))?;
+            eprintln!("[registry] add {} active до {vu}", hex::encode(pk));
+        }
+        Some("add-seed") => {
+            // Провижининг нового абонента: из его seed выводим pub (client_id) и регистрируем ЕГО.
+            // Seed НЕ сохраняется (уходит абоненту в ссылке) — в реестре только публичный id.
+            let seed = parse_hex32(args.get(3), "seed (64 hex)")?;
+            let pk = citadel_token::ed25519_pub_from_seed(&seed)?;
+            let vu = parse_valid_until(args.get(4).map(String::as_str))?;
+            let cur = std::fs::read_to_string(&path).unwrap_or_default();
+            atomic_write(&path, &registry_apply_add(&cur, &pk, vu))?;
+            eprintln!("[registry] add-seed → client_id {} active до {vu}", hex::encode(pk));
+        }
+        Some("revoke") => {
+            let pk = parse_hex32(args.get(3), "pub (client_id, 64 hex)")?;
+            let cur = std::fs::read_to_string(&path).unwrap_or_default();
+            atomic_write(&path, &registry_apply_revoke(&cur, &pk)?)?;
+            eprintln!("[registry] revoke {} (действует ≤ длины эпохи)", hex::encode(pk));
+        }
+        Some("list") => print!("{}", std::fs::read_to_string(&path).unwrap_or_default()),
+        _ => anyhow::bail!(
+            "citadel-token registry <add <pub>|add-seed <seed>|revoke <pub>|list> [valid_until]\n  \
+             valid_until: unix-секунды | +<N>d | +<N>h | +<секунды> (дефолт +365d).  \
+             Каталог реестра — $Citadel_TOKEN_DIR (том issuer'а)."
+        ),
+    }
+    Ok(())
+}
+
+/// Разобрать 32-байтный hex-аргумент (pub/seed) или дать понятную ошибку.
+fn parse_hex32(arg: Option<&String>, what: &str) -> Result<[u8; 32]> {
+    let s = arg.with_context(|| format!("нужен <{what}>"))?;
+    hex::decode(s.trim())
+        .ok()
+        .and_then(|v| v.try_into().ok())
+        .with_context(|| format!("<{what}> должен быть ровно 32 байта hex"))
+}
+
+/// `valid_until`: абсолютные unix-секунды, либо относительно now — `+<N>d`/`+<N>h`/`+<секунды>`.
+/// Пусто → now + 365 дней.
+fn parse_valid_until(arg: Option<&str>) -> Result<u64> {
+    let now = now_unix();
+    let Some(s) = arg else {
+        return Ok(now + 365 * 24 * 3600);
+    };
+    let s = s.trim();
+    if let Some(rest) = s.strip_prefix('+') {
+        let (num, mult) = match rest.chars().last() {
+            Some('d') => (&rest[..rest.len() - 1], 24 * 3600),
+            Some('h') => (&rest[..rest.len() - 1], 3600),
+            _ => (rest, 1),
+        };
+        let n: u64 = num.parse().context("valid_until: ожидалось +<N>d | +<N>h | +<секунды>")?;
+        Ok(now + n * mult)
+    } else {
+        s.parse().context("valid_until: unix-секунды или относительное +<N>d")
+    }
+}
+
+/// Upsert строки реестра: если pub уже есть — заменяем (новый valid_until, статус `active`, в т.ч.
+/// «разотзыв»); иначе добавляем. Прочие строки сохраняются, дубликаты pub схлопываются, пустые
+/// строки убираются. Чистая логика (тестируемо, без I/O).
+fn registry_apply_add(existing: &str, pk: &[u8; 32], valid_until: u64) -> String {
+    let hexpk = hex::encode(pk);
+    let mut out = String::new();
+    let mut done = false;
+    for line in existing.lines() {
+        if line.split_whitespace().next() == Some(hexpk.as_str()) {
+            if !done {
+                out.push_str(&format!("{hexpk} {valid_until} active\n"));
+                done = true;
+            }
+        } else if !line.trim().is_empty() {
+            out.push_str(line);
+            out.push('\n');
+        }
+    }
+    if !done {
+        out.push_str(&format!("{hexpk} {valid_until} active\n"));
+    }
+    out
+}
+
+/// Отзыв: у строки pub статус → `revoked` (valid_until сохраняется). Если pub нет — ошибка
+/// (нечего отзывать; защищает от опечатки в client_id). Чистая логика.
+fn registry_apply_revoke(existing: &str, pk: &[u8; 32]) -> Result<String> {
+    let hexpk = hex::encode(pk);
+    let mut out = String::new();
+    let mut found = false;
+    for line in existing.lines() {
+        let mut it = line.split_whitespace();
+        if it.next() == Some(hexpk.as_str()) {
+            if !found {
+                let vu = it.next().unwrap_or("0");
+                out.push_str(&format!("{hexpk} {vu} revoked\n"));
+                found = true;
+            }
+        } else if !line.trim().is_empty() {
+            out.push_str(line);
+            out.push('\n');
+        }
+    }
+    if !found {
+        anyhow::bail!("client_id {hexpk} не найден в реестре — нечего отзывать");
+    }
+    Ok(out)
+}
+
+/// Атомарная запись файла реестра: temp в том же каталоге + rename (POSIX-атомарно на одной ФС).
+fn atomic_write(path: &str, content: &str) -> Result<()> {
+    let tmp = format!("{path}.tmp.{}", std::process::id());
+    std::fs::write(&tmp, content).with_context(|| format!("запись {tmp}"))?;
+    std::fs::rename(&tmp, path).with_context(|| format!("rename {tmp} → {path}"))?;
+    Ok(())
+}
+
 fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().collect();
+    // C5.5 admin-CLI управления реестром — оффлайн-операция админа (add/revoke/list), не сетевая
+    // роль, поэтому маршрутизируем по arg[1] ДО env-роли (Citadel_TOKEN_ROLE её не задаёт).
+    if args.get(1).map(String::as_str) == Some("registry") {
+        return run_registry(&args);
+    }
     let role = std::env::var("Citadel_TOKEN_ROLE")
         .ok()
         .or_else(|| args.get(1).cloned())
@@ -126,7 +261,9 @@ fn main() -> Result<()> {
         "client" | "fetch" => run_client_fetch(),
         "pubkey" => run_pubkey(),
         "batch" => run_batch(),
-        other => Err(anyhow::anyhow!("Citadel_TOKEN_ROLE должен быть issuer|client|pubkey|batch, а не {other:?}")),
+        other => Err(anyhow::anyhow!(
+            "Citadel_TOKEN_ROLE должен быть issuer|client|pubkey|batch (или arg[1]=registry), а не {other:?}"
+        )),
     }
 }
 
@@ -314,5 +451,56 @@ mod tests {
         let first = merge_registry("", &[pk], 100);
         let second = merge_registry(&first, &[pk], 200);
         assert_eq!(first, second);
+    }
+
+    // ── C5.5 admin-CLI реестра ──
+
+    /// add в пустой реестр, затем add того же pub «разотзывает» и обновляет срок; чужие строки целы.
+    #[test]
+    fn registry_add_upsert_and_unrevoke() {
+        let a = [0xAAu8; 32];
+        let b = [0xBBu8; 32];
+        let ha = hex::encode(a);
+        let hb = hex::encode(b);
+        // старт: A revoked, B active (B — «чужая» строка, не должна пострадать)
+        let start = format!("{ha} 100 revoked\n{hb} 200 active\n");
+        let out = super::registry_apply_add(&start, &a, 500);
+        assert!(out.contains(&format!("{ha} 500 active")), "A обновлён и разотозван");
+        assert!(out.contains(&format!("{hb} 200 active")), "B не тронут");
+        assert_eq!(out.matches(&ha).count(), 1, "A без дубликатов");
+    }
+
+    /// add схлопывает дубликаты одного pub в одну строку.
+    #[test]
+    fn registry_add_dedups() {
+        let a = [0x77u8; 32];
+        let ha = hex::encode(a);
+        let start = format!("{ha} 1 active\n{ha} 2 revoked\n");
+        let out = super::registry_apply_add(&start, &a, 9);
+        assert_eq!(out, format!("{ha} 9 active\n"));
+    }
+
+    /// revoke переводит статус в revoked, сохраняя valid_until; отсутствующий pub → ошибка.
+    #[test]
+    fn registry_revoke_and_missing() {
+        let a = [0xCCu8; 32];
+        let ha = hex::encode(a);
+        let ok = super::registry_apply_revoke(&format!("{ha} 42 active\n"), &a).unwrap();
+        assert_eq!(ok, format!("{ha} 42 revoked\n"), "срок сохранён, статус revoked");
+        assert!(super::registry_apply_revoke("", &a).is_err(), "нет pub → ошибка");
+    }
+
+    /// valid_until: относительные формы и абсолют.
+    #[test]
+    fn valid_until_forms() {
+        let now = super::now_unix();
+        assert_eq!(super::parse_valid_until(Some("1700000000")).unwrap(), 1_700_000_000);
+        let d = super::parse_valid_until(Some("+2d")).unwrap();
+        assert!((d as i64 - (now as i64 + 2 * 24 * 3600)).abs() <= 2);
+        let h = super::parse_valid_until(Some("+3h")).unwrap();
+        assert!((h as i64 - (now as i64 + 3 * 3600)).abs() <= 2);
+        let def = super::parse_valid_until(None).unwrap();
+        assert!((def as i64 - (now as i64 + 365 * 24 * 3600)).abs() <= 2);
+        assert!(super::parse_valid_until(Some("+bad")).is_err());
     }
 }

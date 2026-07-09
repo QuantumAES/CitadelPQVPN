@@ -313,8 +313,13 @@ cat <<EOF
 Двухслойная идентичность включена:
   • Издатель (Layer-1 реестр + epoch-токены) слушает $SERVER_HOST:$ISSUER_PORT/tcp —
     ОТКРОЙ этот порт в firewall/облачной security-group, иначе клиент не получит токен.
-  • Отзыв абонента: правь $DIR/keys/registry (строка client_id → status=revoked); действует
-    ≤ длины эпохи (${EPOCH_SECS}s) и переживает рестарт контейнера. Массовый отзыв — сменить эпоху.
+  • Управление абонентами (admin-CLI, действует со следующего коннекта, C5.5):
+      добавить:  Citadel_TOKEN_DIR=$DIR/keys $DIR/bin/citadel-token registry add-seed <seed> [+30d]
+      отозвать:  Citadel_TOKEN_DIR=$DIR/keys $DIR/bin/citadel-token registry revoke <client_id>
+      список:    Citadel_TOKEN_DIR=$DIR/keys $DIR/bin/citadel-token registry list
+    Новому абоненту: сгенерируй seed → citadel-linkgen --client-seed <seed> … (его ссылка) +
+    registry add-seed <seed> (в реестр идёт только pub — seed остаётся у абонента). Отзыв действует
+    ≤ длины эпохи (${EPOCH_SECS}s), переживает рестарт контейнера. Массовый отзыв — сменить эпоху.
   • ⚠ Издатель на :$ISSUER_PORT — открытый (не-TLS) endpoint блайнд-RSA; Layer-1-хендшейк в
     открытом виде (фингерпринтируем цензором). Hardening (issuer за TLS/obfs) — follow-up.
 EOF

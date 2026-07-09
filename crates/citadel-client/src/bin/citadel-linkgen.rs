@@ -10,7 +10,8 @@
 //! ```
 //! `--psk` — passphrase (BLAKE3-derive, как на exit) или 64-hex; `--pin` — hex из exit.pin.
 //! C5.4b двухслойная идентичность: `--issuer` (host:port издателя) + `--client-seed` (hex64,
-//! приватный Ed25519 «абонента») → GUI авто-фетчит epoch-токен перед коннектом. `--mldsa-pub` —
+//! приватный Ed25519 «абонента») → GUI авто-фетчит epoch-токен перед коннектом. Пара к выдаче —
+//! регистрация абонента у issuer: `citadel-token registry add-seed <тот же seed>` (C5.5). `--mldsa-pub` —
 //! файл ML-DSA-65 pub exit'а (M7): в ссылку кладётся обязательство `H(pub)` (client-enforcement
 //! ждёт commitment-fetch, см. SECURITY-ROADMAP §S3/creds).
 
