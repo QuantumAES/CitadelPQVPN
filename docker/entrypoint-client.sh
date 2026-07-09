@@ -24,6 +24,7 @@ echo "[client] exit резолвится в $EXIT_IP"
 # Издатель подписывает вслепую, токен в файл; издатель не видит токен → unlinkable от сессии на exit.
 echo "[client] получаю токены от издателя (M5 issuer↔exit split)…"
 Citadel_TOKEN_ROLE=client Citadel_TOKEN_ISSUER=issuer:7000 Citadel_TOKEN_DIR=/shared Citadel_TOKEN_COUNT=8 \
+    Citadel_CLIENT_SEED=$(printf 'c5%.0s' {1..32}) \
     citadel-token || echo "[client] WARN: не удалось получить токены от издателя"
 
 rm -f /tmp/Citadel-ready
@@ -276,6 +277,20 @@ if echo "$out" | grep -qi "fail-closed"; then
     echo "  OK ✔ без pin клиент отказал (fail-closed), а не принял любой серт"
 else
     echo "  [!] без pin клиент НЕ отказал (fail-open?) ✗"
+fi
+
+echo
+echo "===================================================================="
+echo "  ТЕСТ 17 (C5.2 Layer-1) — НЕзарегистрированный абонент не получает токены (M5)"
+echo "===================================================================="
+rm -rf /tmp/t17; mkdir -p /tmp/t17; cp /shared/issuer.pub /tmp/t17/ 2>/dev/null || true
+Citadel_TOKEN_ROLE=client Citadel_TOKEN_ISSUER=issuer:7000 Citadel_TOKEN_DIR=/tmp/t17 Citadel_TOKEN_COUNT=1 \
+    Citadel_CLIENT_SEED=deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef \
+    timeout 15 citadel-token >/tmp/t17/out 2>&1 || true
+if [ ! -s /tmp/t17/tokens ]; then
+    echo "  OK ✔ незарегистрированный seed отклонён issuer'ом — токены не выданы (Layer-1 auth ✔)"
+else
+    echo "  [!] незарегистрированный клиент ПОЛУЧИЛ токены ✗"
 fi
 
 echo

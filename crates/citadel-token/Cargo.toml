@@ -10,6 +10,7 @@ anyhow = "1"
 rand = "0.8"
 blind-rsa-signatures = "=0.15.0"   # =0.15.0: 0.15.1+ ломается (derive_more glob → PartialEq ambiguous, E0659)
 hex = "0.4"
+aws-lc-rs = "1.17"                 # C5.2 Layer-1: Ed25519 (тот же крипто-бэкенд, что в движке)
 
 [dev-dependencies]
 criterion = { version = "0.5", default-features = false, features = ["cargo_bench_support"] }

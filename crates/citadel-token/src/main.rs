@@ -24,6 +24,57 @@ fn token_count() -> usize {
     std::env::var("Citadel_TOKEN_COUNT").ok().and_then(|s| s.parse().ok()).unwrap_or(8)
 }
 
+fn now_unix() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+// ===================== C5.2 Layer-1: реестр «абонентов» у issuer =====================
+fn registry_path(dir: &str) -> String {
+    format!("{dir}/registry")
+}
+
+/// Реестр — строки `<pub_hex> <valid_until_unix> <status>`. Возвращает true, если pub найден,
+/// `active` и не истёк. Читается на КАЖДЫЙ auth → отзыв/добавление действуют сразу (≤ след. коннект).
+fn registry_allows(dir: &str, pub_key: &[u8], now: u64) -> bool {
+    let want = hex::encode(pub_key);
+    let Ok(content) = std::fs::read_to_string(registry_path(dir)) else {
+        return false; // нет реестра → никто не авторизован (secure default)
+    };
+    for line in content.lines() {
+        let mut it = line.split_whitespace();
+        if let (Some(p), Some(vu), Some(st)) = (it.next(), it.next(), it.next()) {
+            if p == want {
+                return st == "active" && now < vu.parse::<u64>().unwrap_or(0);
+            }
+        }
+    }
+    false
+}
+
+/// Bootstrap (демо): зарегистрировать pub'ы seed'ов из `Citadel_REGISTER_SEEDS` (hex, через пробел)
+/// как active на +10 лет. В проде реестром управляет админ (C5.5) — правит файл напрямую.
+fn bootstrap_registry(dir: &str) -> Result<()> {
+    let Ok(seeds) = std::env::var("Citadel_REGISTER_SEEDS") else {
+        return Ok(());
+    };
+    let far = now_unix() + 10 * 365 * 24 * 3600;
+    let mut reg = String::new();
+    for s in seeds.split_whitespace() {
+        let seed: [u8; 32] = hex::decode(s)
+            .ok()
+            .and_then(|v| v.try_into().ok())
+            .context("Citadel_REGISTER_SEEDS: seed должен быть 32 байта hex")?;
+        let pk = citadel_token::ed25519_pub_from_seed(&seed)?;
+        reg.push_str(&format!("{} {far} active\n", hex::encode(pk)));
+    }
+    std::fs::write(registry_path(dir), &reg).context("запись реестра")?;
+    eprintln!("[issuer] реестр Layer-1: {} абонент(ов) активны (Citadel_REGISTER_SEEDS)", reg.lines().count());
+    Ok(())
+}
+
 fn write_frame(w: &mut impl Write, data: &[u8]) -> io::Result<()> {
     w.write_all(&(data.len() as u32).to_be_bytes())?;
     w.write_all(data)?;
@@ -74,6 +125,7 @@ fn run_issuer() -> Result<()> {
     let epoch_secs: u64 =
         std::env::var("Citadel_EPOCH_SECS").ok().and_then(|s| s.parse().ok()).unwrap_or(3600);
     let dir = token_dir();
+    bootstrap_registry(&dir)?; // C5.2: демо-регистрация абонентов из Citadel_REGISTER_SEEDS
 
     let e = citadel_token::current_epoch(epoch_secs);
     eprintln!("[issuer] эпоха {e} (длина {epoch_secs}с); генерирую ключ (RSA-{bits}, ~10с)…");
@@ -113,8 +165,9 @@ fn run_issuer() -> Result<()> {
         match conn {
             Ok(stream) => {
                 let state = state.clone();
+                let dir = dir.clone();
                 std::thread::spawn(move || {
-                    if let Err(e) = serve_client(stream, &state) {
+                    if let Err(e) = serve_client(stream, &state, &dir) {
                         eprintln!("[issuer] соединение завершено: {e}");
                     }
                 });
@@ -125,8 +178,24 @@ fn run_issuer() -> Result<()> {
     Ok(())
 }
 
-fn serve_client(mut conn: TcpStream, state: &Mutex<EpochKey>) -> Result<()> {
+fn serve_client(mut conn: TcpStream, state: &Mutex<EpochKey>, dir: &str) -> Result<()> {
     let peer = conn.peer_addr().ok();
+    // C5.2 Layer-1: challenge-response ДО слепой подписи (аутентификация «абонента»).
+    let challenge: [u8; 32] = rand::random();
+    write_frame(&mut conn, &challenge)?;
+    let auth = read_frame(&mut conn)?; // ожидаем pub(32) ‖ sig(64)
+    if auth.len() != 96 {
+        anyhow::bail!("Layer-1: плохой auth-кадр ({} б, ожидалось 96)", auth.len());
+    }
+    let (pk, sig) = (&auth[..32], &auth[32..]);
+    if !citadel_token::ed25519_verify(pk, &challenge, sig) {
+        anyhow::bail!("Layer-1: подпись челленджа неверна (client {peer:?})");
+    }
+    if !registry_allows(dir, pk, now_unix()) {
+        anyhow::bail!("Layer-1: client_id не активен/истёк/отозван — отказ (client {peer:?})");
+    }
+    eprintln!("[issuer] Layer-1 ✔ абонент {}… авторизован", &hex::encode(pk)[..12]);
+
     let mut n = 0u32;
     // клиент закрыл соединение → read_frame вернёт Err → выходим из цикла
     while let Ok(blind_msg) = read_frame(&mut conn) {
@@ -143,6 +212,12 @@ fn serve_client(mut conn: TcpStream, state: &Mutex<EpochKey>) -> Result<()> {
 /// Клиент: интерактивно получает N токенов от издателя (blind→sign→finalize), пишет в файл.
 fn run_client_fetch() -> Result<()> {
     let issuer = std::env::var("Citadel_TOKEN_ISSUER").context("Citadel_TOKEN_ISSUER не задан")?;
+    // C5.2 Layer-1: seed «абонента» (= приватный Ed25519) — обязателен для авторизации у issuer.
+    let seed: [u8; 32] = std::env::var("Citadel_CLIENT_SEED")
+        .ok()
+        .and_then(|s| hex::decode(s.trim()).ok())
+        .and_then(|v| v.try_into().ok())
+        .context("Citadel_CLIENT_SEED (32 байта hex) обязателен для Layer-1")?;
     let count = token_count();
     let dir = token_dir();
     let pk_der = std::fs::read(format!("{dir}/issuer.pub")).context("читаю issuer.pub")?;
@@ -162,6 +237,15 @@ fn run_client_fetch() -> Result<()> {
         }
     }
     let mut conn = conn.with_context(|| format!("издатель {issuer} недоступен"))?;
+    // C5.2 Layer-1: принять челлендж, ответить pub(32)‖sig(64) — доказать владение seed'ом.
+    let challenge = read_frame(&mut conn)?;
+    let pk = citadel_token::ed25519_pub_from_seed(&seed)?;
+    let sig = citadel_token::ed25519_sign(&seed, &challenge)?;
+    let mut auth = Vec::with_capacity(96);
+    auth.extend_from_slice(&pk);
+    auth.extend_from_slice(&sig);
+    write_frame(&mut conn, &auth)?;
+    eprintln!("[client] Layer-1: авторизуюсь как {}…", &hex::encode(pk)[..12]);
     eprintln!("[client] получаю {count} токенов от издателя {issuer} (blind issuance)");
     let mut tokens = Vec::with_capacity(count);
     for _ in 0..count {

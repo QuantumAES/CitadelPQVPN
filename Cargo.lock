@@ -501,6 +501,7 @@ name = "citadel-token"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "aws-lc-rs",
  "blind-rsa-signatures",
  "criterion",
  "hex",

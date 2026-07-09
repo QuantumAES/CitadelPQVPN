@@ -44,6 +44,30 @@ pub fn verify_token_multi(pubs: &[Vec<u8>], token: &[u8]) -> Option<[u8; NONCE_L
     pubs.iter().find_map(|pk| verify_token(pk, token))
 }
 
+// ===================== Layer-1 «абонемент» (C5.2): Ed25519 client-id =====================
+// Клиент держит 32-байтный seed (= приватный Ed25519); его pub — client_id в реестре issuer'а.
+// Issuer шлёт челлендж, клиент подписывает, issuer проверяет подпись + запись реестра
+// (valid_until/status) ДО слепой подписи токенов. Отзыв: status=revoked (≤ длины эпохи) + expiry.
+
+use aws_lc_rs::signature::{Ed25519KeyPair, KeyPair as _, UnparsedPublicKey, ED25519};
+
+/// Ed25519 pub из 32-байтного client-seed (детерминированно; seed = приватный ключ «абонента»).
+pub fn ed25519_pub_from_seed(seed: &[u8; 32]) -> Result<[u8; 32]> {
+    let kp = Ed25519KeyPair::from_seed_unchecked(seed).map_err(|_| anyhow!("ed25519 seed"))?;
+    kp.public_key().as_ref().try_into().map_err(|_| anyhow!("ed25519 pub len"))
+}
+
+/// Подписать сообщение (челлендж issuer'а) client-seed'ом.
+pub fn ed25519_sign(seed: &[u8; 32], msg: &[u8]) -> Result<[u8; 64]> {
+    let kp = Ed25519KeyPair::from_seed_unchecked(seed).map_err(|_| anyhow!("ed25519 seed"))?;
+    kp.sign(msg).as_ref().try_into().map_err(|_| anyhow!("ed25519 sig len"))
+}
+
+/// Проверить подпись челленджа под pub'ом (issuer-сторона Layer-1).
+pub fn ed25519_verify(pub_key: &[u8], msg: &[u8], sig: &[u8]) -> bool {
+    UnparsedPublicKey::new(&ED25519, pub_key).verify(msg, sig).is_ok()
+}
+
 // ===================== интерактивный issuance по ролям (M5, issuer↔exit split) =====================
 // Разделение: КЛИЕНТ держит nonce + секреты ослепления и делает finalize; ИЗДАТЕЛЬ держит только
 // секретный ключ и подписывает ослеплённое сообщение ВСЛЕПУЮ (не видит nonce/токен) → unlinkability,
@@ -153,6 +177,21 @@ pub fn verify_token(pk_der: &[u8], token: &[u8]) -> Option<[u8; NONCE_LEN]> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ed25519_layer1_roundtrip() {
+        let seed = [0x11u8; 32];
+        let pk = ed25519_pub_from_seed(&seed).unwrap();
+        let msg = b"issuer-challenge-nonce";
+        let sig = ed25519_sign(&seed, msg).unwrap();
+        assert!(ed25519_verify(&pk, msg, &sig)); // валидная подпись
+        assert!(!ed25519_verify(&pk, b"other", &sig)); // чужое сообщение
+        assert!(!ed25519_verify(&ed25519_pub_from_seed(&[0x22u8; 32]).unwrap(), msg, &sig)); // чужой pub
+        let mut bad = sig;
+        bad[0] ^= 1;
+        assert!(!ed25519_verify(&pk, msg, &bad)); // подделанная подпись
+        assert_eq!(pk, ed25519_pub_from_seed(&seed).unwrap()); // детерминизм seed→pub
+    }
 
     #[test]
     fn epoch_basics() {

@@ -12,5 +12,7 @@ export Citadel_TOKEN_ROLE=issuer
 export Citadel_TOKEN_DIR=/shared
 export Citadel_TOKEN_LISTEN=0.0.0.0:7000
 export Citadel_EPOCH_SECS=3600   # C5.1: длина эпохи (ДОЛЖНА совпадать с exit) — токены epoch-scoped
+# C5.2 Layer-1: регистрируем демо-абонента (в проде реестром управляет админ, C5.5).
+export Citadel_REGISTER_SEEDS=$(printf 'c5%.0s' {1..32})   # 32×c5 = ровно 64 hex = 32-байтный seed
 echo "[issuer] старт слепого подписания (генерация RSA-ключа, затем TCP :7000)…"
 exec citadel-token
