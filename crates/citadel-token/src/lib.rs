@@ -11,11 +11,13 @@
 //! По сети ходят лишь `blind_msg` и `blind_sig`. `issue_batch` (всё в одном процессе) оставлен
 //! для тестов/локального демо.
 
-use anyhow::{anyhow, Result};
+use anyhow::{anyhow, Context, Result};
 use blind_rsa_signatures::{
     BlindSignature, KeyPair, MessageRandomizer, Options, PublicKey, Secret, SecretKey, Signature,
 };
 use rand::RngCore;
+use std::io::{self, Read, Write};
+use std::net::TcpStream;
 
 pub const NONCE_LEN: usize = 32;
 pub const RAND_LEN: usize = 32;
@@ -66,6 +68,72 @@ pub fn ed25519_sign(seed: &[u8; 32], msg: &[u8]) -> Result<[u8; 64]> {
 /// Проверить подпись челленджа под pub'ом (issuer-сторона Layer-1).
 pub fn ed25519_verify(pub_key: &[u8], msg: &[u8], sig: &[u8]) -> bool {
     UnparsedPublicKey::new(&ED25519, pub_key).verify(msg, sig).is_ok()
+}
+
+// ===================== Сетевой протокол issuance (кадр `u32(len BE) ‖ payload`) =====================
+/// Потолок размера кадра (анти-OOM при чтении len).
+pub const MAX_FRAME: usize = 65536;
+
+pub fn write_frame(w: &mut impl Write, data: &[u8]) -> io::Result<()> {
+    w.write_all(&(data.len() as u32).to_be_bytes())?;
+    w.write_all(data)?;
+    w.flush()
+}
+pub fn read_frame(r: &mut impl Read) -> io::Result<Vec<u8>> {
+    let mut lb = [0u8; 4];
+    r.read_exact(&mut lb)?;
+    let len = u32::from_be_bytes(lb) as usize;
+    if len == 0 || len > MAX_FRAME {
+        return Err(io::Error::new(io::ErrorKind::InvalidData, "плохая длина кадра"));
+    }
+    let mut buf = vec![0u8; len];
+    r.read_exact(&mut buf)?;
+    Ok(buf)
+}
+
+/// C5.3: клиентская сторона issuance по сети (sync). Проходит Layer-1 (`seed` доказывает владение
+/// «абонементом»), получает ТЕКУЩИЙ epoch-pub издателя, добывает `count` токенов
+/// (blind→sign→finalize). Издатель токены НЕ видит (unlinkable). `retries` — попытки коннекта
+/// (издатель мог ещё генерить RSA-ключ). Протокол: challenge → pub‖sig → issuer_pub → {blind→sig}×N.
+pub fn fetch_tokens(
+    issuer_addr: &str,
+    seed: &[u8; 32],
+    count: usize,
+    retries: u32,
+) -> Result<Vec<Vec<u8>>> {
+    let mut conn = None;
+    for _ in 0..retries.max(1) {
+        match TcpStream::connect(issuer_addr) {
+            Ok(c) => {
+                conn = Some(c);
+                break;
+            }
+            Err(_) => std::thread::sleep(std::time::Duration::from_secs(1)),
+        }
+    }
+    let mut conn = conn.ok_or_else(|| anyhow!("издатель {issuer_addr} недоступен"))?;
+
+    // Layer-1: челлендж → pub(32)‖sig(64)
+    let challenge = read_frame(&mut conn)?;
+    let pk = ed25519_pub_from_seed(seed)?;
+    let sig = ed25519_sign(seed, &challenge)?;
+    let mut auth = Vec::with_capacity(96);
+    auth.extend_from_slice(&pk);
+    auth.extend_from_slice(&sig);
+    write_frame(&mut conn, &auth)?;
+
+    // Текущий (epoch) pub издателя для ослепления. Если Layer-1 не прошёл, издатель закрыл
+    // соединение → read_frame вернёт Err (не «авторизован»).
+    let issuer_pub = read_frame(&mut conn).context("Layer-1: издатель не выдал pub (не авторизован?)")?;
+
+    let mut tokens = Vec::with_capacity(count);
+    for _ in 0..count {
+        let (blind_msg, st) = client_blind(&issuer_pub)?;
+        write_frame(&mut conn, &blind_msg)?;
+        let blind_sig = read_frame(&mut conn)?;
+        tokens.push(client_finalize(&issuer_pub, &blind_sig, &st)?);
+    }
+    Ok(tokens)
 }
 
 // ===================== интерактивный issuance по ролям (M5, issuer↔exit split) =====================
@@ -212,6 +280,39 @@ mod tests {
         assert!(verify_token_multi(std::slice::from_ref(&b.pk_der), tok).is_none());
         assert!(verify_token_multi(&[b.pk_der.clone(), a.pk_der.clone()], tok).is_some()); // grace prev+cur
         assert!(verify_token_multi(&[], tok).is_none());
+    }
+
+    /// C5.3: полный клиентский протокол `fetch_tokens` против in-process issuer (Layer-1 auth +
+    /// выдача epoch-pub + слепая подпись). Проверяет, что добытые токены валидны под issuer pub.
+    #[test]
+    fn fetch_tokens_layer1_roundtrip() {
+        use std::net::TcpListener;
+        let seed = [0x33u8; 32];
+        let pk_ed = ed25519_pub_from_seed(&seed).unwrap();
+        let (issuer_pk, issuer_sk) = issuer_keypair(2048).unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        let issuer_pk_srv = issuer_pk.clone();
+        let srv = std::thread::spawn(move || {
+            let (mut conn, _) = listener.accept().unwrap();
+            let challenge = [0x77u8; 32];
+            write_frame(&mut conn, &challenge).unwrap();
+            let auth = read_frame(&mut conn).unwrap(); // pub(32)‖sig(64)
+            assert_eq!(auth.len(), 96);
+            assert!(ed25519_verify(&auth[..32], &challenge, &auth[32..])); // подпись челленджа
+            assert_eq!(&auth[..32], &pk_ed[..]); // зарегистрированный абонент
+            write_frame(&mut conn, &issuer_pk_srv).unwrap(); // текущий epoch-pub
+            while let Ok(blind_msg) = read_frame(&mut conn) {
+                let sig = issuer_blind_sign(&issuer_sk, &blind_msg).unwrap();
+                write_frame(&mut conn, &sig).unwrap();
+            }
+        });
+        let tokens = fetch_tokens(&addr, &seed, 3, 3).unwrap();
+        assert_eq!(tokens.len(), 3);
+        for t in &tokens {
+            assert!(verify_token(&issuer_pk, t).is_some(), "токен валиден под issuer pub");
+        }
+        srv.join().unwrap();
     }
 
     #[test]

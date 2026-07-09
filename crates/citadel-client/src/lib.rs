@@ -11,6 +11,7 @@
 pub mod api;
 pub mod creds;
 pub mod vault;
+pub mod token_agent; // C5.3: добыча Layer-1 epoch-токенов у issuer (async-обёртка над citadel_token)
 // gui_tun компилируется и на Android (unix SCM_RIGHTS/UnixSocket), но там НЕ используется —
 // мобильный путь идёт через VpnService (android_establish/run_data_plane). Нужно, чтобы
 // frb_generated.rs (ссылается на vpn_connect → GuiTunProvider) собирался под android.

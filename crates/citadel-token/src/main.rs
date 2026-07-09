@@ -9,13 +9,12 @@
 //!
 //! Сетевой формат: кадр `u32(len, BE) ‖ payload`; запрос — blind_msg, ответ — blind_sig.
 
-use std::io::{self, Read, Write};
+use std::io::Write;
 use std::net::{TcpListener, TcpStream};
 use std::sync::{Arc, Mutex};
 
 use anyhow::{Context, Result};
-
-const MAX_FRAME: usize = 65536;
+use citadel_token::{read_frame, write_frame}; // C5.3: фрейминг вынесен в lib (переиспользует fetch_tokens)
 
 fn token_dir() -> String {
     std::env::var("Citadel_TOKEN_DIR").unwrap_or_else(|_| "/shared".into())
@@ -73,23 +72,6 @@ fn bootstrap_registry(dir: &str) -> Result<()> {
     std::fs::write(registry_path(dir), &reg).context("запись реестра")?;
     eprintln!("[issuer] реестр Layer-1: {} абонент(ов) активны (Citadel_REGISTER_SEEDS)", reg.lines().count());
     Ok(())
-}
-
-fn write_frame(w: &mut impl Write, data: &[u8]) -> io::Result<()> {
-    w.write_all(&(data.len() as u32).to_be_bytes())?;
-    w.write_all(data)?;
-    w.flush()
-}
-fn read_frame(r: &mut impl Read) -> io::Result<Vec<u8>> {
-    let mut lb = [0u8; 4];
-    r.read_exact(&mut lb)?;
-    let len = u32::from_be_bytes(lb) as usize;
-    if len == 0 || len > MAX_FRAME {
-        return Err(io::Error::new(io::ErrorKind::InvalidData, "плохая длина кадра"));
-    }
-    let mut buf = vec![0u8; len];
-    r.read_exact(&mut buf)?;
-    Ok(buf)
 }
 
 fn main() -> Result<()> {
@@ -195,6 +177,9 @@ fn serve_client(mut conn: TcpStream, state: &Mutex<EpochKey>, dir: &str) -> Resu
         anyhow::bail!("Layer-1: client_id не активен/истёк/отозван — отказ (client {peer:?})");
     }
     eprintln!("[issuer] Layer-1 ✔ абонент {}… авторизован", &hex::encode(pk)[..12]);
+    // C5.3: отдаём клиенту ТЕКУЩИЙ epoch-pub (клиент ослепляет под актуальным ключом).
+    let cur_pub = state.lock().unwrap().1.clone();
+    write_frame(&mut conn, &cur_pub)?;
 
     let mut n = 0u32;
     // клиент закрыл соединение → read_frame вернёт Err → выходим из цикла
@@ -220,40 +205,9 @@ fn run_client_fetch() -> Result<()> {
         .context("Citadel_CLIENT_SEED (32 байта hex) обязателен для Layer-1")?;
     let count = token_count();
     let dir = token_dir();
-    let pk_der = std::fs::read(format!("{dir}/issuer.pub")).context("читаю issuer.pub")?;
-
-    // издатель генерит RSA-ключ ~несколько секунд при старте → ретраим коннект
-    let mut conn = None;
-    for attempt in 1..=20 {
-        match TcpStream::connect(&issuer) {
-            Ok(c) => {
-                conn = Some(c);
-                break;
-            }
-            Err(e) => {
-                eprintln!("[client] издатель {issuer} ещё не готов (попытка {attempt}): {e}");
-                std::thread::sleep(std::time::Duration::from_secs(1));
-            }
-        }
-    }
-    let mut conn = conn.with_context(|| format!("издатель {issuer} недоступен"))?;
-    // C5.2 Layer-1: принять челлендж, ответить pub(32)‖sig(64) — доказать владение seed'ом.
-    let challenge = read_frame(&mut conn)?;
-    let pk = citadel_token::ed25519_pub_from_seed(&seed)?;
-    let sig = citadel_token::ed25519_sign(&seed, &challenge)?;
-    let mut auth = Vec::with_capacity(96);
-    auth.extend_from_slice(&pk);
-    auth.extend_from_slice(&sig);
-    write_frame(&mut conn, &auth)?;
-    eprintln!("[client] Layer-1: авторизуюсь как {}…", &hex::encode(pk)[..12]);
-    eprintln!("[client] получаю {count} токенов от издателя {issuer} (blind issuance)");
-    let mut tokens = Vec::with_capacity(count);
-    for _ in 0..count {
-        let (blind_msg, st) = citadel_token::client_blind(&pk_der)?;
-        write_frame(&mut conn, &blind_msg)?;
-        let blind_sig = read_frame(&mut conn)?;
-        tokens.push(citadel_token::client_finalize(&pk_der, &blind_sig, &st)?);
-    }
+    eprintln!("[client] Layer-1 issuance у издателя {issuer} ({count} токенов, blind epoch-scoped)…");
+    // C5.3: весь протокол (Layer-1 auth + получение текущего epoch-pub + слепая выдача) — в citadel_token.
+    let tokens = citadel_token::fetch_tokens(&issuer, &seed, count, 20)?;
 
     let mut f = std::fs::File::create(format!("{dir}/tokens")).context("запись tokens")?;
     for t in &tokens {

@@ -490,6 +490,7 @@ dependencies = [
  "base64",
  "ciborium",
  "citadel-quic",
+ "citadel-token",
  "citadel-tun",
  "qrcode",
  "russh",
