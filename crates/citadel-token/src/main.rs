@@ -83,8 +83,9 @@ fn main() -> Result<()> {
     match role.as_str() {
         "issuer" | "serve" => run_issuer(),
         "client" | "fetch" => run_client_fetch(),
+        "pubkey" => run_pubkey(),
         "batch" => run_batch(),
-        other => Err(anyhow::anyhow!("Citadel_TOKEN_ROLE должен быть issuer|client|batch, а не {other:?}")),
+        other => Err(anyhow::anyhow!("Citadel_TOKEN_ROLE должен быть issuer|client|pubkey|batch, а не {other:?}")),
     }
 }
 
@@ -214,6 +215,18 @@ fn run_client_fetch() -> Result<()> {
         writeln!(f, "{}", hex::encode(t))?;
     }
     eprintln!("[client] получено {} токенов → {dir}/tokens (издатель их НЕ видел → unlinkable)", tokens.len());
+    Ok(())
+}
+
+/// C5.4: печатает Ed25519 pub (hex) для `Citadel_CLIENT_SEED` — для добавления в реестр issuer'а
+/// (admin, C5.5) или e2e-тестов отзыва. pub = client_id «абонента».
+fn run_pubkey() -> Result<()> {
+    let seed: [u8; 32] = std::env::var("Citadel_CLIENT_SEED")
+        .ok()
+        .and_then(|s| hex::decode(s.trim()).ok())
+        .and_then(|v| v.try_into().ok())
+        .context("Citadel_CLIENT_SEED (32 байта hex)")?;
+    println!("{}", hex::encode(citadel_token::ed25519_pub_from_seed(&seed)?));
     Ok(())
 }
 

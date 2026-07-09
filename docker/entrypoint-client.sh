@@ -27,6 +27,44 @@ Citadel_TOKEN_ROLE=client Citadel_TOKEN_ISSUER=issuer:7000 Citadel_TOKEN_DIR=/sh
     Citadel_CLIENT_SEED=$(printf 'c5%.0s' {1..32}) \
     citadel-token || echo "[client] WARN: не удалось получить токены от издателя"
 
+# ── Layer-1 auth-тесты (C5.2): ДО туннеля — issuer доступен по hostname (нет DNS-lock/full-tunnel).
+#    Проверяют аутентификацию «абонента» у issuer; сам туннель им не нужен. ──
+echo
+echo "===================================================================="
+echo "  ТЕСТ 17 (C5.2 Layer-1) — НЕзарегистрированный абонент не получает токены (M5)"
+echo "===================================================================="
+rm -rf /tmp/t17; mkdir -p /tmp/t17
+Citadel_TOKEN_ROLE=client Citadel_TOKEN_ISSUER=issuer:7000 Citadel_TOKEN_DIR=/tmp/t17 Citadel_TOKEN_COUNT=1 \
+    Citadel_CLIENT_SEED=deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef \
+    timeout 15 citadel-token >/tmp/t17/out 2>&1 || true
+if [ ! -s /tmp/t17/tokens ]; then
+    echo "  OK ✔ незарегистрированный seed отклонён issuer'ом — токены не выданы (Layer-1 auth ✔)"
+else
+    echo "  [!] незарегистрированный клиент ПОЛУЧИЛ токены ✗"
+fi
+
+echo
+echo "===================================================================="
+echo "  ТЕСТ 18 (C5.2 Layer-1) — ОТЗЫВ абонента (status=revoked) → отказ в выдаче (M5)"
+echo "===================================================================="
+SEED_C=$(printf 'ab%.0s' {1..32})
+PUB_C=$(Citadel_CLIENT_SEED=$SEED_C citadel-token pubkey 2>/dev/null)
+echo "$PUB_C 99999999999 active" >> /shared/registry   # добавить активного абонента в реестр
+rm -rf /tmp/t18; mkdir -p /tmp/t18
+Citadel_TOKEN_ROLE=client Citadel_TOKEN_ISSUER=issuer:7000 Citadel_TOKEN_DIR=/tmp/t18 Citadel_TOKEN_COUNT=1 \
+    Citadel_CLIENT_SEED=$SEED_C timeout 15 citadel-token >/tmp/t18/o1 2>&1 || true
+GOT1=$([ -s /tmp/t18/tokens ] && echo yes || echo no)
+sed -i "s#^$PUB_C .*#$PUB_C 99999999999 revoked#" /shared/registry   # ОТЗЫВ (issuer перечитывает реестр)
+rm -f /tmp/t18/tokens
+Citadel_TOKEN_ROLE=client Citadel_TOKEN_ISSUER=issuer:7000 Citadel_TOKEN_DIR=/tmp/t18 Citadel_TOKEN_COUNT=1 \
+    Citadel_CLIENT_SEED=$SEED_C timeout 15 citadel-token >/tmp/t18/o2 2>&1 || true
+GOT2=$([ -s /tmp/t18/tokens ] && echo yes || echo no)
+if [ "$GOT1" = yes ] && [ "$GOT2" = no ]; then
+    echo "  OK ✔ активный получил токены; после revoke — отказ (отзыв действует ≤ длины эпохи, M5)"
+else
+    echo "  [!] revoke: до=$GOT1 после=$GOT2 (ожидалось yes/no) ✗"
+fi
+
 rm -f /tmp/Citadel-ready
 echo "[client] старт citadel-m1 (client)…"
 citadel-m1 &
@@ -277,20 +315,6 @@ if echo "$out" | grep -qi "fail-closed"; then
     echo "  OK ✔ без pin клиент отказал (fail-closed), а не принял любой серт"
 else
     echo "  [!] без pin клиент НЕ отказал (fail-open?) ✗"
-fi
-
-echo
-echo "===================================================================="
-echo "  ТЕСТ 17 (C5.2 Layer-1) — НЕзарегистрированный абонент не получает токены (M5)"
-echo "===================================================================="
-rm -rf /tmp/t17; mkdir -p /tmp/t17; cp /shared/issuer.pub /tmp/t17/ 2>/dev/null || true
-Citadel_TOKEN_ROLE=client Citadel_TOKEN_ISSUER=issuer:7000 Citadel_TOKEN_DIR=/tmp/t17 Citadel_TOKEN_COUNT=1 \
-    Citadel_CLIENT_SEED=deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef \
-    timeout 15 citadel-token >/tmp/t17/out 2>&1 || true
-if [ ! -s /tmp/t17/tokens ]; then
-    echo "  OK ✔ незарегистрированный seed отклонён issuer'ом — токены не выданы (Layer-1 auth ✔)"
-else
-    echo "  [!] незарегистрированный клиент ПОЛУЧИЛ токены ✗"
 fi
 
 echo

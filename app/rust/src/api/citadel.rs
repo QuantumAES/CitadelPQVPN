@@ -316,7 +316,14 @@ fn state_dto(s: &str) -> VpnEventDto {
 }
 
 async fn do_android_establish(uri: &str) -> Result<TunSetupDto> {
-    let cfg = CredentialLink::from_uri(uri)?.to_client_config();
+    // C5.4: авто-фетч Layer-1 токена (если ссылка несёт issuer+client_seed) перед коннектом.
+    let link = CredentialLink::from_uri(uri)?;
+    let cfg = citadel_client::token_agent::with_token(
+        link.to_client_config(),
+        link.issuer.as_deref(),
+        link.client_seed.as_ref(),
+    )
+    .await?;
     let session = establish_session(&cfg).await?;
     let a = session.addr;
     // Клампим MTU под бюджет QUIC-датаграммы (иначе полноразмерные пакеты дропаются «datagram
