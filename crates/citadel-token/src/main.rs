@@ -53,25 +53,66 @@ fn registry_allows(dir: &str, pub_key: &[u8], now: u64) -> bool {
     false
 }
 
-/// Bootstrap (демо): зарегистрировать pub'ы seed'ов из `Citadel_REGISTER_SEEDS` (hex, через пробел)
-/// как active на +10 лет. В проде реестром управляет админ (C5.5) — правит файл напрямую.
+/// Bootstrap реестра Layer-1 из env (демо + installer, C5.4b):
+///   - `Citadel_REGISTER_PUBS`  — client_id-pub'ы (hex32, через пробел): **issuer НЕ видит seed**
+///     абонента (installer/прод-путь — админ регистрирует только публичный id).
+///   - `Citadel_REGISTER_SEEDS` — seed'ы (hex32) → pub деривится здесь (демо/legacy: issuer знает seed).
+///
+/// **Идемпотентно и не затирает** существующие строки: pub, уже присутствующий в реестре, не трогается.
+/// Это критично — иначе admin-revoke (`status=revoked`) терялся бы при рестарте контейнера и отозванный
+/// абонент «воскресал» бы `active`. Добавляются только новые pub'ы как `active` на +10 лет. В проде
+/// правкой файла (revoke/add) управляет админ (C5.5); bootstrap лишь досевает недостающих.
 fn bootstrap_registry(dir: &str) -> Result<()> {
-    let Ok(seeds) = std::env::var("Citadel_REGISTER_SEEDS") else {
-        return Ok(());
-    };
-    let far = now_unix() + 10 * 365 * 24 * 3600;
-    let mut reg = String::new();
-    for s in seeds.split_whitespace() {
-        let seed: [u8; 32] = hex::decode(s)
-            .ok()
-            .and_then(|v| v.try_into().ok())
-            .context("Citadel_REGISTER_SEEDS: seed должен быть 32 байта hex")?;
-        let pk = citadel_token::ed25519_pub_from_seed(&seed)?;
-        reg.push_str(&format!("{} {far} active\n", hex::encode(pk)));
+    let mut pubs: Vec<[u8; 32]> = Vec::new();
+    if let Ok(list) = std::env::var("Citadel_REGISTER_PUBS") {
+        for p in list.split_whitespace() {
+            let pk: [u8; 32] = hex::decode(p)
+                .ok()
+                .and_then(|v| v.try_into().ok())
+                .context("Citadel_REGISTER_PUBS: client_id должен быть 32 байта hex")?;
+            pubs.push(pk);
+        }
     }
-    std::fs::write(registry_path(dir), &reg).context("запись реестра")?;
-    eprintln!("[issuer] реестр Layer-1: {} абонент(ов) активны (Citadel_REGISTER_SEEDS)", reg.lines().count());
+    if let Ok(list) = std::env::var("Citadel_REGISTER_SEEDS") {
+        for s in list.split_whitespace() {
+            let seed: [u8; 32] = hex::decode(s)
+                .ok()
+                .and_then(|v| v.try_into().ok())
+                .context("Citadel_REGISTER_SEEDS: seed должен быть 32 байта hex")?;
+            pubs.push(citadel_token::ed25519_pub_from_seed(&seed)?);
+        }
+    }
+    if pubs.is_empty() {
+        return Ok(()); // нет bootstrap-env → реестр как есть (admin-managed или пуст)
+    }
+    let existing = std::fs::read_to_string(registry_path(dir)).unwrap_or_default();
+    let far = now_unix() + 10 * 365 * 24 * 3600;
+    let merged = merge_registry(&existing, &pubs, far);
+    std::fs::write(registry_path(dir), &merged).context("запись реестра")?;
+    eprintln!(
+        "[issuer] реестр Layer-1: {} абонент(ов) (bootstrap-merge; revoke переживает рестарт)",
+        merged.lines().filter(|l| !l.trim().is_empty()).count()
+    );
     Ok(())
+}
+
+/// Чистая логика слияния реестра: сохраняет ВСЕ существующие строки (в т.ч. `revoked`/`expired`),
+/// добавляет только те `pubs`, которых ещё нет (по pub_hex), как `active` до `valid_until`.
+/// Идемпотентно: повторный вызов с теми же pub'ами не меняет вывод.
+fn merge_registry(existing: &str, pubs: &[[u8; 32]], valid_until: u64) -> String {
+    let present: std::collections::HashSet<&str> =
+        existing.lines().filter_map(|l| l.split_whitespace().next()).collect();
+    let mut out = existing.to_string();
+    if !out.is_empty() && !out.ends_with('\n') {
+        out.push('\n');
+    }
+    for pk in pubs {
+        let hexpk = hex::encode(pk);
+        if !present.contains(hexpk.as_str()) {
+            out.push_str(&format!("{hexpk} {valid_until} active\n"));
+        }
+    }
+    out
 }
 
 fn main() -> Result<()> {
@@ -243,4 +284,35 @@ fn run_batch() -> Result<()> {
     }
     eprintln!("[issuer:batch] готово: issuer.pub + {} токенов", issued.tokens.len());
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::merge_registry;
+
+    /// C5.4b: bootstrap НЕ воскрешает отозванного абонента при рестарте (сохраняет `revoked`),
+    /// новый pub добавляется как `active`, дубликатов нет.
+    #[test]
+    fn merge_preserves_revoked_and_adds_new() {
+        let pk_a = [0xAAu8; 32];
+        let pk_b = [0xBBu8; 32];
+        let hex_a = hex::encode(pk_a);
+        let hex_b = hex::encode(pk_b);
+        // Реестр после admin-revoke абонента A.
+        let existing = format!("{hex_a} 9999999999 revoked\n");
+        // Рестарт: bootstrap снова несёт A (уже отозванного) и нового B.
+        let merged = merge_registry(&existing, &[pk_a, pk_b], 8888888888);
+        assert!(merged.contains(&format!("{hex_a} 9999999999 revoked")), "A остаётся revoked");
+        assert_eq!(merged.matches(&hex_a).count(), 1, "A не продублирован (не воскрешён active)");
+        assert!(merged.contains(&format!("{hex_b} 8888888888 active")), "B добавлен active");
+    }
+
+    /// Повторный bootstrap тех же pub'ов идемпотентен (вывод не растёт/не меняется).
+    #[test]
+    fn merge_is_idempotent() {
+        let pk = [0x11u8; 32];
+        let first = merge_registry("", &[pk], 100);
+        let second = merge_registry(&first, &[pk], 200);
+        assert_eq!(first, second);
+    }
 }

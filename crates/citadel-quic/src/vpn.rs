@@ -119,6 +119,22 @@ impl VpnController {
         let _ = self.events.send(e);
     }
 
+    /// Отметить начало подключения ДО вызова [`connect`] — для pre-connect шагов в GUI-мосте
+    /// (напр. добыча Layer-1 токена у issuer, C5.4b): UI сразу видит «подключаемся», а не висит
+    /// в idle пока идёт фетч. Затем вызывающий зовёт [`connect`] (он повторно выставит Connecting —
+    /// идемпотентно) либо при неудаче шага — [`fail`].
+    pub fn begin(&self) {
+        self.set_state(VpnState::Connecting);
+    }
+
+    /// Сообщить о фатальной ошибке pre-connect шага (эмитит `Error` + переводит в `Down`), чтобы
+    /// UI вышел из спиннера, а не завис. Используется, когда до [`connect`] дело не дошло (напр.
+    /// не удалось получить токен доступа).
+    pub fn fail(&self, msg: String) {
+        self.emit(VpnEvent::Error(msg));
+        self.set_state(VpnState::Down);
+    }
+
     /// Поднять VPN и **держать соединение живым**, пока пользователь не позовёт `disconnect`.
     ///
     /// Первичный коннект: `establish` → `provider.configure` → `data_plane`. При неудаче
@@ -328,5 +344,19 @@ mod tests {
         c.disconnect(); // ставит stopped
         // не ждёт 10с — сразу true (реконнект прерывается пользовательским disconnect)
         assert!(c.sleep_or_stop(Duration::from_secs(10)).await);
+    }
+
+    /// C5.4b: pre-connect провал (напр. фетч Layer-1 токена не удался) эмитит Error → Down,
+    /// чтобы UI вышел из спиннера, а не завис. `begin` перед этим показывает Connecting.
+    #[tokio::test]
+    async fn fail_emits_error_then_down() {
+        let c = VpnController::new();
+        let mut rx = c.subscribe();
+        c.begin();
+        c.fail("токен недоступен".into());
+        assert_eq!(c.state(), VpnState::Down);
+        assert!(matches!(rx.recv().await.unwrap(), VpnEvent::State(VpnState::Connecting)));
+        assert!(matches!(rx.recv().await.unwrap(), VpnEvent::Error(e) if e.contains("токен")));
+        assert!(matches!(rx.recv().await.unwrap(), VpnEvent::State(VpnState::Down)));
     }
 }

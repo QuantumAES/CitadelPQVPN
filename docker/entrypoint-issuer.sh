@@ -4,6 +4,10 @@
 # unlinkability даже при сговоре издателя и exit). Публикует issuer.pub в /shared для exit.
 set -e
 rm -f /shared/issuer.pub /shared/issuer-*.pub /shared/tokens   # C5.1: чистим и epoch-pub'ы прошлого запуска
+# ДЕМО: чистим и реестр — харнес должен стартовать с чистого состояния (иначе revoked-абонент из
+# прошлого прогона TEST 18 переживает рестарт из-за bootstrap-merge и ломает повторный прогон).
+# В installer (install-citadel-server.sh) реестр НЕ трётся — там revoke обязан переживать рестарт.
+rm -f /shared/registry
 # Общий obfs-PSK для exit↔client генерируем здесь (а не хардкодим в репозитории).
 # Для прода PSK доставляется в конфиге по аутентифицированному каналу (см. docs/PHASE0-OBFS §8).
 [ -f /shared/obfs.psk ] || { head -c 32 /dev/urandom | od -An -tx1 | tr -d ' \n' > /shared/obfs.psk; }

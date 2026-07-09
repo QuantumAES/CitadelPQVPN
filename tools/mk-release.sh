@@ -2,7 +2,7 @@
 # ─────────────────────────────────────────────────────────────────────────────
 # Сборка и ПОДПИСЬ релизных артефактов CitadelPQVPN (шаг 2 installer-трека, §8.1).
 #
-# Собирает release-бинари (citadel-m1, citadel-linkgen) под арку хоста, стрипает,
+# Собирает release-бинари (citadel-m1, citadel-linkgen, citadel-token) под арку хоста, стрипает,
 # жмёт zstd, считает sha256sums и подписывает их релизным minisign-секретом.
 # Артефакты → dist/<version>/. Их выкладывают в GitHub Release; сервер-инсталлер
 # тянет .zst + sha256sums + .minisig и проверяет подпись публичным ключом (supply-chain).
@@ -43,6 +43,7 @@ echo "[mk-release] version=$VERSION arch=$SUFFIX out=$OUT"
 # ── сборка release ──
 cargo build --release -p citadel-quic --bin citadel-m1
 cargo build --release -p citadel-client --bin citadel-linkgen
+cargo build --release -p citadel-token --bin citadel-token   # C5.4b: issuer-контейнер (Layer-1 + epoch-токены)
 
 rm -rf "$OUT"
 mkdir -p "$OUT"
@@ -59,6 +60,7 @@ package() {
 echo "[mk-release] упаковка:"
 package citadel-m1
 package citadel-linkgen
+package citadel-token
 
 # ── sha256sums + подпись + self-verify ──
 cd "$OUT"
@@ -75,7 +77,7 @@ minisign -V -p "$PUB" -m sha256sums
 cat <<EOF
 
 === ГОТОВО: $OUT ===
-  citadel-m1-${SUFFIX}.zst, citadel-linkgen-${SUFFIX}.zst, sha256sums, sha256sums.minisig
+  citadel-m1-${SUFFIX}.zst, citadel-linkgen-${SUFFIX}.zst, citadel-token-${SUFFIX}.zst, sha256sums, sha256sums.minisig
 Выложить в GitHub Release тега $VERSION (шаг 4). Сервер-инсталлер проверит подпись
 публичным ключом (packaging/release/citadel-release.pub, вшит в install-citadel-server.sh).
 EOF

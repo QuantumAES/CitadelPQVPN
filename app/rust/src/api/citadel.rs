@@ -253,7 +253,12 @@ fn to_dto(ev: VpnEvent) -> VpnEventDto {
 /// Общий старт сессии. `profile_id` — если коннект по сохранённому профилю (тогда на событии
 /// Connected обновляем его `last_exit` в vault).
 fn start_connect(uri: &str, profile_id: Option<String>, sink: StreamSink<VpnEventDto>) -> Result<()> {
-    let cfg = CredentialLink::from_uri(uri)?.to_client_config();
+    // C5.4b: разбираем ссылку целиком — из неё берём issuer+client_seed для авто-фетча Layer-1
+    // токена (симметрично android-пути do_android_establish). `to_client_config` теряет эти поля.
+    let link = CredentialLink::from_uri(uri)?;
+    let cfg = link.to_client_config();
+    let issuer = link.issuer.clone();
+    let client_seed = link.client_seed;
     let controller = Arc::new(VpnController::new());
     *ACTIVE.lock().unwrap() = Some(controller.clone());
 
@@ -276,6 +281,23 @@ fn start_connect(uri: &str, profile_id: Option<String>, sink: StreamSink<VpnEven
 
     let provider: Arc<dyn TunProvider> = Arc::new(GuiTunProvider::default());
     rt().spawn(async move {
+        // Сразу показываем «подключаемся» — фетч токена может занять секунды (issuer-раунд).
+        controller.begin();
+        // Если ссылка несёт Layer-1 (issuer+client_seed) — добываем epoch-токен ДО коннекта и
+        // вписываем в config.token. Ошибку фетча превращаем в Error+Down (UI не виснет в спиннере).
+        let cfg = match citadel_client::token_agent::with_token(
+            cfg,
+            issuer.as_deref(),
+            client_seed.as_ref(),
+        )
+        .await
+        {
+            Ok(c) => c,
+            Err(e) => {
+                controller.fail(format!("не удалось получить токен доступа: {e}"));
+                return;
+            }
+        };
         let _ = controller.connect(cfg, provider).await;
     });
     Ok(())

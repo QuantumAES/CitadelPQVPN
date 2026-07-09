@@ -389,6 +389,30 @@ mod tests {
         assert!(CredentialLink::from_uri("https://evil/x").is_err());
     }
 
+    /// C5.4b installer-контракт Layer-1: hex-seed из install-скрипта → linkgen(`parse_pin`) →
+    /// компактная ссылка → клиентский разбор → выведенный Ed25519-pub == pub, зарегистрированный
+    /// у issuer. Если бы `parse_pin` или CBOR round-trip искажали seed, издатель отказал бы
+    /// «своему» абоненту (авто-фетч токена сломался бы «на пустом месте»).
+    #[test]
+    fn layer1_seed_survives_installer_pipeline() {
+        // installer: SEED (64 hex из /dev/urandom) → регистрирует у issuer pub(SEED).
+        let raw = [0x9Au8; 32];
+        let hex_seed: String = raw.iter().map(|b| format!("{b:02x}")).collect();
+        let registered_pub = citadel_token::ed25519_pub_from_seed(&raw).unwrap();
+        // linkgen: bundle.client_seed = parse_pin(hex_seed) — должно быть тождество на байтах.
+        let seed_in_bundle =
+            citadel_quic::config::parse_pin(&hex_seed).expect("parse_pin принимает hex64");
+        assert_eq!(seed_in_bundle, raw, "parse_pin — чистый hex64→[u8;32], без искажения");
+        let mut b = sample();
+        b.client_seed = Some(seed_in_bundle);
+        let uri = CredentialLink::from_bundle(&b).to_uri().unwrap();
+        // клиент: из ссылки достаёт seed и выводит pub «абонента» для Layer-1.
+        let link = CredentialLink::from_uri(&uri).unwrap();
+        let seed_from_link = link.client_seed.expect("ссылка несёт client_seed");
+        let derived_pub = citadel_token::ed25519_pub_from_seed(&seed_from_link).unwrap();
+        assert_eq!(derived_pub, registered_pub, "pub из ссылки == зарегистрированный у issuer");
+    }
+
     /// S1.2/M1: ссылка с инъекцией перевода строки в dns отклоняется при импорте (иначе
     /// root-helper записал бы произвольный resolv.conf).
     #[test]
