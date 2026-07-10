@@ -23,7 +23,7 @@ echo "[client] exit резолвится в $EXIT_IP"
 # M5 split: получить анонимные токены ИНТЕРАКТИВНО от издателя (blind issuance) — ДО блокировки DNS.
 # Издатель подписывает вслепую, токен в файл; издатель не видит токен → unlinkable от сессии на exit.
 echo "[client] получаю токены от издателя (M5 issuer↔exit split)…"
-Citadel_TOKEN_ROLE=client Citadel_TOKEN_ISSUER=issuer:7000 Citadel_TOKEN_DIR=/shared Citadel_TOKEN_COUNT=8 \
+Citadel_TOKEN_ROLE=client Citadel_TOKEN_ISSUER=issuer:7000 Citadel_TOKEN_DIR=/shared Citadel_TOKEN_COUNT=10 \
     Citadel_CLIENT_SEED=$(printf 'c5%.0s' {1..32}) \
     citadel-token || echo "[client] WARN: не удалось получить токены от издателя"
 
@@ -319,7 +319,37 @@ fi
 
 echo
 echo "===================================================================="
+echo "  ТЕСТ 19 (§S3) — commitment-fetch: ссылка несёт лишь H(pub); клиент дотягивает pub с exit"
+echo "  ПОЗИТИВ: верный commit → принимает; НЕГАТИВ: чужой commit → отвергает (анти-MITM через ссылку)"
+echo "===================================================================="
+# ПОЗИТИВ: commit = H(pub) НАСТОЯЩЕГО exit. ROUTES пусты + kill сразу по логу establish → второй
+# (проверочный) туннель не конфликтует с рабочим M1E; нужен лишь лог проверки подписи.
+sed -i '1d' /shared/tokens 2>/dev/null || true   # свежий токен (позитив)
+CF_OK=$(sha256sum /shared/exit.mldsa | cut -d' ' -f1)
+Citadel_TUN=Citadel1 Citadel_ROUTES="" Citadel_SERVERS="${EXIT_IP}:4433" \
+    Citadel_PIN="$(cat /shared/exit.pin)" Citadel_MLDSA_COMMIT="$CF_OK" citadel-m1 >/tmp/t19p 2>&1 &
+T19=$!
+for _ in $(seq 1 40); do grep -q 'commitment-fetch' /tmp/t19p 2>/dev/null && break; kill -0 "$T19" 2>/dev/null || break; sleep 0.5; done
+kill "$T19" 2>/dev/null || true; wait "$T19" 2>/dev/null || true
+if grep -q 'commitment-fetch: H(pub)==commit' /tmp/t19p; then
+    echo "  OK ✔ ПОЗИТИВ: клиент дотянул pub с exit, H(pub)==commit из ссылки → PQ-auth ✔"
+else
+    echo "  [!] ПОЗИТИВ commitment-fetch не сработал"
+fi
+# НЕГАТИВ: commit = H(pub) ЧУЖОГО exit2 ≠ pub, который пришлёт exit → отказ (анти-MITM).
+sed -i '1d' /shared/tokens 2>/dev/null || true   # свежий токен (негатив)
+CF_BAD=$(sha256sum /shared/exit2.mldsa | cut -d' ' -f1)
+out=$(Citadel_TUN=Citadel1 Citadel_ROUTES="" Citadel_SERVERS="${EXIT_IP}:4433" \
+      Citadel_PIN="$(cat /shared/exit.pin)" Citadel_MLDSA_COMMIT="$CF_BAD" timeout 25 citadel-m1 2>&1 || true)
+if echo "$out" | grep -q "не соответствует обязательству"; then
+    echo "  OK ✔ НЕГАТИВ: H(pub) exit ≠ commit из ссылки → клиент отверг (анти-MITM через ссылку)"
+else
+    echo "  [!] НЕГАТИВ commitment-fetch не сработал"
+fi
+
+echo
+echo "===================================================================="
 echo "  Готово. M1-M7 + STRIDE F1-F7: pinning, egress, obfs L1, drop-priv, DNS-leak, rate-limit,"
-echo "  миграция, TCP-fallback, split-issuance, multi-server, obfs-кеш, fuzzing, crypto-agility, PQ-auth."
+echo "  миграция, TCP-fallback, split-issuance, multi-server, crypto-agility, PQ-auth, commitment-fetch."
 echo "===================================================================="
 wait "$M1E" 2>/dev/null || true

@@ -264,9 +264,10 @@ impl CredentialLink {
     }
 
     /// Преобразовать компактную ссылку в `ClientConfig` для подключения. pin берётся из
-    /// инлайн-`cert_pin`, obfs_psk инлайн. `mldsa = None` — в ссылке только обязательство
-    /// `H(pub)`, поэтому PQ-auth (ML-DSA) пропускается, пока полный pub не дотянут по каналу
-    /// (commitment-fetch — deferred). `token` пуст (добывается отдельно, C5).
+    /// инлайн-`cert_pin`, obfs_psk инлайн. `mldsa` = обязательство `H(pub)` из ссылки →
+    /// `MldsaSource::Commit`: полный pub exit дотягивается по control-каналу и сверяется с commit
+    /// (commitment-fetch, §S3) — так M7 PQ-auth форсится и через ссылку. `token` пуст (добывается
+    /// отдельно, C5). PQ-auth активна только при активном pin (fail-closed, S0.1).
     pub fn to_client_config(&self) -> ClientConfig {
         ClientConfig {
             servers: self.servers.clone(),
@@ -279,7 +280,7 @@ impl CredentialLink {
             mtu: "1280".into(),
             token: Vec::new(),
             pin: self.cert_pin.map_or(PinSource::None, PinSource::Bytes),
-            mldsa: MldsaSource::None,
+            mldsa: self.mldsa_commit.map_or(MldsaSource::None, MldsaSource::Commit),
             allow_insecure_no_pin: false,
         }
     }

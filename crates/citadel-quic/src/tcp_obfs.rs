@@ -14,7 +14,9 @@ use rand::RngCore;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 /// Потолок размера record на проводе (obfs-overhead + MTU с запасом). Анти-OOM при чтении len.
-const MAX_RECORD: usize = 4096;
+/// 8192 — чтобы control-ответ с ML-DSA-65 pub(1952)+sig(3309) (commitment-fetch, §S3, ~5.3 КБ)
+/// уместился в один record (data-plane record'ы — в пределах MTU, много меньше).
+const MAX_RECORD: usize = 8192;
 
 /// Записать один obfs-record: `len(2 BE) ‖ seal(payload)`.
 pub async fn write_record<W: AsyncWriteExt + Unpin>(

@@ -52,11 +52,12 @@ impl Tunnel {
     }
 
     /// Клиент: послать один control-запрос и получить ответ (reliable QUIC bi-stream).
+    /// Лимит 8192 — ответ несёт ML-DSA-65 pub(1952)+sig(3309) для commitment-fetch (§S3) ⇒ ~5.3 КБ.
     pub async fn control_client(&mut self, req: &[u8]) -> Result<Vec<u8>> {
         let (mut send, mut recv) = self.conn.open_bi().await?;
         send.write_all(req).await?;
         send.finish()?;
-        Ok(recv.read_to_end(4096).await?)
+        Ok(recv.read_to_end(8192).await?)
     }
 
     /// Сервер: принять один control-запрос, обработать `handle` и ответить.

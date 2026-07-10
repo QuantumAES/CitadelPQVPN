@@ -30,7 +30,21 @@ pub enum MldsaSource {
     Bytes(Vec<u8>), // прямые байты ML-DSA pub (из бандла кред / QR, C1.4)
     File(String), // Citadel_MLDSA_PUB
     Dir(String),  // <dir>/<host>.mldsa (Citadel_PIN_DIR)
+    Commit([u8; 32]), // только обязательство H(pub) (из `citadel://`-ссылки / Citadel_MLDSA_COMMIT):
+    // полный pub дотягивается по control-каналу и сверяется с этим commit — commitment-fetch (§S3).
     None,
+}
+
+/// Что клиент ожидает по ML-DSA-65 pub сервера (M7), резолвится per-host в [`ClientConfig::mldsa_expect`].
+#[derive(Clone)]
+pub enum MldsaExpect {
+    /// PQ-auth не запрашивается (pub/commit не провижированы).
+    None,
+    /// Полный pub провижирован (байты/файл/dir) — им и верифицируем подпись.
+    Pub(Vec<u8>),
+    /// Только обязательство `H(pub)` — полный pub берём из ответа сервера, сверяем `sha256(pub)==commit`
+    /// и лишь затем верифицируем подпись (commitment-fetch, §S3).
+    Commit([u8; 32]),
 }
 
 /// Конфигурация клиента: всё, что нужно движку для подключения к exit'ам.
@@ -157,9 +171,12 @@ impl ClientConfig {
             PinSource::None
         };
 
-        // mldsa: Citadel_MLDSA_PUB (файл) > Citadel_PIN_DIR/<host>.mldsa.
+        // mldsa: Citadel_MLDSA_PUB (файл, полный pub) > Citadel_MLDSA_COMMIT (hex32, обязательство →
+        // commitment-fetch) > Citadel_PIN_DIR/<host>.mldsa.
         let mldsa = if let Ok(f) = std::env::var("Citadel_MLDSA_PUB") {
             MldsaSource::File(f)
+        } else if let Ok(h) = std::env::var("Citadel_MLDSA_COMMIT") {
+            parse_pin(&h).map(MldsaSource::Commit).unwrap_or(MldsaSource::None)
         } else if let Ok(d) = std::env::var("Citadel_PIN_DIR") {
             MldsaSource::Dir(d)
         } else {
@@ -211,12 +228,30 @@ impl ClientConfig {
     }
 
     /// ML-DSA-65 pub выбранного `host` (M7): File > Dir/`<host>.mldsa`. None → PQ-auth не запрашивается.
+    /// Только для источников с полным pub; `Commit` полного pub не имеет (см. [`mldsa_expect`]).
     pub fn mldsa_for(&self, host: &str) -> Option<Vec<u8>> {
         match &self.mldsa {
             MldsaSource::Bytes(k) => Some(k.clone()),
             MldsaSource::File(f) => std::fs::read(f).ok(),
             MldsaSource::Dir(dir) => std::fs::read(format!("{dir}/{host}.mldsa")).ok(),
-            MldsaSource::None => None,
+            MldsaSource::Commit(_) | MldsaSource::None => None,
+        }
+    }
+
+    /// Ожидание клиента по ML-DSA pub выбранного `host`: полный pub (Bytes/File/Dir) → `Pub`;
+    /// обязательство (ссылка/`Citadel_MLDSA_COMMIT`) → `Commit`; иначе `None` (PQ-auth не запрашивается).
+    /// Недоступный File/Dir → `None` (как и `mldsa_for`), а не «требуем, но нечем».
+    pub fn mldsa_expect(&self, host: &str) -> MldsaExpect {
+        match &self.mldsa {
+            MldsaSource::Bytes(k) => MldsaExpect::Pub(k.clone()),
+            MldsaSource::File(f) => {
+                std::fs::read(f).map(MldsaExpect::Pub).unwrap_or(MldsaExpect::None)
+            }
+            MldsaSource::Dir(dir) => std::fs::read(format!("{dir}/{host}.mldsa"))
+                .map(MldsaExpect::Pub)
+                .unwrap_or(MldsaExpect::None),
+            MldsaSource::Commit(c) => MldsaExpect::Commit(*c),
+            MldsaSource::None => MldsaExpect::None,
         }
     }
 }

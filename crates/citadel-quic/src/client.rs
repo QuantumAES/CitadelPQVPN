@@ -20,7 +20,7 @@ use rand::RngCore;
 use citadel_masque::{capsule, datagram, ip};
 use citadel_tun::TunIo;
 
-use crate::config::{ClientConfig, PinMode};
+use crate::config::{ClientConfig, MldsaExpect, PinMode};
 use crate::dataplane::{pump, Tunnel};
 use tokio::net::TcpStream;
 
@@ -180,25 +180,27 @@ pub async fn establish_session(cfg: &ClientConfig) -> Result<Session> {
     let mut tunnel = tunnel
         .ok_or_else(|| anyhow!("ни один exit недоступен:\n{}", reasons.join("\n")))?;
 
-    // M7 PQ-auth: pin (Ed25519-cert) + ML-DSA-65 pk выбранного exit (если провижированы)
+    // M7 PQ-auth: pin (Ed25519-cert) + ML-DSA-65 pk выбранного exit — полный pub (провижирован)
+    // ЛИБО обязательство H(pub) из ссылки (полный pub дотянем по каналу, commitment-fetch §S3).
     let host = host_of(&chosen);
-    let mldsa_pk = cfg.mldsa_for(host);
+    let mldsa = cfg.mldsa_expect(host);
+    let pq_active = !matches!(mldsa, MldsaExpect::None);
     // S0.1/H2: cert_pin для ML-DSA-привязки = АКТИВНЫЙ pin. При Pinned rustls уже заставил живой
     // серт совпасть с pin ⇒ привязка идёт к живой сессии. Без активного pin привязывать не к чему
     // (иначе подпись над константой [0;32] — бесполезна против MITM) → отказ.
     let cert_pin = match cfg.pin_for(host) {
         PinMode::Pinned(p) => p,
         _ => {
-            if mldsa_pk.is_some() {
+            if pq_active {
                 return Err(anyhow!(
-                    "PQ-auth: ML-DSA pk провижирован для {host}, но серт-pin не активен — \
+                    "PQ-auth: ML-DSA (pub/commit) провижирован для {host}, но серт-pin не активен — \
                      отказ (fail-closed, S0.1/H2)"
                 ));
             }
             [0u8; 32]
         }
     };
-    if mldsa_pk.is_some() {
+    if pq_active {
         eprintln!("[citadel-m1:client] PQ-auth (M7): буду проверять ML-DSA-65 подпись exit {host}");
     }
 
@@ -208,7 +210,7 @@ pub async fn establish_session(cfg: &ClientConfig) -> Result<Session> {
     } else {
         eprintln!("[citadel-m1:client] предъявляю анонимный токен ({} б)", cfg.token.len());
     }
-    let a = client_request_address(&mut tunnel, &cfg.token, mldsa_pk.as_deref(), cert_pin).await?;
+    let a = client_request_address(&mut tunnel, &cfg.token, &mldsa, cert_pin).await?;
     Ok(Session {
         tunnel,
         addr: a.addr,
@@ -336,11 +338,11 @@ pub(crate) async fn try_quic_connect(
 }
 
 /// Control-обмен (M2): nonce(32)‖varint(token_len)‖token‖ADDRESS_REQUEST → проверка ML-DSA
-/// подписи сервера (M7, если pk провижирован) → ADDRESS_ASSIGN. Возвращает назначенный адрес.
+/// подписи сервера (M7/§S3, согласно `expect`) → ADDRESS_ASSIGN. Возвращает назначенный адрес.
 async fn client_request_address(
     tunnel: &mut Tunnel,
     token: &[u8],
-    mldsa_pk: Option<&[u8]>,
+    expect: &MldsaExpect,
     cert_pin: [u8; 32],
 ) -> Result<capsule::AssignedV4> {
     // M7 PQ-auth: nonce(32) для привязки подписи сервера; далее токен + ADDRESS_REQUEST
@@ -353,22 +355,34 @@ async fn client_request_address(
     out.extend_from_slice(&capsule::encode_address_request_v4(&req));
 
     let buf = tunnel.control_client(&out).await?;
-    // ответ: varint(sig_len) ‖ ML-DSA-sig ‖ ADDRESS_ASSIGN
-    let (sig_len, m) =
-        citadel_masque::varint::decode(&buf).ok_or_else(|| anyhow!("нет sig-префикса"))?;
-    let sig_end = m + sig_len as usize;
-    if buf.len() < sig_end {
+    // ответ: varint(pub_len)‖ML-DSA-pub ‖ varint(sig_len)‖ML-DSA-sig ‖ ADDRESS_ASSIGN (§S3)
+    let (pub_len, p0) =
+        citadel_masque::varint::decode(&buf).ok_or_else(|| anyhow!("нет pub-префикса"))?;
+    let pub_end = p0 + pub_len as usize;
+    if buf.len() < pub_end {
+        return Err(anyhow!("обрезанный ML-DSA pub"));
+    }
+    let server_pub = &buf[p0..pub_end];
+    let tail = &buf[pub_end..];
+    let (sig_len, s0) =
+        citadel_masque::varint::decode(tail).ok_or_else(|| anyhow!("нет sig-префикса"))?;
+    let sig_end = s0 + sig_len as usize;
+    if tail.len() < sig_end {
         return Err(anyhow!("обрезанная PQ-подпись"));
     }
-    let sig = &buf[m..sig_end];
-    let rest = &buf[sig_end..];
+    let sig = &tail[s0..sig_end];
+    let rest = &tail[sig_end..];
 
-    // M7: проверяем ML-DSA-65 подпись сервера, если его pk провижирован (гибрид с Ed25519+pin)
-    if let Some(pk) = mldsa_pk {
-        if !crate::pqauth::verify_binding(pk, &nonce, &cert_pin, sig) {
-            return Err(anyhow!("PQ-auth: ML-DSA подпись сервера НЕ прошла — возможен MITM"));
-        }
-        eprintln!("[citadel-m1:client] PQ-auth ✔ ML-DSA-65 подпись сервера верна (гибрид Ed25519+ML-DSA)");
+    // M7/§S3: проверяем ML-DSA-65 подпись сервера согласно ожиданию (полный pub / commitment-fetch).
+    verify_server_mldsa(expect, server_pub, &nonce, &cert_pin, sig)?;
+    match expect {
+        MldsaExpect::Pub(_) => eprintln!(
+            "[citadel-m1:client] PQ-auth ✔ ML-DSA-65 подпись сервера верна (pub провижирован)"
+        ),
+        MldsaExpect::Commit(_) => eprintln!(
+            "[citadel-m1:client] PQ-auth ✔ commitment-fetch: H(pub)==commit из ссылки + подпись верна"
+        ),
+        MldsaExpect::None => {}
     }
 
     let (t, val, _) = capsule::decode(rest).ok_or_else(|| anyhow!("битая капсула в ответе"))?;
@@ -376,6 +390,52 @@ async fn client_request_address(
         return Err(anyhow!("ожидался ADDRESS_ASSIGN, получен type={t}"));
     }
     capsule::decode_assigned_v4(val).ok_or_else(|| anyhow!("битое тело ADDRESS_ASSIGN"))
+}
+
+/// SHA-256 (для сверки `H(pub)` с обязательством ссылки) — тем же алго, что `citadel_client` считает
+/// commit (aws-lc-rs, тот же стандартный SHA-256).
+fn sha256(data: &[u8]) -> [u8; 32] {
+    let d = aws_lc_rs::digest::digest(&aws_lc_rs::digest::SHA256, data);
+    let mut out = [0u8; 32];
+    out.copy_from_slice(d.as_ref());
+    out
+}
+
+/// Проверить ML-DSA-65 привязку сервера согласно ожиданию клиента. `server_pub` — pub, присланный
+/// сервером по control-каналу (пуст, если PQ-auth у сервера выкл).
+///
+/// - `None` — PQ-auth не запрошена: не проверяем (сервер мог не прислать pub/sig).
+/// - `Pub(p)` — верифицируем провижированным pub (присланный игнорируем: подпись обязана сойтись
+///   именно под провижированным ключом ⇒ подменённый pub не поможет MITM).
+/// - `Commit(c)` — commitment-fetch: сверяем `sha256(server_pub)==c`, затем верифицируем им подпись.
+fn verify_server_mldsa(
+    expect: &MldsaExpect,
+    server_pub: &[u8],
+    nonce: &[u8; 32],
+    cert_pin: &[u8; 32],
+    sig: &[u8],
+) -> Result<()> {
+    let pk: &[u8] = match expect {
+        MldsaExpect::None => return Ok(()),
+        MldsaExpect::Pub(p) => p,
+        MldsaExpect::Commit(c) => {
+            if server_pub.is_empty() {
+                return Err(anyhow!(
+                    "PQ-auth: exit не прислал ML-DSA pub, а ссылка требует его (commit) — отказ"
+                ));
+            }
+            if &sha256(server_pub) != c {
+                return Err(anyhow!(
+                    "PQ-auth: ML-DSA pub exit не соответствует обязательству H(pub) из ссылки — MITM?"
+                ));
+            }
+            server_pub
+        }
+    };
+    if !crate::pqauth::verify_binding(pk, nonce, cert_pin, sig) {
+        return Err(anyhow!("PQ-auth: ML-DSA подпись сервера НЕ прошла — возможен MITM"));
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -389,5 +449,33 @@ mod tests {
         assert!(require_pin_or_insecure(&PinMode::Waiting, false).is_ok()); // ждёт pin, не fail-open
         assert!(require_pin_or_insecure(&PinMode::NoPin, false).is_err()); // ключевое: отказ
         assert!(require_pin_or_insecure(&PinMode::NoPin, true).is_ok()); // dev override
+    }
+
+    /// §S3 commitment-fetch: клиент с обязательством H(pub) из ссылки принимает подпись сервера
+    /// ТОЛЬКО если присланный pub сходится с commit; полный provisioned pub тоже работает; None —
+    /// пропускает; подмена pub/commit/подписи — отказ (анти-MITM).
+    #[test]
+    fn verify_server_mldsa_expectations() {
+        let signer = crate::pqauth::ServerSigner::generate().unwrap();
+        let pk = signer.public_key();
+        let nonce = [7u8; 32];
+        let pin = [9u8; 32];
+        let sig = signer.sign_binding(&nonce, &pin).unwrap();
+
+        // None — не проверяем (даже без pub/sig)
+        assert!(verify_server_mldsa(&MldsaExpect::None, &[], &nonce, &pin, &[]).is_ok());
+        // Pub провижирован — верифицируем им (server_pub игнорируется)
+        assert!(verify_server_mldsa(&MldsaExpect::Pub(pk.clone()), &[], &nonce, &pin, &sig).is_ok());
+        // Commit совпал с H(server_pub) — принимаем (commitment-fetch)
+        let commit = sha256(&pk);
+        assert!(verify_server_mldsa(&MldsaExpect::Commit(commit), &pk, &nonce, &pin, &sig).is_ok());
+        // Commit не совпал (подменённый pub) — отказ
+        assert!(verify_server_mldsa(&MldsaExpect::Commit([0u8; 32]), &pk, &nonce, &pin, &sig).is_err());
+        // Commit есть, а pub не прислан — отказ
+        assert!(verify_server_mldsa(&MldsaExpect::Commit(commit), &[], &nonce, &pin, &sig).is_err());
+        // Правильный commit, но подпись под ЧУЖИМ pin (MITM переиграл привязку) — отказ
+        assert!(verify_server_mldsa(&MldsaExpect::Commit(commit), &pk, &nonce, &[1u8; 32], &sig).is_err());
+        // Pub провижирован, но подпись битая — отказ
+        assert!(verify_server_mldsa(&MldsaExpect::Pub(pk), &[], &nonce, &pin, b"tampered").is_err());
     }
 }

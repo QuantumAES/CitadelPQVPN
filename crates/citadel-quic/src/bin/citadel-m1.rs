@@ -297,13 +297,16 @@ async fn server_assign_address(
             let assign_bytes =
                 capsule::encode_address_assign_v4(&capsule::AssignedV4 { request_id: 1, addr, prefix });
 
-            // M7: ответ = varint(sig_len) ‖ ML-DSA-sig(nonce‖cert_pin) ‖ ADDRESS_ASSIGN.
-            // Без signer'а sig пуст (PQ-auth выключена) — клиент это допускает, если не ждёт pk.
-            let sig = match signer {
-                Some(s) => s.sign_binding(nonce, &cert_pin)?,
-                None => Vec::new(),
+            // M7/§S3: ответ = varint(pub_len)‖ML-DSA-pub ‖ varint(sig_len)‖ML-DSA-sig(nonce‖cert_pin)
+            //         ‖ ADDRESS_ASSIGN. pub прикладывается всегда (commitment-fetch: клиент со ссылки
+            // держит лишь H(pub) и сверяет его с этим pub). Без signer'а pub и sig пусты (PQ-auth выкл).
+            let (pub_bytes, sig) = match signer {
+                Some(s) => (s.public_key(), s.sign_binding(nonce, &cert_pin)?),
+                None => (Vec::new(), Vec::new()),
             };
-            let mut resp = citadel_masque::varint::to_vec(sig.len() as u64);
+            let mut resp = citadel_masque::varint::to_vec(pub_bytes.len() as u64);
+            resp.extend_from_slice(&pub_bytes);
+            resp.extend_from_slice(&citadel_masque::varint::to_vec(sig.len() as u64));
             resp.extend_from_slice(&sig);
             resp.extend_from_slice(&assign_bytes);
             Ok(resp)
