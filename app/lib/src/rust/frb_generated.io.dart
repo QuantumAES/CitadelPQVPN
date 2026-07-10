@@ -3,6 +3,7 @@
 
 // ignore_for_file: unused_import, unused_element, unnecessary_import, duplicate_ignore, invalid_use_of_internal_member, annotate_overrides, non_constant_identifier_names, curly_braces_in_flow_control_structures, prefer_const_literals_to_create_immutables, unused_field
 
+import 'api/admin.dart';
 import 'api/citadel.dart';
 import 'api/diag.dart';
 import 'api/simple.dart';
@@ -49,6 +50,9 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   int dco_decode_i_32(dynamic raw);
 
   @protected
+  PlatformInt64 dco_decode_i_64(dynamic raw);
+
+  @protected
   LinkSummaryDto dco_decode_link_summary_dto(dynamic raw);
 
   @protected
@@ -61,13 +65,22 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   List<ProfileDto> dco_decode_list_profile_dto(dynamic raw);
 
   @protected
+  List<RegistryEntryDto> dco_decode_list_registry_entry_dto(dynamic raw);
+
+  @protected
   String? dco_decode_opt_String(dynamic raw);
 
   @protected
   ProfileDto dco_decode_profile_dto(dynamic raw);
 
   @protected
+  RegistryEntryDto dco_decode_registry_entry_dto(dynamic raw);
+
+  @protected
   TunSetupDto dco_decode_tun_setup_dto(dynamic raw);
+
+  @protected
+  int dco_decode_u_16(dynamic raw);
 
   @protected
   int dco_decode_u_32(dynamic raw);
@@ -112,6 +125,9 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   int sse_decode_i_32(SseDeserializer deserializer);
 
   @protected
+  PlatformInt64 sse_decode_i_64(SseDeserializer deserializer);
+
+  @protected
   LinkSummaryDto sse_decode_link_summary_dto(SseDeserializer deserializer);
 
   @protected
@@ -124,13 +140,24 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   List<ProfileDto> sse_decode_list_profile_dto(SseDeserializer deserializer);
 
   @protected
+  List<RegistryEntryDto> sse_decode_list_registry_entry_dto(
+    SseDeserializer deserializer,
+  );
+
+  @protected
   String? sse_decode_opt_String(SseDeserializer deserializer);
 
   @protected
   ProfileDto sse_decode_profile_dto(SseDeserializer deserializer);
 
   @protected
+  RegistryEntryDto sse_decode_registry_entry_dto(SseDeserializer deserializer);
+
+  @protected
   TunSetupDto sse_decode_tun_setup_dto(SseDeserializer deserializer);
+
+  @protected
+  int sse_decode_u_16(SseDeserializer deserializer);
 
   @protected
   int sse_decode_u_32(SseDeserializer deserializer);
@@ -181,6 +208,9 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   void sse_encode_i_32(int self, SseSerializer serializer);
 
   @protected
+  void sse_encode_i_64(PlatformInt64 self, SseSerializer serializer);
+
+  @protected
   void sse_encode_link_summary_dto(
     LinkSummaryDto self,
     SseSerializer serializer,
@@ -202,13 +232,28 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   );
 
   @protected
+  void sse_encode_list_registry_entry_dto(
+    List<RegistryEntryDto> self,
+    SseSerializer serializer,
+  );
+
+  @protected
   void sse_encode_opt_String(String? self, SseSerializer serializer);
 
   @protected
   void sse_encode_profile_dto(ProfileDto self, SseSerializer serializer);
 
   @protected
+  void sse_encode_registry_entry_dto(
+    RegistryEntryDto self,
+    SseSerializer serializer,
+  );
+
+  @protected
   void sse_encode_tun_setup_dto(TunSetupDto self, SseSerializer serializer);
+
+  @protected
+  void sse_encode_u_16(int self, SseSerializer serializer);
 
   @protected
   void sse_encode_u_32(int self, SseSerializer serializer);

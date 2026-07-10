@@ -254,6 +254,88 @@ impl AdminDeployer {
         .await?;
         Ok(())
     }
+
+    // ─────────────── C5.5/Admin: управление Layer-1 реестром абонентов по SSH ───────────────
+    // Поверх CLI `citadel-token registry …` (C5.5) над томом issuer'а (`<DEPLOY_DIR>/keys` bind-mount
+    // в `/shared` контейнера). Issuer перечитывает реестр на каждый auth ⇒ правки действуют со
+    // следующего коннекта абонента. Аргументы ВАЛИДИРУЮТСЯ (hex64 / шаблон) до подстановки в команду —
+    // `run` не экранирует, поэтому это защита от инъекции в SSH (S1.2).
+
+    fn registry_cmd(sub: &str) -> String {
+        format!("Citadel_TOKEN_DIR={DEPLOY_DIR}/keys {DEPLOY_DIR}/bin/citadel-token registry {sub}")
+    }
+
+    /// Зарегистрировать абонента по `client_id` (Ed25519 pub, 64 hex). `valid_until` —
+    /// `+<N>d`/`+<N>h`/unix-секунды или `None` (дефолт +365d на сервере).
+    pub async fn registry_add(&self, client_id: &str, valid_until: Option<&str>) -> Result<()> {
+        let id = validate_hex64(client_id).context("client_id")?;
+        let vu = validate_valid_until(valid_until)?;
+        let sub = if vu.is_empty() { format!("add {id}") } else { format!("add {id} {vu}") };
+        self.run_checked(&Self::registry_cmd(&sub)).await?;
+        Ok(())
+    }
+
+    /// Отозвать абонента по `client_id` (status=revoked; действует ≤ длины эпохи).
+    pub async fn registry_revoke(&self, client_id: &str) -> Result<()> {
+        let id = validate_hex64(client_id).context("client_id")?;
+        self.run_checked(&Self::registry_cmd(&format!("revoke {id}"))).await?;
+        Ok(())
+    }
+
+    /// Текущий реестр абонентов (для Admin-UI).
+    pub async fn registry_list(&self) -> Result<Vec<RegistryEntry>> {
+        let out = self.run_checked(&Self::registry_cmd("list")).await?;
+        Ok(parse_registry(&out))
+    }
+}
+
+/// Запись Layer-1 реестра для Admin-UI: `client_id` (pub hex), срок (unix), статус.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RegistryEntry {
+    pub client_id: String,
+    pub valid_until: u64,
+    pub status: String,
+}
+
+/// Валидация hex64 (32 байта): только `[0-9a-fA-F]{64}` — не пускаем метасимволы в SSH-команду.
+fn validate_hex64(s: &str) -> Result<String> {
+    let s = s.trim();
+    if s.len() == 64 && s.bytes().all(|b| b.is_ascii_hexdigit()) {
+        Ok(s.to_ascii_lowercase())
+    } else {
+        bail!("ожидался 64-символьный hex (32 байта)")
+    }
+}
+
+/// Валидация `valid_until`: пусто | unix-секунды | `+<N>d` | `+<N>h`. Возвращает безопасную строку
+/// (пусто → CLI подставит дефолт). Анти-инъекция в SSH-команду.
+fn validate_valid_until(v: Option<&str>) -> Result<String> {
+    let Some(v) = v.map(str::trim).filter(|s| !s.is_empty()) else {
+        return Ok(String::new());
+    };
+    let core = v.strip_prefix('+').map(|r| r.strip_suffix(['d', 'h']).unwrap_or(r)).unwrap_or(v);
+    if !core.is_empty() && core.bytes().all(|b| b.is_ascii_digit()) {
+        Ok(v.to_string())
+    } else {
+        bail!("valid_until: unix-секунды | +<N>d | +<N>h")
+    }
+}
+
+/// Разобрать вывод `registry list` (строки `<pub> <valid_until> <status>`); мусорные строки — мимо.
+fn parse_registry(out: &str) -> Vec<RegistryEntry> {
+    out.lines()
+        .filter_map(|line| {
+            let mut it = line.split_whitespace();
+            match (it.next(), it.next(), it.next()) {
+                (Some(id), Some(vu), Some(st)) if id.len() == 64 => Some(RegistryEntry {
+                    client_id: id.to_string(),
+                    valid_until: vu.parse().unwrap_or(0),
+                    status: st.to_string(),
+                }),
+                _ => None,
+            }
+        })
+        .collect()
 }
 
 /// Корень развёртывания на сервере (бинарь, ключи, compose/entrypoints).
@@ -455,6 +537,9 @@ Z4mbJlUf7AUq/VZM9ezNAAAAFGNpdGFkZWwtdGVzdC1ob3N0a2V5AQ==\n\
                 ("# docker installed\n".to_string(), 0)
             } else if cmd.contains("systemctl") || cmd.contains("mkdir") {
                 (String::new(), 0)
+            } else if cmd.contains("registry list") {
+                // эмуляция реестра issuer'а: один active + один revoked
+                (format!("{} 2000000000 active\n{} 1000000000 revoked\n", "a".repeat(64), "b".repeat(64)), 0)
             } else if cmd.contains("--bad") {
                 ("boom\n".to_string(), 2)
             } else {
@@ -623,5 +708,46 @@ Z4mbJlUf7AUq/VZM9ezNAAAAFGNpdGFkZWwtdGVzdC1ob3N0a2V5AQ==\n\
         let a = DeployConfig::with_random_psk().unwrap().obfs_psk;
         let b = DeployConfig::with_random_psk().unwrap().obfs_psk;
         assert_ne!(a, b, "PSK должен быть случайным на каждый деплой");
+    }
+
+    /// C5.5/Admin: add/revoke/list реестра по SSH; невалидный/инъекционный ввод отвергается ДО
+    /// отправки команды (анти-инъекция).
+    #[tokio::test]
+    async fn admin_registry_ops() {
+        let (addr, _) = spawn_server(true).await;
+        let d = connect_admin(&addr).await;
+        let id = "a".repeat(64);
+        // валидный client_id — add/revoke проходят (тест-сервер эмулирует успех)
+        d.registry_add(&id, Some("+30d")).await.unwrap();
+        d.registry_add(&id, None).await.unwrap(); // без срока — дефолт на сервере
+        d.registry_revoke(&id).await.unwrap();
+        // list парсится в записи
+        let e = d.registry_list().await.unwrap();
+        assert_eq!(e.len(), 2);
+        assert_eq!((e[0].status.as_str(), e[0].valid_until), ("active", 2_000_000_000));
+        assert_eq!(e[1].status, "revoked");
+        // инъекция / битый ввод — Err ДО SSH (никакой команды не уходит)
+        assert!(d.registry_add("bad; rm -rf /", None).await.is_err());
+        assert!(d.registry_add(&"a".repeat(63), None).await.is_err()); // не 64
+        assert!(d.registry_add(&id, Some("+30d; evil")).await.is_err()); // инъекция в срок
+        assert!(d.registry_revoke("$(curl evil)").await.is_err());
+        d.close().await.unwrap();
+    }
+
+    #[test]
+    fn registry_input_validation() {
+        assert!(super::validate_hex64(&"A".repeat(64)).is_ok()); // регистр норм → lower
+        assert_eq!(super::validate_hex64(&"A".repeat(64)).unwrap(), "a".repeat(64));
+        assert!(super::validate_hex64("zz").is_err());
+        assert!(super::validate_hex64(&"a".repeat(65)).is_err());
+        assert_eq!(super::validate_valid_until(None).unwrap(), "");
+        assert_eq!(super::validate_valid_until(Some("+30d")).unwrap(), "+30d");
+        assert_eq!(super::validate_valid_until(Some("1700000000")).unwrap(), "1700000000");
+        assert!(super::validate_valid_until(Some("+30d; rm")).is_err());
+        assert!(super::validate_valid_until(Some("soon")).is_err());
+        // парсер реестра отбрасывает мусор и не-64-hex id
+        let parsed = super::parse_registry(&format!("{} 5 active\ngarbage\nshort 1 active\n", "c".repeat(64)));
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(parsed[0].client_id, "c".repeat(64));
     }
 }

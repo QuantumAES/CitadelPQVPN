@@ -9,7 +9,9 @@ import 'package:flutter_rust_bridge/flutter_rust_bridge_for_generated.dart';
 // These functions are ignored because they are not marked as `pub`: `bus`, `load_prev_log_history`, `push_line_mem`, `push_line`, `spawn_stderr_capture`
 // These types are ignored because they are neither used by any `pub` functions nor (for structs and enums) marked `#[frb(unignore)]`: `LogBus`
 
-/// Задать файл персиста лога (Dart зовёт до `start_log_capture`, на Android — `<filesDir>/citadel.log`).
+/// Задать путь файла-персиста лога. NB (S1.4/M8): сам файловый персист по умолчанию ВЫКЛЮЧЕН
+/// (приватность — лог несёт серверы/адреса/время); файл пишется ТОЛЬКО при `Citadel_DEBUG_LOG`,
+/// иначе лог живёт лишь в in-memory ring. Путь задаётся заранее, чтобы дебаг-режим знал, куда писать.
 void setLogFile({required String path}) =>
     RustLib.instance.api.crateApiDiagSetLogFile(path: path);
 

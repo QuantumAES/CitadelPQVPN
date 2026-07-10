@@ -1,8 +1,10 @@
 import 'dart:async';
+import 'dart:io' show Platform;
 
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 
+import 'package:app/admin_registry_page.dart';
 import 'package:app/app_state.dart';
 import 'package:app/debug_panel.dart';
 import 'package:app/src/rust/api/citadel.dart';
@@ -211,6 +213,20 @@ class _HomePageState extends State<HomePage> {
                 Navigator.pop(sheetCtx);
               },
             ),
+            // Admin-режим — десктоп-функция (SSH-управление сервером; на мобилке скрыт).
+            if (!Platform.isAndroid && !Platform.isIOS)
+              ListTile(
+                leading: const Icon(Icons.dns_outlined),
+                title: const Text('Admin: реестр абонентов'),
+                subtitle: const Text('Доступ на развёрнутом сервере (SSH)'),
+                onTap: () {
+                  Navigator.pop(sheetCtx);
+                  Navigator.push(
+                    context,
+                    MaterialPageRoute(builder: (_) => const AdminRegistryPage()),
+                  );
+                },
+              ),
             ListTile(
               leading: const Icon(Icons.info_outline),
               title: const Text('О приложении'),

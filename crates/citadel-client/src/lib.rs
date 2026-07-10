@@ -40,7 +40,7 @@ pub use gui_tun::GuiTunProvider;
 #[cfg(not(any(target_os = "android", target_os = "ios")))]
 pub use deploy::{
     AdminDeployer, CommandOutput, DeployConfig, HostKeyDecision, HostKeyVerifier, MemoryTofu,
-    ServerArch, SshAuth, DEPLOY_DIR,
+    RegistryEntry, ServerArch, SshAuth, DEPLOY_DIR,
 };
 
 /// Версия ядра (about-экран UI / диагностика).

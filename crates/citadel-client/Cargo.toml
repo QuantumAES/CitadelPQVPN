@@ -22,6 +22,11 @@ aws-lc-rs = "1.17"          # vault: PBKDF2-HMAC-SHA256 + AES-256-GCM (то же
 zeroize = "1"               # S1.3/M7: затирание секретов (vault-ключ, plaintext профилей, PSK, seed)
 qrcode = { version = "0.14", default-features = false, features = ["svg"] }  # генерация QR (без image-crate)
 citadel-tun = { path = "../citadel-tun" }   # GuiTunProvider: Tun::from_raw_fd (Linux-desktop)
+# token_agent::fetch_tokens гоняет sync-issuance в spawn_blocking → tokio(rt) нужен на ВСЕХ платформах,
+# включая Android (token_agent зовётся из do_android_establish, C5.4). Desktop-таргет ниже добирает
+# rt-multi-thread+macros союзом фич (для citadel-diag/#[tokio::main]). Без этого android-сборка ломалась
+# «cannot find crate tokio» (латентно с C5.3 — под android не собирали).
+tokio = { version = "1", features = ["rt"] }
 
 # SCM_RIGHTS для GuiTunProvider (Linux-desktop). На Android gui_tun компилируется, но не
 # используется (TUN даёт VpnService) — dep нужен, чтобы frb_generated.rs собрался под android.
