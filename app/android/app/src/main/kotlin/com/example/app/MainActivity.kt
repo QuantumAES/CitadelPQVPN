@@ -30,6 +30,9 @@ class MainActivity : FlutterActivity() {
 
     private var netCallback: ConnectivityManager.NetworkCallback? = null
     private var currentNetworkId: Long = -1L
+    // Была ли уже underlying-сеть: отличает ПЕРВЫЙ onAvailable (туннель поднимается — реконнект не
+    // нужен) от возврата сети после onLost (toggle WiFi — реконнект НУЖЕН).
+    private var hadNetwork: Boolean = false
 
     override fun configureFlutterEngine(flutterEngine: FlutterEngine) {
         super.configureFlutterEngine(flutterEngine)
@@ -102,18 +105,25 @@ class MainActivity : FlutterActivity() {
         val cb = object : ConnectivityManager.NetworkCallback() {
             override fun onAvailable(network: Network) {
                 val id = network.networkHandle
-                val changed = currentNetworkId != -1L && currentNetworkId != id
+                // Реконнект нужен, если сеть сменилась на другую ЛИБО вернулась после потери текущей
+                // (onLost обнулил currentNetworkId в -1). Пропускаем только САМЫЙ первый onAvailable
+                // (hadNetwork=false — туннель и так поднимается над этой сетью). Раньше без hadNetwork
+                // toggle WiFi (onLost→onAvailable) не триггерил реконнект: onLost ставил -1, а
+                // onAvailable трактовал -1 как «первое событие» → туннель висел на мёртвом сокете.
+                val changed = hadNetwork && currentNetworkId != id
                 currentNetworkId = id
+                hadNetwork = true
                 // сказать VPN'у, поверх какой реальной сети он идёт (правильная маршрутизация
                 // protected-сокета движка на новую сеть)
                 CitadelVpnService.instance?.setUnderlyingNetworks(arrayOf(network))
-                // первое событие = текущая сеть (коннект уже над ней) → реконнект не нужен
                 if (changed) {
                     runOnUiThread { channel?.invokeMethod("onNetworkChanged", null) }
                 }
             }
 
             override fun onLost(network: Network) {
+                // Потеряли текущую сеть → -1; следующий onAvailable (даже той же сети с новым handle)
+                // станет "changed" (hadNetwork=true) → форс реконнект. hadNetwork НЕ сбрасываем.
                 if (network.networkHandle == currentNetworkId) currentNetworkId = -1L
             }
         }
@@ -133,6 +143,7 @@ class MainActivity : FlutterActivity() {
         }
         netCallback = null
         currentNetworkId = -1L
+        hadNetwork = false // следующий старт VPN — снова «первый onAvailable», без лишнего реконнекта
     }
 
     @Deprecated("compat: onActivityResult для VpnService.prepare consent")

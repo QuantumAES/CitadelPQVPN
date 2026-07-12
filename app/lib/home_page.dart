@@ -9,6 +9,11 @@ import 'package:app/app_state.dart';
 import 'package:app/debug_panel.dart';
 import 'package:app/src/rust/api/citadel.dart';
 
+/// Версия сборки для экрана «О приложении». Задаётся `--dart-define=CITADEL_VERSION=<tag>` в
+/// mk-client-release.sh (совпадает с тегом релиза, напр. v0.3.0-pre2); для локальных `flutter run`
+/// — 'dev'. Заменяет прежний `ядро v${coreVersion()}` (тот всегда показывал версию крейта 0.1.0).
+const String appVersion = String.fromEnvironment('CITADEL_VERSION', defaultValue: 'dev');
+
 class HomePage extends StatefulWidget {
   const HomePage({super.key, required this.state});
   final AppState state;
@@ -230,7 +235,7 @@ class _HomePageState extends State<HomePage> {
             ListTile(
               leading: const Icon(Icons.info_outline),
               title: const Text('О приложении'),
-              subtitle: Text('Постквантовый VPN · ядро v${coreVersion()}'),
+              subtitle: Text('Постквантовый VPN · $appVersion · ядро v${coreVersion()}'),
             ),
           ],
         ),

@@ -104,7 +104,12 @@ class _MonoLogViewState extends State<MonoLogView> {
   Color? _lineColor(BuildContext context, String l) {
     final cs = Theme.of(context).colorScheme;
     final low = l.toLowerCase();
-    if (low.contains('mitm') ||
+    // Успех (движок явно метит ✔/✓) — зелёный, ПЕРВЫМ: иначе подстрока красит успех в ошибку
+    // (напр. "commitment" содержит "mitm" → строка "PQ-auth ✔ commitment-fetch" краснела).
+    if (low.contains('✔') || low.contains('✓')) {
+      return Colors.green.shade600;
+    }
+    if (low.contains(' mitm') || // с границей слова — "commitment" больше не ложно-красный
         low.contains('ошибка') ||
         low.contains('недоступен') ||
         low.contains('failed') ||
@@ -115,9 +120,6 @@ class _MonoLogViewState extends State<MonoLogView> {
         low.contains('таймаут') ||
         low.contains('false')) {
       return Colors.amber.shade700;
-    }
-    if (low.contains('✔') || low.contains('✓')) {
-      return Colors.green.shade600;
     }
     return null;
   }

@@ -17,7 +17,7 @@ use flutter_rust_bridge::frb;
 use crate::frb_generated::StreamSink;
 
 use citadel_client::{
-    establish_session, run_data_plane, tun_from_fd, ClientConfig, CredentialLink, GuiTunProvider,
+    establish_session, run_data_plane, tun_from_fd, CredentialLink, GuiTunProvider,
     Profile, Session, TunProvider, Vault, VpnController, VpnEvent, VpnState,
 };
 
@@ -416,7 +416,14 @@ pub fn android_run_data_plane(fd: i32, sink: StreamSink<VpnEventDto>) -> Result<
 /// закрывает TUN-fd → интерфейс VpnService гаснет.
 #[frb(sync)]
 pub fn android_disconnect() {
-    if let Some(h) = ANDROID_DP.lock().unwrap().take() {
+    // Диагностика (видно в панели лога — это stderr движка): помогает понять, доходит ли цепочка
+    // смены сети (NetworkCallback → onNetworkChanged → _onNetworkChanged) до аборта data-plane.
+    let had = ANDROID_DP.lock().unwrap().take();
+    eprintln!(
+        "[android] android_disconnect: аборт data-plane ({})",
+        if had.is_some() { "есть активный — реконнект" } else { "нет активного" }
+    );
+    if let Some(h) = had {
         h.abort();
     }
 }
@@ -438,8 +445,9 @@ pub struct DiagLineDto {
     pub detail: String,
 }
 
-/// Собрать `ClientConfig` из сохранённого профиля (по id) или из сырой `citadel://`-ссылки.
-fn cfg_from(profile_id: Option<String>, link: Option<String>) -> Result<ClientConfig> {
+/// Разобрать креды сохранённого профиля (по id) или сырой `citadel://`-ссылки в [`CredentialLink`]
+/// (нужны issuer+client_seed для добычи Layer-1 токена в диагностике, не только `ClientConfig`).
+fn link_from(profile_id: Option<String>, link: Option<String>) -> Result<CredentialLink> {
     let uri = match (profile_id, link) {
         (Some(id), _) => {
             let g = VAULT.lock().unwrap();
@@ -453,7 +461,7 @@ fn cfg_from(profile_id: Option<String>, link: Option<String>) -> Result<ClientCo
         (None, Some(l)) => l,
         (None, None) => return Err(anyhow!("нужен profile_id или link")),
     };
-    Ok(CredentialLink::from_uri(&uri)?.to_client_config())
+    CredentialLink::from_uri(&uri)
 }
 
 /// Прогнать тест-кейсы подключения к exit'у профиля/ссылки, стримя результат по шагам
@@ -464,8 +472,42 @@ pub fn run_diagnostics(
     link: Option<String>,
     sink: StreamSink<DiagLineDto>,
 ) -> Result<()> {
-    let cfg = cfg_from(profile_id, link)?;
+    let dlink = link_from(profile_id, link)?;
+    let cfg = dlink.to_client_config();
+    let issuer = dlink.issuer.clone();
+    let client_seed = dlink.client_seed;
     rt().spawn(async move {
+        // Диагностика идёт тем же путём, что реальный коннект: если креды несут Layer-1
+        // (issuer+client_seed) — ДОБЫВАЕМ epoch-токен, иначе establish к token-required exit всегда
+        // «✗» без токена (хотя exit исправен — ложный негатив). Токен тратится (proba spend'ит его).
+        let cfg = if issuer.is_some() && client_seed.is_some() {
+            match citadel_client::token_agent::with_token(
+                cfg.clone(),
+                issuer.as_deref(),
+                client_seed.as_ref(),
+            )
+            .await
+            {
+                Ok(c) => {
+                    let _ = sink.add(DiagLineDto {
+                        step: "Токен (Layer-1)".into(),
+                        ok: true,
+                        detail: "добыт у issuer (предъявится exit'у)".into(),
+                    });
+                    c
+                }
+                Err(e) => {
+                    let _ = sink.add(DiagLineDto {
+                        step: "Токен (Layer-1)".into(),
+                        ok: false,
+                        detail: format!("не удалось добыть у issuer: {e}"),
+                    });
+                    cfg // без токена — establish покажет отказ token-required exit честно
+                }
+            }
+        } else {
+            cfg
+        };
         citadel_client::run_diagnostics(&cfg, |s| {
             let _ = sink.add(DiagLineDto { step: s.name, ok: s.ok, detail: s.detail });
         })

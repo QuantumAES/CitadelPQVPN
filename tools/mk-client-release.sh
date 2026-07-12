@@ -59,7 +59,7 @@ cargo build --release -p citadel-helper
 
 # ── 2. Linux desktop-бандл (flutter build linux) ──
 echo "[mk-client] flutter build linux --release…"
-( cd "$REPO_ROOT/app" && "$FLUTTER" build linux --release )
+( cd "$REPO_ROOT/app" && "$FLUTTER" build linux --release --dart-define=CITADEL_VERSION="$VERSION" )
 BUNDLE="$REPO_ROOT/app/build/linux/x64/release/bundle"
 [[ -d "$BUNDLE" ]] || die "нет linux-бандла: $BUNDLE"
 
@@ -129,7 +129,7 @@ if [[ "$NO_APK" -eq 1 ]]; then
   echo "[mk-client] --no-apk: сборка APK пропущена (Linux-бандл собран)."
 else
   echo "[mk-client] flutter build apk --release…"
-  ( cd "$REPO_ROOT/app" && "$FLUTTER" build apk --release )
+  ( cd "$REPO_ROOT/app" && "$FLUTTER" build apk --release --dart-define=CITADEL_VERSION="$VERSION" )
   APK="$REPO_ROOT/app/build/app/outputs/flutter-apk/app-release.apk"
   [[ -f "$APK" ]] || die "нет APK: $APK"
   cp "$APK" "$OUT/CitadelPQVPN-$VERSION.apk"
