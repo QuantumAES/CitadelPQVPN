@@ -218,6 +218,18 @@ class _HomePageState extends State<HomePage> {
                 Navigator.pop(sheetCtx);
               },
             ),
+            // Kill-switch — десктоп-функция (реализован Linux-хелпером через firewall).
+            if (!Platform.isAndroid && !Platform.isIOS)
+              SwitchListTile(
+                secondary: const Icon(Icons.shield_outlined),
+                title: const Text('Kill-switch'),
+                subtitle: const Text('Блокировать трафик вне туннеля (fail-closed); с новой сессии'),
+                value: s.killswitch,
+                onChanged: (_) {
+                  s.toggleKillswitch();
+                  Navigator.pop(sheetCtx);
+                },
+              ),
             // Admin-режим — десктоп-функция (SSH-управление сервером; на мобилке скрыт).
             if (!Platform.isAndroid && !Platform.isIOS)
               ListTile(

@@ -67,6 +67,11 @@ impl TunProvider for GuiTunProvider {
         if !p.exit_ips.is_empty() {
             cmd.args(["--exit-ips", &p.exit_ips.join(" ")]);
         }
+        // C6/M9 kill-switch: армируем fail-closed firewall в хелпере (снимется только на чистый
+        // disconnect через сигнал 'Q' от GuiTun::clean_shutdown).
+        if p.killswitch {
+            cmd.arg("--killswitch");
+        }
         let mut child = cmd.spawn().context("запустить pkexec citadel-helper")?;
 
         // ждём подключения хелпера (после polkit-auth); ловим отмену/ошибку pkexec
@@ -78,7 +83,7 @@ impl TunProvider for GuiTunProvider {
         let tun = unsafe { Tun::from_raw_fd(fd) };
         Ok(Arc::new(GuiTun {
             tun,
-            _ctrl: stream,
+            ctrl: stream,
             _child: child,
         }))
     }
@@ -133,7 +138,7 @@ fn recv_fd(stream: &UnixStream) -> Result<i32> {
 /// закрывается → хелпер ловит EOF → сворачивает сеть (адрес/маршруты/DNS).
 struct GuiTun {
     tun: Tun,
-    _ctrl: UnixStream,
+    ctrl: UnixStream,
     _child: Child,
 }
 
@@ -146,6 +151,14 @@ impl TunIo for GuiTun {
     }
     fn raw_fd(&self) -> Option<i32> {
         self.tun.raw_fd()
+    }
+    /// C6/M9: чистый disconnect → шлём хелперу байт 'Q' ПЕРЕД закрытием сокета, чтобы он снял
+    /// kill-switch. Реконнект-разрыв этот метод НЕ зовёт (VpnController) → helper видит EOF без 'Q'
+    /// → KS остаётся (fail-closed в разрыве). Пишем в `&UnixStream` (реализует Write).
+    fn clean_shutdown(&self) {
+        use std::io::Write;
+        let _ = (&self.ctrl).write_all(b"Q");
+        let _ = (&self.ctrl).flush();
     }
 }
 

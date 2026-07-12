@@ -61,6 +61,9 @@ pub struct TunParams {
     /// уходить в туннель при full-tunnel (`0.0.0.0/0`), иначе — петля маршрутизации и egress встаёт.
     /// На Android не используется (там `VpnService.protect()` исключает сокет из туннеля).
     pub exit_ips: Vec<String>,
+    /// C6/M9 kill-switch: провайдер (Linux `citadel-helper`) ставит fail-closed firewall —
+    /// не-туннельный трафик блокируется, пока туннель активен; переживает краш движка.
+    pub killswitch: bool,
 }
 
 /// Платформенный провайдер туннеля: по назначенному адресу строит/конфигурирует TUN и
@@ -206,6 +209,7 @@ impl VpnController {
                 routes: cfg.routes.clone(),
                 dns: cfg.dns.clone(),
                 exit_ips: exit_ips.into_iter().collect(),
+                killswitch: cfg.killswitch,
             };
             let tun = match provider.configure(&params) {
                 Ok(t) => t,
@@ -232,14 +236,19 @@ impl VpnController {
 
             // data-plane крутится до разрыва транспорта ИЛИ до disconnect (тогда future data-plane
             // дропается → транспорт (QUIC/TCP) закрывается при drop, TUN сворачивается).
+            // Клон для сигнала ЧИСТОГО disconnect: на shutdown-ветке зовём clean_shutdown() ДО дропа
+            // (Linux GuiTun шлёт 'Q' → helper снимает kill-switch). На реконнекте не зовём → KS остаётся.
+            let tun_ctrl = tun.clone();
             let r = tokio::select! {
                 r = run_data_plane(session, tun) => r,
                 _ = self.shutdown.notified() => {
                     eprintln!("[vpn] disconnect — закрываю сессию");
+                    tun_ctrl.clean_shutdown();
                     self.set_state(VpnState::Down);
                     return Ok(());
                 }
             };
+            drop(tun_ctrl); // реконнект: закрыть старый TUN/сокет сейчас (helper EOF без 'Q' → KS держится)
             if self.stopped.load(Ordering::SeqCst) {
                 self.set_state(VpnState::Down);
                 return Ok(());

@@ -6,10 +6,18 @@
 import '../frb_generated.dart';
 import 'package:flutter_rust_bridge/flutter_rust_bridge_for_generated.dart';
 
-// These functions are ignored because they are not marked as `pub`: `cfg_from`, `do_android_establish`, `profile_to_dto`, `rt`, `start_connect`, `state_dto`, `to_dto`, `vault_path`
+// These functions are ignored because they are not marked as `pub`: `do_android_establish`, `link_from`, `profile_to_dto`, `rt`, `start_connect`, `state_dto`, `to_dto`, `vault_path`
 
 /// Версия PQ-VPN-ядра (about-экран).
 String coreVersion() => RustLib.instance.api.crateApiCitadelCoreVersion();
+
+/// Включить/выключить kill-switch (GUI-тумблер, desktop). Применяется со СЛЕДУЮЩЕГО подключения.
+void setKillswitch({required bool on_}) =>
+    RustLib.instance.api.crateApiCitadelSetKillswitch(on_: on_);
+
+/// Текущее состояние kill-switch (инициализация тумблера).
+bool killswitchEnabled() =>
+    RustLib.instance.api.crateApiCitadelKillswitchEnabled();
 
 /// Задать каталог данных приложения (вызывается из Dart на старте, до любых vault-операций).
 /// На Android — `getApplicationSupportDirectory()`; на десктопе можно не вызывать. Идемпотентно:

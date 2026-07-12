@@ -125,6 +125,7 @@ impl CredentialBundle {
                 .clone()
                 .map_or(MldsaSource::None, MldsaSource::Bytes),
             allow_insecure_no_pin: false,
+            killswitch: false, // клиентская настройка (GUI-тумблер), не из ссылки/бандла
         }
     }
 }
@@ -282,6 +283,7 @@ impl CredentialLink {
             pin: self.cert_pin.map_or(PinSource::None, PinSource::Bytes),
             mldsa: self.mldsa_commit.map_or(MldsaSource::None, MldsaSource::Commit),
             allow_insecure_no_pin: false,
+            killswitch: false, // клиентская настройка (GUI-тумблер), не из ссылки/бандла
         }
     }
 }

@@ -31,6 +31,16 @@ class AppState extends ChangeNotifier {
     notifyListeners();
   }
 
+  /// C6/M9 kill-switch (desktop): блокировать не-туннельный трафик, пока туннель активен (fail-closed
+  /// при краше движка). Применяется со СЛЕДУЮЩЕГО подключения. Session-level (персист — follow-up).
+  bool killswitch = killswitchEnabled();
+
+  void toggleKillswitch() {
+    killswitch = !killswitch;
+    setKillswitch(on_: killswitch);
+    notifyListeners();
+  }
+
   /// id сохранённого профиля в работе (null — «пробный» коннект ещё-не-сохранённой ссылки).
   String? activeProfileId;
   String exit = '';

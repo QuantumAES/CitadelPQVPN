@@ -96,6 +96,21 @@ static ANDROID_DP: Mutex<Option<tokio::task::AbortHandle>> = Mutex::new(None);
 /// Базовый каталог данных, заданный платформой (Android: app filesDir). На десктопе не ставится —
 /// там путь резолвится из XDG/HOME. Без него на Android cwd=`/` (песочница не writable) и vault не создать.
 static DATA_DIR: OnceLock<PathBuf> = OnceLock::new();
+/// C6/M9 kill-switch (desktop): включён ли. Читается в `start_connect` → `ClientConfig.killswitch`.
+/// GUI-тумблер через [`set_killswitch`]. Пока session-level (персист настройки — follow-up).
+static KILLSWITCH: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Включить/выключить kill-switch (GUI-тумблер, desktop). Применяется со СЛЕДУЮЩЕГО подключения.
+#[frb(sync)]
+pub fn set_killswitch(on: bool) {
+    KILLSWITCH.store(on, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Текущее состояние kill-switch (инициализация тумблера).
+#[frb(sync)]
+pub fn killswitch_enabled() -> bool {
+    KILLSWITCH.load(std::sync::atomic::Ordering::Relaxed)
+}
 
 /// Каталог данных, заданный платформой (Android передаёт filesDir через [`set_data_dir`]).
 /// Если задан — хранилище кладём прямо в него (он уже приватный и writable, без подпапки `.config`).
@@ -256,7 +271,8 @@ fn start_connect(uri: &str, profile_id: Option<String>, sink: StreamSink<VpnEven
     // C5.4b: разбираем ссылку целиком — из неё берём issuer+client_seed для авто-фетча Layer-1
     // токена (симметрично android-пути do_android_establish). `to_client_config` теряет эти поля.
     let link = CredentialLink::from_uri(uri)?;
-    let cfg = link.to_client_config();
+    let mut cfg = link.to_client_config();
+    cfg.killswitch = killswitch_enabled(); // C6/M9: desktop kill-switch по GUI-тумблеру
     let issuer = link.issuer.clone();
     let client_seed = link.client_seed;
     let controller = Arc::new(VpnController::new());

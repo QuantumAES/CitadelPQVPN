@@ -75,6 +75,9 @@ pub struct ClientConfig {
     /// S0.1/H2: разрешить QUIC БЕЗ серт-pin (AcceptAnyServerCert = MITM-открыто). Только
     /// dev/PoC (env `Citadel_INSECURE_NO_PIN=1`); прод — `false` (fail-closed).
     pub allow_insecure_no_pin: bool,
+    /// C6/M9 kill-switch: блокировать не-туннельный трафик, пока туннель активен (fail-closed при
+    /// краше движка). Клиентская настройка (не из ссылки); env `Citadel_KILLSWITCH=1` / GUI-тумблер.
+    pub killswitch: bool,
 }
 
 impl Drop for ClientConfig {
@@ -213,6 +216,9 @@ impl ClientConfig {
             allow_insecure_no_pin: std::env::var("Citadel_INSECURE_NO_PIN")
                 .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
                 .unwrap_or(false),
+            killswitch: std::env::var("Citadel_KILLSWITCH")
+                .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+                .unwrap_or(false),
         })
     }
 
@@ -303,6 +309,7 @@ mod tests {
             pin,
             mldsa: MldsaSource::None,
             allow_insecure_no_pin: false,
+            killswitch: false,
         };
         assert!(matches!(mk(PinSource::None).pin_for("h"), PinMode::NoPin));
         let p = [3u8; 32];
@@ -326,6 +333,7 @@ mod tests {
             pin: PinSource::None,
             mldsa: MldsaSource::Bytes(vec![1, 2, 3]),
             allow_insecure_no_pin: false,
+            killswitch: false,
         };
         assert_eq!(cfg.mldsa_for("any"), Some(vec![1, 2, 3]));
     }

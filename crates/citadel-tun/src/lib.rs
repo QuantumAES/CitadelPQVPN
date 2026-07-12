@@ -30,6 +30,11 @@ pub trait TunIo: Send + Sync + 'static {
     fn raw_fd(&self) -> Option<i32> {
         None
     }
+    /// Сигнал ЧИСТОГО disconnect (пользователь остановил VPN — НЕ реконнект). Реализации с
+    /// привилегированным контроллером (`citadel-helper`) используют это, чтобы снять fail-closed
+    /// kill-switch (C6/M9): реконнект-разрыв сигнал НЕ шлёт → KS держится в разрыве (не утекает).
+    /// По умолчанию — no-op (для TUN на основе fd, VpnService и т.п.).
+    fn clean_shutdown(&self) {}
 }
 
 #[cfg(any(target_os = "linux", target_os = "android"))]
