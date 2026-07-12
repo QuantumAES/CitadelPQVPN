@@ -187,7 +187,8 @@ class _HomePageState extends State<HomePage> {
       context: context,
       showDragHandle: true,
       builder: (sheetCtx) => SafeArea(
-        child: Column(
+        child: SingleChildScrollView( // #6: скролл — в компактном окне все пункты влезают
+          child: Column(
           mainAxisSize: MainAxisSize.min,
           children: [
             if (s.unlocked) ...[
@@ -250,6 +251,7 @@ class _HomePageState extends State<HomePage> {
               subtitle: Text('Постквантовый VPN · $appVersion · ядро v${coreVersion()}'),
             ),
           ],
+        ),
         ),
       ),
     );

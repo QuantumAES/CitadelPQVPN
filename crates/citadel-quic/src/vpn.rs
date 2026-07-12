@@ -75,6 +75,15 @@ pub trait TunProvider: Send + Sync + 'static {
     fn configure(&self, p: &TunParams) -> Result<Arc<dyn TunIo>>;
 }
 
+/// Асинхронный добытчик свежего Layer-1 токена: зовётся перед КАЖДЫМ establish (в т.ч. реконнект),
+/// чтобы не переиспользовать потраченный токен (exit ловит double-spend, M4/M5). `None` из замыкания —
+/// токен не обновляем (token-less exit / нет Layer-1). Ставится приложением ([`VpnController::set_token_refresher`]).
+pub type TokenRefresher = Arc<
+    dyn Fn() -> std::pin::Pin<Box<dyn std::future::Future<Output = Option<Vec<u8>>> + Send>>
+        + Send
+        + Sync,
+>;
+
 /// Высокоуровневый контроллер VPN-сессии. Потокобезопасен; для фонового запуска
 /// держится в `Arc` и `connect` крутится в `tokio::spawn`, а `disconnect` зовётся из UI-потока.
 pub struct VpnController {
@@ -84,6 +93,8 @@ pub struct VpnController {
     /// Пользователь запросил разрыв — глушит авто-реконнект. Persistent-флаг (не только `Notify`)
     /// закрывает гонку: disconnect между итерациями цикла не теряется.
     stopped: AtomicBool,
+    /// Добытчик свежего токена на каждый establish (реконнект-безопасность).
+    token_refresh: Mutex<Option<TokenRefresher>>,
 }
 
 impl Default for VpnController {
@@ -100,7 +111,14 @@ impl VpnController {
             events,
             shutdown: Notify::new(),
             stopped: AtomicBool::new(false),
+            token_refresh: Mutex::new(None),
         }
+    }
+
+    /// Задать добытчик свежего Layer-1 токена (зовётся перед каждым establish). Приложение
+    /// передаёт замыкание с `token_agent`, чтобы реконнект брал НОВЫЙ токен, а не потраченный.
+    pub fn set_token_refresher(&self, f: TokenRefresher) {
+        *self.token_refresh.lock().unwrap() = Some(f);
     }
 
     /// Подписаться на поток событий (несколько подписчиков допустимы).
@@ -148,7 +166,7 @@ impl VpnController {
     /// (WiFi↔LTE/NAT-rebind) прозрачны на уровне QUIC-миграции и сюда не доходят.
     ///
     /// Для фонового запуска — `tokio::spawn` с `Arc<VpnController>`. События — через `subscribe`.
-    pub async fn connect(&self, cfg: ClientConfig, provider: Arc<dyn TunProvider>) -> Result<()> {
+    pub async fn connect(&self, mut cfg: ClientConfig, provider: Arc<dyn TunProvider>) -> Result<()> {
         self.stopped.store(false, Ordering::SeqCst);
         self.set_state(VpnState::Connecting);
         let mut backoff = RECONNECT_BACKOFF_START;
@@ -158,6 +176,17 @@ impl VpnController {
             if self.stopped.load(Ordering::SeqCst) {
                 self.set_state(VpnState::Down);
                 return Ok(());
+            }
+
+            // Свежий Layer-1 токен на КАЖДУЮ попытку establish: реконнект НЕ должен переиспользовать
+            // потраченный токен — exit отвергнет его как double-spend (M4/M5) и порвёт control-стрим.
+            // Недоступен issuer → None → establish покажет отказ token-required exit, цикл ретраит
+            // (само-лечится по восстановлении сети). token-less/без Layer-1 → refresher не задан.
+            let refresher = self.token_refresh.lock().unwrap().clone();
+            if let Some(f) = refresher {
+                if let Some(t) = f().await {
+                    cfg.token = t;
+                }
             }
 
             // ── establish ──

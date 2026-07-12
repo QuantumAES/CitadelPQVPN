@@ -120,7 +120,9 @@ fn is_cidr(s: &str) -> bool {
 }
 
 fn ip(args: &[&str]) {
-    let _ = Command::new("ip").args(args).status();
+    // stderr в null: команды идемпотентны и fire-and-forget (удаление осиротевшего iface/маршрута
+    // на несуществующем — норма); иначе лог засоряется «Cannot find device»/«No such process».
+    let _ = Command::new("ip").args(args).stderr(std::process::Stdio::null()).status();
 }
 
 /// Текущий default-маршрут `(gateway, dev)` ДО подмены туннелем. Нужен для bypass-маршрутов
@@ -134,7 +136,9 @@ fn default_route() -> Option<(String, String)> {
     Some((toks.get(via + 1)?.clone(), toks.get(dev + 1)?.clone()))
 }
 fn iptables(args: &[&str]) {
-    let _ = Command::new("iptables").args(args).status();
+    // stderr в null: idempotent-очистка (напр. teardown_killswitch на несуществующей цепочке при
+    // первом арминге) шумит «Chain does not exist» — это ожидаемо, не ошибка.
+    let _ = Command::new("iptables").args(args).stderr(std::process::Stdio::null()).status();
 }
 
 /// F6: резолвер только через туннель + fail-closed на прочий :53 (анти-leak). Бэкапит resolv.conf.

@@ -97,19 +97,40 @@ static ANDROID_DP: Mutex<Option<tokio::task::AbortHandle>> = Mutex::new(None);
 /// там путь резолвится из XDG/HOME. Без него на Android cwd=`/` (песочница не writable) и vault не создать.
 static DATA_DIR: OnceLock<PathBuf> = OnceLock::new();
 /// C6/M9 kill-switch (desktop): включён ли. Читается в `start_connect` → `ClientConfig.killswitch`.
-/// GUI-тумблер через [`set_killswitch`]. Пока session-level (персист настройки — follow-up).
+/// GUI-тумблер через [`set_killswitch`]; персистится в файл рядом с vault (переживает рестарт).
 static KILLSWITCH: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static KILLSWITCH_LOADED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
-/// Включить/выключить kill-switch (GUI-тумблер, desktop). Применяется со СЛЕДУЮЩЕГО подключения.
-#[frb(sync)]
-pub fn set_killswitch(on: bool) {
-    KILLSWITCH.store(on, std::sync::atomic::Ordering::Relaxed);
+/// Файл персиста настройки kill-switch (рядом с vault: XDG/DATA_DIR).
+fn killswitch_file() -> PathBuf {
+    vault_path().with_file_name("killswitch")
 }
 
-/// Текущее состояние kill-switch (инициализация тумблера).
+/// Включить/выключить kill-switch (GUI-тумблер, desktop). Применяется со СЛЕДУЮЩЕГО подключения;
+/// сохраняется на диск (переживает рестарт приложения).
+#[frb(sync)]
+pub fn set_killswitch(on: bool) {
+    use std::sync::atomic::Ordering::Relaxed;
+    KILLSWITCH.store(on, Relaxed);
+    KILLSWITCH_LOADED.store(true, Relaxed);
+    let f = killswitch_file();
+    if let Some(d) = f.parent() {
+        let _ = std::fs::create_dir_all(d);
+    }
+    let _ = std::fs::write(f, if on { "1" } else { "0" });
+}
+
+/// Текущее состояние kill-switch (инициализация тумблера). Ленивая подгрузка сохранённого значения
+/// при первом обращении — персист между запусками.
 #[frb(sync)]
 pub fn killswitch_enabled() -> bool {
-    KILLSWITCH.load(std::sync::atomic::Ordering::Relaxed)
+    use std::sync::atomic::Ordering::Relaxed;
+    if !KILLSWITCH_LOADED.swap(true, Relaxed) {
+        if let Ok(s) = std::fs::read_to_string(killswitch_file()) {
+            KILLSWITCH.store(s.trim() == "1", Relaxed);
+        }
+    }
+    KILLSWITCH.load(Relaxed)
 }
 
 /// Каталог данных, заданный платформой (Android передаёт filesDir через [`set_data_dir`]).
@@ -273,10 +294,22 @@ fn start_connect(uri: &str, profile_id: Option<String>, sink: StreamSink<VpnEven
     let link = CredentialLink::from_uri(uri)?;
     let mut cfg = link.to_client_config();
     cfg.killswitch = killswitch_enabled(); // C6/M9: desktop kill-switch по GUI-тумблеру
-    let issuer = link.issuer.clone();
-    let client_seed = link.client_seed;
     let controller = Arc::new(VpnController::new());
     *ACTIVE.lock().unwrap() = Some(controller.clone());
+    // Свежий Layer-1 токен на КАЖДЫЙ establish (в т.ч. реконнект): иначе реконнект предъявляет уже
+    // потраченный токен, exit рвёт его как double-spend (M4/M5) → establish «connection lost» в петле.
+    // Заменяет однократный with_token; refresher фетчит и первый токен (перед первым establish).
+    if let (Some(iss), Some(seed)) = (link.issuer.clone(), link.client_seed) {
+        controller.set_token_refresher(Arc::new(move || {
+            let iss = iss.clone();
+            Box::pin(async move {
+                citadel_client::token_agent::fetch_tokens(&iss, &seed, 1, 3)
+                    .await
+                    .ok()
+                    .and_then(|mut v| v.pop())
+            }) as std::pin::Pin<Box<dyn std::future::Future<Output = Option<Vec<u8>>> + Send>>
+        }));
+    }
 
     let mut rx = controller.subscribe();
     rt().spawn(async move {
@@ -297,23 +330,9 @@ fn start_connect(uri: &str, profile_id: Option<String>, sink: StreamSink<VpnEven
 
     let provider: Arc<dyn TunProvider> = Arc::new(GuiTunProvider::default());
     rt().spawn(async move {
-        // Сразу показываем «подключаемся» — фетч токена может занять секунды (issuer-раунд).
+        // Сразу показываем «подключаемся»; токен добывает refresher перед каждым establish (внутри
+        // connect), в т.ч. первый — реконнект берёт свежий, не потраченный.
         controller.begin();
-        // Если ссылка несёт Layer-1 (issuer+client_seed) — добываем epoch-токен ДО коннекта и
-        // вписываем в config.token. Ошибку фетча превращаем в Error+Down (UI не виснет в спиннере).
-        let cfg = match citadel_client::token_agent::with_token(
-            cfg,
-            issuer.as_deref(),
-            client_seed.as_ref(),
-        )
-        .await
-        {
-            Ok(c) => c,
-            Err(e) => {
-                controller.fail(format!("не удалось получить токен доступа: {e}"));
-                return;
-            }
-        };
         let _ = controller.connect(cfg, provider).await;
     });
     Ok(())
