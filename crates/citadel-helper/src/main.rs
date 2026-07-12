@@ -43,8 +43,15 @@ fn parse_args() -> Result<Args> {
     let argv: Vec<String> = std::env::args().collect();
     let mut map = std::collections::HashMap::new();
     let mut i = 1;
-    while i + 1 < argv.len() {
-        map.insert(argv[i].clone(), argv[i + 1].clone());
+    while i < argv.len() {
+        // бинарные флаги без значения (обрабатываются в main через argv-скан) — не ломать парность пар
+        if argv[i] == "--killswitch" || argv[i] == "--disarm-killswitch" {
+            i += 1;
+            continue;
+        }
+        if i + 1 < argv.len() {
+            map.insert(argv[i].clone(), argv[i + 1].clone());
+        }
         i += 2;
     }
     let get = |k: &str| map.get(k).cloned();
@@ -147,8 +154,55 @@ fn teardown_dns(ifn: &str) {
     let _ = std::fs::remove_file(RESOLV_BAK);
 }
 
+/// C6/M9 kill-switch — правила fail-closed firewall (отдельными списками аргументов iptables, чтобы
+/// тестировать генерацию без root). Блокируем ВЕСЬ не-туннельный OUTPUT, кроме: lo, самого туннеля
+/// (`ifn`), зашифрованного пути к exit'ам (`-d <eip>`) и DHCP-аренды. Отдельная цепочка `CITADEL_KS`
+/// с хуком в начало `OUTPUT` — не трогаем чужую политику. RETURN = разрешено (продолжить OUTPUT),
+/// финальный DROP = утечка заблокирована.
+fn killswitch_rules(ifn: &str, exit_ips: &[&str]) -> Vec<Vec<String>> {
+    let a = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+    let mut r = vec![
+        a(&["-N", "CITADEL_KS"]),
+        a(&["-A", "CITADEL_KS", "-o", "lo", "-j", "RETURN"]),
+        a(&["-A", "CITADEL_KS", "-o", ifn, "-j", "RETURN"]),
+    ];
+    for eip in exit_ips {
+        r.push(a(&["-A", "CITADEL_KS", "-d", &format!("{eip}/32"), "-j", "RETURN"]));
+    }
+    // DHCP-аренда (иначе можно потерять IP на физическом линке при full-tunnel)
+    r.push(a(&["-A", "CITADEL_KS", "-p", "udp", "--dport", "67:68", "-j", "RETURN"]));
+    r.push(a(&["-A", "CITADEL_KS", "-j", "DROP"]));
+    r.push(a(&["-I", "OUTPUT", "1", "-j", "CITADEL_KS"]));
+    r
+}
+
+/// Армировать kill-switch: сперва снять осиротевшую цепочку прошлой сессии (idempotent), затем
+/// применить правила.
+fn setup_killswitch(ifn: &str, exit_ips: &[&str]) {
+    teardown_killswitch();
+    for rule in killswitch_rules(ifn, exit_ips) {
+        let args: Vec<&str> = rule.iter().map(String::as_str).collect();
+        iptables(&args);
+    }
+}
+
+/// Снять kill-switch (хук из OUTPUT + цепочка). На ЧИСТЫЙ disconnect или явным `--disarm-killswitch`.
+fn teardown_killswitch() {
+    iptables(&["-D", "OUTPUT", "-j", "CITADEL_KS"]);
+    iptables(&["-F", "CITADEL_KS"]);
+    iptables(&["-X", "CITADEL_KS"]);
+}
+
 fn main() -> Result<()> {
+    // Аварийный режим: снять «залипший» kill-switch (остался fail-closed после краха движка) и выйти.
+    // Escape hatch для юзера, у которого после краха нет интернета (весь не-туннельный OUTPUT в DROP).
+    if std::env::args().any(|a| a == "--disarm-killswitch") {
+        teardown_killswitch();
+        eprintln!("[helper] kill-switch снят (--disarm-killswitch)");
+        return Ok(());
+    }
     let args = parse_args()?;
+    let killswitch = std::env::args().any(|a| a == "--killswitch");
 
     // привилегированная часть: создать TUN + настроить интерфейс (нужен root/CAP_NET_ADMIN).
     // Идемпотентность: снять возможный осиротевший интерфейс от прошлой сессии, иначе
@@ -193,6 +247,11 @@ fn main() -> Result<()> {
     if let Some(dns) = &args.dns {
         setup_dns(&ifn, dns);
     }
+    if killswitch {
+        let eips: Vec<&str> = args.exit_ips.split_whitespace().collect();
+        setup_killswitch(&ifn, &eips);
+        eprintln!("[helper] kill-switch АРМИРОВАН (fail-closed): не-туннельный OUTPUT заблокирован");
+    }
     eprintln!("[helper] TUN '{ifn}' {} up; передаю fd приложению", args.cidr);
 
     // передать fd туннеля непривилегированному приложению (SCM_RIGHTS)
@@ -204,10 +263,17 @@ fn main() -> Result<()> {
 
     // держим привилегии (и tun-fd) до EOF: приложение закрыло сокет = disconnect/выход
     eprintln!("[helper] fd передан; держу сеть до disconnect");
+    // Читаем управляющий сокет до EOF. Чистый disconnect: приложение шлёт байт 'Q' ПЕРЕД закрытием
+    // → снимаем kill-switch. Краш/аварийный разрыв (EOF без 'Q') → kill-switch ОСТАЁТСЯ (fail-closed:
+    // трафик заблокирован, не утекает). Прочий teardown (DNS/bypass/TUN) выполняется всегда.
+    let mut clean = false;
     let mut buf = [0u8; 16];
     while let Ok(n) = stream.read(&mut buf) {
         if n == 0 {
             break; // EOF
+        }
+        if buf[..n].contains(&b'Q') {
+            clean = true;
         }
     }
     if args.dns.is_some() {
@@ -215,6 +281,15 @@ fn main() -> Result<()> {
     }
     for eip in &bypass {
         ip(&["route", "del", &format!("{eip}/32")]);
+    }
+    if killswitch {
+        if clean {
+            teardown_killswitch();
+            eprintln!("[helper] чистый disconnect — kill-switch снят");
+        } else {
+            eprintln!("[helper] АВАРИЙНЫЙ разрыв (без 'Q') — kill-switch ОСТАВЛЕН (fail-closed). \
+                       Снять вручную: pkexec citadel-helper --disarm-killswitch");
+        }
     }
     // TUN-интерфейс исчезает сам, когда приложение закрывает свой (переданный) fd.
     eprintln!("[helper] disconnect — сеть свёрнута, выход");
@@ -263,5 +338,27 @@ mod tests {
         assert_eq!(&got, b"hi");
 
         unsafe { libc::close(r) }; // оригинальный r (приёмник получил dup); wf/rf закроются при drop
+    }
+
+    /// C6/M9: правила kill-switch — форма и fail-closed порядок (DROP ПОСЛЕ всех RETURN; хук в OUTPUT).
+    #[test]
+    fn killswitch_rules_shape() {
+        let r = killswitch_rules("citadel0", &["1.2.3.4", "5.6.7.8"]);
+        fn s(v: &[String]) -> Vec<&str> {
+            v.iter().map(String::as_str).collect()
+        }
+        // цепочка создаётся первой, хук в OUTPUT — последним
+        assert_eq!(s(r.first().unwrap()), vec!["-N", "CITADEL_KS"]);
+        assert_eq!(s(r.last().unwrap()), vec!["-I", "OUTPUT", "1", "-j", "CITADEL_KS"]);
+        // lo + туннель + оба exit'а разрешены (RETURN)
+        assert!(r.iter().any(|x| s(x) == vec!["-A", "CITADEL_KS", "-o", "lo", "-j", "RETURN"]));
+        assert!(r.iter().any(|x| s(x) == vec!["-A", "CITADEL_KS", "-o", "citadel0", "-j", "RETURN"]));
+        let flat: Vec<&str> = r.iter().flatten().map(String::as_str).collect();
+        assert!(flat.contains(&"1.2.3.4/32") && flat.contains(&"5.6.7.8/32"));
+        // fail-closed: финальный DROP идёт ПОСЛЕ всех RETURN (иначе трафик утёк бы)
+        let drop_idx = r.iter().position(|x| x.last().map(String::as_str) == Some("DROP")).unwrap();
+        let last_return =
+            r.iter().rposition(|x| x.last().map(String::as_str) == Some("RETURN")).unwrap();
+        assert!(drop_idx > last_return, "DROP должен быть после всех RETURN (fail-closed)");
     }
 }
