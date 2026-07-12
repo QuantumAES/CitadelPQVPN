@@ -129,12 +129,17 @@ class MainActivity : FlutterActivity() {
                 // сказать VPN'у, поверх какой реальной сети он идёт (правильная маршрутизация
                 // protected-сокета движка на новую сеть)
                 CitadelVpnService.instance?.setUnderlyingNetworks(arrayOf(network))
+                android.util.Log.d(
+                    "CitadelNet",
+                    "onAvailable id=$id changed=$changed channel=${channel != null}"
+                )
                 if (changed) {
                     runOnUiThread { channel?.invokeMethod("onNetworkChanged", null) }
                 }
             }
 
             override fun onLost(network: Network) {
+                android.util.Log.d("CitadelNet", "onLost id=${network.networkHandle} cur=$currentNetworkId")
                 // Потеряли текущую сеть → -1; следующий onAvailable (даже той же сети с новым handle)
                 // станет "changed" (hadNetwork=true) → форс реконнект. hadNetwork НЕ сбрасываем.
                 if (network.networkHandle == currentNetworkId) currentNetworkId = -1L
@@ -143,10 +148,15 @@ class MainActivity : FlutterActivity() {
         netCallback = cb
         try {
             cm.registerNetworkCallback(req, cb)
+            android.util.Log.d("CitadelNet", "NetworkCallback зарегистрирован")
         } catch (e: Exception) {
             netCallback = null
+            android.util.Log.d("CitadelNet", "registerNetworkCallback FAILED: ${e.message}")
         }
     }
+
+    // Dart-обработчик onNetworkChanged (лог для logcat — доходит ли до Dart)
+    // NB: см. также CitadelNet-логи в callback выше.
 
     private fun unregisterNetCallback() {
         val cb = netCallback ?: return

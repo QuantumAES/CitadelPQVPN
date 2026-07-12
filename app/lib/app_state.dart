@@ -70,6 +70,7 @@ class AppState extends ChangeNotifier {
   /// мёртв → абортим data-plane, и цикл [_androidConnect] переустановит сессию над новой сетью
   /// (быстрый реконнект, не ждём QUIC idle-timeout). Игнор, если пользователь отключил VPN.
   void _onNetworkChanged() {
+    debugPrint('[CitadelNet] _onNetworkChanged phase=$phase stopped=$_userStopped');
     if (_userStopped) return;
     if (phase == VpnPhase.up || phase == VpnPhase.connecting) {
       androidDisconnect(); // аборт data-plane → _androidRunDataPlane завершится → реконнект
