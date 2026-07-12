@@ -193,14 +193,13 @@ impl VpnController {
             let session = match establish_session(&cfg).await {
                 Ok(s) => s,
                 Err(e) => {
-                    if !ever_up {
-                        // первичный коннект — показываем ошибку и выходим (не крутим ретраи)
-                        self.emit(VpnEvent::Error(e.to_string()));
-                        self.set_state(VpnState::Down);
-                        return Err(e);
-                    }
-                    eprintln!("[vpn] реконнект: establish не удался: {e} — ретрай через {:?}", backoff);
-                    self.set_state(VpnState::Migrating);
+                    // Ретраим ВСЕГДА, в т.ч. ПЕРВЫЙ коннект: сеть/issuer могли быть недоступны на
+                    // старте (подключились до появления сети) — по восстановлении следующая попытка
+                    // возьмёт свежий токен и поднимется. Причину показываем (Error), но не сдаёмся до
+                    // disconnect (стандартное поведение VPN «connecting…»). Пользователь остановит сам.
+                    self.emit(VpnEvent::Error(e.to_string()));
+                    eprintln!("[vpn] establish не удался: {e} — ретрай через {:?}", backoff);
+                    self.set_state(if ever_up { VpnState::Migrating } else { VpnState::Connecting });
                     if self.sleep_or_stop(backoff).await {
                         self.set_state(VpnState::Down);
                         return Ok(());

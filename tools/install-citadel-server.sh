@@ -34,6 +34,7 @@ SERVER_HOST="${CITADEL_SERVER_HOST:-}"       # публичный host/IP для
 UDP_PORT="${CITADEL_UDP_PORT:-4433}"
 TCP_PORT="${CITADEL_TCP_PORT:-443}"
 ROUTES="${CITADEL_ROUTES:-0.0.0.0/0}"        # что гнать в туннель (full-tunnel по умолчанию)
+DNS="${CITADEL_DNS:-1.1.1.1}"                # DNS, проталкиваемый клиенту (через туннель; анти-leak F6)
 DIR="${CITADEL_DIR:-/opt/citadel}"
 ISSUER_ON="${CITADEL_ISSUER:-1}"             # 1 = двухслойная идентичность (issuer+токены+ML-DSA); 0 = token-less
 ISSUER_PORT="${CITADEL_ISSUER_PORT:-7000}"   # публичный порт издателя (клиент фетчит токены сюда)
@@ -286,7 +287,7 @@ fi
 [[ -n "$SERVER_HOST" ]] || die "не удалось определить публичный IP — задай CITADEL_SERVER_HOST=<ip/host>"
 
 LINKARGS=(--servers "$SERVER_HOST:$UDP_PORT" --psk "$PSK" --pin "$PIN"
-          --kx pq --tcp-port "$TCP_PORT" --routes "$ROUTES" "${MLDSA_ARGS[@]}")
+          --kx pq --tcp-port "$TCP_PORT" --routes "$ROUTES" --dns "$DNS" "${MLDSA_ARGS[@]}")
 if [[ "$ISSUER_ON" == 1 ]]; then
   # Layer-1: клиент авто-фетчит epoch-токен у издателя перед коннектом (issuer host:port + seed).
   LINKARGS+=(--issuer "$SERVER_HOST:$ISSUER_PORT" --client-seed "$CLIENT_SEED")

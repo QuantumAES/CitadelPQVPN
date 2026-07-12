@@ -116,7 +116,7 @@ impl CredentialBundle {
             kx_suite: self.kx_suite.clone(),
             tcp_port: self.tcp_port.clone().unwrap_or_else(|| "443".into()),
             routes: self.routes.clone(),
-            dns: self.dns.clone(),
+            dns: default_tunnel_dns(self.dns.clone(), &self.routes),
             mtu: "1280".into(),
             token: Vec::new(),
             pin: self.cert_pin.map_or(PinSource::None, PinSource::Bytes),
@@ -132,6 +132,19 @@ impl CredentialBundle {
 
 /// Префикс компактной ссылки.
 const URI_PREFIX: &str = "citadel://";
+
+/// Full-tunnel (`0.0.0.0/0`) требует ТУННЕЛЬНЫЙ DNS: без явного DNS системный резолвер (часто
+/// локальный роутер) при kill-switch блокируется (запрос уходит мимо туннеля → KS DROP) ИЛИ утекает
+/// мимо VPN (F6). Если DNS не задан и маршрут full-tunnel — дефолтим на `1.1.1.1` (пойдёт через
+/// citadel0). Split-tunnel не трогаем (там локальный DNS уместен).
+fn default_tunnel_dns(dns: Option<String>, routes: &str) -> Option<String> {
+    dns.or_else(|| {
+        routes
+            .split_whitespace()
+            .any(|r| r == "0.0.0.0/0")
+            .then(|| "1.1.1.1".to_string())
+    })
+}
 
 /// SHA-256 — обязательство к публичному ключу.
 fn sha256(data: &[u8]) -> [u8; 32] {
@@ -277,7 +290,7 @@ impl CredentialLink {
             kx_suite: self.kx_suite.clone(),
             tcp_port: self.tcp_port.clone().unwrap_or_else(|| "443".into()),
             routes: self.routes.clone(),
-            dns: self.dns.clone(),
+            dns: default_tunnel_dns(self.dns.clone(), &self.routes),
             mtu: "1280".into(),
             token: Vec::new(),
             pin: self.cert_pin.map_or(PinSource::None, PinSource::Bytes),
@@ -390,6 +403,16 @@ mod tests {
     #[test]
     fn from_uri_rejects_bad_prefix() {
         assert!(CredentialLink::from_uri("https://evil/x").is_err());
+    }
+
+    /// Full-tunnel без явного DNS → дефолт туннельного 1.1.1.1 (анти-leak F6 + KS не блокирует
+    /// резолв); явный DNS сохраняется; split-tunnel не трогаем.
+    #[test]
+    fn tunnel_dns_default_for_full_tunnel() {
+        assert_eq!(default_tunnel_dns(None, "1.1.1.1/32 0.0.0.0/0"), Some("1.1.1.1".into()));
+        assert_eq!(default_tunnel_dns(Some("9.9.9.9".into()), "0.0.0.0/0"), Some("9.9.9.9".into()));
+        assert_eq!(default_tunnel_dns(None, "10.0.0.0/8"), None);
+        assert_eq!(default_tunnel_dns(None, ""), None);
     }
 
     /// C5.4b installer-контракт Layer-1: hex-seed из install-скрипта → linkgen(`parse_pin`) →
