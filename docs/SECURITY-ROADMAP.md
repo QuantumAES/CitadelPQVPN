@@ -76,6 +76,7 @@ Security-пуш на 40+ юнит + 15 docker-тестов без страхов
 ### S2 — Свёрнуто в клиентский трек (уже запланировано)
 - **C5 (идентичность)** = продакшенизация auth: двухслойные epoch-токены + issuer-registry (закрывает **M5** per-user + **M6** persistent double-spend); завести токены+ML-DSA в installer.
 - **C6 (упаковка)** = fail-closed kill-switch (desktop-firewall + Android `setBlocking`/always-on, закрывает **M9**) + нотаризация + **Argon2id** для vault (L1).
+  - **Известное ограничение (2026-07-12, боевой тест APK):** реконнект при смене сети (toggle WiFi) работает только на **переднем плане**. Причина — детект-сети (NetworkCallback) и цикл реконнекта привязаны к Activity/Flutter-движку; при уходе app в фон (а именно так пользователь переключает WiFi) Activity гасится → событие сети теряется, движок не крутит ретраи, и передний план это не восстанавливает (событие уже прошло). Фикс архитектурный и входит в C6 «always-on»: увести детект-сети + реконнект (и сам движок) в **нативный `CitadelVpnService`** (переживает смерть Activity) либо в фоновый Flutter-isolate. Тестируется только на устройстве. Первый Dart-driven срез (2026-07-05) закрывает foreground-случай.
 
 ### S3 — Сверка доков с кодом (непрерывно)
 По мере фиксов приводить в соответствие claims: SPEC (QUIC-in-TCP, anti-replay, KX-policy), PHASE0 (векторы), creds (SPKI-pin vs blake3-DER), THREAT-MODEL (статусы S4/E1/kill-switch), CLIENT-ARCH.

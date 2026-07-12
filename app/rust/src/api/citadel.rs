@@ -405,7 +405,13 @@ pub fn android_run_data_plane(fd: i32, sink: StreamSink<VpnEventDto>) -> Result<
     // SAFETY: fd получен от VpnService.establish() (detachFd) — владеем им единолично.
     let tun = unsafe { tun_from_fd(fd) };
     let h = rt().spawn(async move {
-        let _ = run_data_plane(session, tun).await;
+        // Лог в панель (stderr движка): показывает, ЗАВЕРШИЛСЯ ли data-plane сам (транспорт
+        // детектировал мёртвое соединение — тогда цикл реконнектит) или молчит (стоит). При аборте
+        // (android_disconnect) эта ветка не выполняется — задача снята, что и отличает разрыв от стопа.
+        match run_data_plane(session, tun).await {
+            Ok(()) => eprintln!("[android] data-plane завершился штатно → реконнект"),
+            Err(e) => eprintln!("[android] data-plane упал: {e} → реконнект"),
+        }
         let _ = sink.add(state_dto("down"));
     });
     *ANDROID_DP.lock().unwrap() = Some(h.abort_handle());
