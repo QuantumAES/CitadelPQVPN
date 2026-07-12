@@ -18,6 +18,9 @@ class _AdminRegistryPageState extends State<AdminRegistryPage> {
   final _port = TextEditingController(text: '22');
   final _user = TextEditingController(text: 'root');
   final _pass = TextEditingController();
+  final _keyPath = TextEditingController();
+  final _keyPass = TextEditingController();
+  bool _useKey = false; // авторизация приватным ключом вместо пароля
 
   List<RegistryEntryDto>? _entries;
   bool _busy = false;
@@ -25,11 +28,23 @@ class _AdminRegistryPageState extends State<AdminRegistryPage> {
 
   int get _portNum => int.tryParse(_port.text.trim()) ?? 22;
   bool get _connReady =>
-      _host.text.trim().isNotEmpty && _user.text.trim().isNotEmpty && _pass.text.isNotEmpty;
+      _host.text.trim().isNotEmpty &&
+      _user.text.trim().isNotEmpty &&
+      (_useKey ? _keyPath.text.trim().isNotEmpty : _pass.text.isNotEmpty);
+
+  /// Параметры подключения для ядра (пароль или ключ по [_useKey]).
+  AdminConn get _conn => AdminConn(
+        host: _host.text.trim(),
+        port: _portNum,
+        user: _user.text.trim(),
+        password: _useKey ? '' : _pass.text,
+        keyPath: _useKey ? _keyPath.text.trim() : '',
+        keyPassphrase: _useKey ? _keyPass.text : '',
+      );
 
   @override
   void dispose() {
-    for (final c in [_host, _port, _user, _pass]) {
+    for (final c in [_host, _port, _user, _pass, _keyPath, _keyPass]) {
       c.dispose();
     }
     super.dispose();
@@ -56,12 +71,7 @@ class _AdminRegistryPageState extends State<AdminRegistryPage> {
   }
 
   Future<void> _refresh() async {
-    final list = await _run(() => adminRegistryList(
-          host: _host.text.trim(),
-          port: _portNum,
-          user: _user.text.trim(),
-          password: _pass.text,
-        ));
+    final list = await _run(() => adminRegistryList(conn: _conn));
     if (list != null && mounted) setState(() => _entries = list);
   }
 
@@ -73,13 +83,7 @@ class _AdminRegistryPageState extends State<AdminRegistryPage> {
     );
     if (ok != true) return;
     await _run(
-      () => adminRegistryRevoke(
-        host: _host.text.trim(),
-        port: _portNum,
-        user: _user.text.trim(),
-        password: _pass.text,
-        clientId: e.clientId,
-      ),
+      () => adminRegistryRevoke(conn: _conn, clientId: e.clientId),
       okMsg: 'Абонент отозван',
     );
     await _refresh();
@@ -129,10 +133,7 @@ class _AdminRegistryPageState extends State<AdminRegistryPage> {
     if (added != true) return;
     await _run(
       () => adminRegistryAdd(
-        host: _host.text.trim(),
-        port: _portNum,
-        user: _user.text.trim(),
-        password: _pass.text,
+        conn: _conn,
         clientId: idC.text.trim(),
         validUntil: vuC.text.trim(),
       ),
@@ -238,13 +239,37 @@ class _AdminRegistryPageState extends State<AdminRegistryPage> {
             onChanged: (_) => setState(() {}),
             decoration: const InputDecoration(labelText: 'Пользователь SSH'),
           ),
-          TextField(
-            controller: _pass,
-            obscureText: true,
-            onChanged: (_) => setState(() {}),
-            onSubmitted: (_) => _connReady ? _refresh() : null,
-            decoration: const InputDecoration(labelText: 'Пароль SSH'),
+          SwitchListTile(
+            contentPadding: EdgeInsets.zero,
+            title: const Text('Авторизация ключом'),
+            subtitle: const Text('приватным SSH-ключом вместо пароля'),
+            value: _useKey,
+            onChanged: (v) => setState(() => _useKey = v),
           ),
+          if (!_useKey)
+            TextField(
+              controller: _pass,
+              obscureText: true,
+              onChanged: (_) => setState(() {}),
+              onSubmitted: (_) => _connReady ? _refresh() : null,
+              decoration: const InputDecoration(labelText: 'Пароль SSH'),
+            )
+          else ...[
+            TextField(
+              controller: _keyPath,
+              onChanged: (_) => setState(() {}),
+              decoration: const InputDecoration(
+                labelText: 'Путь к приватному ключу',
+                hintText: '~/.ssh/id_ed25519',
+              ),
+            ),
+            TextField(
+              controller: _keyPass,
+              obscureText: true,
+              onSubmitted: (_) => _connReady ? _refresh() : null,
+              decoration: const InputDecoration(labelText: 'Passphrase ключа (если есть)'),
+            ),
+          ],
           const SizedBox(height: 12),
           Align(
             alignment: Alignment.centerRight,
@@ -257,8 +282,8 @@ class _AdminRegistryPageState extends State<AdminRegistryPage> {
           const Padding(
             padding: EdgeInsets.only(top: 8),
             child: Text(
-              'Пароль хранится только в памяти этого экрана. Host-key принимается при первом '
-              'подключении (TOFU).',
+              'Пароль/passphrase — только в памяти экрана; ключ читается ядром из файла. '
+              'Host-key принимается при первом подключении (TOFU).',
               style: TextStyle(fontSize: 12),
             ),
           ),

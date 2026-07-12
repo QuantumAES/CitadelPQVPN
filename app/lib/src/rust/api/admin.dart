@@ -7,50 +7,76 @@ import '../frb_generated.dart';
 import 'package:flutter_rust_bridge/flutter_rust_bridge_for_generated.dart';
 
 /// Список абонентов реестра развёрнутого сервера (SSH → `citadel-token registry list`).
-Future<List<RegistryEntryDto>> adminRegistryList({
-  required String host,
-  required int port,
-  required String user,
-  required String password,
-}) => RustLib.instance.api.crateApiAdminAdminRegistryList(
-  host: host,
-  port: port,
-  user: user,
-  password: password,
-);
+Future<List<RegistryEntryDto>> adminRegistryList({required AdminConn conn}) =>
+    RustLib.instance.api.crateApiAdminAdminRegistryList(conn: conn);
 
 /// Зарегистрировать абонента. `client_id` — Ed25519 pub (64 hex). `valid_until` — `+<N>d`/`+<N>h`/
 /// unix-секунды или пусто (дефолт +365d на сервере). Ввод валидируется в ядре (анти-инъекция).
 Future<void> adminRegistryAdd({
-  required String host,
-  required int port,
-  required String user,
-  required String password,
+  required AdminConn conn,
   required String clientId,
   required String validUntil,
 }) => RustLib.instance.api.crateApiAdminAdminRegistryAdd(
-  host: host,
-  port: port,
-  user: user,
-  password: password,
+  conn: conn,
   clientId: clientId,
   validUntil: validUntil,
 );
 
 /// Отозвать абонента по `client_id` (status=revoked; действует ≤ длины эпохи).
 Future<void> adminRegistryRevoke({
-  required String host,
-  required int port,
-  required String user,
-  required String password,
+  required AdminConn conn,
   required String clientId,
 }) => RustLib.instance.api.crateApiAdminAdminRegistryRevoke(
-  host: host,
-  port: port,
-  user: user,
-  password: password,
+  conn: conn,
   clientId: clientId,
 );
+
+/// Параметры SSH-подключения к серверу для Admin-операций.
+class AdminConn {
+  final String host;
+  final int port;
+  final String user;
+
+  /// Пароль (используется, если `key_path` пуст).
+  final String password;
+
+  /// Путь к приватному SSH-ключу (OpenSSH-PEM). Не пуст → key-auth вместо пароля. Ключ читается
+  /// в ядре, в Dart не передаётся.
+  final String keyPath;
+
+  /// Passphrase ключа (пусто → без passphrase).
+  final String keyPassphrase;
+
+  const AdminConn({
+    required this.host,
+    required this.port,
+    required this.user,
+    required this.password,
+    required this.keyPath,
+    required this.keyPassphrase,
+  });
+
+  @override
+  int get hashCode =>
+      host.hashCode ^
+      port.hashCode ^
+      user.hashCode ^
+      password.hashCode ^
+      keyPath.hashCode ^
+      keyPassphrase.hashCode;
+
+  @override
+  bool operator ==(Object other) =>
+      identical(this, other) ||
+      other is AdminConn &&
+          runtimeType == other.runtimeType &&
+          host == other.host &&
+          port == other.port &&
+          user == other.user &&
+          password == other.password &&
+          keyPath == other.keyPath &&
+          keyPassphrase == other.keyPassphrase;
+}
 
 /// Запись Layer-1 реестра для Admin-UI.
 class RegistryEntryDto {

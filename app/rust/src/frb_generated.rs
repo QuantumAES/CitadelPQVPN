@@ -68,10 +68,7 @@ fn wire__crate__api__admin__admin_registry_add_impl(
             };
             let mut deserializer =
                 flutter_rust_bridge::for_generated::SseDeserializer::new(message);
-            let api_host = <String>::sse_decode(&mut deserializer);
-            let api_port = <u16>::sse_decode(&mut deserializer);
-            let api_user = <String>::sse_decode(&mut deserializer);
-            let api_password = <String>::sse_decode(&mut deserializer);
+            let api_conn = <crate::api::admin::AdminConn>::sse_decode(&mut deserializer);
             let api_client_id = <String>::sse_decode(&mut deserializer);
             let api_valid_until = <String>::sse_decode(&mut deserializer);
             deserializer.end();
@@ -79,10 +76,7 @@ fn wire__crate__api__admin__admin_registry_add_impl(
                 transform_result_sse::<_, flutter_rust_bridge::for_generated::anyhow::Error>(
                     (move || async move {
                         let output_ok = crate::api::admin::admin_registry_add(
-                            api_host,
-                            api_port,
-                            api_user,
-                            api_password,
+                            api_conn,
                             api_client_id,
                             api_valid_until,
                         )
@@ -117,21 +111,12 @@ fn wire__crate__api__admin__admin_registry_list_impl(
             };
             let mut deserializer =
                 flutter_rust_bridge::for_generated::SseDeserializer::new(message);
-            let api_host = <String>::sse_decode(&mut deserializer);
-            let api_port = <u16>::sse_decode(&mut deserializer);
-            let api_user = <String>::sse_decode(&mut deserializer);
-            let api_password = <String>::sse_decode(&mut deserializer);
+            let api_conn = <crate::api::admin::AdminConn>::sse_decode(&mut deserializer);
             deserializer.end();
             move |context| async move {
                 transform_result_sse::<_, flutter_rust_bridge::for_generated::anyhow::Error>(
                     (move || async move {
-                        let output_ok = crate::api::admin::admin_registry_list(
-                            api_host,
-                            api_port,
-                            api_user,
-                            api_password,
-                        )
-                        .await?;
+                        let output_ok = crate::api::admin::admin_registry_list(api_conn).await?;
                         Ok(output_ok)
                     })()
                     .await,
@@ -162,23 +147,15 @@ fn wire__crate__api__admin__admin_registry_revoke_impl(
             };
             let mut deserializer =
                 flutter_rust_bridge::for_generated::SseDeserializer::new(message);
-            let api_host = <String>::sse_decode(&mut deserializer);
-            let api_port = <u16>::sse_decode(&mut deserializer);
-            let api_user = <String>::sse_decode(&mut deserializer);
-            let api_password = <String>::sse_decode(&mut deserializer);
+            let api_conn = <crate::api::admin::AdminConn>::sse_decode(&mut deserializer);
             let api_client_id = <String>::sse_decode(&mut deserializer);
             deserializer.end();
             move |context| async move {
                 transform_result_sse::<_, flutter_rust_bridge::for_generated::anyhow::Error>(
                     (move || async move {
-                        let output_ok = crate::api::admin::admin_registry_revoke(
-                            api_host,
-                            api_port,
-                            api_user,
-                            api_password,
-                            api_client_id,
-                        )
-                        .await?;
+                        let output_ok =
+                            crate::api::admin::admin_registry_revoke(api_conn, api_client_id)
+                                .await?;
                         Ok(output_ok)
                     })()
                     .await,
@@ -1234,6 +1211,26 @@ impl SseDecode for String {
     }
 }
 
+impl SseDecode for crate::api::admin::AdminConn {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    fn sse_decode(deserializer: &mut flutter_rust_bridge::for_generated::SseDeserializer) -> Self {
+        let mut var_host = <String>::sse_decode(deserializer);
+        let mut var_port = <u16>::sse_decode(deserializer);
+        let mut var_user = <String>::sse_decode(deserializer);
+        let mut var_password = <String>::sse_decode(deserializer);
+        let mut var_keyPath = <String>::sse_decode(deserializer);
+        let mut var_keyPassphrase = <String>::sse_decode(deserializer);
+        return crate::api::admin::AdminConn {
+            host: var_host,
+            port: var_port,
+            user: var_user,
+            password: var_password,
+            key_path: var_keyPath,
+            key_passphrase: var_keyPassphrase,
+        };
+    }
+}
+
 impl SseDecode for bool {
     // Codec=Sse (Serialization based), see doc to use other codecs
     fn sse_decode(deserializer: &mut flutter_rust_bridge::for_generated::SseDeserializer) -> Self {
@@ -1538,6 +1535,28 @@ fn pde_ffi_dispatcher_sync_impl(
 // Section: rust2dart
 
 // Codec=Dco (DartCObject based), see doc to use other codecs
+impl flutter_rust_bridge::IntoDart for crate::api::admin::AdminConn {
+    fn into_dart(self) -> flutter_rust_bridge::for_generated::DartAbi {
+        [
+            self.host.into_into_dart().into_dart(),
+            self.port.into_into_dart().into_dart(),
+            self.user.into_into_dart().into_dart(),
+            self.password.into_into_dart().into_dart(),
+            self.key_path.into_into_dart().into_dart(),
+            self.key_passphrase.into_into_dart().into_dart(),
+        ]
+        .into_dart()
+    }
+}
+impl flutter_rust_bridge::for_generated::IntoDartExceptPrimitive for crate::api::admin::AdminConn {}
+impl flutter_rust_bridge::IntoIntoDart<crate::api::admin::AdminConn>
+    for crate::api::admin::AdminConn
+{
+    fn into_into_dart(self) -> crate::api::admin::AdminConn {
+        self
+    }
+}
+// Codec=Dco (DartCObject based), see doc to use other codecs
 impl flutter_rust_bridge::IntoDart for crate::api::citadel::DiagLineDto {
     fn into_dart(self) -> flutter_rust_bridge::for_generated::DartAbi {
         [
@@ -1722,6 +1741,18 @@ impl SseEncode for String {
     // Codec=Sse (Serialization based), see doc to use other codecs
     fn sse_encode(self, serializer: &mut flutter_rust_bridge::for_generated::SseSerializer) {
         <Vec<u8>>::sse_encode(self.into_bytes(), serializer);
+    }
+}
+
+impl SseEncode for crate::api::admin::AdminConn {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    fn sse_encode(self, serializer: &mut flutter_rust_bridge::for_generated::SseSerializer) {
+        <String>::sse_encode(self.host, serializer);
+        <u16>::sse_encode(self.port, serializer);
+        <String>::sse_encode(self.user, serializer);
+        <String>::sse_encode(self.password, serializer);
+        <String>::sse_encode(self.key_path, serializer);
+        <String>::sse_encode(self.key_passphrase, serializer);
     }
 }
 

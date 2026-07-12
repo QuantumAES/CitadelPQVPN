@@ -41,7 +41,13 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   String dco_decode_String(dynamic raw);
 
   @protected
+  AdminConn dco_decode_admin_conn(dynamic raw);
+
+  @protected
   bool dco_decode_bool(dynamic raw);
+
+  @protected
+  AdminConn dco_decode_box_autoadd_admin_conn(dynamic raw);
 
   @protected
   DiagLineDto dco_decode_diag_line_dto(dynamic raw);
@@ -116,7 +122,13 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   String sse_decode_String(SseDeserializer deserializer);
 
   @protected
+  AdminConn sse_decode_admin_conn(SseDeserializer deserializer);
+
+  @protected
   bool sse_decode_bool(SseDeserializer deserializer);
+
+  @protected
+  AdminConn sse_decode_box_autoadd_admin_conn(SseDeserializer deserializer);
 
   @protected
   DiagLineDto sse_decode_diag_line_dto(SseDeserializer deserializer);
@@ -199,7 +211,16 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   void sse_encode_String(String self, SseSerializer serializer);
 
   @protected
+  void sse_encode_admin_conn(AdminConn self, SseSerializer serializer);
+
+  @protected
   void sse_encode_bool(bool self, SseSerializer serializer);
+
+  @protected
+  void sse_encode_box_autoadd_admin_conn(
+    AdminConn self,
+    SseSerializer serializer,
+  );
 
   @protected
   void sse_encode_diag_line_dto(DiagLineDto self, SseSerializer serializer);

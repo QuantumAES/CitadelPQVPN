@@ -82,26 +82,17 @@ class RustLib extends BaseEntrypoint<RustLibApi, RustLibApiImpl, RustLibWire> {
 
 abstract class RustLibApi extends BaseApi {
   Future<void> crateApiAdminAdminRegistryAdd({
-    required String host,
-    required int port,
-    required String user,
-    required String password,
+    required AdminConn conn,
     required String clientId,
     required String validUntil,
   });
 
   Future<List<RegistryEntryDto>> crateApiAdminAdminRegistryList({
-    required String host,
-    required int port,
-    required String user,
-    required String password,
+    required AdminConn conn,
   });
 
   Future<void> crateApiAdminAdminRegistryRevoke({
-    required String host,
-    required int port,
-    required String user,
-    required String password,
+    required AdminConn conn,
     required String clientId,
   });
 
@@ -187,10 +178,7 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
 
   @override
   Future<void> crateApiAdminAdminRegistryAdd({
-    required String host,
-    required int port,
-    required String user,
-    required String password,
+    required AdminConn conn,
     required String clientId,
     required String validUntil,
   }) {
@@ -198,10 +186,7 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
       NormalTask(
         callFfi: (port_) {
           final serializer = SseSerializer(generalizedFrbRustBinding);
-          sse_encode_String(host, serializer);
-          sse_encode_u_16(port, serializer);
-          sse_encode_String(user, serializer);
-          sse_encode_String(password, serializer);
+          sse_encode_box_autoadd_admin_conn(conn, serializer);
           sse_encode_String(clientId, serializer);
           sse_encode_String(validUntil, serializer);
           pdeCallFfi(
@@ -216,7 +201,7 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
           decodeErrorData: sse_decode_AnyhowException,
         ),
         constMeta: kCrateApiAdminAdminRegistryAddConstMeta,
-        argValues: [host, port, user, password, clientId, validUntil],
+        argValues: [conn, clientId, validUntil],
         apiImpl: this,
       ),
     );
@@ -225,31 +210,18 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
   TaskConstMeta get kCrateApiAdminAdminRegistryAddConstMeta =>
       const TaskConstMeta(
         debugName: "admin_registry_add",
-        argNames: [
-          "host",
-          "port",
-          "user",
-          "password",
-          "clientId",
-          "validUntil",
-        ],
+        argNames: ["conn", "clientId", "validUntil"],
       );
 
   @override
   Future<List<RegistryEntryDto>> crateApiAdminAdminRegistryList({
-    required String host,
-    required int port,
-    required String user,
-    required String password,
+    required AdminConn conn,
   }) {
     return handler.executeNormal(
       NormalTask(
         callFfi: (port_) {
           final serializer = SseSerializer(generalizedFrbRustBinding);
-          sse_encode_String(host, serializer);
-          sse_encode_u_16(port, serializer);
-          sse_encode_String(user, serializer);
-          sse_encode_String(password, serializer);
+          sse_encode_box_autoadd_admin_conn(conn, serializer);
           pdeCallFfi(
             generalizedFrbRustBinding,
             serializer,
@@ -262,34 +234,25 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
           decodeErrorData: sse_decode_AnyhowException,
         ),
         constMeta: kCrateApiAdminAdminRegistryListConstMeta,
-        argValues: [host, port, user, password],
+        argValues: [conn],
         apiImpl: this,
       ),
     );
   }
 
   TaskConstMeta get kCrateApiAdminAdminRegistryListConstMeta =>
-      const TaskConstMeta(
-        debugName: "admin_registry_list",
-        argNames: ["host", "port", "user", "password"],
-      );
+      const TaskConstMeta(debugName: "admin_registry_list", argNames: ["conn"]);
 
   @override
   Future<void> crateApiAdminAdminRegistryRevoke({
-    required String host,
-    required int port,
-    required String user,
-    required String password,
+    required AdminConn conn,
     required String clientId,
   }) {
     return handler.executeNormal(
       NormalTask(
         callFfi: (port_) {
           final serializer = SseSerializer(generalizedFrbRustBinding);
-          sse_encode_String(host, serializer);
-          sse_encode_u_16(port, serializer);
-          sse_encode_String(user, serializer);
-          sse_encode_String(password, serializer);
+          sse_encode_box_autoadd_admin_conn(conn, serializer);
           sse_encode_String(clientId, serializer);
           pdeCallFfi(
             generalizedFrbRustBinding,
@@ -303,7 +266,7 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
           decodeErrorData: sse_decode_AnyhowException,
         ),
         constMeta: kCrateApiAdminAdminRegistryRevokeConstMeta,
-        argValues: [host, port, user, password, clientId],
+        argValues: [conn, clientId],
         apiImpl: this,
       ),
     );
@@ -312,7 +275,7 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
   TaskConstMeta get kCrateApiAdminAdminRegistryRevokeConstMeta =>
       const TaskConstMeta(
         debugName: "admin_registry_revoke",
-        argNames: ["host", "port", "user", "password", "clientId"],
+        argNames: ["conn", "clientId"],
       );
 
   @override
@@ -1140,9 +1103,31 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
   }
 
   @protected
+  AdminConn dco_decode_admin_conn(dynamic raw) {
+    // Codec=Dco (DartCObject based), see doc to use other codecs
+    final arr = raw as List<dynamic>;
+    if (arr.length != 6)
+      throw Exception('unexpected arr length: expect 6 but see ${arr.length}');
+    return AdminConn(
+      host: dco_decode_String(arr[0]),
+      port: dco_decode_u_16(arr[1]),
+      user: dco_decode_String(arr[2]),
+      password: dco_decode_String(arr[3]),
+      keyPath: dco_decode_String(arr[4]),
+      keyPassphrase: dco_decode_String(arr[5]),
+    );
+  }
+
+  @protected
   bool dco_decode_bool(dynamic raw) {
     // Codec=Dco (DartCObject based), see doc to use other codecs
     return raw as bool;
+  }
+
+  @protected
+  AdminConn dco_decode_box_autoadd_admin_conn(dynamic raw) {
+    // Codec=Dco (DartCObject based), see doc to use other codecs
+    return dco_decode_admin_conn(raw);
   }
 
   @protected
@@ -1344,9 +1329,34 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
   }
 
   @protected
+  AdminConn sse_decode_admin_conn(SseDeserializer deserializer) {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    var var_host = sse_decode_String(deserializer);
+    var var_port = sse_decode_u_16(deserializer);
+    var var_user = sse_decode_String(deserializer);
+    var var_password = sse_decode_String(deserializer);
+    var var_keyPath = sse_decode_String(deserializer);
+    var var_keyPassphrase = sse_decode_String(deserializer);
+    return AdminConn(
+      host: var_host,
+      port: var_port,
+      user: var_user,
+      password: var_password,
+      keyPath: var_keyPath,
+      keyPassphrase: var_keyPassphrase,
+    );
+  }
+
+  @protected
   bool sse_decode_bool(SseDeserializer deserializer) {
     // Codec=Sse (Serialization based), see doc to use other codecs
     return deserializer.buffer.getUint8() != 0;
+  }
+
+  @protected
+  AdminConn sse_decode_box_autoadd_admin_conn(SseDeserializer deserializer) {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    return (sse_decode_admin_conn(deserializer));
   }
 
   @protected
@@ -1613,9 +1623,29 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
   }
 
   @protected
+  void sse_encode_admin_conn(AdminConn self, SseSerializer serializer) {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    sse_encode_String(self.host, serializer);
+    sse_encode_u_16(self.port, serializer);
+    sse_encode_String(self.user, serializer);
+    sse_encode_String(self.password, serializer);
+    sse_encode_String(self.keyPath, serializer);
+    sse_encode_String(self.keyPassphrase, serializer);
+  }
+
+  @protected
   void sse_encode_bool(bool self, SseSerializer serializer) {
     // Codec=Sse (Serialization based), see doc to use other codecs
     serializer.buffer.putUint8(self ? 1 : 0);
+  }
+
+  @protected
+  void sse_encode_box_autoadd_admin_conn(
+    AdminConn self,
+    SseSerializer serializer,
+  ) {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    sse_encode_admin_conn(self, serializer);
   }
 
   @protected
