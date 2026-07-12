@@ -47,4 +47,8 @@ class AndroidVpn {
   }
 
   static Future<void> stopService() => _ch.invokeMethod('stopService');
+
+  /// Открыть системные настройки VPN (там включается always-on + «блокировать без VPN» —
+  /// Android kill-switch, C6). Приложение не может форсить его само.
+  static Future<void> openVpnSettings() => _ch.invokeMethod('openVpnSettings');
 }

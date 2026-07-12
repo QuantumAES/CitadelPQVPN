@@ -87,6 +87,19 @@ class MainActivity : FlutterActivity() {
                     CitadelVpnService.instance?.stopTun()
                     result.success(true)
                 }
+                "openVpnSettings" -> {
+                    // C6 Android kill-switch = СИСТЕМНЫЙ always-on + «блокировать без VPN» (lockdown).
+                    // Приложение не может форсить его (iptables-аналога у VpnService нет), но ведёт сюда.
+                    try {
+                        startActivity(
+                            Intent("android.settings.VPN_SETTINGS")
+                                .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                        )
+                        result.success(true)
+                    } catch (e: Exception) {
+                        result.success(false)
+                    }
+                }
                 else -> result.notImplemented()
             }
         }

@@ -5,6 +5,7 @@ import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 
 import 'package:app/admin_registry_page.dart';
+import 'package:app/android_vpn.dart';
 import 'package:app/app_state.dart';
 import 'package:app/debug_panel.dart';
 import 'package:app/src/rust/api/citadel.dart';
@@ -219,7 +220,8 @@ class _HomePageState extends State<HomePage> {
                 Navigator.pop(sheetCtx);
               },
             ),
-            // Kill-switch — десктоп-функция (реализован Linux-хелпером через firewall).
+            // Kill-switch — на десктопе тумблер (Linux-хелпер через firewall); на Android это
+            // СИСТЕМНЫЙ always-on+lockdown (приложение не может форсить), поэтому — гайд в настройки.
             if (!Platform.isAndroid && !Platform.isIOS)
               SwitchListTile(
                 secondary: const Icon(Icons.shield_outlined),
@@ -229,6 +231,16 @@ class _HomePageState extends State<HomePage> {
                 onChanged: (_) {
                   s.toggleKillswitch();
                   Navigator.pop(sheetCtx);
+                },
+              ),
+            if (Platform.isAndroid)
+              ListTile(
+                leading: const Icon(Icons.shield_outlined),
+                title: const Text('Kill-switch (always-on)'),
+                subtitle: const Text('Настроить в системных настройках VPN'),
+                onTap: () {
+                  Navigator.pop(sheetCtx);
+                  _showAlwaysOnGuide();
                 },
               ),
             // Admin-режим — десктоп-функция (SSH-управление сервером; на мобилке скрыт).
@@ -255,6 +267,30 @@ class _HomePageState extends State<HomePage> {
         ),
       ),
     );
+  }
+
+  /// Android kill-switch = системный always-on+lockdown: объясняем и ведём в настройки VPN.
+  Future<void> _showAlwaysOnGuide() async {
+    final ok = await showDialog<bool>(
+      context: context,
+      builder: (dctx) => AlertDialog(
+        title: const Text('Kill-switch (always-on)'),
+        content: const Text(
+          'На Android блокировку трафика мимо VPN включает система, не приложение.\n\n'
+          'В системных настройках VPN включи для CitadelPQVPN:\n'
+          '• Постоянный VPN (Always-on VPN)\n'
+          '• Блокировать соединения без VPN',
+        ),
+        actions: [
+          TextButton(onPressed: () => Navigator.pop(dctx, false), child: const Text('Закрыть')),
+          FilledButton(
+            onPressed: () => Navigator.pop(dctx, true),
+            child: const Text('Открыть настройки'),
+          ),
+        ],
+      ),
+    );
+    if (ok == true) await AndroidVpn.openVpnSettings();
   }
 
   Future<void> _changePassword() async {
