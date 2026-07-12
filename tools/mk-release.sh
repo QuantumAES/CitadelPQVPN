@@ -19,6 +19,10 @@ set -euo pipefail
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$REPO_ROOT"
 
+# aws-lc-rs требует cmake; на dev-хосте он в .venv (pip). Делаем сборку самодостаточной (как
+# run-demo.sh): если .venv есть — первой в PATH (иначе системный/flutter cmake может конфликтовать).
+[ -d "$REPO_ROOT/.venv/bin" ] && export PATH="$REPO_ROOT/.venv/bin:$PATH"
+
 VERSION="${1:-$(git describe --tags --always --dirty 2>/dev/null || echo dev)}"
 SEC="${CITADEL_RELEASE_KEY_DIR:-$HOME/.citadel/release}/citadel-release.key"
 PUB="${CITADEL_RELEASE_PUB:-$REPO_ROOT/packaging/release/citadel-release.pub}"

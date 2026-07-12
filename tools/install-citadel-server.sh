@@ -99,7 +99,11 @@ work="$(mktemp -d)"; trap 'rm -rf "$work"' EXIT
 )
 log "подпись и хеши OK — распаковываю"
 mkdir -p "$DIR/bin" "$DIR/keys" "$DIR/etc"
-chmod 700 "$DIR/keys"
+# 711 (не 700!): exit сбрасывает привилегии до nobody (F4) и per-auth ЧИТАЕТ публичные issuer-<epoch>.pub
+# из этого каталога. При 700 nobody не может войти в каталог → чтение падает → verify_token видит
+# пустой список ключей → ВСЕ токены «невалидны» (тихо, docker-демо это не ловит — named volume там 0755).
+# 711 даёт traverse без листинга; секреты (obfs.psk/client.seed) остаются 600 и nobody недоступны.
+chmod 711 "$DIR/keys"
 for name in citadel-m1 citadel-linkgen citadel-token; do
   zstd -q -d -f "$work/$name-$ARCH.zst" -o "$DIR/bin/$name"
   chmod +x "$DIR/bin/$name"
