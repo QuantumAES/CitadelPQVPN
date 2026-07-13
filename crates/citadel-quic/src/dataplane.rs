@@ -143,6 +143,19 @@ impl Inbound {
     }
 }
 
+/// Окно pump-watchdog и минимум отправленных датаграмм в окне, при котором «0 принятых»
+/// трактуется как мёртвый путь. Окно > keep-alive-интервала (5с), чтобы здоровый простой и
+/// одиночные потери не срабатывали; порог tx отсекает простой (мало шлём — путь не трогаем).
+const WATCHDOG_INTERVAL: std::time::Duration = std::time::Duration::from_secs(8);
+const WATCHDOG_TX_MIN: u64 = 12;
+
+/// Решение watchdog по дельте счётчиков датаграмм за окно: путь считаем мёртвым, если за окно
+/// отправлено ≥ порога, а принято 0 (шлём под нагрузкой, но обратно НИЧЕГО — MTU-чёрная-дыра или
+/// NAT-rebind после смены сети; quinn idle-timeout это НЕ ловит, т.к. keep-alive проходит).
+fn watchdog_trips(sent: u64, recvd: u64) -> bool {
+    sent >= WATCHDOG_TX_MIN && recvd == 0
+}
+
 /// Двунаправленная перекачка TUN ⇄ транспорт (QUIC DATAGRAM либо obfs-TCP record).
 /// `egress = Some(назначенный клиенту адрес)` включает egress-политику exit: анти-спуфинг
 /// inner-src (S0.2/H3), default-deny не-IPv4 и F2 (дроп во внутренние/служебные сети); `None`
@@ -156,10 +169,16 @@ pub async fn pump(
     egress: Option<[u8; 4]>,
     rate_limit: Option<RateCfg>,
 ) -> Result<()> {
-    use std::sync::atomic::AtomicBool;
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
     use tokio::sync::mpsc;
     let (tun_to_net_tx, mut tun_to_net_rx) = mpsc::channel::<Vec<u8>>(1024);
     let (net_to_tun_tx, mut net_to_tun_rx) = mpsc::channel::<Vec<u8>>(1024);
+
+    // Watchdog-счётчики датаграмм: tx — успешно отправленных в транспорт, rx — принятых из него.
+    // По дельте за окно (см. watchdog-задачу ниже) ловим односторонне мёртвый data-path, который
+    // quinn idle-timeout не ловит (keep-alive проходит → соединение «живо», а датаграммы теряются).
+    let tx_count = Arc::new(AtomicU64::new(0));
+    let rx_count = Arc::new(AtomicU64::new(0));
 
     // Сигнал остановки reader-потока TUN. Ставится при отмене pump (disconnect: future
     // дропается → CancelGuard) ИЛИ при закрытии транспорта (receiver-задача). Без него
@@ -204,21 +223,28 @@ pub async fn pump(
     // здесь была вторая ветка «голого» obfs-TCP datagram-протокола; теперь TCP несёт тот же QUIC.
     let Tunnel { conn, .. } = tunnel;
     let send_conn = conn.clone();
+    let send_tx = tx_count.clone();
     let sender = tokio::spawn(async move {
         while let Some(pkt) = tun_to_net_rx.recv().await {
             let dg = datagram::encode(datagram::CTX_RAW_IP, &pkt);
-            if let Err(e) = send_conn.send_datagram(bytes::Bytes::from(dg)) {
-                eprintln!("[pump] датаграмма отброшена ({} б): {e}", pkt.len());
+            match send_conn.send_datagram(bytes::Bytes::from(dg)) {
+                Ok(()) => {
+                    send_tx.fetch_add(1, Ordering::Relaxed);
+                }
+                Err(e) => eprintln!("[pump] датаграмма отброшена ({} б): {e}", pkt.len()),
             }
         }
     });
     let recv_conn = conn.clone();
     let recv_stop = stop.clone();
+    let recv_rx = rx_count.clone();
     let receiver = tokio::spawn(async move {
         let mut inb = Inbound::new(egress, rate_limit);
         loop {
             match recv_conn.read_datagram().await {
                 Ok(dg) => {
+                    // любой принятый датаграм = обратный путь жив (для watchdog); фильтр — дальше
+                    recv_rx.fetch_add(1, Ordering::Relaxed);
                     if let Some((datagram::CTX_RAW_IP, pkt)) = datagram::decode(&dg) {
                         if inb.accept(pkt) && net_to_tun_tx.send(pkt.to_vec()).await.is_err() {
                             break;
@@ -235,9 +261,46 @@ pub async fn pump(
         // pump ждётся до конца — иначе reader-поток зависал бы в recv на общем TUN).
         recv_stop.store(true, std::sync::atomic::Ordering::Release);
     });
+
+    // pump-watchdog: если за окно отправили ≥ порога датаграмм, а приняли 0 — путь односторонне
+    // мёртв (MTU-чёрная-дыра/NAT-rebind после смены сети): quinn idle-timeout молчит (keep-alive
+    // проходит), read_datagram висел бы вечно → pump не завершается → реконнекта нет. Закрываем
+    // conn → receiver ловит Err → pump выходит → цикл реконнекта (Android) / VpnController (desktop)
+    // поднимает сессию над живым путём. На живом пути под нагрузкой rx растёт → не срабатывает;
+    // на простое tx мал → не срабатывает.
+    let wd_conn = conn.clone();
+    let wd_tx = tx_count.clone();
+    let wd_rx = rx_count.clone();
+    let wd_stop = stop.clone();
+    let watchdog = tokio::spawn(async move {
+        let (mut seen_tx, mut seen_rx) = (0u64, 0u64);
+        loop {
+            tokio::time::sleep(WATCHDOG_INTERVAL).await;
+            if wd_stop.load(Ordering::Acquire) {
+                break;
+            }
+            let (tx, rx) = (wd_tx.load(Ordering::Relaxed), wd_rx.load(Ordering::Relaxed));
+            let (sent, recvd) = (tx.wrapping_sub(seen_tx), rx.wrapping_sub(seen_rx));
+            seen_tx = tx;
+            seen_rx = rx;
+            if watchdog_trips(sent, recvd) {
+                eprintln!(
+                    "[pump] watchdog: {sent} датаграмм отправлено, 0 принято за {}с — путь мёртв, рву транспорт",
+                    WATCHDOG_INTERVAL.as_secs()
+                );
+                wd_conn.close(0u32.into(), b"citadel: data-path watchdog");
+                break;
+            }
+        }
+    });
+
     let _guard = CancelGuard {
         stop,
-        aborts: vec![sender.abort_handle(), receiver.abort_handle()],
+        aborts: vec![
+            sender.abort_handle(),
+            receiver.abort_handle(),
+            watchdog.abort_handle(),
+        ],
     };
     let _ = tokio::try_join!(sender, receiver);
     Ok(())
@@ -336,5 +399,16 @@ mod tests {
         // клиентский режим: фильтра нет — пропускаем даже «спуфнутый» и приватный
         let mut client = Inbound::new(None, None);
         assert!(client.accept(&ipv4([9, 9, 9, 9], [10, 0, 0, 1])));
+    }
+
+    /// pump-watchdog: рвём путь только если под нагрузкой (tx ≥ порога) обратно 0 датаграмм.
+    /// Хоть один принятый — путь жив; мало отправленных — это простой, не трогаем.
+    #[test]
+    fn watchdog_trips_only_on_dead_path_under_load() {
+        assert!(watchdog_trips(WATCHDOG_TX_MIN, 0), "ровно порог tx, 0 принято — путь мёртв");
+        assert!(watchdog_trips(WATCHDOG_TX_MIN + 500, 0), "много шлём, 0 принято — путь мёртв");
+        assert!(!watchdog_trips(WATCHDOG_TX_MIN, 1), "хоть 1 принят — путь жив");
+        assert!(!watchdog_trips(WATCHDOG_TX_MIN - 1, 0), "мало отправили (простой) — не трогаем");
+        assert!(!watchdog_trips(0, 0), "полный простой — не трогаем");
     }
 }
