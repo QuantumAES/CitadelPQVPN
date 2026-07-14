@@ -90,6 +90,12 @@ pub struct VpnController {
     state: Mutex<VpnState>,
     events: broadcast::Sender<VpnEvent>,
     shutdown: Notify,
+    /// Сигнал «сменилась underlying-сеть» (Android NetworkCallback): будит connect-loop оборвать
+    /// текущий pump и НЕМЕДЛЕННО переустановить сессию над новой сетью — не ждать pump-watchdog
+    /// (~8с) / QUIC idle-timeout. В отличие от [`shutdown`] — НЕ персистентный флаг: пропущенный
+    /// сигнал (пришёл вне `select!`, напр. в фазе establish) безвреден, т.к. следующий establish и
+    /// так идёт над новой сетью (`setUnderlyingNetworks` уже применён нативно).
+    network_changed: Notify,
     /// Пользователь запросил разрыв — глушит авто-реконнект. Persistent-флаг (не только `Notify`)
     /// закрывает гонку: disconnect между итерациями цикла не теряется.
     stopped: AtomicBool,
@@ -110,6 +116,7 @@ impl VpnController {
             state: Mutex::new(VpnState::Idle),
             events,
             shutdown: Notify::new(),
+            network_changed: Notify::new(),
             stopped: AtomicBool::new(false),
             token_refresh: Mutex::new(None),
         }
@@ -267,6 +274,7 @@ impl VpnController {
             // Клон для сигнала ЧИСТОГО disconnect: на shutdown-ветке зовём clean_shutdown() ДО дропа
             // (Linux GuiTun шлёт 'Q' → helper снимает kill-switch). На реконнекте не зовём → KS остаётся.
             let tun_ctrl = tun.clone();
+            let mut net_changed = false;
             let r = tokio::select! {
                 r = run_data_plane(session, tun) => r,
                 _ = self.shutdown.notified() => {
@@ -274,6 +282,14 @@ impl VpnController {
                     tun_ctrl.clean_shutdown();
                     self.set_state(VpnState::Down);
                     return Ok(());
+                }
+                _ = self.network_changed.notified() => {
+                    // Смена сети (Android): путь над старой сетью, скорее всего, мёртв — рвём pump и
+                    // реконнектимся над новой СРАЗУ, не дожидаясь pump-watchdog / QUIC idle-timeout.
+                    // Не глушит авто-реконнект (в отличие от disconnect): loop идёт на следующую итерацию.
+                    eprintln!("[vpn] смена сети — переустанавливаю сессию над новой сетью");
+                    net_changed = true;
+                    Ok(())
                 }
             };
             drop(tun_ctrl); // реконнект: закрыть старый TUN/сокет сейчас (helper EOF без 'Q' → KS держится)
@@ -283,16 +299,24 @@ impl VpnController {
             }
 
             // Транспорт упал сам (не пользователь) → авто-реконнект.
-            match r {
-                Ok(()) => eprintln!("[vpn] транспорт закрылся — восстанавливаю соединение"),
-                Err(e) => eprintln!("[vpn] data-plane упал: {e} — восстанавливаю соединение"),
+            if !net_changed {
+                match r {
+                    Ok(()) => eprintln!("[vpn] транспорт закрылся — восстанавливаю соединение"),
+                    Err(e) => eprintln!("[vpn] data-plane упал: {e} — восстанавливаю соединение"),
+                }
             }
             self.set_state(VpnState::Migrating);
-            if self.sleep_or_stop(backoff).await {
-                self.set_state(VpnState::Down);
-                return Ok(());
+            // Смена сети → реконнект немедленный (новая сеть уже поднята) — сбрасываем backoff и НЕ
+            // спим. Иначе — прогрессивный backoff между попытками (сеть/exit могут быть ещё недоступны).
+            if net_changed {
+                backoff = RECONNECT_BACKOFF_START;
+            } else {
+                if self.sleep_or_stop(backoff).await {
+                    self.set_state(VpnState::Down);
+                    return Ok(());
+                }
+                backoff = next_backoff(backoff);
             }
-            backoff = next_backoff(backoff);
         }
     }
 
@@ -313,6 +337,14 @@ impl VpnController {
     pub fn disconnect(&self) {
         self.stopped.store(true, Ordering::SeqCst);
         self.shutdown.notify_waiters();
+    }
+
+    /// Сигнал «сменилась underlying-сеть» (Android NetworkCallback: WiFi↔LTE/toggle): оборвать
+    /// текущий pump и немедленно переустановить сессию над новой сетью. НЕ глушит авто-реконнект
+    /// (в отличие от [`disconnect`]). Безопасно в любом состоянии: если активного pump нет,
+    /// `notify_waiters` не запоминает сигнал — следующий establish и так пойдёт над новой сетью.
+    pub fn notify_network_changed(&self) {
+        self.network_changed.notify_waiters();
     }
 }
 
@@ -358,6 +390,15 @@ mod tests {
     fn disconnect_when_idle_is_safe() {
         let c = VpnController::new();
         c.disconnect(); // не паникует, no-op без активной сессии
+        assert_eq!(c.state(), VpnState::Idle);
+    }
+
+    #[test]
+    fn notify_network_changed_when_idle_is_safe() {
+        let c = VpnController::new();
+        // Нет активного pump → notify_waiters без ждущих: сигнал не запоминается, не паникует,
+        // состояние не трогает (реконнект инициирует только connect-loop, если он крутится).
+        c.notify_network_changed();
         assert_eq!(c.state(), VpnState::Idle);
     }
 

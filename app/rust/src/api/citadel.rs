@@ -17,8 +17,8 @@ use flutter_rust_bridge::frb;
 use crate::frb_generated::StreamSink;
 
 use citadel_client::{
-    establish_session, run_data_plane, tun_from_fd, CredentialLink, GuiTunProvider,
-    Profile, Session, TunProvider, Vault, VpnController, VpnEvent, VpnState,
+    CredentialLink, GuiTunProvider, Profile, TunIo, TunParams, TunProvider, Vault, VpnController,
+    VpnEvent, VpnState,
 };
 
 /// Версия PQ-VPN-ядра (about-экран).
@@ -65,17 +65,6 @@ pub struct LinkSummaryDto {
     pub has_obfs: bool,
 }
 
-/// Параметры назначенного туннеля для Android `VpnService.Builder` (фаза 1 → фаза 2).
-pub struct TunSetupDto {
-    pub addr: String,
-    pub prefix: u32,
-    pub mtu: String,
-    pub routes: String,
-    pub dns: String,
-    pub exit: String,
-    pub transport: String,
-}
-
 // ───────────────────────────── глобальное состояние ─────────────────────────────
 
 static RT: OnceLock<tokio::runtime::Runtime> = OnceLock::new();
@@ -89,10 +78,6 @@ fn rt() -> &'static tokio::runtime::Runtime {
 }
 static ACTIVE: Mutex<Option<Arc<VpnController>>> = Mutex::new(None);
 static VAULT: Mutex<Option<Vault>> = Mutex::new(None);
-/// Установленная сессия (сеть готова, TUN ещё нет) между фазами Android-подключения.
-static ANDROID_SESSION: Mutex<Option<Session>> = Mutex::new(None);
-/// Хэндл задачи Android data-plane — для остановки (abort → pump сворачивается, fd закрывается).
-static ANDROID_DP: Mutex<Option<tokio::task::AbortHandle>> = Mutex::new(None);
 /// Базовый каталог данных, заданный платформой (Android: app filesDir). На десктопе не ставится —
 /// там путь резолвится из XDG/HOME. Без него на Android cwd=`/` (песочница не writable) и vault не создать.
 static DATA_DIR: OnceLock<PathBuf> = OnceLock::new();
@@ -286,14 +271,23 @@ fn to_dto(ev: VpnEvent) -> VpnEventDto {
     d
 }
 
-/// Общий старт сессии. `profile_id` — если коннект по сохранённому профилю (тогда на событии
-/// Connected обновляем его `last_exit` в vault).
-fn start_connect(uri: &str, profile_id: Option<String>, sink: StreamSink<VpnEventDto>) -> Result<()> {
+/// Ядро запуска нативной сессии (общее для desktop и Android). Создаёт `VpnController`, ставит
+/// token-refresher (свежий Layer-1 токен на КАЖДЫЙ establish — анти-double-spend на реконнекте),
+/// форвардит события в `sink` (+ отмечает `last_exit` профиля) и крутит `connect`-loop на rt() с
+/// платформенным `provider`. Реконнект/backoff держит сам нативный loop → он переживает смерть
+/// UI-изолята (Android: сессия жива, пока `CitadelVpnService` активен, даже при закрытом окне — C6).
+/// `profile_id` — коннект по сохранённому профилю (тогда на Connected обновляем его `last_exit`).
+fn start_session_with_provider(
+    uri: &str,
+    profile_id: Option<String>,
+    provider: Arc<dyn TunProvider>,
+    sink: StreamSink<VpnEventDto>,
+) -> Result<()> {
     // C5.4b: разбираем ссылку целиком — из неё берём issuer+client_seed для авто-фетча Layer-1
-    // токена (симметрично android-пути do_android_establish). `to_client_config` теряет эти поля.
+    // токена. `to_client_config` теряет эти поля.
     let link = CredentialLink::from_uri(uri)?;
     let mut cfg = link.to_client_config();
-    cfg.killswitch = killswitch_enabled(); // C6/M9: desktop kill-switch по GUI-тумблеру
+    cfg.killswitch = killswitch_enabled(); // C6/M9: kill-switch по GUI-тумблеру (desktop; Android — OS-level)
     let controller = Arc::new(VpnController::new());
     *ACTIVE.lock().unwrap() = Some(controller.clone());
     // Свежий Layer-1 токен на КАЖДЫЙ establish (в т.ч. реконнект): иначе реконнект предъявляет уже
@@ -328,7 +322,6 @@ fn start_connect(uri: &str, profile_id: Option<String>, sink: StreamSink<VpnEven
         }
     });
 
-    let provider: Arc<dyn TunProvider> = Arc::new(GuiTunProvider::default());
     rt().spawn(async move {
         // Сразу показываем «подключаемся»; токен добывает refresher перед каждым establish (внутри
         // connect), в т.ч. первый — реконнект берёт свежий, не потраченный.
@@ -336,6 +329,12 @@ fn start_connect(uri: &str, profile_id: Option<String>, sink: StreamSink<VpnEven
         let _ = controller.connect(cfg, provider).await;
     });
     Ok(())
+}
+
+/// Desktop: старт сессии через polkit-helper (`GuiTunProvider`).
+fn start_connect(uri: &str, profile_id: Option<String>, sink: StreamSink<VpnEventDto>) -> Result<()> {
+    let provider: Arc<dyn TunProvider> = Arc::new(GuiTunProvider::default());
+    start_session_with_provider(uri, profile_id, provider, sink)
 }
 
 /// Подключить по «сырой» ссылке (ещё не сохранённой — первый коннект перед сохранением).
@@ -357,56 +356,50 @@ pub fn vpn_connect_profile(id: String, sink: StreamSink<VpnEventDto>) -> Result<
     start_connect(&uri, Some(id), sink)
 }
 
-// ─────────────────────────── Android: двухфазное подключение ───────────────────────────
-// TUN-fd даёт VpnService (не polkit-helper), поэтому используем split движка:
-// establish (сеть, без TUN) → Dart строит TUN через VpnService.Builder → fd → data-plane.
+// ─────────────────────────── Android: нативная сессия (C6/S1) ───────────────────────────
+// TUN-fd даёт VpnService (не polkit-helper). `AndroidTunProvider::configure` зовёт
+// `CitadelVpnService.establishTun(...)` по JNI (Rust→Kotlin) и оборачивает fd — так ТОТ ЖЕ
+// `VpnController::connect`-loop, что на desktop, держит establish+реконнект НАТИВНО (переживает
+// смерть UI-изолята: сессия жива, пока сервис активен, даже при закрытом окне). Заменяет прежний
+// двухфазный Dart-цикл (establish → Dart строит TUN → data_plane).
 
-fn state_dto(s: &str) -> VpnEventDto {
-    VpnEventDto {
-        kind: "state".into(),
-        state: s.into(),
-        exit: String::new(),
-        transport: String::new(),
-        cidr: String::new(),
-        error: String::new(),
+/// Провайдер туннеля для Android: `configure` (в `VpnController::connect`-loop, на КАЖДЫЙ
+/// (ре)коннект) зовёт `CitadelVpnService.establishTun(...)` по JNI → detached fd → `TunIo`.
+/// Аналог desktop `GuiTunProvider` (там fd приходит от polkit-helper). Внутренний, не FFI: codegen
+/// его пропускает (unit-struct — логирует INFO-skip, Dart-тип не генерит; это и нужно).
+struct AndroidTunProvider;
+
+impl TunProvider for AndroidTunProvider {
+    fn configure(&self, p: &TunParams) -> Result<Arc<dyn TunIo>> {
+        #[cfg(target_os = "android")]
+        {
+            let fd = crate::android_jni::establish_tun(p)?;
+            if fd < 0 {
+                return Err(anyhow!("VpnService.establish() не выдал TUN-fd (нет разрешения VPN?)"));
+            }
+            // SAFETY: fd получен от VpnService.establish() (detachFd) — владеем им единолично.
+            Ok(unsafe { citadel_client::tun_from_fd(fd) })
+        }
+        // Не-Android: провайдер не используется (frb-функции ниже зовутся лишь из Android-Dart), но
+        // тип компилируется всюду — не городим cfg вокруг frb-поверхности (как прежние android_*).
+        #[cfg(not(target_os = "android"))]
+        {
+            let _ = p;
+            Err(anyhow!("AndroidTunProvider доступен только на Android"))
+        }
     }
 }
 
-async fn do_android_establish(uri: &str) -> Result<TunSetupDto> {
-    // C5.4: авто-фетч Layer-1 токена (если ссылка несёт issuer+client_seed) перед коннектом.
-    let link = CredentialLink::from_uri(uri)?;
-    let cfg = citadel_client::token_agent::with_token(
-        link.to_client_config(),
-        link.issuer.as_deref(),
-        link.client_seed.as_ref(),
-    )
-    .await?;
-    let session = establish_session(&cfg).await?;
-    let a = session.addr;
-    // Клампим MTU под бюджет QUIC-датаграммы (иначе полноразмерные пакеты дропаются «datagram
-    // too large»). VpnService.Builder примет это как MTU интерфейса.
-    let mtu = citadel_client::clamp_tun_mtu(&cfg.mtu, session.quic_datagram_mtu());
-    let dto = TunSetupDto {
-        addr: format!("{}.{}.{}.{}", a[0], a[1], a[2], a[3]),
-        prefix: session.prefix as u32,
-        mtu,
-        routes: cfg.routes.clone(),
-        dns: cfg.dns.clone().unwrap_or_default(),
-        exit: session.chosen.clone(),
-        transport: session.transport().to_string(),
-    };
-    *ANDROID_SESSION.lock().unwrap() = Some(session);
-    Ok(dto)
+/// Android: старт нативной сессии (сырая ссылка). Спавнит `VpnController::connect` с
+/// `AndroidTunProvider` на rt() — реконнект-loop нативный, события стримятся через `sink`.
+/// Заменяет двухфазный `android_establish` + `android_run_data_plane`; останов — `vpn_disconnect`.
+pub fn android_start_session(link: String, sink: StreamSink<VpnEventDto>) -> Result<()> {
+    let provider: Arc<dyn TunProvider> = Arc::new(AndroidTunProvider);
+    start_session_with_provider(&link, None, provider, sink)
 }
 
-/// Фаза 1 (сырая ссылка): установить сессию (PQ-хендшейк + адрес, БЕЗ TUN). Вернуть параметры
-/// для `VpnService.Builder`. Сессия удерживается до фазы 2.
-pub async fn android_establish(link: String) -> Result<TunSetupDto> {
-    do_android_establish(&link).await
-}
-
-/// Фаза 1 (сохранённый профиль): ссылка достаётся из vault, не покидает ядро.
-pub async fn android_establish_profile(id: String) -> Result<TunSetupDto> {
+/// Android: старт нативной сессии по сохранённому профилю (ссылка не покидает ядро).
+pub fn android_start_session_profile(id: String, sink: StreamSink<VpnEventDto>) -> Result<()> {
     let uri = {
         let g = VAULT.lock().unwrap();
         let v = g.as_ref().ok_or_else(|| anyhow!("хранилище заблокировано"))?;
@@ -416,56 +409,17 @@ pub async fn android_establish_profile(id: String) -> Result<TunSetupDto> {
             .map(|p| p.uri)
             .ok_or_else(|| anyhow!("профиль не найден"))?
     };
-    do_android_establish(&uri).await
+    let provider: Arc<dyn TunProvider> = Arc::new(AndroidTunProvider);
+    start_session_with_provider(&uri, Some(id), provider, sink)
 }
 
-/// Фаза 2: Dart получил TUN-fd от `VpnService.establish()` → запустить data-plane, стримить
-/// события. Останов — со стороны Dart (stopService закрывает fd → reader завершает pump).
-pub fn android_run_data_plane(fd: i32, sink: StreamSink<VpnEventDto>) -> Result<()> {
-    let session = ANDROID_SESSION
-        .lock()
-        .unwrap()
-        .take()
-        .ok_or_else(|| anyhow!("нет установленной сессии — сначала android_establish"))?;
-    let connected = VpnEventDto {
-        kind: "connected".into(),
-        state: String::new(),
-        exit: session.chosen.clone(),
-        transport: session.transport().to_string(),
-        cidr: session.cidr(),
-        error: String::new(),
-    };
-    let _ = sink.add(connected);
-    let _ = sink.add(state_dto("up"));
-    // SAFETY: fd получен от VpnService.establish() (detachFd) — владеем им единолично.
-    let tun = unsafe { tun_from_fd(fd) };
-    let h = rt().spawn(async move {
-        // Лог в панель (stderr движка): показывает, ЗАВЕРШИЛСЯ ли data-plane сам (транспорт
-        // детектировал мёртвое соединение — тогда цикл реконнектит) или молчит (стоит). При аборте
-        // (android_disconnect) эта ветка не выполняется — задача снята, что и отличает разрыв от стопа.
-        match run_data_plane(session, tun).await {
-            Ok(()) => eprintln!("[android] data-plane завершился штатно → реконнект"),
-            Err(e) => eprintln!("[android] data-plane упал: {e} → реконнект"),
-        }
-        let _ = sink.add(state_dto("down"));
-    });
-    *ANDROID_DP.lock().unwrap() = Some(h.abort_handle());
-    Ok(())
-}
-
-/// Остановить Android data-plane (Dart зовёт при stopService). Аборт задачи → pump-CancelGuard
-/// закрывает TUN-fd → интерфейс VpnService гаснет.
+/// Android: сигнал «сменилась underlying-сеть» (WiFi↔LTE/toggle) от NetworkCallback → нативный
+/// loop оборвёт текущий pump и переустановит сессию над новой сетью СРАЗУ (не ждёт pump-watchdog
+/// ~8с). No-op, если активной сессии нет.
 #[frb(sync)]
-pub fn android_disconnect() {
-    // Диагностика (видно в панели лога — это stderr движка): помогает понять, доходит ли цепочка
-    // смены сети (NetworkCallback → onNetworkChanged → _onNetworkChanged) до аборта data-plane.
-    let had = ANDROID_DP.lock().unwrap().take();
-    eprintln!(
-        "[android] android_disconnect: аборт data-plane ({})",
-        if had.is_some() { "есть активный — реконнект" } else { "нет активного" }
-    );
-    if let Some(h) = had {
-        h.abort();
+pub fn android_notify_network_changed() {
+    if let Some(c) = ACTIVE.lock().unwrap().as_ref() {
+        c.notify_network_changed();
     }
 }
 

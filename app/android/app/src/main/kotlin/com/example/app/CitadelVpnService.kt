@@ -16,8 +16,9 @@ import android.os.ParcelFileDescriptor
  * исходящих сокетов движка от заворачивания в туннель.
  *
  * fd передаётся через detachFd(): владельцем становится Rust (Tun::from_raw_fd), он же закрывает
- * его при остановке data-plane (android_disconnect → pump сворачивается). Поэтому сервис fd НЕ
- * закрывает (иначе double-close).
+ * его при остановке/реконнекте нативного connect-loop (vpn_disconnect → loop завершается → tun
+ * дропается → fd закрывается; на реконнекте старый fd дропается перед новым establishTun). Поэтому
+ * сервис fd НЕ закрывает (иначе double-close).
  */
 class CitadelVpnService : VpnService() {
 
@@ -56,18 +57,21 @@ class CitadelVpnService : VpnService() {
         return START_STICKY
     }
 
-    /** Построить TUN по параметрам, назначенным движком (фаза 1), вернуть detached fd для Rust. */
-    fun establishTun(addr: String, prefix: Int, routes: List<String>, dns: List<String>, mtu: Int): Int {
+    /** Построить TUN по параметрам, назначенным движком, вернуть detached fd для Rust. Зовётся из
+     *  Rust через JNI (`AndroidTunProvider::configure` в нативном connect-loop) на КАЖДЫЙ (ре)коннект,
+     *  НЕ из Dart. routes/dns приходят строкой через пробел (Rust шлёт TunParams как есть, без массивов). */
+    fun establishTun(addr: String, prefix: Int, routes: String, dns: String, mtu: Int): Int {
+        val routeList = routes.split(" ").filter { it.isNotEmpty() }
         val b = Builder()
             .setSession("CitadelPQVPN")
             .setMtu(mtu)
             .addAddress(addr, prefix)
-        for (r in routes) {
+        for (r in routeList) {
             val s = splitCidr(r)
             b.addRoute(s.first, s.second)
         }
-        for (d in dns) b.addDnsServer(d)
-        if (routes.isEmpty()) b.addRoute("0.0.0.0", 0) // нет split-маршрутов → full-tunnel
+        for (d in dns.split(" ").filter { it.isNotEmpty() }) b.addDnsServer(d)
+        if (routeList.isEmpty()) b.addRoute("0.0.0.0", 0) // нет split-маршрутов → full-tunnel
         val fd = b.establish() ?: throw IllegalStateException("VpnService.establish() == null (нет разрешения VPN?)")
         return fd.detachFd() // владение переходит в Rust
     }

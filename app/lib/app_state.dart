@@ -53,8 +53,9 @@ class AppState extends ChangeNotifier {
 
   StreamSubscription<VpnEventDto>? _sub;
 
-  /// Пользователь сам нажал «Отключить» — глушит авто-реконнект (Android-путь; на Linux
-  /// реконнект живёт в ядре `VpnController`). Сбрасывается в false на новом коннекте.
+  /// Пользователь сам нажал «Отключить» — гасит форс-реконнект по смене сети (`_onNetworkChanged`)
+  /// в зазоре, пока не долетит `down`. Сам авто-реконнект держит нативный `VpnController` (обе
+  /// платформы). Сбрасывается в false на новом коннекте.
   bool _userStopped = false;
 
   bool get isBusy => phase == VpnPhase.connecting || phase == VpnPhase.up;
@@ -67,13 +68,13 @@ class AppState extends ChangeNotifier {
   }
 
   /// Смена underlying-сети (native NetworkCallback): транспорт над старой сетью, скорее всего,
-  /// мёртв → абортим data-plane, и цикл [_androidConnect] переустановит сессию над новой сетью
-  /// (быстрый реконнект, не ждём QUIC idle-timeout). Игнор, если пользователь отключил VPN.
+  /// мёртв → сигналим нативному loop переустановить сессию над новой сетью СРАЗУ (не ждём
+  /// pump-watchdog ~8с / QUIC idle-timeout). Игнор, если пользователь отключил VPN.
   void _onNetworkChanged() {
     debugPrint('[CitadelNet] _onNetworkChanged phase=$phase stopped=$_userStopped');
     if (_userStopped) return;
     if (phase == VpnPhase.up || phase == VpnPhase.connecting) {
-      androidDisconnect(); // аборт data-plane → _androidRunDataPlane завершится → реконнект
+      androidNotifyNetworkChanged(); // нативный VpnController оборвёт pump и реконнектнётся
     }
   }
 
@@ -149,14 +150,13 @@ class AppState extends ChangeNotifier {
     }
   }
 
-  /// Android: двухфазно — establish (сеть) → VpnService строит TUN → run_data_plane. Держит
-  /// соединение живым: **любой** сбой (в т.ч. первичный коннект без сети или разрыв при смене
-  /// WiFi/LTE) → авто-ретрай с прогрессивным backoff (1→2→…→30с), пока пользователь не нажмёт
-  /// «Отключить». Причина сбоя показывается на карточке (и в лог-панели), но попытки продолжаются
-  /// — так соединение само поднимается, когда сеть возвращается. Backoff сбрасывается после
-  /// успешной сессии.
+  /// Android: старт нативной сессии. Консент (`prepare`) + `startService` (foreground + JNI-протектор)
+  /// — один раз; дальше нативный `VpnController`-loop (`android_start_session`) САМ держит
+  /// establish + авто-реконнект (backoff, always-retry, свежий токен, kill-switch) и переживает
+  /// смерть UI-изолята (сессия жива, пока сервис активен, даже при закрытом окне — C6). Dart лишь
+  /// слушает поток событий — тем же `_listen`, что desktop-путь.
   Future<void> _androidConnect({String? profileId, String? link}) async {
-    _sub?.cancel();
+    // «Подключаемся» уже на время консента/старта сервиса (может всплыть системный диалог).
     _userStopped = false;
     phase = VpnPhase.connecting;
     activeProfileId = profileId;
@@ -164,9 +164,6 @@ class AppState extends ChangeNotifier {
     since = null;
     notifyListeners();
 
-    // Консент + запуск сервиса — ОДИН раз; сервис живёт всю сессию (реконнект переустанавливает
-    // только TUN+транспорт, а не сам VpnService). Так native NetworkCallback стабилен и при смене
-    // сети реконнект чистый, без teardown'а сервиса.
     if (!await AndroidVpn.prepare()) {
       phase = VpnPhase.error;
       errorMsg = 'Нет разрешения на VPN';
@@ -175,80 +172,12 @@ class AppState extends ChangeNotifier {
     }
     await AndroidVpn.startService();
 
-    var backoff = const Duration(seconds: 1);
-
-    while (!_userStopped) {
-      var attemptFailed = false;
-      try {
-        final setup = profileId != null
-            ? await androidEstablishProfile(id: profileId)
-            : await androidEstablish(link: link!);
-        final fd = await AndroidVpn.establishTun(setup); // заменяет предыдущий TUN
-        if (fd < 0) throw 'VpnService не выдал TUN-fd';
-
-        // блокирует до разрыва транспорта; true — сессия успела подняться (сброс backoff)
-        final wasUp = await _androidRunDataPlane(fd, setup);
-        if (wasUp) backoff = const Duration(seconds: 1);
-      } catch (e) {
-        // НЕ сдаёмся: показываем причину, но продолжаем ретраи (keep-connected).
-        attemptFailed = true;
-        errorMsg = '$e';
-        phase = VpnPhase.error;
-        since = null;
-        notifyListeners();
-      }
-
-      if (_userStopped) break;
-      // разрыв без явной ошибки → «восстановление» (amber); при ошибке оставляем причину видимой
-      if (!attemptFailed) {
-        phase = VpnPhase.connecting;
-        since = null;
-        notifyListeners();
-      }
-      await Future.delayed(backoff);
-      backoff = backoff * 2 >= const Duration(seconds: 30)
-          ? const Duration(seconds: 30)
-          : backoff * 2;
-      if (_userStopped) break;
-      phase = VpnPhase.connecting; // начинаем новую попытку
-      notifyListeners();
-    }
-  }
-
-  /// Запустить Android data-plane и дождаться его завершения. Возвращает, поднялась ли сессия
-  /// (была ли фаза `up`) — для решения о реконнекте.
-  Future<bool> _androidRunDataPlane(int fd, TunSetupDto setup) {
-    final done = Completer<bool>();
-    var up = false;
-    exit = setup.exit;
-    transport = setup.transport;
-    cidr = '${setup.addr}/${setup.prefix}';
-    _sub?.cancel();
-    _sub = androidRunDataPlane(fd: fd).listen(
-      (ev) {
-        switch (ev.kind) {
-          case 'state':
-            _onState(ev.state);
-            if (ev.state == 'up') up = true;
-          case 'connected':
-            exit = ev.exit;
-            transport = ev.transport;
-            cidr = ev.cidr;
-          case 'error':
-            errorMsg = ev.error;
-        }
-        notifyListeners();
-      },
-      onDone: () {
-        if (!done.isCompleted) done.complete(up);
-      },
-      onError: (Object e) {
-        errorMsg = '$e';
-        notifyListeners();
-        if (!done.isCompleted) done.complete(up);
-      },
+    _listen(
+      profileId != null
+          ? androidStartSessionProfile(id: profileId)
+          : androidStartSession(link: link!),
+      profileId: profileId,
     );
-    return done.future;
   }
 
   void _listen(Stream<VpnEventDto> stream, {String? profileId}) {
@@ -299,13 +228,11 @@ class AppState extends ChangeNotifier {
   }
 
   void disconnect() {
-    _userStopped = true; // глушим авто-реконнект (Android-путь)
-    if (Platform.isAndroid) {
-      androidDisconnect(); // abort data-plane → fd закрывается → TUN гаснет
-      AndroidVpn.stopService();
-    } else {
-      vpnDisconnect();
-    }
+    _userStopped = true;
+    // Останавливает нативный loop (ACTIVE.disconnect): гасит авто-реконнект, connect-loop дропает
+    // tun → fd закрывается → TUN гаснет. Симметрично обеим платформам.
+    vpnDisconnect();
+    if (Platform.isAndroid) AndroidVpn.stopService(); // + снять foreground-сервис и мониторинг сети
     _sub?.cancel();
     _sub = null;
     phase = VpnPhase.off;

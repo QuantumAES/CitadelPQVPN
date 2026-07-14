@@ -6,7 +6,9 @@
 import '../frb_generated.dart';
 import 'package:flutter_rust_bridge/flutter_rust_bridge_for_generated.dart';
 
-// These functions are ignored because they are not marked as `pub`: `do_android_establish`, `killswitch_file`, `link_from`, `profile_to_dto`, `rt`, `start_connect`, `state_dto`, `to_dto`, `vault_path`
+// These functions are ignored because they are not marked as `pub`: `killswitch_file`, `link_from`, `profile_to_dto`, `rt`, `start_connect`, `start_session_with_provider`, `to_dto`, `vault_path`
+// These types are ignored because they are neither used by any `pub` functions nor (for structs and enums) marked `#[frb(unignore)]`: `AndroidTunProvider`
+// These function are ignored because they are on traits that is not defined in current crate (put an empty `#[frb]` on it to unignore): `configure`
 
 /// Версия PQ-VPN-ядра (about-экран).
 String coreVersion() => RustLib.instance.api.crateApiCitadelCoreVersion();
@@ -74,24 +76,21 @@ Stream<VpnEventDto> vpnConnect({required String link}) =>
 Stream<VpnEventDto> vpnConnectProfile({required String id}) =>
     RustLib.instance.api.crateApiCitadelVpnConnectProfile(id: id);
 
-/// Фаза 1 (сырая ссылка): установить сессию (PQ-хендшейк + адрес, БЕЗ TUN). Вернуть параметры
-/// для `VpnService.Builder`. Сессия удерживается до фазы 2.
-Future<TunSetupDto> androidEstablish({required String link}) =>
-    RustLib.instance.api.crateApiCitadelAndroidEstablish(link: link);
+/// Android: старт нативной сессии (сырая ссылка). Спавнит `VpnController::connect` с
+/// `AndroidTunProvider` на rt() — реконнект-loop нативный, события стримятся через `sink`.
+/// Заменяет двухфазный `android_establish` + `android_run_data_plane`; останов — `vpn_disconnect`.
+Stream<VpnEventDto> androidStartSession({required String link}) =>
+    RustLib.instance.api.crateApiCitadelAndroidStartSession(link: link);
 
-/// Фаза 1 (сохранённый профиль): ссылка достаётся из vault, не покидает ядро.
-Future<TunSetupDto> androidEstablishProfile({required String id}) =>
-    RustLib.instance.api.crateApiCitadelAndroidEstablishProfile(id: id);
+/// Android: старт нативной сессии по сохранённому профилю (ссылка не покидает ядро).
+Stream<VpnEventDto> androidStartSessionProfile({required String id}) =>
+    RustLib.instance.api.crateApiCitadelAndroidStartSessionProfile(id: id);
 
-/// Фаза 2: Dart получил TUN-fd от `VpnService.establish()` → запустить data-plane, стримить
-/// события. Останов — со стороны Dart (stopService закрывает fd → reader завершает pump).
-Stream<VpnEventDto> androidRunDataPlane({required int fd}) =>
-    RustLib.instance.api.crateApiCitadelAndroidRunDataPlane(fd: fd);
-
-/// Остановить Android data-plane (Dart зовёт при stopService). Аборт задачи → pump-CancelGuard
-/// закрывает TUN-fd → интерфейс VpnService гаснет.
-void androidDisconnect() =>
-    RustLib.instance.api.crateApiCitadelAndroidDisconnect();
+/// Android: сигнал «сменилась underlying-сеть» (WiFi↔LTE/toggle) от NetworkCallback → нативный
+/// loop оборвёт текущий pump и переустановит сессию над новой сетью СРАЗУ (не ждёт pump-watchdog
+/// ~8с). No-op, если активной сессии нет.
+void androidNotifyNetworkChanged() =>
+    RustLib.instance.api.crateApiCitadelAndroidNotifyNetworkChanged();
 
 /// Разорвать активную сессию (если есть).
 void vpnDisconnect() => RustLib.instance.api.crateApiCitadelVpnDisconnect();
@@ -218,50 +217,6 @@ class ProfileDto {
           hasPqAuth == other.hasPqAuth &&
           hasObfs == other.hasObfs &&
           lastExit == other.lastExit;
-}
-
-/// Параметры назначенного туннеля для Android `VpnService.Builder` (фаза 1 → фаза 2).
-class TunSetupDto {
-  final String addr;
-  final int prefix;
-  final String mtu;
-  final String routes;
-  final String dns;
-  final String exit;
-  final String transport;
-
-  const TunSetupDto({
-    required this.addr,
-    required this.prefix,
-    required this.mtu,
-    required this.routes,
-    required this.dns,
-    required this.exit,
-    required this.transport,
-  });
-
-  @override
-  int get hashCode =>
-      addr.hashCode ^
-      prefix.hashCode ^
-      mtu.hashCode ^
-      routes.hashCode ^
-      dns.hashCode ^
-      exit.hashCode ^
-      transport.hashCode;
-
-  @override
-  bool operator ==(Object other) =>
-      identical(this, other) ||
-      other is TunSetupDto &&
-          runtimeType == other.runtimeType &&
-          addr == other.addr &&
-          prefix == other.prefix &&
-          mtu == other.mtu &&
-          routes == other.routes &&
-          dns == other.dns &&
-          exit == other.exit &&
-          transport == other.transport;
 }
 
 /// Событие VPN-сессии для UI. `kind`: `state` | `connected` | `error`.

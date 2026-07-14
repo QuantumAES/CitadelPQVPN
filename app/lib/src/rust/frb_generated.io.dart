@@ -53,9 +53,6 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   DiagLineDto dco_decode_diag_line_dto(dynamic raw);
 
   @protected
-  int dco_decode_i_32(dynamic raw);
-
-  @protected
   PlatformInt64 dco_decode_i_64(dynamic raw);
 
   @protected
@@ -83,13 +80,7 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   RegistryEntryDto dco_decode_registry_entry_dto(dynamic raw);
 
   @protected
-  TunSetupDto dco_decode_tun_setup_dto(dynamic raw);
-
-  @protected
   int dco_decode_u_16(dynamic raw);
-
-  @protected
-  int dco_decode_u_32(dynamic raw);
 
   @protected
   int dco_decode_u_8(dynamic raw);
@@ -134,9 +125,6 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   DiagLineDto sse_decode_diag_line_dto(SseDeserializer deserializer);
 
   @protected
-  int sse_decode_i_32(SseDeserializer deserializer);
-
-  @protected
   PlatformInt64 sse_decode_i_64(SseDeserializer deserializer);
 
   @protected
@@ -166,13 +154,7 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   RegistryEntryDto sse_decode_registry_entry_dto(SseDeserializer deserializer);
 
   @protected
-  TunSetupDto sse_decode_tun_setup_dto(SseDeserializer deserializer);
-
-  @protected
   int sse_decode_u_16(SseDeserializer deserializer);
-
-  @protected
-  int sse_decode_u_32(SseDeserializer deserializer);
 
   @protected
   int sse_decode_u_8(SseDeserializer deserializer);
@@ -182,6 +164,9 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
 
   @protected
   VpnEventDto sse_decode_vpn_event_dto(SseDeserializer deserializer);
+
+  @protected
+  int sse_decode_i_32(SseDeserializer deserializer);
 
   @protected
   void sse_encode_AnyhowException(
@@ -226,9 +211,6 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   void sse_encode_diag_line_dto(DiagLineDto self, SseSerializer serializer);
 
   @protected
-  void sse_encode_i_32(int self, SseSerializer serializer);
-
-  @protected
   void sse_encode_i_64(PlatformInt64 self, SseSerializer serializer);
 
   @protected
@@ -271,13 +253,7 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   );
 
   @protected
-  void sse_encode_tun_setup_dto(TunSetupDto self, SseSerializer serializer);
-
-  @protected
   void sse_encode_u_16(int self, SseSerializer serializer);
-
-  @protected
-  void sse_encode_u_32(int self, SseSerializer serializer);
 
   @protected
   void sse_encode_u_8(int self, SseSerializer serializer);
@@ -287,6 +263,9 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
 
   @protected
   void sse_encode_vpn_event_dto(VpnEventDto self, SseSerializer serializer);
+
+  @protected
+  void sse_encode_i_32(int self, SseSerializer serializer);
 }
 
 // Section: wire_class
