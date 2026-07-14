@@ -9,19 +9,8 @@ class AndroidVpn {
 
   static bool get isAndroid => Platform.isAndroid;
 
-  /// Колбэк из native при смене underlying-сети (WiFi↔LTE/toggle) — форсировать реконнект.
-  static void Function()? onNetworkChanged;
-  static bool _handlerSet = false;
-
-  /// Подписать канал на вызовы native→Dart (`onNetworkChanged`). Идемпотентно; звать один раз.
-  static void ensureHandler() {
-    if (_handlerSet) return;
-    _handlerSet = true;
-    _ch.setMethodCallHandler((call) async {
-      if (call.method == 'onNetworkChanged') onNetworkChanged?.call();
-      return null;
-    });
-  }
+  // Смена underlying-сети больше не идёт через Dart: NetworkCallback живёт в CitadelVpnService и
+  // сигналит нативному loop по JNI напрямую (S2) — переживает Activity, работает при закрытом окне.
 
   /// Системный консент VpnService (показывается один раз). `true` — разрешено.
   static Future<bool> prepare() async =>

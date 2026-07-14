@@ -53,30 +53,7 @@ class AppState extends ChangeNotifier {
 
   StreamSubscription<VpnEventDto>? _sub;
 
-  /// Пользователь сам нажал «Отключить» — гасит форс-реконнект по смене сети (`_onNetworkChanged`)
-  /// в зазоре, пока не долетит `down`. Сам авто-реконнект держит нативный `VpnController` (обе
-  /// платформы). Сбрасывается в false на новом коннекте.
-  bool _userStopped = false;
-
   bool get isBusy => phase == VpnPhase.connecting || phase == VpnPhase.up;
-
-  AppState() {
-    if (Platform.isAndroid) {
-      AndroidVpn.ensureHandler();
-      AndroidVpn.onNetworkChanged = _onNetworkChanged;
-    }
-  }
-
-  /// Смена underlying-сети (native NetworkCallback): транспорт над старой сетью, скорее всего,
-  /// мёртв → сигналим нативному loop переустановить сессию над новой сетью СРАЗУ (не ждём
-  /// pump-watchdog ~8с / QUIC idle-timeout). Игнор, если пользователь отключил VPN.
-  void _onNetworkChanged() {
-    debugPrint('[CitadelNet] _onNetworkChanged phase=$phase stopped=$_userStopped');
-    if (_userStopped) return;
-    if (phase == VpnPhase.up || phase == VpnPhase.connecting) {
-      androidNotifyNetworkChanged(); // нативный VpnController оборвёт pump и реконнектнётся
-    }
-  }
 
   // ─────────────────────────── vault ───────────────────────────
 
@@ -157,7 +134,6 @@ class AppState extends ChangeNotifier {
   /// слушает поток событий — тем же `_listen`, что desktop-путь.
   Future<void> _androidConnect({String? profileId, String? link}) async {
     // «Подключаемся» уже на время консента/старта сервиса (может всплыть системный диалог).
-    _userStopped = false;
     phase = VpnPhase.connecting;
     activeProfileId = profileId;
     exit = transport = cidr = errorMsg = '';
@@ -182,7 +158,6 @@ class AppState extends ChangeNotifier {
 
   void _listen(Stream<VpnEventDto> stream, {String? profileId}) {
     _sub?.cancel();
-    _userStopped = false;
     phase = VpnPhase.connecting;
     activeProfileId = profileId;
     exit = transport = cidr = errorMsg = '';
@@ -228,7 +203,6 @@ class AppState extends ChangeNotifier {
   }
 
   void disconnect() {
-    _userStopped = true;
     // Останавливает нативный loop (ACTIVE.disconnect): гасит авто-реконнект, connect-loop дропает
     // tun → fd закрывается → TUN гаснет. Симметрично обеим платформам.
     vpnDisconnect();

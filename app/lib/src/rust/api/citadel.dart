@@ -86,12 +86,6 @@ Stream<VpnEventDto> androidStartSession({required String link}) =>
 Stream<VpnEventDto> androidStartSessionProfile({required String id}) =>
     RustLib.instance.api.crateApiCitadelAndroidStartSessionProfile(id: id);
 
-/// Android: сигнал «сменилась underlying-сеть» (WiFi↔LTE/toggle) от NetworkCallback → нативный
-/// loop оборвёт текущий pump и переустановит сессию над новой сетью СРАЗУ (не ждёт pump-watchdog
-/// ~8с). No-op, если активной сессии нет.
-void androidNotifyNetworkChanged() =>
-    RustLib.instance.api.crateApiCitadelAndroidNotifyNetworkChanged();
-
 /// Разорвать активную сессию (если есть).
 void vpnDisconnect() => RustLib.instance.api.crateApiCitadelVpnDisconnect();
 

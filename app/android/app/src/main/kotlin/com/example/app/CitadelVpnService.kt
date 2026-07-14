@@ -5,6 +5,10 @@ import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.content.Intent
 import android.content.pm.ServiceInfo
+import android.net.ConnectivityManager
+import android.net.Network
+import android.net.NetworkCapabilities
+import android.net.NetworkRequest
 import android.net.VpnService
 import android.os.Build
 import android.os.ParcelFileDescriptor
@@ -44,10 +48,22 @@ class CitadelVpnService : VpnService() {
     private external fun nativeRegister()
     private external fun nativeUnregister()
 
+    // JNI (S2): смена underlying-сети → разбудить нативный connect-loop (Rust notify_network_changed)
+    private external fun nativeNetworkChanged()
+
+    // Мониторинг underlying-сети (WiFi/LTE) живёт в СЕРВИСЕ (переживает Activity → сигнал доходит и
+    // при закрытом окне; в S1 он был в MainActivity и умирал с окном).
+    private var netCallback: ConnectivityManager.NetworkCallback? = null
+    private var currentNetworkId: Long = -1L
+    // Была ли уже underlying-сеть: отличает ПЕРВЫЙ onAvailable (туннель поднимается — реконнект не
+    // нужен) от возврата сети после onLost (toggle WiFi — реконнект НУЖЕН).
+    private var hadNetwork: Boolean = false
+
     override fun onCreate() {
         super.onCreate()
         instance = this
         nativeRegister() // движок теперь может protect() свои исходящие сокеты
+        registerNetCallback() // мониторим underlying-сеть на всю жизнь сервиса
         onServiceReady?.invoke()
         onServiceReady = null
     }
@@ -85,9 +101,64 @@ class CitadelVpnService : VpnService() {
     }
 
     override fun onDestroy() {
+        unregisterNetCallback()
         nativeUnregister()
         instance = null
         super.onDestroy()
+    }
+
+    /** Следить за underlying-сетями (WiFi/LTE, не VPN). При смене — обновить setUnderlyingNetworks
+     *  (protected-сокет движка маршрутизируется на новую сеть) и разбудить нативный connect-loop
+     *  (`nativeNetworkChanged`) переустановить сессию. Идемпотентно. */
+    private fun registerNetCallback() {
+        if (netCallback != null) return
+        val cm = getSystemService(ConnectivityManager::class.java) ?: return
+        val req = NetworkRequest.Builder()
+            .addCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)
+            .addTransportType(NetworkCapabilities.TRANSPORT_WIFI)
+            .addTransportType(NetworkCapabilities.TRANSPORT_CELLULAR)
+            .build()
+        val cb = object : ConnectivityManager.NetworkCallback() {
+            override fun onAvailable(network: Network) {
+                val id = network.networkHandle
+                // Реконнект нужен, если сеть сменилась ЛИБО вернулась после потери текущей (onLost
+                // обнулил currentNetworkId в -1). Пропускаем только САМЫЙ первый onAvailable
+                // (hadNetwork=false — туннель и так поднимается над этой сетью).
+                val changed = hadNetwork && currentNetworkId != id
+                currentNetworkId = id
+                hadNetwork = true
+                // сказать VPN'у, поверх какой реальной сети он идёт (маршрутизация protected-сокета)
+                setUnderlyingNetworks(arrayOf(network))
+                android.util.Log.d("CitadelNet", "onAvailable id=$id changed=$changed")
+                if (changed) nativeNetworkChanged() // разбудить нативный connect-loop
+            }
+
+            override fun onLost(network: Network) {
+                android.util.Log.d("CitadelNet", "onLost id=${network.networkHandle} cur=$currentNetworkId")
+                // Потеряли текущую сеть → -1; следующий onAvailable (даже той же сети с новым handle)
+                // станет "changed" → форс реконнект. hadNetwork НЕ сбрасываем.
+                if (network.networkHandle == currentNetworkId) currentNetworkId = -1L
+            }
+        }
+        netCallback = cb
+        try {
+            cm.registerNetworkCallback(req, cb)
+            android.util.Log.d("CitadelNet", "NetworkCallback зарегистрирован (сервис)")
+        } catch (e: Exception) {
+            netCallback = null
+            android.util.Log.d("CitadelNet", "registerNetworkCallback FAILED: ${e.message}")
+        }
+    }
+
+    private fun unregisterNetCallback() {
+        val cb = netCallback ?: return
+        try {
+            getSystemService(ConnectivityManager::class.java)?.unregisterNetworkCallback(cb)
+        } catch (_: Exception) {
+        }
+        netCallback = null
+        currentNetworkId = -1L
+        hadNetwork = false
     }
 
     private fun splitCidr(cidr: String): Pair<String, Int> {

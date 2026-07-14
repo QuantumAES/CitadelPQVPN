@@ -413,11 +413,12 @@ pub fn android_start_session_profile(id: String, sink: StreamSink<VpnEventDto>) 
     start_session_with_provider(&uri, Some(id), provider, sink)
 }
 
-/// Android: сигнал «сменилась underlying-сеть» (WiFi↔LTE/toggle) от NetworkCallback → нативный
-/// loop оборвёт текущий pump и переустановит сессию над новой сетью СРАЗУ (не ждёт pump-watchdog
-/// ~8с). No-op, если активной сессии нет.
-#[frb(sync)]
-pub fn android_notify_network_changed() {
+/// Android: сигнал «сменилась underlying-сеть» (WiFi↔LTE/toggle) → активный `VpnController`
+/// оборвёт текущий pump и переустановит сессию над новой сетью СРАЗУ (не ждёт pump-watchdog ~8с).
+/// No-op, если активной сессии нет. Зовётся из JNI `Java_..._nativeNetworkChanged` (NetworkCallback
+/// живёт в `CitadelVpnService` — переживает Activity), т.е. сигнал нативный, минуя Dart (S2).
+#[cfg(target_os = "android")]
+pub(crate) fn notify_active_network_changed() {
     if let Some(c) = ACTIVE.lock().unwrap().as_ref() {
         c.notify_network_changed();
     }

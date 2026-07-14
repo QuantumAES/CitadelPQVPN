@@ -2,10 +2,6 @@ package com.example.app
 
 import android.app.Activity
 import android.content.Intent
-import android.net.ConnectivityManager
-import android.net.Network
-import android.net.NetworkCapabilities
-import android.net.NetworkRequest
 import android.net.VpnService
 import android.os.Build
 import io.flutter.embedding.android.FlutterActivity
@@ -15,29 +11,21 @@ import io.flutter.plugin.common.MethodChannel
 /**
  * Мост Dart ↔ Android VpnService (трек C3.2). Канал `dev.citadelpqvpn/vpn`:
  *   prepare      → системный консент VpnService (один раз) → Bool granted
- *   startService → запустить foreground CitadelVpnService (+ мониторинг сети)
- *   stopService  → остановить сервис (+ снять мониторинг сети)
+ *   startService → запустить foreground CitadelVpnService → Bool ready
+ *   stopService  → остановить сервис
  * TUN строит Rust напрямую (JNI → CitadelVpnService.establishTun) в нативном connect-loop, не Dart.
- * Обратно (native → Dart): `onNetworkChanged` — сменилась underlying-сеть (WiFi↔LTE/toggle) →
- * Dart форсирует реконнект над новой сетью. Плюс сервису обновляется setUnderlyingNetworks, чтобы
- * protected-сокет движка корректно маршрутизировался на новую сеть (иначе туннель «висит» мёртвым).
+ * Мониторинг underlying-сети (WiFi↔LTE) и сигнал реконнекта при её смене живут в CitadelVpnService
+ * (S2 — переживают Activity, работают при закрытом окне), а не здесь: Activity в смене сети больше
+ * не участвует.
  */
 class MainActivity : FlutterActivity() {
     private val channelName = "dev.citadelpqvpn/vpn"
     private val reqVpn = 0x1011
     private var prepareResult: MethodChannel.Result? = null
-    private var channel: MethodChannel? = null
-
-    private var netCallback: ConnectivityManager.NetworkCallback? = null
-    private var currentNetworkId: Long = -1L
-    // Была ли уже underlying-сеть: отличает ПЕРВЫЙ onAvailable (туннель поднимается — реконнект не
-    // нужен) от возврата сети после onLost (toggle WiFi — реконнект НУЖЕН).
-    private var hadNetwork: Boolean = false
 
     override fun configureFlutterEngine(flutterEngine: FlutterEngine) {
         super.configureFlutterEngine(flutterEngine)
         val ch = MethodChannel(flutterEngine.dartExecutor.binaryMessenger, channelName)
-        channel = ch
         ch.setMethodCallHandler { call, result ->
             when (call.method) {
                 "prepare" -> {
@@ -50,7 +38,6 @@ class MainActivity : FlutterActivity() {
                     }
                 }
                 "startService" -> {
-                    registerNetCallback() // мониторим underlying-сеть на всю сессию
                     if (CitadelVpnService.instance != null) {
                         result.success(true) // уже запущен (реконнект)
                     } else {
@@ -64,7 +51,6 @@ class MainActivity : FlutterActivity() {
                     }
                 }
                 "stopService" -> {
-                    unregisterNetCallback()
                     CitadelVpnService.instance?.stopTun()
                     result.success(true)
                 }
@@ -84,70 +70,6 @@ class MainActivity : FlutterActivity() {
                 else -> result.notImplemented()
             }
         }
-    }
-
-    /** Следить за underlying-сетями (WiFi/LTE, не VPN). При смене — обновить setUnderlyingNetworks
-     *  сервиса и дёрнуть Dart на реконнект. Идемпотентно. */
-    private fun registerNetCallback() {
-        if (netCallback != null) return
-        val cm = getSystemService(ConnectivityManager::class.java) ?: return
-        val req = NetworkRequest.Builder()
-            .addCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)
-            .addTransportType(NetworkCapabilities.TRANSPORT_WIFI)
-            .addTransportType(NetworkCapabilities.TRANSPORT_CELLULAR)
-            .build()
-        val cb = object : ConnectivityManager.NetworkCallback() {
-            override fun onAvailable(network: Network) {
-                val id = network.networkHandle
-                // Реконнект нужен, если сеть сменилась на другую ЛИБО вернулась после потери текущей
-                // (onLost обнулил currentNetworkId в -1). Пропускаем только САМЫЙ первый onAvailable
-                // (hadNetwork=false — туннель и так поднимается над этой сетью). Раньше без hadNetwork
-                // toggle WiFi (onLost→onAvailable) не триггерил реконнект: onLost ставил -1, а
-                // onAvailable трактовал -1 как «первое событие» → туннель висел на мёртвом сокете.
-                val changed = hadNetwork && currentNetworkId != id
-                currentNetworkId = id
-                hadNetwork = true
-                // сказать VPN'у, поверх какой реальной сети он идёт (правильная маршрутизация
-                // protected-сокета движка на новую сеть)
-                CitadelVpnService.instance?.setUnderlyingNetworks(arrayOf(network))
-                android.util.Log.d(
-                    "CitadelNet",
-                    "onAvailable id=$id changed=$changed channel=${channel != null}"
-                )
-                if (changed) {
-                    runOnUiThread { channel?.invokeMethod("onNetworkChanged", null) }
-                }
-            }
-
-            override fun onLost(network: Network) {
-                android.util.Log.d("CitadelNet", "onLost id=${network.networkHandle} cur=$currentNetworkId")
-                // Потеряли текущую сеть → -1; следующий onAvailable (даже той же сети с новым handle)
-                // станет "changed" (hadNetwork=true) → форс реконнект. hadNetwork НЕ сбрасываем.
-                if (network.networkHandle == currentNetworkId) currentNetworkId = -1L
-            }
-        }
-        netCallback = cb
-        try {
-            cm.registerNetworkCallback(req, cb)
-            android.util.Log.d("CitadelNet", "NetworkCallback зарегистрирован")
-        } catch (e: Exception) {
-            netCallback = null
-            android.util.Log.d("CitadelNet", "registerNetworkCallback FAILED: ${e.message}")
-        }
-    }
-
-    // Dart-обработчик onNetworkChanged (лог для logcat — доходит ли до Dart)
-    // NB: см. также CitadelNet-логи в callback выше.
-
-    private fun unregisterNetCallback() {
-        val cb = netCallback ?: return
-        try {
-            getSystemService(ConnectivityManager::class.java)?.unregisterNetworkCallback(cb)
-        } catch (_: Exception) {
-        }
-        netCallback = null
-        currentNetworkId = -1L
-        hadNetwork = false // следующий старт VPN — снова «первый onAvailable», без лишнего реконнекта
     }
 
     @Deprecated("compat: onActivityResult для VpnService.prepare consent")

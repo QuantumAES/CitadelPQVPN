@@ -101,6 +101,18 @@ pub extern "system" fn Java_com_example_app_CitadelVpnService_nativeUnregister<'
     *SERVICE.lock().unwrap() = None;
 }
 
+/// Kotlin `CitadelVpnService` NetworkCallback → сменилась underlying-сеть (WiFi↔LTE/toggle) →
+/// разбудить нативный connect-loop переустановить сессию над новой сетью (S2). Зовётся из
+/// Java-потока колбэка ConnectivityManager — env валиден, attach не нужен; аргументы не используются.
+/// NetworkCallback теперь в СЕРВИСЕ (переживает Activity), поэтому сигнал доходит и при закрытом окне.
+#[no_mangle]
+pub extern "system" fn Java_com_example_app_CitadelVpnService_nativeNetworkChanged<'local>(
+    _env: JNIEnv<'local>,
+    _service: JObject<'local>,
+) {
+    crate::api::citadel::notify_active_network_changed();
+}
+
 /// Построить TUN через `CitadelVpnService.establishTun(...)` (JNI, Rust→Kotlin) → detached fd.
 /// Зовётся из `AndroidTunProvider::configure` в нативном `VpnController::connect`-loop
 /// (tokio-поток, НЕ Java-поток → `attach_current_thread`, как `protectFd`). routes/dns передаём

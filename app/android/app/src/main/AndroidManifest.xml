@@ -7,6 +7,9 @@
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE"/>
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_SYSTEM_EXEMPTED"/>
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS"/>
+    <!-- S2: registerNetworkCallback в CitadelVpnService требует ACCESS_NETWORK_STATE — без него
+         callback молча падает (SecurityException в try/catch) и смена сети не форсит реконнект. -->
+    <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE"/>
     <application
         android:label="CitadelPQVPN"
         android:name="${applicationName}"
