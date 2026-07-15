@@ -6,8 +6,8 @@
 import '../frb_generated.dart';
 import 'package:flutter_rust_bridge/flutter_rust_bridge_for_generated.dart';
 
-// These functions are ignored because they are not marked as `pub`: `killswitch_file`, `link_from`, `profile_to_dto`, `rt`, `start_connect`, `start_session_with_provider`, `to_dto`, `vault_path`
-// These types are ignored because they are neither used by any `pub` functions nor (for structs and enums) marked `#[frb(unignore)]`: `AndroidTunProvider`
+// These functions are ignored because they are not marked as `pub`: `android_start`, `idle`, `killswitch_file`, `link_from`, `profile_to_dto`, `rt`, `spawn_controller`, `start_connect`, `state_dto`, `to_dto`, `update_android_status`, `update_last_exit`, `vault_path`, `vpn_state_str`
+// These types are ignored because they are neither used by any `pub` functions nor (for structs and enums) marked `#[frb(unignore)]`: `AndroidStatus`, `AndroidTunProvider`
 // These function are ignored because they are on traits that is not defined in current crate (put an empty `#[frb]` on it to unignore): `configure`
 
 /// Версия PQ-VPN-ядра (about-экран).
@@ -76,15 +76,30 @@ Stream<VpnEventDto> vpnConnect({required String link}) =>
 Stream<VpnEventDto> vpnConnectProfile({required String id}) =>
     RustLib.instance.api.crateApiCitadelVpnConnectProfile(id: id);
 
-/// Android: старт нативной сессии (сырая ссылка). Спавнит `VpnController::connect` с
-/// `AndroidTunProvider` на rt() — реконнект-loop нативный, события стримятся через `sink`.
-/// Заменяет двухфазный `android_establish` + `android_run_data_plane`; останов — `vpn_disconnect`.
+/// Android: старт нативной сессии (сырая ссылка). Останов — [`android_stop_session`].
 Stream<VpnEventDto> androidStartSession({required String link}) =>
     RustLib.instance.api.crateApiCitadelAndroidStartSession(link: link);
 
 /// Android: старт нативной сессии по сохранённому профилю (ссылка не покидает ядро).
 Stream<VpnEventDto> androidStartSessionProfile({required String id}) =>
     RustLib.instance.api.crateApiCitadelAndroidStartSessionProfile(id: id);
+
+/// Android: снимок статуса сессии (sync) — перезапуск (новый изолят) спрашивает при старте, чтобы
+/// отразить живой VPN, а не показать «отключено» и не поднять второй коннект поверх (нюанс 2).
+AndroidStatusDto androidSessionStatus() =>
+    RustLib.instance.api.crateApiCitadelAndroidSessionStatus();
+
+/// Android: переподписать новый Dart-изолят на события живой сессии (перезапуск после закрытия окна).
+/// Ставит `sink` текущим (перекрывает мёртвый) и сразу праймит его снимком (state + connected-инфо),
+/// чтобы UI-поток был консистентен без ожидания следующего события контроллера.
+Stream<VpnEventDto> androidAttachEvents() =>
+    RustLib.instance.api.crateApiCitadelAndroidAttachEvents();
+
+/// Android: остановить сессию (пользователь нажал «Отключить»). Глушит нативный loop (реконнект),
+/// инкремент [`ANDROID_GEN`] выводит форвард-задачу, статус → idle, sink снят — чтобы перезапуск
+/// не принял мёртвую сессию за живую.
+void androidStopSession() =>
+    RustLib.instance.api.crateApiCitadelAndroidStopSession();
 
 /// Разорвать активную сессию (если есть).
 void vpnDisconnect() => RustLib.instance.api.crateApiCitadelVpnDisconnect();
@@ -96,6 +111,44 @@ Stream<DiagLineDto> runDiagnostics({String? profileId, String? link}) => RustLib
     .instance
     .api
     .crateApiCitadelRunDiagnostics(profileId: profileId, link: link);
+
+/// Снимок статуса живой Android-сессии для UI при перезапуске (нюанс 2: натив переживает смерть
+/// Activity, Dart — нет). `state`: `idle`|`connecting`|`up`|`migrating`|`down`; `profile_id` — ""
+/// если коннект по сырой ссылке.
+class AndroidStatusDto {
+  final String state;
+  final String exit;
+  final String transport;
+  final String cidr;
+  final String profileId;
+
+  const AndroidStatusDto({
+    required this.state,
+    required this.exit,
+    required this.transport,
+    required this.cidr,
+    required this.profileId,
+  });
+
+  @override
+  int get hashCode =>
+      state.hashCode ^
+      exit.hashCode ^
+      transport.hashCode ^
+      cidr.hashCode ^
+      profileId.hashCode;
+
+  @override
+  bool operator ==(Object other) =>
+      identical(this, other) ||
+      other is AndroidStatusDto &&
+          runtimeType == other.runtimeType &&
+          state == other.state &&
+          exit == other.exit &&
+          transport == other.transport &&
+          cidr == other.cidr &&
+          profileId == other.profileId;
+}
 
 /// Один шаг прогона диагностики для UI.
 class DiagLineDto {

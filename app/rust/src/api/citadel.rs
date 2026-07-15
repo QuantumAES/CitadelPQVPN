@@ -65,6 +65,17 @@ pub struct LinkSummaryDto {
     pub has_obfs: bool,
 }
 
+/// Снимок статуса живой Android-сессии для UI при перезапуске (нюанс 2: натив переживает смерть
+/// Activity, Dart — нет). `state`: `idle`|`connecting`|`up`|`migrating`|`down`; `profile_id` — ""
+/// если коннект по сырой ссылке.
+pub struct AndroidStatusDto {
+    pub state: String,
+    pub exit: String,
+    pub transport: String,
+    pub cidr: String,
+    pub profile_id: String,
+}
+
 // ───────────────────────────── глобальное состояние ─────────────────────────────
 
 static RT: OnceLock<tokio::runtime::Runtime> = OnceLock::new();
@@ -78,6 +89,36 @@ fn rt() -> &'static tokio::runtime::Runtime {
 }
 static ACTIVE: Mutex<Option<Arc<VpnController>>> = Mutex::new(None);
 static VAULT: Mutex<Option<Vault>> = Mutex::new(None);
+
+/// C6/S3 (нюанс 2). Снимок статуса активной Android-сессии — обновляется персистентной форвард-
+/// задачей на КАЖДОЕ событие контроллера (даже когда Dart не подписан), чтобы перезапуск (новый
+/// изолят) увидел живой VPN. Процесс жив foreground-сервисом → статик переживает смерть Activity.
+struct AndroidStatus {
+    state: &'static str,
+    exit: String,
+    transport: String,
+    cidr: String,
+    profile_id: String,
+}
+impl AndroidStatus {
+    const fn idle() -> Self {
+        Self {
+            state: "idle",
+            exit: String::new(),
+            transport: String::new(),
+            cidr: String::new(),
+            profile_id: String::new(),
+        }
+    }
+}
+static ANDROID_STATUS: Mutex<AndroidStatus> = Mutex::new(AndroidStatus::idle());
+/// Свап-able sink: пересылка событий в ТЕКУЩИЙ Dart-изолят. Умирает с изолятом (окно закрыто) —
+/// форвард-задача снимает мёртвый; новый изолят ставит свежий через [`android_attach_events`].
+static ANDROID_SINK: Mutex<Option<StreamSink<VpnEventDto>>> = Mutex::new(None);
+/// Поколение Android-сессии: инкремент при старте/остановке глушит форвард-задачу прошлой сессии,
+/// чтобы её события (напр. поздний `Down` от останавливаемого контроллера) не перезаписали статус
+/// новой (анти-гонка при рестарте сессии поверх живой).
+static ANDROID_GEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 /// Базовый каталог данных, заданный платформой (Android: app filesDir). На десктопе не ставится —
 /// там путь резолвится из XDG/HOME. Без него на Android cwd=`/` (песочница не writable) и vault не создать.
 static DATA_DIR: OnceLock<PathBuf> = OnceLock::new();
@@ -236,6 +277,16 @@ pub fn parse_link_summary(uri: String) -> LinkSummaryDto {
 
 // ───────────────────────────── vpn FFI ─────────────────────────────
 
+fn vpn_state_str(s: VpnState) -> &'static str {
+    match s {
+        VpnState::Idle => "idle",
+        VpnState::Connecting => "connecting",
+        VpnState::Up => "up",
+        VpnState::Migrating => "migrating",
+        VpnState::Down => "down",
+    }
+}
+
 fn to_dto(ev: VpnEvent) -> VpnEventDto {
     let mut d = VpnEventDto {
         kind: String::new(),
@@ -248,14 +299,7 @@ fn to_dto(ev: VpnEvent) -> VpnEventDto {
     match ev {
         VpnEvent::State(s) => {
             d.kind = "state".into();
-            d.state = match s {
-                VpnState::Idle => "idle",
-                VpnState::Connecting => "connecting",
-                VpnState::Up => "up",
-                VpnState::Migrating => "migrating",
-                VpnState::Down => "down",
-            }
-            .into();
+            d.state = vpn_state_str(s).into();
         }
         VpnEvent::Connected { exit, transport, cidr } => {
             d.kind = "connected".into();
@@ -271,28 +315,73 @@ fn to_dto(ev: VpnEvent) -> VpnEventDto {
     d
 }
 
-/// Ядро запуска нативной сессии (общее для desktop и Android). Создаёт `VpnController`, ставит
-/// token-refresher (свежий Layer-1 токен на КАЖДЫЙ establish — анти-double-spend на реконнекте),
-/// форвардит события в `sink` (+ отмечает `last_exit` профиля) и крутит `connect`-loop на rt() с
-/// платформенным `provider`. Реконнект/backoff держит сам нативный loop → он переживает смерть
-/// UI-изолята (Android: сессия жива, пока `CitadelVpnService` активен, даже при закрытом окне — C6).
-/// `profile_id` — коннект по сохранённому профилю (тогда на Connected обновляем его `last_exit`).
-fn start_session_with_provider(
+/// Плоский `state`-DTO (для прайминга re-attach текущим состоянием).
+fn state_dto(state: &str) -> VpnEventDto {
+    VpnEventDto {
+        kind: "state".into(),
+        state: state.into(),
+        exit: String::new(),
+        transport: String::new(),
+        cidr: String::new(),
+        error: String::new(),
+    }
+}
+
+/// Отметить exit последнего успешного коннекта в vault (только для сохранённого профиля).
+fn update_last_exit(profile_id: &Option<String>, ev: &VpnEvent) {
+    if let (VpnEvent::Connected { exit, .. }, Some(id)) = (ev, profile_id) {
+        if let Ok(mut g) = VAULT.lock() {
+            if let Some(v) = g.as_mut() {
+                let _ = v.set_last_exit(id, exit);
+            }
+        }
+    }
+}
+
+/// Обновить снимок [`ANDROID_STATUS`] по событию контроллера (нюанс 2: перезапуск видит живой VPN).
+/// Возвращает `false`, если поколение устарело (стартовала/остановилась новая сессия) → форвард-
+/// задача должна выйти. Проверка `ANDROID_GEN` ПОД локом статуса делает её атомарной с переустановкой
+/// статуса в [`android_start`]/[`android_stop_session`] → поздний `Down` старого контроллера не
+/// перезапишет статус новой сессии (иначе рестарт увидел бы живой VPN как «отключён»).
+fn update_android_status(ev: &VpnEvent, generation: u64) -> bool {
+    let mut st = ANDROID_STATUS.lock().unwrap();
+    if ANDROID_GEN.load(std::sync::atomic::Ordering::SeqCst) != generation {
+        return false;
+    }
+    match ev {
+        VpnEvent::State(s) => st.state = vpn_state_str(*s),
+        VpnEvent::Connected { exit, transport, cidr } => {
+            st.exit = exit.clone();
+            st.transport = transport.clone();
+            st.cidr = cidr.clone();
+        }
+        VpnEvent::Error(_) => {}
+    }
+    true
+}
+
+/// Общее ядро запуска сессии (desktop+Android): останавливает прошлую активную сессию (её нативный
+/// loop иначе продолжит крутиться поверх новой — двойной establish/туннель), создаёт `VpnController`
+/// под ссылку (+ token-refresher: свежий Layer-1 токен на КАЖДЫЙ establish — анти-double-spend на
+/// реконнекте, exit иначе рвёт потраченный токен), кладёт в `ACTIVE` и крутит `connect`-loop на rt().
+/// Реконнект/backoff держит сам нативный loop → переживает смерть UI-изолята (Android — C6).
+/// Возвращает подписку на события для платформенной пересылки в UI.
+fn spawn_controller(
     uri: &str,
-    profile_id: Option<String>,
     provider: Arc<dyn TunProvider>,
-    sink: StreamSink<VpnEventDto>,
-) -> Result<()> {
-    // C5.4b: разбираем ссылку целиком — из неё берём issuer+client_seed для авто-фетча Layer-1
-    // токена. `to_client_config` теряет эти поля.
+) -> Result<tokio::sync::broadcast::Receiver<VpnEvent>> {
+    // C5.4b: разбираем ссылку целиком — из неё issuer+client_seed для авто-фетча Layer-1 токена.
     let link = CredentialLink::from_uri(uri)?;
     let mut cfg = link.to_client_config();
     cfg.killswitch = killswitch_enabled(); // C6/M9: kill-switch по GUI-тумблеру (desktop; Android — OS-level)
+    // Остановить прошлую сессию перед новой (анти-double-connect): её loop глушим, иначе он продолжит
+    // держать/реконнектить старый туннель параллельно новому. Берём Arc и disconnect() вне лока.
+    let prev = ACTIVE.lock().unwrap().take();
+    if let Some(old) = prev {
+        old.disconnect();
+    }
     let controller = Arc::new(VpnController::new());
     *ACTIVE.lock().unwrap() = Some(controller.clone());
-    // Свежий Layer-1 токен на КАЖДЫЙ establish (в т.ч. реконнект): иначе реконнект предъявляет уже
-    // потраченный токен, exit рвёт его как double-spend (M4/M5) → establish «connection lost» в петле.
-    // Заменяет однократный with_token; refresher фетчит и первый токен (перед первым establish).
     if let (Some(iss), Some(seed)) = (link.issuer.clone(), link.client_seed) {
         controller.set_token_refresher(Arc::new(move || {
             let iss = iss.clone();
@@ -304,37 +393,28 @@ fn start_session_with_provider(
             }) as std::pin::Pin<Box<dyn std::future::Future<Output = Option<Vec<u8>>> + Send>>
         }));
     }
+    // Подписка ДО begin() (первый Connecting буферизуется в broadcast до старта форвард-задачи).
+    let rx = controller.subscribe();
+    rt().spawn(async move {
+        controller.begin();
+        let _ = controller.connect(cfg, provider).await;
+    });
+    Ok(rx)
+}
 
-    let mut rx = controller.subscribe();
+/// Desktop: старт через polkit-helper (`GuiTunProvider`) + прямая пересылка событий в `sink`
+/// (десктопный изолят живёт с процессом → swap-able sink не нужен, в отличие от Android).
+fn start_connect(uri: &str, profile_id: Option<String>, sink: StreamSink<VpnEventDto>) -> Result<()> {
+    let mut rx = spawn_controller(uri, Arc::new(GuiTunProvider::default()))?;
     rt().spawn(async move {
         while let Ok(ev) = rx.recv().await {
-            // отметить exit последнего успешного коннекта (только сохранённый профиль)
-            if let (VpnEvent::Connected { exit, .. }, Some(id)) = (&ev, &profile_id) {
-                if let Ok(mut g) = VAULT.lock() {
-                    if let Some(v) = g.as_mut() {
-                        let _ = v.set_last_exit(id, exit);
-                    }
-                } // guard сброшен до следующего await
-            }
+            update_last_exit(&profile_id, &ev);
             if sink.add(to_dto(ev)).is_err() {
                 break; // Dart отписался
             }
         }
     });
-
-    rt().spawn(async move {
-        // Сразу показываем «подключаемся»; токен добывает refresher перед каждым establish (внутри
-        // connect), в т.ч. первый — реконнект берёт свежий, не потраченный.
-        controller.begin();
-        let _ = controller.connect(cfg, provider).await;
-    });
     Ok(())
-}
-
-/// Desktop: старт сессии через polkit-helper (`GuiTunProvider`).
-fn start_connect(uri: &str, profile_id: Option<String>, sink: StreamSink<VpnEventDto>) -> Result<()> {
-    let provider: Arc<dyn TunProvider> = Arc::new(GuiTunProvider::default());
-    start_session_with_provider(uri, profile_id, provider, sink)
 }
 
 /// Подключить по «сырой» ссылке (ещё не сохранённой — первый коннект перед сохранением).
@@ -390,12 +470,43 @@ impl TunProvider for AndroidTunProvider {
     }
 }
 
-/// Android: старт нативной сессии (сырая ссылка). Спавнит `VpnController::connect` с
-/// `AndroidTunProvider` на rt() — реконнект-loop нативный, события стримятся через `sink`.
-/// Заменяет двухфазный `android_establish` + `android_run_data_plane`; останов — `vpn_disconnect`.
+/// Android: общий старт нативной сессии. Спавнит контроллер с `AndroidTunProvider`, ставит свежий
+/// статус+sink (перекрывает мёртвый от прошлого изолята) и ПЕРСИСТЕНТНУЮ форвард-задачу: она обновляет
+/// [`ANDROID_STATUS`] на каждое событие (даже когда Dart не подписан → перезапуск видит живой VPN,
+/// нюанс 2) и шлёт в swap-able [`ANDROID_SINK`]. Поколение [`ANDROID_GEN`] глушит задачу прошлой
+/// сессии. Останов — [`android_stop_session`].
+fn android_start(uri: &str, profile_id: Option<String>, sink: StreamSink<VpnEventDto>) -> Result<()> {
+    let mut rx = spawn_controller(uri, Arc::new(AndroidTunProvider))?; // парсит ссылку (может упасть)
+    let generation = ANDROID_GEN.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+    {
+        let mut st = ANDROID_STATUS.lock().unwrap();
+        *st = AndroidStatus::idle();
+        st.state = "connecting";
+        st.profile_id = profile_id.clone().unwrap_or_default();
+    }
+    *ANDROID_SINK.lock().unwrap() = Some(sink);
+    rt().spawn(async move {
+        while let Ok(ev) = rx.recv().await {
+            // Обновить статус (нюанс 2) — и выйти, если сессию сменили (устаревшее поколение).
+            if !update_android_status(&ev, generation) {
+                break;
+            }
+            update_last_exit(&profile_id, &ev);
+            // Переслать в текущий изолят (если подписан); мёртвый sink снимаем до re-attach.
+            let mut guard = ANDROID_SINK.lock().unwrap();
+            if let Some(s) = guard.as_ref() {
+                if s.add(to_dto(ev)).is_err() {
+                    *guard = None;
+                }
+            }
+        }
+    });
+    Ok(())
+}
+
+/// Android: старт нативной сессии (сырая ссылка). Останов — [`android_stop_session`].
 pub fn android_start_session(link: String, sink: StreamSink<VpnEventDto>) -> Result<()> {
-    let provider: Arc<dyn TunProvider> = Arc::new(AndroidTunProvider);
-    start_session_with_provider(&link, None, provider, sink)
+    android_start(&link, None, sink)
 }
 
 /// Android: старт нативной сессии по сохранённому профилю (ссылка не покидает ядро).
@@ -409,8 +520,56 @@ pub fn android_start_session_profile(id: String, sink: StreamSink<VpnEventDto>) 
             .map(|p| p.uri)
             .ok_or_else(|| anyhow!("профиль не найден"))?
     };
-    let provider: Arc<dyn TunProvider> = Arc::new(AndroidTunProvider);
-    start_session_with_provider(&uri, Some(id), provider, sink)
+    android_start(&uri, Some(id), sink)
+}
+
+/// Android: снимок статуса сессии (sync) — перезапуск (новый изолят) спрашивает при старте, чтобы
+/// отразить живой VPN, а не показать «отключено» и не поднять второй коннект поверх (нюанс 2).
+#[frb(sync)]
+pub fn android_session_status() -> AndroidStatusDto {
+    let st = ANDROID_STATUS.lock().unwrap();
+    AndroidStatusDto {
+        state: st.state.into(),
+        exit: st.exit.clone(),
+        transport: st.transport.clone(),
+        cidr: st.cidr.clone(),
+        profile_id: st.profile_id.clone(),
+    }
+}
+
+/// Android: переподписать новый Dart-изолят на события живой сессии (перезапуск после закрытия окна).
+/// Ставит `sink` текущим (перекрывает мёртвый) и сразу праймит его снимком (state + connected-инфо),
+/// чтобы UI-поток был консистентен без ожидания следующего события контроллера.
+pub fn android_attach_events(sink: StreamSink<VpnEventDto>) -> Result<()> {
+    {
+        let st = ANDROID_STATUS.lock().unwrap();
+        let _ = sink.add(state_dto(st.state));
+        if !st.exit.is_empty() {
+            let _ = sink.add(VpnEventDto {
+                kind: "connected".into(),
+                state: String::new(),
+                exit: st.exit.clone(),
+                transport: st.transport.clone(),
+                cidr: st.cidr.clone(),
+                error: String::new(),
+            });
+        }
+    }
+    *ANDROID_SINK.lock().unwrap() = Some(sink);
+    Ok(())
+}
+
+/// Android: остановить сессию (пользователь нажал «Отключить»). Глушит нативный loop (реконнект),
+/// инкремент [`ANDROID_GEN`] выводит форвард-задачу, статус → idle, sink снят — чтобы перезапуск
+/// не принял мёртвую сессию за живую.
+#[frb(sync)]
+pub fn android_stop_session() {
+    ANDROID_GEN.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    if let Some(c) = ACTIVE.lock().unwrap().take() {
+        c.disconnect();
+    }
+    *ANDROID_STATUS.lock().unwrap() = AndroidStatus::idle();
+    *ANDROID_SINK.lock().unwrap() = None;
 }
 
 /// Android: сигнал «сменилась underlying-сеть» (WiFi↔LTE/toggle) → активный `VpnController`

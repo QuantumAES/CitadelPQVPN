@@ -55,6 +55,27 @@ class AppState extends ChangeNotifier {
 
   bool get isBusy => phase == VpnPhase.connecting || phase == VpnPhase.up;
 
+  AppState() {
+    // C6/S3 (нюанс 2): новый изолят при перезапуске может застать ЖИВУЮ нативную сессию (loop
+    // пережил закрытие окна, процесс держит foreground-сервис) — отразить её, а не показать «off».
+    if (Platform.isAndroid) _restoreAndroidSession();
+  }
+
+  /// Спросить ядро о статусе сессии; если живая — отразить состояние и переподписаться на события
+  /// (иначе UI показал бы «отключено» над живым VPN, а «Подключить» поднял бы второй коннект поверх).
+  void _restoreAndroidSession() {
+    final st = androidSessionStatus();
+    if (st.state != 'up' && st.state != 'connecting' && st.state != 'migrating') return;
+    activeProfileId = st.profileId.isEmpty ? null : st.profileId;
+    exit = st.exit;
+    transport = st.transport;
+    cidr = st.cidr;
+    _onState(st.state);
+    _sub?.cancel();
+    _sub = androidAttachEvents().listen(_handleEvent, onError: _onStreamError);
+    notifyListeners();
+  }
+
   // ─────────────────────────── vault ───────────────────────────
 
   Future<void> unlock(String pw) async {
@@ -163,27 +184,31 @@ class AppState extends ChangeNotifier {
     exit = transport = cidr = errorMsg = '';
     since = null;
     notifyListeners();
+    _sub = stream.listen(_handleEvent, onError: _onStreamError);
+  }
 
-    _sub = stream.listen((ev) {
-      switch (ev.kind) {
-        case 'state':
-          _onState(ev.state);
-        case 'connected':
-          exit = ev.exit;
-          transport = ev.transport;
-          cidr = ev.cidr;
-        case 'error':
-          phase = VpnPhase.error;
-          errorMsg = ev.error;
-          since = null;
-      }
-      notifyListeners();
-    }, onError: (Object e) {
-      phase = VpnPhase.error;
-      errorMsg = '$e';
-      since = null;
-      notifyListeners();
-    });
+  /// Применить событие сессии к состоянию (общее для первого коннекта и re-attach при перезапуске).
+  void _handleEvent(VpnEventDto ev) {
+    switch (ev.kind) {
+      case 'state':
+        _onState(ev.state);
+      case 'connected':
+        exit = ev.exit;
+        transport = ev.transport;
+        cidr = ev.cidr;
+      case 'error':
+        phase = VpnPhase.error;
+        errorMsg = ev.error;
+        since = null;
+    }
+    notifyListeners();
+  }
+
+  void _onStreamError(Object e) {
+    phase = VpnPhase.error;
+    errorMsg = '$e';
+    since = null;
+    notifyListeners();
   }
 
   void _onState(String s) {
@@ -203,10 +228,13 @@ class AppState extends ChangeNotifier {
   }
 
   void disconnect() {
-    // Останавливает нативный loop (ACTIVE.disconnect): гасит авто-реконнект, connect-loop дропает
-    // tun → fd закрывается → TUN гаснет. Симметрично обеим платформам.
-    vpnDisconnect();
-    if (Platform.isAndroid) AndroidVpn.stopService(); // + снять foreground-сервис и мониторинг сети
+    // Останавливает нативный loop (гасит авто-реконнект, connect-loop дропает tun → fd → TUN гаснет).
+    if (Platform.isAndroid) {
+      androidStopSession(); // + сброс статуса/sink: перезапуск не примет мёртвую сессию за живую (S3)
+      AndroidVpn.stopService(); // + снять foreground-сервис и мониторинг сети
+    } else {
+      vpnDisconnect();
+    }
     _sub?.cancel();
     _sub = null;
     phase = VpnPhase.off;

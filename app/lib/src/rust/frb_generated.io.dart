@@ -44,6 +44,9 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   AdminConn dco_decode_admin_conn(dynamic raw);
 
   @protected
+  AndroidStatusDto dco_decode_android_status_dto(dynamic raw);
+
+  @protected
   bool dco_decode_bool(dynamic raw);
 
   @protected
@@ -114,6 +117,9 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
 
   @protected
   AdminConn sse_decode_admin_conn(SseDeserializer deserializer);
+
+  @protected
+  AndroidStatusDto sse_decode_android_status_dto(SseDeserializer deserializer);
 
   @protected
   bool sse_decode_bool(SseDeserializer deserializer);
@@ -197,6 +203,12 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
 
   @protected
   void sse_encode_admin_conn(AdminConn self, SseSerializer serializer);
+
+  @protected
+  void sse_encode_android_status_dto(
+    AndroidStatusDto self,
+    SseSerializer serializer,
+  );
 
   @protected
   void sse_encode_bool(bool self, SseSerializer serializer);
