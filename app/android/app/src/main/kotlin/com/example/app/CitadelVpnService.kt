@@ -19,12 +19,10 @@ import android.os.ParcelFileDescriptor
  * параметрам и отдаёт fd в Rust; (2) держит foreground-нотификацию; (3) (C3.3) protect()
  * исходящих сокетов движка от заворачивания в туннель.
  *
- * S4 (leak-proof handover): СЕРВИС держит ParcelFileDescriptor интерфейса (currentPfd), а Rust
- * получает dup(fd). На реконнекте Rust закрывает свой dup, но интерфейс жив (держим pfd) → нет
- * зазора «нет VPN» → реальный IP не утекает: трафик в зазоре ловит ещё-живой старый TUN (blackhole),
- * пока establish() нового TUN атомарно не заменит старый. Интерфейс гаснет только на stopTun/onDestroy
- * (пользователь отключил / сервис умер). Прежде (до S4) Rust владел fd через detachFd и закрывал его
- * на реконнекте → интерфейс гас в зазоре → утечка.
+ * fd передаётся через detachFd(): владельцем становится Rust (Tun::from_raw_fd), он же закрывает
+ * его при остановке/реконнекте нативного connect-loop (vpn_disconnect → loop завершается → tun
+ * дропается → fd закрывается; на реконнекте старый fd дропается перед новым establishTun). Поэтому
+ * сервис fd НЕ закрывает (иначе double-close).
  */
 class CitadelVpnService : VpnService() {
 
@@ -61,11 +59,6 @@ class CitadelVpnService : VpnService() {
     // нужен) от возврата сети после onLost (toggle WiFi — реконнект НУЖЕН).
     private var hadNetwork: Boolean = false
 
-    // S4: pfd активного TUN-интерфейса. Держим здесь (не отдаём владение Rust) → интерфейс переживает
-    // закрытие Rust'ом своего dup на реконнекте (нет зазора → нет утечки). Меняется в establishTun,
-    // закрывается в closeTun (реальный останов).
-    private var currentPfd: ParcelFileDescriptor? = null
-
     override fun onCreate() {
         super.onCreate()
         instance = this
@@ -95,37 +88,20 @@ class CitadelVpnService : VpnService() {
         }
         for (d in dns.split(" ").filter { it.isNotEmpty() }) b.addDnsServer(d)
         if (routeList.isEmpty()) b.addRoute("0.0.0.0", 0) // нет split-маршрутов → full-tunnel
-        // establish() создаёт НОВЫЙ интерфейс, ОС атомарно заменяет прежний (был жив до этого момента
-        // → нет зазора «нет VPN»). Если бросит/вернёт null — прежний интерфейс НЕ трогаем (currentPfd
-        // жив, ловит трафик blackhole'ом), Rust отретраит establish на следующей итерации реконнекта.
-        val pfd = b.establish() ?: throw IllegalStateException("VpnService.establish() == null (нет разрешения VPN?)")
-        val old = currentPfd
-        currentPfd = pfd
-        try { old?.close() } catch (_: Exception) {} // прежний интерфейс уже деактивирован establish()
-        // Rust получает ДУБЛИКАТ fd: владелец интерфейса — currentPfd в сервисе. Rust закроет свой dup
-        // на реконнекте — интерфейс не гаснет (держим pfd) → нет утечки реального IP в зазоре транспорта.
-        return pfd.dup().detachFd()
+        val fd = b.establish() ?: throw IllegalStateException("VpnService.establish() == null (нет разрешения VPN?)")
+        return fd.detachFd() // владение переходит в Rust
     }
 
     /** C3.3: исключить сокет движка из туннеля (анти-петля). Зовётся из Rust через JNI. */
     fun protectFd(fd: Int): Boolean = protect(fd)
 
-    /** Закрыть TUN-интерфейс (VPN гаснет) — только на РЕАЛЬНОМ останове (пользователь отключил /
-     *  сервис умирает), НЕ на реконнекте (там establishTun сам заменяет интерфейс, не гася его). */
-    private fun closeTun() {
-        try { currentPfd?.close() } catch (_: Exception) {}
-        currentPfd = null
-    }
-
     fun stopTun() {
-        closeTun() // пользователь отключил → интерфейс вниз (трафик снова напрямую), не blackhole
         stopForeground(STOP_FOREGROUND_REMOVE)
         stopSelf()
     }
 
     override fun onDestroy() {
         unregisterNetCallback()
-        closeTun() // сервис умирает без stopTun (системный kill) → не оставляем интерфейс/fd
         nativeUnregister()
         instance = null
         super.onDestroy()
