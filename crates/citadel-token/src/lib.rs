@@ -19,6 +19,8 @@ use rand::RngCore;
 use std::io::{self, Read, Write};
 use std::net::TcpStream;
 
+pub mod pqtls; // S2.1/A1: PQ-TLS + pin канал к издателю (анти-MITM, анти-деанон client_id)
+
 pub const NONCE_LEN: usize = 32;
 pub const RAND_LEN: usize = 32;
 
@@ -95,23 +97,30 @@ pub fn read_frame(r: &mut impl Read) -> io::Result<Vec<u8>> {
 /// «абонементом»), получает ТЕКУЩИЙ epoch-pub издателя, добывает `count` токенов
 /// (blind→sign→finalize). Издатель токены НЕ видит (unlinkable). `retries` — попытки коннекта
 /// (издатель мог ещё генерить RSA-ключ). Протокол: challenge → pub‖sig → issuer_pub → {blind→sig}×N.
+///
+/// S2.1/A1: весь обмен идёт по **PQ-TLS с пиннингом** серта издателя (`issuer_pin`). Это закрывает
+/// (a) MITM-кражу токенов (подстановку чужих `blind_msg`), (b) деанон `client_id` в открытом виде,
+/// (c) импёрсонацию издателя. Несовпадение pin → отказ на TLS-хендшейке (fail-closed).
 pub fn fetch_tokens(
     issuer_addr: &str,
+    issuer_pin: &[u8; 32],
     seed: &[u8; 32],
     count: usize,
     retries: u32,
 ) -> Result<Vec<Vec<u8>>> {
-    let mut conn = None;
+    let mut tcp = None;
     for _ in 0..retries.max(1) {
         match TcpStream::connect(issuer_addr) {
             Ok(c) => {
-                conn = Some(c);
+                tcp = Some(c);
                 break;
             }
             Err(_) => std::thread::sleep(std::time::Duration::from_secs(1)),
         }
     }
-    let mut conn = conn.ok_or_else(|| anyhow!("издатель {issuer_addr} недоступен"))?;
+    let tcp = tcp.ok_or_else(|| anyhow!("издатель {issuer_addr} недоступен"))?;
+    // S2.1/A1: поднять PQ-TLS поверх TCP; серт издателя пиннится → канал аутентифицирован и скрыт.
+    let mut conn = pqtls::connect_tls(tcp, *issuer_pin)?;
 
     // Layer-1: челлендж → pub(32)‖sig(64)
     let challenge = read_frame(&mut conn)?;
@@ -282,19 +291,29 @@ mod tests {
         assert!(verify_token_multi(&[], tok).is_none());
     }
 
-    /// C5.3: полный клиентский протокол `fetch_tokens` против in-process issuer (Layer-1 auth +
-    /// выдача epoch-pub + слепая подпись). Проверяет, что добытые токены валидны под issuer pub.
+    /// C5.3 + S2.1/A1: полный клиентский протокол `fetch_tokens` против in-process issuer поверх
+    /// PQ-TLS (Layer-1 auth + выдача epoch-pub + слепая подпись). Проверяет, что добытые токены
+    /// валидны под issuer pub И что канал идёт через пиннящийся TLS (fetch_tokens требует pin).
     #[test]
     fn fetch_tokens_layer1_roundtrip() {
         use std::net::TcpListener;
         let seed = [0x33u8; 32];
         let pk_ed = ed25519_pub_from_seed(&seed).unwrap();
         let (issuer_pk, issuer_sk) = issuer_keypair(2048).unwrap();
+
+        // S2.1/A1: издатель поднимает постоянный TLS-серт; клиент пиннит его pin.
+        let dir = std::env::temp_dir().join(format!("citadel-fetch-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let identity = pqtls::IssuerIdentity::load_or_generate(dir.to_str().unwrap()).unwrap();
+        let issuer_pin = identity.pin;
+        let scfg = identity.server_config().unwrap();
+
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap().to_string();
         let issuer_pk_srv = issuer_pk.clone();
         let srv = std::thread::spawn(move || {
-            let (mut conn, _) = listener.accept().unwrap();
+            let (tcp, _) = listener.accept().unwrap();
+            let mut conn = pqtls::accept_tls(tcp, scfg).unwrap();
             let challenge = [0x77u8; 32];
             write_frame(&mut conn, &challenge).unwrap();
             let auth = read_frame(&mut conn).unwrap(); // pub(32)‖sig(64)
@@ -307,12 +326,13 @@ mod tests {
                 write_frame(&mut conn, &sig).unwrap();
             }
         });
-        let tokens = fetch_tokens(&addr, &seed, 3, 3).unwrap();
+        let tokens = fetch_tokens(&addr, &issuer_pin, &seed, 3, 3).unwrap();
         assert_eq!(tokens.len(), 3);
         for t in &tokens {
             assert!(verify_token(&issuer_pk, t).is_some(), "токен валиден под issuer pub");
         }
         srv.join().unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

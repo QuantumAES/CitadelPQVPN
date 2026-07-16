@@ -160,10 +160,11 @@ export Citadel_TUN_ADDR=10.7.0.1/16
 export Citadel_MTU=1100
 export Citadel_NAT_SRC=10.7.0.0/16
 export Citadel_PIN_FILE=/shared/exit.pin
+export Citadel_KEY_DIR=/shared   # A7: постоянная идентичность exit (cert/pin + ML-DSA seed) → рестарт НЕ ломает розданные ссылки
 export Citadel_OBFS_PSK="${Citadel_OBFS_PSK:-}"
 export Citadel_TCP_LISTEN=0.0.0.0:443
 export Citadel_KX=pq   # S1.1/M4: PQ-only (анти-HNDL) — classical не принимаем
-rm -f /shared/exit.pin
+rm -f /shared/exit.pin   # pin перезапишется тем же значением из постоянного серта (A7)
 EOF
   if [[ "$ISSUER_ON" == 1 ]]; then
     cat <<EOF
@@ -272,12 +273,15 @@ for _ in $(seq 1 90); do [[ -s "$DIR/keys/exit.pin" ]] && break; sleep 1; done
 PIN="$(cat "$DIR/keys/exit.pin")"
 
 MLDSA_ARGS=()
+ISSUER_TLS_PIN=""
 if [[ "$ISSUER_ON" == 1 ]]; then
-  log "жду издателя (issuer.pub) и ML-DSA pub exit'а…"
-  for _ in $(seq 1 90); do [[ -s "$DIR/keys/issuer.pub" && -s "$DIR/keys/exit.mldsa" ]] && break; sleep 1; done
+  log "жду издателя (issuer.pub, issuer-tls.pin) и ML-DSA pub exit'а…"
+  for _ in $(seq 1 90); do [[ -s "$DIR/keys/issuer.pub" && -s "$DIR/keys/issuer-tls.pin" && -s "$DIR/keys/exit.mldsa" ]] && break; sleep 1; done
   [[ -s "$DIR/keys/issuer.pub" ]] || { docker compose -f "$DIR/etc/compose.yml" logs --tail 40 issuer || true; die "издатель не опубликовал issuer.pub за 90с"; }
+  [[ -s "$DIR/keys/issuer-tls.pin" ]] || die "издатель не опубликовал issuer-tls.pin (PQ-TLS канал, A1) за 90с"
   [[ -s "$DIR/keys/exit.mldsa" ]] || die "exit не опубликовал ML-DSA pub (exit.mldsa) за 90с"
   MLDSA_ARGS=(--mldsa-pub "$DIR/keys/exit.mldsa")
+  ISSUER_TLS_PIN="$(cat "$DIR/keys/issuer-tls.pin")"   # S2.1/A1: pin PQ-TLS канала издателя → в ссылку
 fi
 
 # ─── 7. публичный адрес + citadel:// (секрет) ───
@@ -290,7 +294,8 @@ LINKARGS=(--servers "$SERVER_HOST:$UDP_PORT" --psk "$PSK" --pin "$PIN"
           --kx pq --tcp-port "$TCP_PORT" --routes "$ROUTES" --dns "$DNS" "${MLDSA_ARGS[@]}")
 if [[ "$ISSUER_ON" == 1 ]]; then
   # Layer-1: клиент авто-фетчит epoch-токен у издателя перед коннектом (issuer host:port + seed).
-  LINKARGS+=(--issuer "$SERVER_HOST:$ISSUER_PORT" --client-seed "$CLIENT_SEED")
+  # S2.1/A1: --issuer-pin → клиент пиннит PQ-TLS канал фетча (анти-MITM + скрытие client_id).
+  LINKARGS+=(--issuer "$SERVER_HOST:$ISSUER_PORT" --issuer-pin "$ISSUER_TLS_PIN" --client-seed "$CLIENT_SEED")
 fi
 LINK="$("$DIR/bin/citadel-linkgen" "${LINKARGS[@]}" 2>/dev/null)" \
   || die "citadel-linkgen не сгенерировал ссылку"
@@ -325,7 +330,8 @@ cat <<EOF
     Новому абоненту: сгенерируй seed → citadel-linkgen --client-seed <seed> … (его ссылка) +
     registry add-seed <seed> (в реестр идёт только pub — seed остаётся у абонента). Отзыв действует
     ≤ длины эпохи (${EPOCH_SECS}s), переживает рестарт контейнера. Массовый отзыв — сменить эпоху.
-  • ⚠ Издатель на :$ISSUER_PORT — открытый (не-TLS) endpoint блайнд-RSA; Layer-1-хендшейк в
-    открытом виде (фингерпринтируем цензором). Hardening (issuer за TLS/obfs) — follow-up.
+  • Издатель на :$ISSUER_PORT работает поверх PQ-TLS с пиннингом серта (S2.1/A1): Layer-1 и слепая
+    выдача идут в шифре с целостностью, client_id скрыт, серт издателя пиннится клиентом (анти-MITM).
+    ⚠ Остаётся: TLS-хендшейк на выделенном порту фингерпринтируем цензором (obfs-обёртка — follow-up).
 EOF
 fi

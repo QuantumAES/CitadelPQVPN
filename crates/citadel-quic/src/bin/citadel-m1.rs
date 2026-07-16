@@ -21,6 +21,7 @@ use std::time::Duration;
 
 use anyhow::{anyhow, Context, Result};
 use rand::RngCore;
+use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
 use citadel_masque::capsule;
 use citadel_quic::config::{parse_pin, ClientConfig, PinMode};
 use citadel_quic::dataplane::{pump, Tunnel};
@@ -31,6 +32,12 @@ use citadel_tun::Tun;
 // Пул адресов exit для клиентов: база/префикс из Citadel_TUN_ADDR; счётчик u16 заполняет
 // весь диапазон (для /16 — 10.7.0.2 … 10.7.255.253), чтобы адреса не кончались на реконнектах.
 static ADDR_POOL: AtomicU16 = AtomicU16::new(2);
+
+// S2.5/A5: потолок ОДНОВРЕМЕННЫХ pre-auth хендшейков TCP-fallback (анти-DoS: без него флуд
+// «молчаливыми» коннектами копит quinn-Endpoint'ы/задачи/fd). Слот держится только на хендшейк.
+const TCP_FALLBACK_MAX_INFLIGHT: usize = 256;
+// Таймаут на весь TCP-fallback хендшейк (obfs-gate + PQ-QUIC): idle/битый коннект не висит вечно.
+const TCP_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// (первые два октета сети, префикс) из Citadel_TUN_ADDR (default 10.7.0.1/24).
 fn tun_net() -> ([u8; 2], u8) {
@@ -144,6 +151,13 @@ fn server_setup_net(ifname: &str) {
     run("iptables", &["-A", "FORWARD", "-i", ifname, "-s", &nat, "-o", &eg, "-j", "ACCEPT"]);
     run("iptables", &["-A", "FORWARD", "-i", &eg, "-o", ifname, "-m", "state", "--state", "RELATED,ESTABLISHED", "-j", "ACCEPT"]);
     run("iptables", &["-A", "FORWARD", "-i", ifname, "!", "-s", &nat, "-j", "DROP"]);
+    // S2.3/A4: клиент НЕ должен достукиваться до самого exit-хоста через туннель. Пакет с dst =
+    // локальный адрес exit (его ПУБЛИЧНЫЙ IP, SSH:22, issuer:7000, docker-API, published-порты) идёт
+    // в INPUT — не в FORWARD и не в NAT — поэтому egress-фильтр (F2/is_blocked_dst) его не ловит
+    // (F2 покрывает RFC1918/10.x — приватные, но не публичный IP самого exit). Data-plane читает
+    // TUN через userspace-fd, ядровый INPUT с туннеля ему не нужен ⇒ дропаем весь INPUT с ifname.
+    // Закрывает пивот туннельного клиента на сервисы exit-хоста (аудит-2/A4).
+    run("iptables", &["-A", "INPUT", "-i", ifname, "-j", "DROP"]);
     let _ = std::fs::write("/proc/sys/net/ipv4/conf/all/rp_filter", b"1");
     // MSS-clamp: ограничить TCP-сегменты под PMTU туннеля. Без него крупные ответные
     // сегменты (TLS ServerHello/cert) не влезают в QUIC-датаграмму и теряются — PMTUD
@@ -258,6 +272,9 @@ async fn server_assign_address(
     signer: Option<&citadel_quic::pqauth::ServerSigner>,
     cert_pin: [u8; 32],
 ) -> Result<()> {
+    // S2.6/A3: TLS exporter серверной сессии для channel-binding ML-DSA-подписи. Считаем ДО
+    // control_server (он берёт &mut tunnel) и заносим в замыкание.
+    let exporter = tunnel.exporter()?;
     tunnel
         .control_server(|buf| {
             // M7: первые 32 байта — nonce клиента для PQ-auth привязки
@@ -301,7 +318,7 @@ async fn server_assign_address(
             //         ‖ ADDRESS_ASSIGN. pub прикладывается всегда (commitment-fetch: клиент со ссылки
             // держит лишь H(pub) и сверяет его с этим pub). Без signer'а pub и sig пусты (PQ-auth выкл).
             let (pub_bytes, sig) = match signer {
-                Some(s) => (s.public_key(), s.sign_binding(nonce, &cert_pin)?),
+                Some(s) => (s.public_key(), s.sign_binding(nonce, &cert_pin, &exporter)?),
                 None => (Vec::new(), Vec::new()),
             };
             let mut resp = citadel_masque::varint::to_vec(pub_bytes.len() as u64);
@@ -316,6 +333,60 @@ async fn server_assign_address(
 
 // load_token вынесён в ClientConfig::from_env (C0.3).
 
+// ---------------------- A7: персистентная идентичность exit ----------------------
+/// chmod 600 (unix) — приватные ключи не должны читаться dropped-uid/другими.
+fn set_key_perms(path: &str) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
+    }
+}
+
+/// A7: постоянная Ed25519-идентичность exit (стабильный pin между рестартами). Каталог из
+/// `Citadel_KEY_DIR`; не задан → `None` (эфемерная идентичность — демо/back-compat). Загружает
+/// `<dir>/exit-cert.der`+`exit-key.der` либо генерит и сохраняет (ключ 600). Без этого каждый
+/// рестарт менял бы pin → все розданные `citadel://`-ссылки переставали бы подключаться.
+fn persistent_cert() -> Result<Option<(CertificateDer<'static>, PrivateKeyDer<'static>)>> {
+    let Ok(dir) = std::env::var("Citadel_KEY_DIR") else {
+        return Ok(None);
+    };
+    let crt = format!("{dir}/exit-cert.der");
+    let key = format!("{dir}/exit-key.der");
+    match (std::fs::read(&crt), std::fs::read(&key)) {
+        (Ok(c), Ok(k)) if !c.is_empty() && !k.is_empty() => {
+            eprintln!("[citadel-m1:server] A7: постоянный серт загружен из {dir}");
+            Ok(Some((CertificateDer::from(c), PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(k)))))
+        }
+        _ => {
+            let (c, k) = citadel_quic::self_signed_ed25519()?;
+            std::fs::write(&crt, c.as_ref()).with_context(|| format!("запись {crt}"))?;
+            std::fs::write(&key, k.secret_der()).with_context(|| format!("запись {key}"))?;
+            set_key_perms(&key);
+            eprintln!("[citadel-m1:server] A7: постоянный серт сгенерирован → {dir}");
+            Ok(Some((c, k)))
+        }
+    }
+}
+
+/// A7: постоянный ML-DSA-65 seed (32 б) из `<dir>/exit-mldsa.seed` либо генерит+сохраняет (600).
+/// Стабильный seed → стабильный ML-DSA pub → обязательство `H(pub)` в ссылках не ломается.
+fn persistent_mldsa_seed(dir: &str) -> Result<[u8; citadel_quic::pqauth::MLDSA_SEED_LEN]> {
+    let path = format!("{dir}/exit-mldsa.seed");
+    if let Ok(b) = std::fs::read(&path) {
+        if let Ok(seed) = <[u8; citadel_quic::pqauth::MLDSA_SEED_LEN]>::try_from(b.as_slice()) {
+            eprintln!("[citadel-m1:server] A7: ML-DSA seed загружен из {dir}");
+            return Ok(seed);
+        }
+    }
+    let mut seed = [0u8; citadel_quic::pqauth::MLDSA_SEED_LEN];
+    rand::thread_rng().fill_bytes(&mut seed);
+    std::fs::write(&path, seed).with_context(|| format!("запись {path}"))?;
+    set_key_perms(&path);
+    eprintln!("[citadel-m1:server] A7: ML-DSA seed сгенерирован → {dir}");
+    Ok(seed)
+}
+
 // ------------------------------- роли -------------------------------
 async fn run_server(tun: Arc<Tun>) -> Result<()> {
     server_setup_net(tun.name());
@@ -327,7 +398,13 @@ async fn run_server(tun: Arc<Tun>) -> Result<()> {
         "[citadel-m1:server] KX-suite (crypto-agility): {}",
         citadel_quic::kx_suite_name(&std::env::var("Citadel_KX").unwrap_or_default())
     );
-    let (cfg, pin) = citadel_quic::server_config_with_pin(citadel_quic::kx_groups_from_env())?;
+    // A7: постоянная идентичность (Citadel_KEY_DIR) → стабильный pin; иначе эфемерный серт (демо).
+    let (cfg, pin) = match persistent_cert()? {
+        Some((cert, key)) => {
+            citadel_quic::server_config_with_cert(citadel_quic::kx_groups_from_env(), cert, key)?
+        }
+        None => citadel_quic::server_config_with_pin(citadel_quic::kx_groups_from_env())?,
+    };
     if let Ok(path) = std::env::var("Citadel_PIN_FILE") {
         let _ = std::fs::write(&path, hex::encode(pin));
         eprintln!("[Citadel-m1:server] pin сертификата → {path}: {}", hex::encode(pin));
@@ -352,7 +429,12 @@ async fn run_server(tun: Arc<Tun>) -> Result<()> {
     // M7 PQ-auth: ML-DSA-65 keypair (если задан Citadel_MLDSA) + публикация pk клиенту.
     // Гибрид с Ed25519-cert+pin: сервер подписывает привязку nonce‖cert_pin, клиент проверяет.
     let signer = Arc::new(if std::env::var("Citadel_MLDSA").is_ok() {
-        let s = citadel_quic::pqauth::ServerSigner::generate()?;
+        // A7: постоянный seed (Citadel_KEY_DIR) → стабильный ML-DSA pub (commitment в ссылках цел);
+        // иначе эфемерный ключ (демо/back-compat).
+        let s = match std::env::var("Citadel_KEY_DIR") {
+            Ok(dir) => citadel_quic::pqauth::ServerSigner::from_seed(&persistent_mldsa_seed(&dir)?)?,
+            Err(_) => citadel_quic::pqauth::ServerSigner::generate()?,
+        };
         if let Ok(path) = std::env::var("Citadel_MLDSA_PUB_FILE") {
             let pk = s.public_key();
             std::fs::write(&path, &pk).ok();
@@ -394,10 +476,24 @@ async fn run_server(tun: Arc<Tun>) -> Result<()> {
         let issuer_auth = issuer_auth.clone();
         let spent = spent.clone();
         let signer = signer.clone();
+        // S2.5/A5: каждый accept'нутый TCP-стрим аллоцирует quinn-Endpoint + задачи ДО обфс/PQ-auth;
+        // флуд «молчаливыми» коннектами (ничего не шлют) копил бы их безлимитно (DoS-исчерпание
+        // fd/памяти). Ограничиваем число ОДНОВРЕМЕННЫХ pre-auth хендшейков семафором (нет слота →
+        // мгновенный дроп) + таймаут на сам хендшейк (idle-коннект не висит вечно). Слот держим
+        // только на время хендшейка — established-сессии его не занимают.
+        let tcp_sema = Arc::new(tokio::sync::Semaphore::new(TCP_FALLBACK_MAX_INFLIGHT));
         tokio::spawn(async move {
             loop {
                 match listener.accept().await {
                     Ok((stream, _)) => {
+                        let permit = match tcp_sema.clone().try_acquire_owned() {
+                            Ok(p) => p,
+                            Err(_) => {
+                                eprintln!("[citadel-m1:server] TCP-fallback: лимит {TCP_FALLBACK_MAX_INFLIGHT} одновременных хендшейков — соединение отклонено (A5)");
+                                drop(stream);
+                                continue;
+                            }
+                        };
                         let (tun, issuer_auth, spent, signer, scfg) = (
                             tun.clone(),
                             issuer_auth.clone(),
@@ -413,15 +509,30 @@ async fn run_server(tun: Arc<Tun>) -> Result<()> {
                                     return;
                                 }
                             };
-                            if let Some(incoming) = ep.accept().await {
-                                match incoming.await {
-                                    Ok(conn) => {
-                                        let (addr, prefix) = next_client_addr();
-                                        handle_client(Tunnel::new(conn, true), tun, addr, prefix, issuer_auth, spent, rate_limit, signer, pin).await;
-                                    }
-                                    Err(e) => eprintln!("[citadel-m1:server] obfs-TCP хендшейк: {e}"),
+                            // A5: таймаут на весь хендшейк (obfs-gate + PQ-QUIC). Молчаливый/битый
+                            // коннект → таймаут → ep и задачи дропаются, слот освобождается.
+                            let handshake = async {
+                                match ep.accept().await {
+                                    Some(incoming) => incoming.await.ok(),
+                                    None => None,
                                 }
-                            }
+                            };
+                            let conn = match tokio::time::timeout(TCP_HANDSHAKE_TIMEOUT, handshake).await {
+                                Ok(Some(c)) => c,
+                                Ok(None) => {
+                                    eprintln!("[citadel-m1:server] obfs-TCP хендшейк не удался");
+                                    return;
+                                }
+                                Err(_) => {
+                                    eprintln!("[citadel-m1:server] obfs-TCP хендшейк: таймаут — соединение отклонено (A5)");
+                                    return;
+                                }
+                            };
+                            // Хендшейк прошёл (obfs+PQ+токен впереди) → освобождаем pre-auth слот:
+                            // established-сессия лимит одновременных хендшейков больше не держит.
+                            drop(permit);
+                            let (addr, prefix) = next_client_addr();
+                            handle_client(Tunnel::new(conn, true), tun, addr, prefix, issuer_auth, spent, rate_limit, signer, pin).await;
                             // ep жив до конца handle_client (в scope) → соединение не рвётся
                         });
                     }

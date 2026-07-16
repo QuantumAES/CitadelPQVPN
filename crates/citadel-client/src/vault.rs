@@ -261,6 +261,7 @@ mod tests {
             tcp_port: None,
             issuer: None,
             issuer_pub: None,
+            issuer_pin: None,
             client_seed: None,
             routes: String::new(),
             dns: None,

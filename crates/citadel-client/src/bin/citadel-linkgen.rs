@@ -6,10 +6,11 @@
 //! citadel-linkgen --servers "1.2.3.4:4433" --psk <hex64|passphrase> --pin <hex64> \
 //!   [--kx all] [--tcp-port 443] [--routes "1.1.1.1/32 1.0.0.1/32"] \
 //!   [--dns 1.1.1.1] [--server-name citadel.exit] [--qr link.svg] \
-//!   [--issuer host:7000] [--client-seed <hex64>] [--mldsa-pub exit.mldsa]
+//!   [--issuer host:7000] [--issuer-pin <hex64>] [--client-seed <hex64>] [--mldsa-pub exit.mldsa]
 //! ```
 //! `--psk` — passphrase (BLAKE3-derive, как на exit) или 64-hex; `--pin` — hex из exit.pin.
-//! C5.4b двухслойная идентичность: `--issuer` (host:port издателя) + `--client-seed` (hex64,
+//! C5.4b двухслойная идентичность: `--issuer` (host:port издателя) + `--issuer-pin` (hex из
+//! issuer-tls.pin, S2.1/A1 — клиент пиннит PQ-TLS канал) + `--client-seed` (hex64,
 //! приватный Ed25519 «абонента») → GUI авто-фетчит epoch-токен перед коннектом. Пара к выдаче —
 //! регистрация абонента у issuer: `citadel-token registry add-seed <тот же seed>` (C5.5). `--mldsa-pub` —
 //! файл ML-DSA-65 pub exit'а (M7): в ссылку кладётся обязательство `H(pub)` (client-enforcement
@@ -59,6 +60,8 @@ fn main() {
         // C5.4b Layer-1: issuer host:port + client_seed (hex64 → [u8;32], та же кодировка, что pin).
         issuer: get("--issuer"),
         issuer_pub: None, // клиент дотягивает issuer_pub по каналу при фетче (не нужен в ссылке)
+        // S2.1/A1: pin TLS-серта издателя (из issuer-tls.pin) — клиент пиннит PQ-TLS канал фетча.
+        issuer_pin: get("--issuer-pin").as_deref().and_then(parse_pin),
         client_seed: get("--client-seed").as_deref().and_then(parse_pin),
         routes: get("--routes").unwrap_or_default(),
         dns: get("--dns"),
@@ -67,13 +70,17 @@ fn main() {
     let link = CredentialLink::from_bundle(&bundle);
     let uri = link.to_uri().expect("to_uri");
     println!("{uri}");
+    if bundle.issuer.is_some() && bundle.issuer_pin.is_none() {
+        eprintln!("[linkgen] ⚠ --issuer задан БЕЗ --issuer-pin — клиент не сможет безопасно фетчить токен (A1)");
+    }
     eprintln!(
-        "[linkgen] servers={:?} pin={} psk={} mldsa={} issuer={} layer1-seed={} routes={:?}",
+        "[linkgen] servers={:?} pin={} psk={} mldsa={} issuer={} issuer-pin={} layer1-seed={} routes={:?}",
         bundle.servers,
         if bundle.cert_pin.is_some() { "да" } else { "НЕТ (no-pin, PoC)" },
         if bundle.obfs_psk.is_some() { "да" } else { "НЕТ" },
         if bundle.mldsa_pub.is_some() { "H(pub) в ссылке" } else { "НЕТ" },
         bundle.issuer.as_deref().unwrap_or("НЕТ (token-less)"),
+        if bundle.issuer_pin.is_some() { "да" } else { "НЕТ" },
         if bundle.client_seed.is_some() { "да" } else { "НЕТ" },
         bundle.routes,
     );

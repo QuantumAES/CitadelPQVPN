@@ -141,6 +141,12 @@ fn iptables(args: &[&str]) {
     let _ = Command::new("iptables").args(args).stderr(std::process::Stdio::null()).status();
 }
 
+/// S2.2/A2: то же для IPv6 (`ip6tables`). Туннель — IPv4-only, поэтому нативный IPv6 нигде не
+/// заворачивается и без блока утекал бы мимо туннеля И мимо IPv4-kill-switch (деанон на dual-stack).
+fn ip6tables(args: &[&str]) {
+    let _ = Command::new("ip6tables").args(args).stderr(std::process::Stdio::null()).status();
+}
+
 /// F6: резолвер только через туннель + fail-closed на прочий :53 (анти-leak). Бэкапит resolv.conf.
 fn setup_dns(ifn: &str, dns: &str) {
     ip(&["route", "replace", &format!("{dns}/32"), "dev", ifn]);
@@ -197,16 +203,55 @@ fn teardown_killswitch() {
     iptables(&["-X", "CITADEL_KS"]);
 }
 
+/// S2.2/A2 — правила fail-closed блока IPv6 (`ip6tables`). Туннель IPv4-only ⇒ весь исходящий IPv6
+/// (данные + DNS) — это утечка мимо туннеля. RETURN разрешаем только: lo и link-local ND (RS/RA/NS/NA,
+/// ICMPv6 133–136 — чтобы не ломать локальный IPv6-стек), всё остальное — DROP. Отдельная цепочка
+/// `CITADEL_KS6` с хуком в начало OUTPUT (чужую политику не трогаем).
+fn ipv6_block_rules() -> Vec<Vec<String>> {
+    let a = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+    let mut r = vec![
+        a(&["-N", "CITADEL_KS6"]),
+        a(&["-A", "CITADEL_KS6", "-o", "lo", "-j", "RETURN"]),
+    ];
+    for t in ["133", "134", "135", "136"] {
+        r.push(a(&["-A", "CITADEL_KS6", "-p", "ipv6-icmp", "--icmpv6-type", t, "-j", "RETURN"]));
+    }
+    r.push(a(&["-A", "CITADEL_KS6", "-j", "DROP"]));
+    r.push(a(&["-I", "OUTPUT", "1", "-j", "CITADEL_KS6"]));
+    r
+}
+
+/// Армировать IPv6-блок (сперва снять осиротевшую цепочку — idempotent).
+fn setup_ipv6_block() {
+    teardown_ipv6_block();
+    for rule in ipv6_block_rules() {
+        let args: Vec<&str> = rule.iter().map(String::as_str).collect();
+        ip6tables(&args);
+    }
+}
+
+/// Снять IPv6-блок (хук из OUTPUT + цепочка). Логика та же, что у kill-switch.
+fn teardown_ipv6_block() {
+    ip6tables(&["-D", "OUTPUT", "-j", "CITADEL_KS6"]);
+    ip6tables(&["-F", "CITADEL_KS6"]);
+    ip6tables(&["-X", "CITADEL_KS6"]);
+}
+
 fn main() -> Result<()> {
     // Аварийный режим: снять «залипший» kill-switch (остался fail-closed после краха движка) и выйти.
     // Escape hatch для юзера, у которого после краха нет интернета (весь не-туннельный OUTPUT в DROP).
     if std::env::args().any(|a| a == "--disarm-killswitch") {
         teardown_killswitch();
-        eprintln!("[helper] kill-switch снят (--disarm-killswitch)");
+        teardown_ipv6_block(); // S2.2/A2: снять и IPv6-блок (мог остаться fail-closed после краха)
+        eprintln!("[helper] kill-switch + IPv6-блок сняты (--disarm-killswitch)");
         return Ok(());
     }
     let args = parse_args()?;
     let killswitch = std::env::args().any(|a| a == "--killswitch");
+    // S2.2/A2: full-tunnel (0.0.0.0/0) или kill-switch ⇒ блокируем IPv6 (иначе он утекает мимо
+    // IPv4-only туннеля). Split-tunnel без killswitch не трогаем (там IPv6 вне туннеля — намеренно).
+    let full_tunnel = args.routes.split_whitespace().any(|r| r == "0.0.0.0/0");
+    let block_ipv6 = killswitch || full_tunnel;
 
     // привилегированная часть: создать TUN + настроить интерфейс (нужен root/CAP_NET_ADMIN).
     // Идемпотентность: снять возможный осиротевший интерфейс от прошлой сессии, иначе
@@ -256,6 +301,13 @@ fn main() -> Result<()> {
         setup_killswitch(&ifn, &eips);
         eprintln!("[helper] kill-switch АРМИРОВАН (fail-closed): не-туннельный OUTPUT заблокирован");
     }
+    if block_ipv6 {
+        setup_ipv6_block();
+        eprintln!(
+            "[helper] S2.2/A2: IPv6 заблокирован (fail-closed) — туннель IPv4-only, IPv6 не утечёт (причина: {})",
+            if killswitch { "kill-switch" } else { "full-tunnel" }
+        );
+    }
     eprintln!("[helper] TUN '{ifn}' {} up; передаю fd приложению", args.cidr);
 
     // передать fd туннеля непривилегированному приложению (SCM_RIGHTS)
@@ -293,6 +345,17 @@ fn main() -> Result<()> {
         } else {
             eprintln!("[helper] АВАРИЙНЫЙ разрыв (без 'Q') — kill-switch ОСТАВЛЕН (fail-closed). \
                        Снять вручную: pkexec citadel-helper --disarm-killswitch");
+        }
+    }
+    // S2.2/A2: IPv6-блок снимаем на чистый disconnect ВСЕГДА; на аварийный (краш) — оставляем
+    // ТОЛЬКО при killswitch (fail-closed, как KS). Без killswitch (блок был из-за full-tunnel) —
+    // снимаем, чтобы после падения движка IPv6-связность восстановилась (как и IPv4 без KS).
+    if block_ipv6 {
+        if killswitch && !clean {
+            eprintln!("[helper] IPv6-блок ОСТАВЛЕН (fail-closed, аварийный разрыв). \
+                       Снять вручную: pkexec citadel-helper --disarm-killswitch");
+        } else {
+            teardown_ipv6_block();
         }
     }
     // TUN-интерфейс исчезает сам, когда приложение закрывает свой (переданный) fd.
@@ -364,5 +427,31 @@ mod tests {
         let last_return =
             r.iter().rposition(|x| x.last().map(String::as_str) == Some("RETURN")).unwrap();
         assert!(drop_idx > last_return, "DROP должен быть после всех RETURN (fail-closed)");
+    }
+
+    /// S2.2/A2: правила IPv6-блока — своя цепочка `CITADEL_KS6`, хук в OUTPUT, RETURN только для lo
+    /// и link-local ND (ICMPv6 133–136), финальный DROP ПОСЛЕ всех RETURN (fail-closed, без утечки).
+    #[test]
+    fn ipv6_block_rules_shape() {
+        let r = ipv6_block_rules();
+        fn s(v: &[String]) -> Vec<&str> {
+            v.iter().map(String::as_str).collect()
+        }
+        assert_eq!(s(r.first().unwrap()), vec!["-N", "CITADEL_KS6"]);
+        assert_eq!(s(r.last().unwrap()), vec!["-I", "OUTPUT", "1", "-j", "CITADEL_KS6"]);
+        assert!(r.iter().any(|x| s(x) == vec!["-A", "CITADEL_KS6", "-o", "lo", "-j", "RETURN"]));
+        // ND-типы разрешены (иначе локальный IPv6-стек ломается)
+        for t in ["133", "134", "135", "136"] {
+            assert!(
+                r.iter().any(|x| s(x)
+                    == vec!["-A", "CITADEL_KS6", "-p", "ipv6-icmp", "--icmpv6-type", t, "-j", "RETURN"]),
+                "ICMPv6 {t} (ND) должен быть RETURN"
+            );
+        }
+        // fail-closed: DROP после всех RETURN
+        let drop_idx = r.iter().position(|x| x.last().map(String::as_str) == Some("DROP")).unwrap();
+        let last_return =
+            r.iter().rposition(|x| x.last().map(String::as_str) == Some("RETURN")).unwrap();
+        assert!(drop_idx > last_return, "DROP должен быть после всех RETURN (fail-closed IPv6)");
     }
 }

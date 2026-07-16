@@ -13,7 +13,8 @@ use citadel_quic::config::{ClientConfig, MldsaSource, PinSource};
 use serde::{Deserialize, Serialize};
 
 /// Версия формата бандла (растёт при несовместимых изменениях схемы).
-pub const BUNDLE_VERSION: u8 = 1;
+/// v2 (S2.1/A1): добавлен `issuer_pin` — pin TLS-серта издателя (PQ-TLS канал к issuer'у).
+pub const BUNDLE_VERSION: u8 = 2;
 
 /// Полный набор кред для подключения к exit'ам — всё инлайн.
 ///
@@ -29,7 +30,7 @@ pub struct CredentialBundle {
     pub server_name: String,
     /// KX-suite (M6): "", "pq", "classical", "all".
     pub kx_suite: String,
-    /// Cert-pin (F1, SHA-256 SPKI); `None` → PoC no-pin.
+    /// Cert-pin (F1) = BLAKE3(cert DER) — как `citadel_quic::cert_pin`; `None` → PoC no-pin.
     #[serde(with = "serde_bytes")]
     pub cert_pin: Option<[u8; 32]>,
     /// ML-DSA-65 pub (M7, 1952 B); `None` → только Ed25519+pin.
@@ -45,6 +46,10 @@ pub struct CredentialBundle {
     /// Pub издателя (RSA) для проверки токенов на клиенте.
     #[serde(with = "serde_bytes")]
     pub issuer_pub: Option<Vec<u8>>,
+    /// S2.1/A1: pin TLS-серта издателя (BLAKE3 DER) для PQ-TLS канала фетча токенов; `None` → нет
+    /// issuer / legacy. Без него клиент НЕ может безопасно фетчить (fail-closed в `token_agent`).
+    #[serde(with = "serde_bytes")]
+    pub issuer_pin: Option<[u8; 32]>,
     /// Ed25519 client-seed (Layer-1 «абонемент», C5); `None` → анонимный режим без идентичности.
     #[serde(with = "serde_bytes")]
     pub client_seed: Option<[u8; 32]>,
@@ -164,7 +169,7 @@ pub struct CredentialLink {
     pub servers: Vec<String>,
     pub server_name: String,
     pub kx_suite: String,
-    /// Cert-pin (F1) — уже обязательство (SHA-256 SPKI), идёт инлайн.
+    /// Cert-pin (F1) — уже обязательство (BLAKE3 cert DER, как `citadel_quic::cert_pin`), идёт инлайн.
     #[serde(with = "serde_bytes")]
     pub cert_pin: Option<[u8; 32]>,
     /// Обязательство к ML-DSA-65 pub: `H(mldsa_pub)`.
@@ -178,6 +183,9 @@ pub struct CredentialLink {
     /// Обязательство к pub издателя: `H(issuer_pub)`.
     #[serde(with = "serde_bytes")]
     pub issuer_commit: Option<[u8; 32]>,
+    /// S2.1/A1: pin TLS-серта издателя (BLAKE3 DER) — клиент пиннит PQ-TLS канал фетча токенов.
+    #[serde(with = "serde_bytes")]
+    pub issuer_pin: Option<[u8; 32]>,
     /// Ed25519 client-seed (секрет Layer-1 — инлайн).
     #[serde(with = "serde_bytes")]
     pub client_seed: Option<[u8; 32]>,
@@ -212,6 +220,7 @@ impl CredentialLink {
             tcp_port: b.tcp_port.clone(),
             issuer: b.issuer.clone(),
             issuer_commit: b.issuer_pub.as_deref().map(sha256),
+            issuer_pin: b.issuer_pin,
             client_seed: b.client_seed,
             routes: b.routes.clone(),
             dns: b.dns.clone(),
@@ -317,6 +326,7 @@ mod tests {
             tcp_port: Some("443".into()),
             issuer: Some("issuer.example:7000".into()),
             issuer_pub: Some(vec![0x44; 270]),
+            issuer_pin: Some([0x66; 32]),
             client_seed: Some([0x55; 32]),
             routes: "1.1.1.1/32 0.0.0.0/0".into(),
             dns: Some("1.1.1.1".into()),
@@ -344,6 +354,7 @@ mod tests {
             tcp_port: None,
             issuer: None,
             issuer_pub: None,
+            issuer_pin: None,
             client_seed: None,
             routes: String::new(),
             dns: None,

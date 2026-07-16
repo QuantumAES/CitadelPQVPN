@@ -9,6 +9,7 @@
 //!
 //! Сетевой формат: кадр `u32(len, BE) ‖ payload`; запрос — blind_msg, ответ — blind_sig.
 
+use std::collections::HashMap;
 use std::io::Write;
 use std::net::{TcpListener, TcpStream};
 use std::sync::{Arc, Mutex};
@@ -272,6 +273,9 @@ fn main() -> Result<()> {
 /// текущей±прошлой эпохи → «гаснут» к концу эпохи (отзыв по времени, M6).
 type EpochKey = (u64, Vec<u8>, Vec<u8>);
 
+/// S2.4/A6: счётчик выданных токенов `client_id → (эпоха, число)` (анти-фарминг, per-epoch).
+type QuotaMap = HashMap<[u8; 32], (u64, u32)>;
+
 /// Опубликовать pub эпохи (`issuer-<epoch>.pub`) + `issuer.pub` (= current, back-compat не-epoch exit).
 fn publish_epoch_pub(dir: &str, epoch: u64, pk: &[u8]) -> Result<()> {
     std::fs::write(format!("{dir}/{}", citadel_token::epoch_pub_name(epoch)), pk)
@@ -287,6 +291,14 @@ fn run_issuer() -> Result<()> {
         std::env::var("Citadel_EPOCH_SECS").ok().and_then(|s| s.parse().ok()).unwrap_or(3600);
     let dir = token_dir();
     bootstrap_registry(&dir)?; // C5.2: демо-регистрация абонентов из Citadel_REGISTER_SEEDS
+
+    // S2.1/A1: постоянная TLS-идентичность издателя (pin кладётся в ссылку → клиент пиннит канал).
+    let identity = citadel_token::pqtls::IssuerIdentity::load_or_generate(&dir)?;
+    eprintln!(
+        "[issuer] PQ-TLS канал: pin {} → {dir}/issuer-tls.pin (клиент пиннит, анти-MITM A1)",
+        hex::encode(identity.pin)
+    );
+    let scfg = identity.server_config()?;
 
     let e = citadel_token::current_epoch(epoch_secs);
     eprintln!("[issuer] эпоха {e} (длина {epoch_secs}с); генерирую ключ (RSA-{bits}, ~10с)…");
@@ -319,16 +331,25 @@ fn run_issuer() -> Result<()> {
         });
     }
 
+    // S2.4/A6: квота выданных токенов на client_id за эпоху (анти-фарминг). Env `Citadel_TOKEN_QUOTA`
+    // (default 64 — с запасом на реконнекты нормального абонента, но режет массовую раздачу).
+    let max_per_epoch: u32 =
+        std::env::var("Citadel_TOKEN_QUOTA").ok().and_then(|s| s.parse().ok()).unwrap_or(64);
+    let quota: Arc<Mutex<QuotaMap>> = Arc::new(Mutex::new(HashMap::new()));
+    eprintln!("[issuer] квота выдачи: {max_per_epoch} токен(ов) на абонента в эпоху (A6)");
+
     let listen = std::env::var("Citadel_TOKEN_LISTEN").unwrap_or_else(|_| "0.0.0.0:7000".into());
     let listener = TcpListener::bind(&listen).with_context(|| format!("bind {listen}"))?;
-    eprintln!("[issuer] слепое подписание на {listen} (blind RSA-{bits}, epoch-scoped)");
+    eprintln!("[issuer] слепое подписание на {listen} (blind RSA-{bits}, epoch-scoped, PQ-TLS+pin)");
     for conn in listener.incoming() {
         match conn {
             Ok(stream) => {
                 let state = state.clone();
                 let dir = dir.clone();
+                let scfg = scfg.clone();
+                let quota = quota.clone();
                 std::thread::spawn(move || {
-                    if let Err(e) = serve_client(stream, &state, &dir) {
+                    if let Err(e) = serve_client(stream, scfg, &state, &dir, &quota, max_per_epoch) {
                         eprintln!("[issuer] соединение завершено: {e}");
                     }
                 });
@@ -339,8 +360,38 @@ fn run_issuer() -> Result<()> {
     Ok(())
 }
 
-fn serve_client(mut conn: TcpStream, state: &Mutex<EpochKey>, dir: &str) -> Result<()> {
-    let peer = conn.peer_addr().ok();
+/// S2.4/A6: под локом решить, можно ли выдать ещё один токен `client_id` в `epoch` (инкрементит
+/// счётчик). Смена эпохи сбрасывает счётчик. `false` → квота исчерпана. Чистая логика (тестируемо).
+fn quota_grant(
+    map: &mut QuotaMap,
+    client_id: [u8; 32],
+    epoch: u64,
+    max: u32,
+) -> bool {
+    let e = map.entry(client_id).or_insert((epoch, 0));
+    if e.0 != epoch {
+        *e = (epoch, 0); // новая эпоха → сброс
+    }
+    if e.1 >= max {
+        return false;
+    }
+    e.1 += 1;
+    true
+}
+
+#[allow(clippy::too_many_arguments)]
+fn serve_client(
+    tcp: TcpStream,
+    scfg: Arc<rustls::ServerConfig>,
+    state: &Mutex<EpochKey>,
+    dir: &str,
+    quota: &Mutex<QuotaMap>,
+    max_per_epoch: u32,
+) -> Result<()> {
+    let peer = tcp.peer_addr().ok();
+    // S2.1/A1: поднять PQ-TLS поверх TCP ДО любого обмена — Layer-1 и слепая выдача идут в шифре
+    // с целостностью; клиент уже спиннил серт (MITM не подставит свои blind_msg, client_id скрыт).
+    let mut conn = citadel_token::pqtls::accept_tls(tcp, scfg)?;
     // C5.2 Layer-1: challenge-response ДО слепой подписи (аутентификация «абонента»).
     let challenge: [u8; 32] = rand::random();
     write_frame(&mut conn, &challenge)?;
@@ -355,6 +406,7 @@ fn serve_client(mut conn: TcpStream, state: &Mutex<EpochKey>, dir: &str) -> Resu
     if !registry_allows(dir, pk, now_unix()) {
         anyhow::bail!("Layer-1: client_id не активен/истёк/отозван — отказ (client {peer:?})");
     }
+    let client_id: [u8; 32] = pk.try_into().expect("pk = auth[..32], ровно 32 байта");
     eprintln!("[issuer] Layer-1 ✔ абонент {}… авторизован", &hex::encode(pk)[..12]);
     // C5.3: отдаём клиенту ТЕКУЩИЙ epoch-pub (клиент ослепляет под актуальным ключом).
     let cur_pub = state.lock().unwrap().1.clone();
@@ -363,6 +415,19 @@ fn serve_client(mut conn: TcpStream, state: &Mutex<EpochKey>, dir: &str) -> Resu
     let mut n = 0u32;
     // клиент закрыл соединение → read_frame вернёт Err → выходим из цикла
     while let Ok(blind_msg) = read_frame(&mut conn) {
+        // S2.4/A6: квота токенов на client_id за эпоху. Без неё один «абонемент» чеканил бы
+        // неограниченно токенов → раздача безлимиту фрирайдеров за эпоху (epoch+double-spend
+        // режут повтор ОДНОГО токена, но не число разных). Счётчик per-(client_id, эпоха),
+        // сбрасывается со сменой эпохи. In-RAM (как spent-set exit'а): рестарт обнуляет, но
+        // квота epoch-bounded. Достигнут потолок → прекращаем выдачу этому клиенту в эту эпоху.
+        let cur_epoch = state.lock().unwrap().0;
+        if !quota_grant(&mut quota.lock().unwrap(), client_id, cur_epoch, max_per_epoch) {
+            eprintln!(
+                "[issuer] квота исчерпана: {}… уже получил {max_per_epoch} токен(ов) в эпоху {cur_epoch} — стоп",
+                &hex::encode(client_id)[..12]
+            );
+            break;
+        }
         // sk текущей эпохи (клонируем, чтобы не держать лок во время RSA-подписи)
         let sk = state.lock().unwrap().2.clone();
         let blind_sig = citadel_token::issuer_blind_sign(&sk, &blind_msg)?;
@@ -382,11 +447,17 @@ fn run_client_fetch() -> Result<()> {
         .and_then(|s| hex::decode(s.trim()).ok())
         .and_then(|v| v.try_into().ok())
         .context("Citadel_CLIENT_SEED (32 байта hex) обязателен для Layer-1")?;
+    // S2.1/A1: pin TLS-серта издателя — обязателен (fail-closed: без него канал был бы MITM-открыт).
+    let issuer_pin: [u8; 32] = std::env::var("Citadel_ISSUER_PIN")
+        .ok()
+        .and_then(|s| hex::decode(s.trim()).ok())
+        .and_then(|v| v.try_into().ok())
+        .context("Citadel_ISSUER_PIN (32 байта hex) обязателен для PQ-TLS канала к издателю")?;
     let count = token_count();
     let dir = token_dir();
-    eprintln!("[client] Layer-1 issuance у издателя {issuer} ({count} токенов, blind epoch-scoped)…");
+    eprintln!("[client] Layer-1 issuance у издателя {issuer} ({count} токенов, PQ-TLS+pin, blind epoch-scoped)…");
     // C5.3: весь протокол (Layer-1 auth + получение текущего epoch-pub + слепая выдача) — в citadel_token.
-    let tokens = citadel_token::fetch_tokens(&issuer, &seed, count, 20)?;
+    let tokens = citadel_token::fetch_tokens(&issuer, &issuer_pin, &seed, count, 20)?;
 
     let mut f = std::fs::File::create(format!("{dir}/tokens")).context("запись tokens")?;
     for t in &tokens {
@@ -488,6 +559,27 @@ mod tests {
         let ok = super::registry_apply_revoke(&format!("{ha} 42 active\n"), &a).unwrap();
         assert_eq!(ok, format!("{ha} 42 revoked\n"), "срок сохранён, статус revoked");
         assert!(super::registry_apply_revoke("", &a).is_err(), "нет pub → ошибка");
+    }
+
+    /// S2.4/A6: квота на client_id за эпоху — до потолка выдаём, дальше отказ; смена эпохи сбрасывает;
+    /// разные client_id учитываются раздельно.
+    #[test]
+    fn quota_grant_caps_per_epoch() {
+        use super::quota_grant;
+        let mut m = std::collections::HashMap::new();
+        let a = [0xAAu8; 32];
+        let b = [0xBBu8; 32];
+        // до потолка (3) — выдаём
+        assert!(quota_grant(&mut m, a, 100, 3));
+        assert!(quota_grant(&mut m, a, 100, 3));
+        assert!(quota_grant(&mut m, a, 100, 3));
+        // потолок достигнут — отказ
+        assert!(!quota_grant(&mut m, a, 100, 3));
+        // другой абонент — свой счётчик
+        assert!(quota_grant(&mut m, b, 100, 3));
+        // смена эпохи сбрасывает счётчик a
+        assert!(quota_grant(&mut m, a, 101, 3));
+        assert!(quota_grant(&mut m, a, 101, 3));
     }
 
     /// valid_until: относительные формы и абсолют.

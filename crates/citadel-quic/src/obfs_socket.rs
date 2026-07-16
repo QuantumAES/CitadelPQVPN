@@ -139,7 +139,11 @@ impl ObfsUdpSocket {
             inner: ArcSwap::from_pointee(inner),
             sealer: citadel_obfs::Sealer::new(&psk, &sid),
             opener: Mutex::new(citadel_obfs::Opener::new(&psk)),
-            send_ctr: AtomicU64::new(0),
+            // S2/A8: старт packet_id со случайного u64 (как в obfs_tcp) — снижает шанс (key,nonce)-
+            // коллизии body-AEAD при совпадении 8-байтного sid под общим PSK (birthday ~2^32).
+            // Wire-формат не меняется (packet_id и так на проводе). Полный фикс (per-session соль/
+            // больше sid) остаётся отдельной wire-ломающей задачей.
+            send_ctr: AtomicU64::new(rand::random()),
             padding: citadel_obfs::Padding::Bucket(citadel_obfs::DEFAULT_BUCKETS),
             pacing,
             queue: Mutex::new(VecDeque::new()),

@@ -503,10 +503,13 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "aws-lc-rs",
+ "blake3",
  "blind-rsa-signatures",
  "criterion",
  "hex",
  "rand 0.8.6",
+ "rcgen",
+ "rustls",
 ]
 
 [[package]]

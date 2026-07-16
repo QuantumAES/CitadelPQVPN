@@ -39,6 +39,18 @@ impl Tunnel {
         self.conn.remote_address()
     }
 
+    /// S2.6/A3: TLS keying-material exporter (RFC 5705) соединения — channel-binding для ML-DSA
+    /// подписи (M7). Уникален на TLS-сессию: relay-MITM держит ДВЕ разные сессии ⇒ значения на его
+    /// плечах не совпадут, поэтому подпись сервера не пройдёт на клиенте. Оба конца ОДНОЙ сессии
+    /// выводят одинаковые байты. Работает и над obfs-TCP (там тот же quinn+TLS).
+    pub fn exporter(&self) -> Result<[u8; crate::pqauth::EXPORTER_LEN]> {
+        let mut out = [0u8; crate::pqauth::EXPORTER_LEN];
+        self.conn
+            .export_keying_material(&mut out, crate::pqauth::EXPORTER_LABEL, b"")
+            .map_err(|_| anyhow::anyhow!("TLS exporter (export_keying_material) недоступен"))?;
+        Ok(out)
+    }
+
     pub fn kind(&self) -> &'static str {
         if self.over_tcp {
             "QUIC/obfs-TCP"

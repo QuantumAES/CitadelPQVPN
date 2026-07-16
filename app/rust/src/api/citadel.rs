@@ -382,11 +382,15 @@ fn spawn_controller(
     }
     let controller = Arc::new(VpnController::new());
     *ACTIVE.lock().unwrap() = Some(controller.clone());
-    if let (Some(iss), Some(seed)) = (link.issuer.clone(), link.client_seed) {
+    // S2.1/A1: Layer-1 фетч требует issuer + issuer_pin (PQ-TLS канал) + client_seed. Без pin
+    // refresher не ставим (token-less путь; exit откажет, если требует токен — misconfig виден).
+    if let (Some(iss), Some(pin), Some(seed)) =
+        (link.issuer.clone(), link.issuer_pin, link.client_seed)
+    {
         controller.set_token_refresher(Arc::new(move || {
             let iss = iss.clone();
             Box::pin(async move {
-                citadel_client::token_agent::fetch_tokens(&iss, &seed, 1, 3)
+                citadel_client::token_agent::fetch_tokens(&iss, &pin, &seed, 1, 3)
                     .await
                     .ok()
                     .and_then(|mut v| v.pop())
@@ -630,6 +634,7 @@ pub fn run_diagnostics(
     let dlink = link_from(profile_id, link)?;
     let cfg = dlink.to_client_config();
     let issuer = dlink.issuer.clone();
+    let issuer_pin = dlink.issuer_pin; // S2.1/A1: pin PQ-TLS канала к издателю
     let client_seed = dlink.client_seed;
     rt().spawn(async move {
         // Диагностика идёт тем же путём, что реальный коннект: если креды несут Layer-1
@@ -639,6 +644,7 @@ pub fn run_diagnostics(
             match citadel_client::token_agent::with_token(
                 cfg.clone(),
                 issuer.as_deref(),
+                issuer_pin.as_ref(),
                 client_seed.as_ref(),
             )
             .await

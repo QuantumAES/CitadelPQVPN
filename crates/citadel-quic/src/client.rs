@@ -355,6 +355,8 @@ async fn client_request_address(
     out.extend_from_slice(&capsule::encode_address_request_v4(&req));
 
     let buf = tunnel.control_client(&out).await?;
+    // S2.6/A3: TLS exporter клиентской сессии для channel-binding ML-DSA-подписи (см. verify ниже).
+    let exporter = tunnel.exporter()?;
     // ответ: varint(pub_len)‖ML-DSA-pub ‖ varint(sig_len)‖ML-DSA-sig ‖ ADDRESS_ASSIGN (§S3)
     let (pub_len, p0) =
         citadel_masque::varint::decode(&buf).ok_or_else(|| anyhow!("нет pub-префикса"))?;
@@ -374,7 +376,7 @@ async fn client_request_address(
     let rest = &tail[sig_end..];
 
     // M7/§S3: проверяем ML-DSA-65 подпись сервера согласно ожиданию (полный pub / commitment-fetch).
-    verify_server_mldsa(expect, server_pub, &nonce, &cert_pin, sig)?;
+    verify_server_mldsa(expect, server_pub, &nonce, &cert_pin, &exporter, sig)?;
     match expect {
         MldsaExpect::Pub(_) => eprintln!(
             "[citadel-m1:client] PQ-auth ✔ ML-DSA-65 подпись сервера верна (pub провижирован)"
@@ -413,6 +415,7 @@ fn verify_server_mldsa(
     server_pub: &[u8],
     nonce: &[u8; 32],
     cert_pin: &[u8; 32],
+    exporter: &[u8],
     sig: &[u8],
 ) -> Result<()> {
     let pk: &[u8] = match expect {
@@ -432,7 +435,8 @@ fn verify_server_mldsa(
             server_pub
         }
     };
-    if !crate::pqauth::verify_binding(pk, nonce, cert_pin, sig) {
+    // S2.6/A3: exporter входит в привязку → relay-MITM (иной TLS-канал) даёт иной exporter ⇒ отказ.
+    if !crate::pqauth::verify_binding(pk, nonce, cert_pin, exporter, sig) {
         return Err(anyhow!("PQ-auth: ML-DSA подпись сервера НЕ прошла — возможен MITM"));
     }
     Ok(())
@@ -460,22 +464,25 @@ mod tests {
         let pk = signer.public_key();
         let nonce = [7u8; 32];
         let pin = [9u8; 32];
-        let sig = signer.sign_binding(&nonce, &pin).unwrap();
+        let exporter = [0x5cu8; 32];
+        let sig = signer.sign_binding(&nonce, &pin, &exporter).unwrap();
 
         // None — не проверяем (даже без pub/sig)
-        assert!(verify_server_mldsa(&MldsaExpect::None, &[], &nonce, &pin, &[]).is_ok());
+        assert!(verify_server_mldsa(&MldsaExpect::None, &[], &nonce, &pin, &exporter, &[]).is_ok());
         // Pub провижирован — верифицируем им (server_pub игнорируется)
-        assert!(verify_server_mldsa(&MldsaExpect::Pub(pk.clone()), &[], &nonce, &pin, &sig).is_ok());
+        assert!(verify_server_mldsa(&MldsaExpect::Pub(pk.clone()), &[], &nonce, &pin, &exporter, &sig).is_ok());
         // Commit совпал с H(server_pub) — принимаем (commitment-fetch)
         let commit = sha256(&pk);
-        assert!(verify_server_mldsa(&MldsaExpect::Commit(commit), &pk, &nonce, &pin, &sig).is_ok());
+        assert!(verify_server_mldsa(&MldsaExpect::Commit(commit), &pk, &nonce, &pin, &exporter, &sig).is_ok());
         // Commit не совпал (подменённый pub) — отказ
-        assert!(verify_server_mldsa(&MldsaExpect::Commit([0u8; 32]), &pk, &nonce, &pin, &sig).is_err());
+        assert!(verify_server_mldsa(&MldsaExpect::Commit([0u8; 32]), &pk, &nonce, &pin, &exporter, &sig).is_err());
         // Commit есть, а pub не прислан — отказ
-        assert!(verify_server_mldsa(&MldsaExpect::Commit(commit), &[], &nonce, &pin, &sig).is_err());
+        assert!(verify_server_mldsa(&MldsaExpect::Commit(commit), &[], &nonce, &pin, &exporter, &sig).is_err());
         // Правильный commit, но подпись под ЧУЖИМ pin (MITM переиграл привязку) — отказ
-        assert!(verify_server_mldsa(&MldsaExpect::Commit(commit), &pk, &nonce, &[1u8; 32], &sig).is_err());
+        assert!(verify_server_mldsa(&MldsaExpect::Commit(commit), &pk, &nonce, &[1u8; 32], &exporter, &sig).is_err());
+        // S2.6/A3: правильный commit, но подпись под ЧУЖИМ exporter (relay-MITM) — отказ
+        assert!(verify_server_mldsa(&MldsaExpect::Commit(commit), &pk, &nonce, &pin, &[0x5du8; 32], &sig).is_err());
         // Pub провижирован, но подпись битая — отказ
-        assert!(verify_server_mldsa(&MldsaExpect::Pub(pk), &[], &nonce, &pin, b"tampered").is_err());
+        assert!(verify_server_mldsa(&MldsaExpect::Pub(pk), &[], &nonce, &pin, &exporter, b"tampered").is_err());
     }
 }

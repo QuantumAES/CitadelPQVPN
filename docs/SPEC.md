@@ -148,6 +148,7 @@ sequenceDiagram
 
 ### Замечания по фазам
 - **Фаза 0** гейтит активное зондирование (A3): без `K_obf` сервер не выдаёт ничего, отличимого от закрытого порта / случайного веб-сервера. `ts` + окно + кэш nonce → анти-replay.
+  > **Статус реализации (аудит-2, 2026-07):** отдельный Phase-0 gate-хендшейк с `ts`+окном+nonce-cache в текущем транспорте НЕ подключён — L1 несёт сразу `TYPE_DATA` поверх PQ-QUIC. Анти-replay де-факто обеспечивает **внутренний QUIC** (номера пакетов + AEAD отвергают дубликат), а probe-resistance — AEAD-гейт L1 (невалидный тег → молчание). Отдельный obfs-replay-кэш — низкий приоритет (defense-in-depth), т.к. после S0.3 внутри obfs идёт настоящий QUIC/TLS. Данный пункт спеки — целевой дизайн, не текущий код.
 - **Фаза 1**: 1-RTT. **0-RTT отключён по умолчанию** — нет PFS и есть replay; для смены сети используем не 0-RTT, а **миграцию соединения QUIC** (тот же Connection ID, новый путь — туннель не рвётся при WiFi↔LTE, PFS сохраняется). Obfs-keystream скоупится на соединение, не на путь → миграция совместима с обфускацией.
 - **Фаза 2**: `CONNECT-IP` даёт полноценный IP-туннель (любой протокол, не только TCP/UDP). Альтернатива для лёгких клиентов — `CONNECT-UDP` (RFC 9298).
 - **Rekey**: QUIC key-update по объёму/времени; полный рехендшейк по таймеру (ограничение окна HNDL даже при утечке).
@@ -319,7 +320,7 @@ CitadelPQVPN/
 | **M4** | TCP/443-fallback (obfs-over-TCP) + миграция соединения | Туннель выживает блокировку UDP и смену пути WiFi↔LTE (оба ✅ Docker: ТЕСТ 10 миграция, ТЕСТ 11 fallback) | ✅ |
 | **M5** | Control: анонимные токены (blind-RSA) ✅, issuer↔exit split ✅, multi-server/выбор exit ✅ | Unlinkable-аутентификация (издатель подписывает вслепую); клиент выбирает exit из списка с failover (✅ Docker: ТЕСТ 12 failover, ТЕСТ 13 split) | ✅ |
 | **M6** | fuzzing ✅ + бенчмарки ✅ + obfs-кеш ✅ + crypto-agility ✅ | fuzz (robustness); criterion (`docs/BENCHMARKS.md`); кеш KDF/cipher (−15% мелкие); `kx_groups_for` (pq/classical/all, TLS negotiate — ✅ Docker ТЕСТ 14) | ✅ |
-| **M7** | PQ-аутентификация: гибрид Ed25519 (TLS-cert+pin) + ML-DSA-65 (FIPS 204, aws-lc-rs) | Сервер ML-DSA-подписывает `nonce‖cert_pin` на control-стриме, клиент проверяет под provisioned pk (✅ Docker ТЕСТ 15: позитив + негатив с чужим pk) | ✅ |
+| **M7** | PQ-аутентификация: гибрид Ed25519 (TLS-cert+pin) + ML-DSA-65 (FIPS 204, aws-lc-rs) | Сервер ML-DSA-подписывает `nonce‖cert_pin‖tls_exporter` на control-стриме (аудит-2/A3: TLS channel-binding против relay-MITM), клиент проверяет под provisioned pk (✅ Docker ТЕСТ 15: позитив + негатив с чужим pk) | ✅ |
 
 ---
 

@@ -88,6 +88,7 @@ mod tests {
             tcp_port: None,
             issuer: Some("issuer.example:7000".into()),
             issuer_pub: Some(vec![4u8; 270]),
+            issuer_pin: Some([5u8; 32]),
             client_seed: None,
             routes: String::new(),
             dns: None,

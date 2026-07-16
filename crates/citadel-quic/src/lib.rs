@@ -118,6 +118,16 @@ pub fn server_config_with_pin(
     groups: Vec<&'static dyn SupportedKxGroup>,
 ) -> Result<(quinn::ServerConfig, [u8; 32])> {
     let (cert, key) = self_signed_ed25519()?;
+    server_config_with_cert(groups, cert, key)
+}
+
+/// A7: как [`server_config_with_pin`], но из ЗАДАННЫХ cert/key — для персистентной идентичности
+/// exit (стабильный pin между рестартами; иначе розданные клиентам ссылки ломались бы на ребуте).
+pub fn server_config_with_cert(
+    groups: Vec<&'static dyn SupportedKxGroup>,
+    cert: CertificateDer<'static>,
+    key: PrivateKeyDer<'static>,
+) -> Result<(quinn::ServerConfig, [u8; 32])> {
     let pin = cert_pin(&cert);
     let mut crypto = rustls::ServerConfig::builder_with_provider(provider(groups))
         .with_protocol_versions(&[&rustls::version::TLS13])?
@@ -276,5 +286,15 @@ mod tests {
         // S1.1/M4: только pq/пусто гарантируют PQ; classical/all — нет.
         assert!(kx_is_pq("pq") && kx_is_pq(""));
         assert!(!kx_is_pq("classical") && !kx_is_pq("all"));
+    }
+
+    /// A7: `server_config_with_cert` даёт pin = BLAKE3(cert DER) — стабильный для одной идентичности
+    /// (персист серта между рестартами ⇒ pin в розданных ссылках не ломается).
+    #[test]
+    fn server_config_cert_pin_is_stable() {
+        let (cert, key) = self_signed_ed25519().unwrap();
+        let expected = cert_pin(&cert);
+        let (_sc, pin) = server_config_with_cert(pq_groups(), cert, key).unwrap();
+        assert_eq!(pin, expected, "pin детерминирован от серта (A7)");
     }
 }

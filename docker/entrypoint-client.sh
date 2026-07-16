@@ -20,10 +20,17 @@ EXIT_IP=$(getent hosts exit 2>/dev/null | awk '{print $1; exit}')
 EXIT_IP=${EXIT_IP:-exit}
 echo "[client] exit резолвится в $EXIT_IP"
 
+# S2.1/A1: pin TLS-серта издателя для PQ-TLS канала фетча токенов (издатель пишет его в /shared).
+for _ in $(seq 1 30); do [ -s /shared/issuer-tls.pin ] && break; sleep 1; done
+ISSUER_PIN=$(cat /shared/issuer-tls.pin 2>/dev/null || echo "")
+[ -n "$ISSUER_PIN" ] && echo "[client] issuer TLS-pin: ${ISSUER_PIN:0:16}… (PQ-TLS+pin канал, A1)" \
+    || echo "[client] WARN: нет issuer-tls.pin — фетч токенов не пройдёт (A1 fail-closed)"
+
 # M5 split: получить анонимные токены ИНТЕРАКТИВНО от издателя (blind issuance) — ДО блокировки DNS.
 # Издатель подписывает вслепую, токен в файл; издатель не видит токен → unlinkable от сессии на exit.
-echo "[client] получаю токены от издателя (M5 issuer↔exit split)…"
-Citadel_TOKEN_ROLE=client Citadel_TOKEN_ISSUER=issuer:7000 Citadel_TOKEN_DIR=/shared Citadel_TOKEN_COUNT=10 \
+# S2.1/A1: канал к издателю — PQ-TLS с пиннингом (Citadel_ISSUER_PIN).
+echo "[client] получаю токены от издателя (M5 issuer↔exit split, PQ-TLS+pin)…"
+Citadel_TOKEN_ROLE=client Citadel_TOKEN_ISSUER=issuer:7000 Citadel_ISSUER_PIN=$ISSUER_PIN Citadel_TOKEN_DIR=/shared Citadel_TOKEN_COUNT=10 \
     Citadel_CLIENT_SEED=$(printf 'c5%.0s' {1..32}) \
     citadel-token || echo "[client] WARN: не удалось получить токены от издателя"
 
@@ -34,7 +41,7 @@ echo "===================================================================="
 echo "  ТЕСТ 17 (C5.2 Layer-1) — НЕзарегистрированный абонент не получает токены (M5)"
 echo "===================================================================="
 rm -rf /tmp/t17; mkdir -p /tmp/t17
-Citadel_TOKEN_ROLE=client Citadel_TOKEN_ISSUER=issuer:7000 Citadel_TOKEN_DIR=/tmp/t17 Citadel_TOKEN_COUNT=1 \
+Citadel_TOKEN_ROLE=client Citadel_TOKEN_ISSUER=issuer:7000 Citadel_ISSUER_PIN=$ISSUER_PIN Citadel_TOKEN_DIR=/tmp/t17 Citadel_TOKEN_COUNT=1 \
     Citadel_CLIENT_SEED=deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef \
     timeout 15 citadel-token >/tmp/t17/out 2>&1 || true
 if [ ! -s /tmp/t17/tokens ]; then
@@ -51,12 +58,12 @@ SEED_C=$(printf 'ab%.0s' {1..32})
 PUB_C=$(Citadel_CLIENT_SEED=$SEED_C citadel-token pubkey 2>/dev/null)
 echo "$PUB_C 99999999999 active" >> /shared/registry   # добавить активного абонента в реестр
 rm -rf /tmp/t18; mkdir -p /tmp/t18
-Citadel_TOKEN_ROLE=client Citadel_TOKEN_ISSUER=issuer:7000 Citadel_TOKEN_DIR=/tmp/t18 Citadel_TOKEN_COUNT=1 \
+Citadel_TOKEN_ROLE=client Citadel_TOKEN_ISSUER=issuer:7000 Citadel_ISSUER_PIN=$ISSUER_PIN Citadel_TOKEN_DIR=/tmp/t18 Citadel_TOKEN_COUNT=1 \
     Citadel_CLIENT_SEED=$SEED_C timeout 15 citadel-token >/tmp/t18/o1 2>&1 || true
 GOT1=$([ -s /tmp/t18/tokens ] && echo yes || echo no)
 sed -i "s#^$PUB_C .*#$PUB_C 99999999999 revoked#" /shared/registry   # ОТЗЫВ (issuer перечитывает реестр)
 rm -f /tmp/t18/tokens
-Citadel_TOKEN_ROLE=client Citadel_TOKEN_ISSUER=issuer:7000 Citadel_TOKEN_DIR=/tmp/t18 Citadel_TOKEN_COUNT=1 \
+Citadel_TOKEN_ROLE=client Citadel_TOKEN_ISSUER=issuer:7000 Citadel_ISSUER_PIN=$ISSUER_PIN Citadel_TOKEN_DIR=/tmp/t18 Citadel_TOKEN_COUNT=1 \
     Citadel_CLIENT_SEED=$SEED_C timeout 15 citadel-token >/tmp/t18/o2 2>&1 || true
 GOT2=$([ -s /tmp/t18/tokens ] && echo yes || echo no)
 if [ "$GOT1" = yes ] && [ "$GOT2" = no ]; then
