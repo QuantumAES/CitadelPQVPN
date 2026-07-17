@@ -222,7 +222,8 @@ pub async fn establish_session(cfg: &ClientConfig) -> Result<Session> {
 /// Запустить data-plane: перекачка пакетов TUN ⇄ транспорт. Клиент себя не лимитирует
 /// (rate-limit F7 — забота exit). Поглощает `session` (транспорт уходит в `pump`).
 pub async fn run_data_plane(session: Session, tun: Arc<dyn TunIo>) -> Result<()> {
-    pump(session.tunnel, tun, None, None).await
+    // клиент: egress-фильтр/rate-limit/admin-VIP выключены (это политика exit-стороны).
+    pump(session.tunnel, tun, None, None, None).await
 }
 
 /// Подключиться к ОДНОМУ exit'у: основной путь PQ-QUIC, при недоступности — obfs-over-TCP

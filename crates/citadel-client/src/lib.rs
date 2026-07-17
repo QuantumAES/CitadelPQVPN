@@ -33,7 +33,7 @@ pub use citadel_quic::vpn::{
     clamp_tun_mtu, TunParams, TunProvider, VpnController, VpnEvent, VpnState,
 };
 pub use citadel_tun::TunIo;
-pub use creds::{CredentialBundle, CredentialLink, BUNDLE_VERSION};
+pub use creds::{CredentialBundle, CredentialLink, BUNDLE_VERSION, DEFAULT_ADMIN_PORT};
 pub use vault::{Profile, Vault};
 #[cfg(any(target_os = "linux", target_os = "android"))]
 pub use gui_tun::GuiTunProvider;

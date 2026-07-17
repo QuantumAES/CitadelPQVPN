@@ -91,6 +91,9 @@ impl Tunnel {
 pub struct Inbound {
     /// `Some(назначенный клиенту адрес)` → exit-режим (анти-спуфинг+egress); `None` → клиент.
     egress: Option<[u8; 4]>,
+    /// C7.2: `Some((admin_vip, admin_port))` → TCP к этому dst:port на exit'е пропускается мимо
+    /// egress-фильтра (ядро DNAT'ит его на issuer, admin-плоскость по туннелю). Прочее — как раньше.
+    admin_dst: Option<([u8; 4], u16)>,
     bucket: Option<TokenBucket>,
     dropped: u64,
     dropped_bytes: u64,
@@ -98,8 +101,19 @@ pub struct Inbound {
 
 impl Inbound {
     pub fn new(egress: Option<[u8; 4]>, rate_limit: Option<RateCfg>) -> Self {
+        Self::with_admin(egress, rate_limit, None)
+    }
+
+    /// Как [`Inbound::new`], но с точечным разрешением admin-VIP:порта (C7.2). Только exit-режим
+    /// (`egress = Some`) его использует; на клиенте (`egress = None`) фильтр не активен вовсе.
+    pub fn with_admin(
+        egress: Option<[u8; 4]>,
+        rate_limit: Option<RateCfg>,
+        admin_dst: Option<([u8; 4], u16)>,
+    ) -> Self {
         Self {
             egress,
+            admin_dst,
             bucket: rate_limit.map(|c| TokenBucket::new(c, Instant::now())),
             dropped: 0,
             dropped_bytes: 0,
@@ -121,8 +135,15 @@ impl Inbound {
                         );
                         return false;
                     }
+                    // C7.2: admin-плоскость — TCP к назначенному admin-VIP:порту разрешён мимо
+                    // egress-фильтра (ядро DNAT'ит его на issuer). Анти-спуфинг src уже пройден,
+                    // так что доступ имеет только легитимно подключённый клиент; сам доступ к
+                    // управлению реестром отсекается admin-подписью на issuer (citadel-token::admin).
+                    let is_admin = self.admin_dst.is_some_and(|(vip, port)| {
+                        v.dst == vip && ip::tcp_dport(&v) == Some(port)
+                    });
                     // F2: не форвардить во внутренние/служебные сети (metadata/RFC1918/loopback/…)
-                    if ip::is_blocked_dst(v.dst) {
+                    if !is_admin && ip::is_blocked_dst(v.dst) {
                         eprintln!(
                             "[exit] F2: заблокирован inner-dst {}.{}.{}.{}",
                             v.dst[0], v.dst[1], v.dst[2], v.dst[3]
@@ -172,6 +193,8 @@ fn watchdog_trips(sent: u64, recvd: u64) -> bool {
 /// `egress = Some(назначенный клиенту адрес)` включает egress-политику exit: анти-спуфинг
 /// inner-src (S0.2/H3), default-deny не-IPv4 и F2 (дроп во внутренние/служебные сети); `None`
 /// (клиент) — без фильтра. `rate_limit` (на exit) ограничивает входящее token-bucket'ом (F7/D3).
+/// `admin_dst` (C7.2, только exit) — `Some((vip, port))` пропускает TCP к admin-VIP мимо F2
+/// (ядро DNAT'ит на issuer); `None` — admin-плоскость по туннелю выключена.
 ///
 /// TUN читается/пишется через `TunIo` — блокирующие recv/send изолированы в отдельных
 /// потоках и мостятся в async каналами (платформа туннеля движку не важна).
@@ -180,6 +203,7 @@ pub async fn pump(
     tun: Arc<dyn TunIo>,
     egress: Option<[u8; 4]>,
     rate_limit: Option<RateCfg>,
+    admin_dst: Option<([u8; 4], u16)>,
 ) -> Result<()> {
     use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
     use tokio::sync::mpsc;
@@ -251,7 +275,7 @@ pub async fn pump(
     let recv_stop = stop.clone();
     let recv_rx = rx_count.clone();
     let receiver = tokio::spawn(async move {
-        let mut inb = Inbound::new(egress, rate_limit);
+        let mut inb = Inbound::with_admin(egress, rate_limit, admin_dst);
         loop {
             match recv_conn.read_datagram().await {
                 Ok(dg) => {
@@ -396,6 +420,13 @@ mod tests {
         ip::build_ipv4(17, src, dst, &[0u8; 4]) // UDP, тело неважно для фильтра
     }
 
+    /// TCP-пакет src→dst с заданным dst-портом (мин. TCP-заголовок: src_port|dst_port|…).
+    fn tcp(src: [u8; 4], dst: [u8; 4], dport: u16) -> Vec<u8> {
+        let mut seg = vec![0u8; 20];
+        seg[2..4].copy_from_slice(&dport.to_be_bytes()); // dst-порт
+        ip::build_ipv4(6, src, dst, &seg)
+    }
+
     /// S0.2/H3: exit-режим (`Some(assigned)`) — пропускает только src==назначенный на публичный
     /// dst; дропает спуфнутый src, приватный dst (F2) и не-IPv4 (default-deny). Клиент (`None`) — без фильтра.
     #[test]
@@ -411,6 +442,32 @@ mod tests {
         // клиентский режим: фильтра нет — пропускаем даже «спуфнутый» и приватный
         let mut client = Inbound::new(None, None);
         assert!(client.accept(&ipv4([9, 9, 9, 9], [10, 0, 0, 1])));
+    }
+
+    /// C7.2: admin-VIP:порт (приватный dst, обычно дропнулся бы F2) пропускается ТОЛЬКО для TCP на
+    /// точный порт и только с назначенного src; другой порт/протокол/VIP на том же приватном dst —
+    /// дроп; спуфнутый src к admin-VIP — дроп (анти-спуфинг раньше исключения).
+    #[test]
+    fn inbound_admin_dst_exception() {
+        let assigned = [10, 7, 0, 5];
+        let vip = [10, 7, 0, 1];
+        let mut exit = Inbound::with_admin(Some(assigned), None, Some((vip, 7001)));
+        // TCP к admin-VIP:7001 с легитимным src — пропуск, хотя dst приватный
+        assert!(exit.accept(&tcp(assigned, vip, 7001)), "admin TCP → VIP:порт пропущен мимо F2");
+        // тот же VIP, другой порт — F2 дропает (не admin)
+        assert!(!exit.accept(&tcp(assigned, vip, 22)), "другой порт на VIP — дроп");
+        // UDP на VIP:7001 — не TCP, tcp_dport=None → F2 дропает
+        assert!(!exit.accept(&ipv4(assigned, vip)), "UDP на VIP — дроп (только TCP-исключение)");
+        // admin-порт, но другой приватный dst (не VIP) — дроп
+        assert!(!exit.accept(&tcp(assigned, [10, 0, 0, 9], 7001)), "порт тот же, dst не VIP — дроп");
+        // спуфнутый src к admin-VIP — дроп (анти-спуфинг срабатывает до исключения)
+        assert!(!exit.accept(&tcp([9, 9, 9, 9], vip, 7001)), "спуфнутый src к VIP — дроп");
+        // публичный dst по-прежнему проходит
+        assert!(exit.accept(&tcp(assigned, [1, 1, 1, 1], 443)), "публичный dst — пропуск");
+
+        // без admin_dst (None) VIP:7001 снова дропается (базовое поведение F2)
+        let mut plain = Inbound::with_admin(Some(assigned), None, None);
+        assert!(!plain.accept(&tcp(assigned, vip, 7001)), "нет admin-исключения → F2 дропает");
     }
 
     /// pump-watchdog: рвём путь только если под нагрузкой (tx ≥ порога) обратно 0 датаграмм.

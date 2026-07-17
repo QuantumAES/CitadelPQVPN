@@ -19,6 +19,12 @@ use serde::{Deserialize, Serialize};
 use crate::pqtls::{ClientTlsStream, IssuerTlsStream};
 use crate::{ed25519_pub_from_seed, ed25519_sign, ed25519_verify, read_frame, write_frame};
 
+/// C7.2: admin-VIP — адрес, на который клиент-админ адресует admin-канал ИЗ ТУННЕЛЯ (шлюз туннеля).
+/// Совпадает с гейтвеем `Citadel_TUN_ADDR` exit'а (installer: `10.7.0.1/16`). Exit пропускает TCP
+/// к `ADMIN_VIP:admin_port` мимо egress-фильтра и DNAT'ит его на issuer (порт наружу не публикуется).
+/// Инвариант деплоя: при смене `Citadel_TUN_ADDR` синхронизировать это значение (и наоборот).
+pub const ADMIN_VIP: &str = "10.7.0.1";
+
 /// Домен admin-подписи. Layer-1 подписывает СЫРОЙ challenge — admin-подпись живёт в другом
 /// домене, поэтому issuer никогда не примет одну вместо другой (даже при совпадении ключей).
 pub const AUTH_DOMAIN: &[u8] = b"citadel-admin/v1";

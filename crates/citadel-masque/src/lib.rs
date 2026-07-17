@@ -253,6 +253,15 @@ pub mod ip {
         Some(Ipv4View { ihl, proto: pkt[9], src, dst, payload: &pkt[ihl..end] })
     }
 
+    /// Порт назначения TCP-сегмента внутри IPv4-пакета (`None`, если это не TCP или заголовок
+    /// усечён). C7.2: exit по нему точечно разрешает admin-VIP:порт мимо egress-фильтра.
+    pub fn tcp_dport(v: &Ipv4View<'_>) -> Option<u16> {
+        if v.proto != 6 || v.payload.len() < 4 {
+            return None;
+        }
+        Some(u16::from_be_bytes([v.payload[2], v.payload[3]]))
+    }
+
     /// Назначение, которое exit НЕ должен форвардить (анти-пивот во внутреннюю сеть):
     /// приватные/loopback/link-local(incl. 169.254.169.254 metadata)/CGNAT/multicast/reserved.
     pub fn is_blocked_dst(a: [u8; 4]) -> bool {

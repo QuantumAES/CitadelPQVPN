@@ -76,6 +76,8 @@ mod tests {
             issuer_pub: None,
             issuer_pin: None,
             client_seed: None,
+            admin_seed: None,
+            admin_port: None,
             routes: String::new(),
             dns: None,
         }
@@ -101,6 +103,8 @@ mod tests {
             issuer_pub: None,
             issuer_pin: None,
             client_seed: None,
+            admin_seed: None,
+            admin_port: None,
             routes: String::new(),
             dns: None,
         }

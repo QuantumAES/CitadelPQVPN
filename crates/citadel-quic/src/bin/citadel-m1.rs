@@ -137,6 +137,18 @@ fn mtu() -> String {
     std::env::var("Citadel_MTU").unwrap_or_else(|_| "1280".into())
 }
 
+/// C7.2: admin-VIP:порт для точечного пропуска в data-plane (`Citadel_ADMIN_VIP` = IPv4 шлюза
+/// туннеля, `Citadel_ADMIN_PORT`). `None` (нет env) → admin-плоскость по туннелю выключена.
+/// Значения должны совпадать с DNAT-правилом (`server_setup_net`), иначе пакет пройдёт фильтр,
+/// но не будет перенаправлен на issuer.
+fn admin_dst_from_env() -> Option<([u8; 4], u16)> {
+    let vip = std::env::var("Citadel_ADMIN_VIP").ok()?;
+    let port = std::env::var("Citadel_ADMIN_PORT").ok()?;
+    let octs: Vec<u8> = vip.trim().split('.').filter_map(|o| o.parse().ok()).collect();
+    let ip: [u8; 4] = octs.try_into().ok()?;
+    Some((ip, port.trim().parse().ok()?))
+}
+
 fn server_setup_net(ifname: &str) {
     if let Ok(addr) = std::env::var("Citadel_TUN_ADDR") {
         run("ip", &["addr", "add", &addr, "dev", ifname]);
@@ -166,6 +178,20 @@ fn server_setup_net(ifname: &str) {
     // в туннель = MTU туннеля), т.е. адаптивно под Citadel_MTU.
     run("iptables", &["-t", "mangle", "-A", "FORWARD", "-p", "tcp", "--tcp-flags", "SYN,RST", "SYN", "-j", "TCPMSS", "--clamp-mss-to-pmtu"]);
     eprintln!("[net] server: ip_forward + MASQUERADE + MSS-clamp через '{eg}' (src {nat})");
+
+    // C7.2 admin-плоскость: пакеты из туннеля на admin-VIP:порт DNAT'им на issuer. Правило —
+    // ТОЛЬКО `-i ifname` (из туннеля): admin-канал недостижим с WAN (порт не опубликован наружу).
+    // Требует пропуска этого dst в data-plane (`admin_dst_from_env` → Inbound), иначе egress-фильтр
+    // дропнул бы его до ядра. `Citadel_ADMIN_DNAT` = "issuer_host:port" (entrypoint резолвит issuer).
+    if let (Some((vip, port)), Ok(target)) =
+        (admin_dst_from_env(), std::env::var("Citadel_ADMIN_DNAT"))
+    {
+        let vip_s = format!("{}.{}.{}.{}", vip[0], vip[1], vip[2], vip[3]);
+        let port_s = port.to_string();
+        run("iptables", &["-t", "nat", "-A", "PREROUTING", "-i", ifname, "-p", "tcp",
+            "-d", &vip_s, "--dport", &port_s, "-j", "DNAT", "--to-destination", target.trim()]);
+        eprintln!("[net] C7.2 admin-plane: DNAT {vip_s}:{port_s} → {} (только -i {ifname})", target.trim());
+    }
 }
 
 /// F6 (I3): DNS только через туннель + fail-closed на прочий :53 (анти-leak).
@@ -454,6 +480,17 @@ async fn run_server(tun: Arc<Tun>) -> Result<()> {
         );
     }
 
+    // C7.2: admin-VIP:порт (пропуск в data-plane к admin-каналу issuer'а по туннелю). Копируемое
+    // значение — захватывается в per-client задачи наравне с rate_limit; DNAT ставится отдельно
+    // в server_setup_net. Нет env → admin-плоскость по туннелю выключена (клиентам недоступна).
+    let admin_dst = admin_dst_from_env();
+    if let Some((ip, port)) = admin_dst {
+        eprintln!(
+            "[citadel-m1:server] C7.2 admin-plane: пропуск в data-plane к {}.{}.{}.{}:{port} (DNAT → issuer)",
+            ip[0], ip[1], ip[2], ip[3]
+        );
+    }
+
     // TCP-fallback listener (M4): bind ДО сброса привилегий (порт <1024). Только при obfs PSK
     // (obfs-over-TCP использует тот же L1). Включается env `Citadel_TCP_LISTEN` (напр. 0.0.0.0:443).
     let tcp_listener = match (std::env::var("Citadel_TCP_LISTEN"), obfs_psk()) {
@@ -532,7 +569,7 @@ async fn run_server(tun: Arc<Tun>) -> Result<()> {
                             // established-сессия лимит одновременных хендшейков больше не держит.
                             drop(permit);
                             let (addr, prefix) = next_client_addr();
-                            handle_client(Tunnel::new(conn, true), tun, addr, prefix, issuer_auth, spent, rate_limit, signer, pin).await;
+                            handle_client(Tunnel::new(conn, true), tun, addr, prefix, issuer_auth, spent, rate_limit, admin_dst, signer, pin).await;
                             // ep жив до конца handle_client (в scope) → соединение не рвётся
                         });
                     }
@@ -555,7 +592,7 @@ async fn run_server(tun: Arc<Tun>) -> Result<()> {
             match incoming.await {
                 Ok(conn) => {
                     let (addr, prefix) = next_client_addr();
-                    handle_client(Tunnel::new(conn, false), tun, addr, prefix, issuer_auth, spent, rate_limit, signer, pin).await;
+                    handle_client(Tunnel::new(conn, false), tun, addr, prefix, issuer_auth, spent, rate_limit, admin_dst, signer, pin).await;
                 }
                 Err(e) => eprintln!("[citadel-m1:server] хендшейк не удался: {e}"),
             }
@@ -574,6 +611,7 @@ async fn handle_client(
     issuer_auth: Arc<IssuerAuth>,
     spent: Arc<Mutex<HashSet<[u8; 32]>>>,
     rate_limit: Option<RateCfg>,
+    admin_dst: Option<([u8; 4], u16)>,
     signer: Arc<Option<citadel_quic::pqauth::ServerSigner>>,
     cert_pin: [u8; 32],
 ) {
@@ -586,7 +624,7 @@ async fn handle_client(
         return;
     }
     eprintln!("[citadel-m1:server] выдан {}.{}.{}.{}/{}", addr[0], addr[1], addr[2], addr[3], prefix);
-    if let Err(e) = pump(tunnel, tun, Some(addr), rate_limit).await {
+    if let Err(e) = pump(tunnel, tun, Some(addr), rate_limit, admin_dst).await {
         eprintln!("[citadel-m1:server] pump завершён: {e}");
     }
 }

@@ -90,6 +90,8 @@ mod tests {
             issuer_pub: Some(vec![4u8; 270]),
             issuer_pin: Some([5u8; 32]),
             client_seed: None,
+            admin_seed: None,
+            admin_port: None,
             routes: String::new(),
             dns: None,
         }

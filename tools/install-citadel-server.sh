@@ -38,6 +38,8 @@ DNS="${CITADEL_DNS:-1.1.1.1}"                # DNS, проталкиваемый
 DIR="${CITADEL_DIR:-/opt/citadel}"
 ISSUER_ON="${CITADEL_ISSUER:-1}"             # 1 = двухслойная идентичность (issuer+токены+ML-DSA); 0 = token-less
 ISSUER_PORT="${CITADEL_ISSUER_PORT:-7000}"   # публичный порт издателя (клиент фетчит токены сюда)
+ADMIN_PORT="${CITADEL_ADMIN_PORT:-7001}"     # C7.2: порт admin-канала — НЕ публикуется наружу (только из туннеля)
+ADMIN_VIP="${CITADEL_ADMIN_VIP:-10.7.0.1}"   # C7.2: admin-VIP = шлюз туннеля (= Citadel_TUN_ADDR exit'а)
 EPOCH_SECS="${CITADEL_EPOCH_SECS:-3600}"     # длина эпохи токенов (exit и issuer ДОЛЖНЫ совпадать)
 
 log()  { printf '\033[1;36m[citadel]\033[0m %s\n' "$*"; }
@@ -119,6 +121,7 @@ fi
 PSK="$(cat "$PSK_FILE")"
 
 CLIENT_SEED=""; CLIENT_PUB=""
+ADMIN_SEED=""; ADMIN_PUB=""
 if [[ "$ISSUER_ON" == 1 ]]; then
   # client_seed = приватный Ed25519 «абонента» (Layer-1); хранится ТОЛЬКО у админа (в ссылке).
   SEED_FILE="$DIR/keys/client.seed"
@@ -131,6 +134,23 @@ if [[ "$ISSUER_ON" == 1 ]]; then
   CLIENT_PUB="$(Citadel_CLIENT_SEED="$CLIENT_SEED" "$DIR/bin/citadel-token" pubkey)" \
     || die "не удалось вывести client_id абонента (citadel-token pubkey)"
   log "Layer-1 абонент: client_id=${CLIENT_PUB:0:16}… (seed остаётся только в ссылке)"
+
+  # C7.2 admin-плоскость: ОТДЕЛЬНЫЙ Ed25519 админа (не равен client.seed — домен-разделение auth).
+  # admin.seed уходит ТОЛЬКО в мастер-ссылку; на сервере (том issuer) остаётся лишь pub (admin_id).
+  ADMIN_SEED_FILE="$DIR/keys/admin.seed"
+  if [[ ! -f "$ADMIN_SEED_FILE" ]]; then
+    head -c 32 /dev/urandom | od -An -tx1 | tr -d ' \n' > "$ADMIN_SEED_FILE"
+    chmod 600 "$ADMIN_SEED_FILE"
+  fi
+  ADMIN_SEED="$(cat "$ADMIN_SEED_FILE")"
+  ADMIN_PUB="$(Citadel_CLIENT_SEED="$ADMIN_SEED" "$DIR/bin/citadel-token" pubkey)" \
+    || die "не удалось вывести admin_id (citadel-token pubkey)"
+  # admin_id — pub, по которому issuer пускает в admin-канал. admin.client_id — Layer-1 client_id
+  # самого админа: issuer запрещает его отзыв (анти-self-lockout, R6). Оба файла читает issuer из /shared.
+  printf '%s' "$ADMIN_PUB"  > "$DIR/keys/admin_id"
+  printf '%s' "$CLIENT_PUB" > "$DIR/keys/admin.client_id"
+  chmod 644 "$DIR/keys/admin_id" "$DIR/keys/admin.client_id"  # публичные id (не секрет), nobody читает
+  log "admin-плоскость: admin_id=${ADMIN_PUB:0:16}… (admin.seed только в мастер-ссылке)"
 fi
 
 # ─── 5. образ (Dockerfile) + entrypoints + compose ───
@@ -175,6 +195,18 @@ export Citadel_EPOCH_SECS=$EPOCH_SECS
 export Citadel_MLDSA=1
 export Citadel_MLDSA_PUB_FILE=/shared/exit.mldsa
 rm -f /shared/exit.mldsa
+# C7.2 admin-плоскость: пропуск в data-plane к admin-VIP:порт + DNAT на issuer (реестр по туннелю).
+# VIP = шлюз туннеля (Citadel_TUN_ADDR); порт наружу НЕ опубликован → admin-канал только из туннеля.
+# Резолвим issuer по docker-DNS в IP (iptables DNAT принимает адрес, не имя).
+export Citadel_ADMIN_VIP=$ADMIN_VIP
+export Citadel_ADMIN_PORT=$ADMIN_PORT
+ISSUER_IP="\$(getent hosts issuer | awk '{print \$1}' | head -n1)"
+if [ -n "\$ISSUER_IP" ]; then
+  export Citadel_ADMIN_DNAT="\$ISSUER_IP:$ADMIN_PORT"
+  echo "[citadel-exit] admin-plane: DNAT $ADMIN_VIP:$ADMIN_PORT -> \$ISSUER_IP:$ADMIN_PORT (только из туннеля)"
+else
+  echo "[citadel-exit] ⚠ admin-plane: issuer не резолвится — DNAT не поднят (admin по туннелю недоступен)"
+fi
 echo "[citadel-exit] token-required (epoch=${EPOCH_SECS}s) + ML-DSA; listen 4433/udp + 443/tcp"
 EOF
   else
@@ -192,10 +224,13 @@ set -e
 export Citadel_TOKEN_ROLE=issuer
 export Citadel_TOKEN_DIR=/shared
 export Citadel_TOKEN_LISTEN=0.0.0.0:7000
+# C7.2 admin-канал: тот же PQ-TLS+pin, отдельный порт. НЕ публикуется наружу (compose без ports:7001)
+# → достижим только из туннеля (exit DNAT'ит). admin_id/admin.client_id читаются из /shared.
+export Citadel_ADMIN_LISTEN=0.0.0.0:$ADMIN_PORT
 export Citadel_EPOCH_SECS=$EPOCH_SECS
 export Citadel_REGISTER_PUBS="$CLIENT_PUB"   # client_id админа (issuer НЕ получает seed)
 rm -f /shared/issuer.pub /shared/issuer-*.pub /shared/tokens
-echo "[citadel-issuer] Layer-1 registry + слепая выдача epoch-токенов (epoch=${EPOCH_SECS}s, :7000)…"
+echo "[citadel-issuer] Layer-1 registry + слепая выдача epoch-токенов (epoch=${EPOCH_SECS}s, :7000) + admin-канал :$ADMIN_PORT…"
 exec citadel-token
 EOF
 chmod +x "$DIR/etc/entrypoint-issuer.sh"
@@ -297,11 +332,20 @@ if [[ "$ISSUER_ON" == 1 ]]; then
   # S2.1/A1: --issuer-pin → клиент пиннит PQ-TLS канал фетча (анти-MITM + скрытие client_id).
   LINKARGS+=(--issuer "$SERVER_HOST:$ISSUER_PORT" --issuer-pin "$ISSUER_TLS_PIN" --client-seed "$CLIENT_SEED")
 fi
+# Клиентская ссылка (для раздачи абонентам) — БЕЗ admin-seed. Генерим ДО добавления admin-полей.
+CLIENT_LINK="$("$DIR/bin/citadel-linkgen" "${LINKARGS[@]}" 2>/dev/null)" \
+  || die "citadel-linkgen не сгенерировал клиентскую ссылку"
+
+# C7.2: МАСТЕР-ссылка = клиентская + admin-плоскость (управление реестром по туннелю). ТОЛЬКО админу.
+if [[ "$ISSUER_ON" == 1 ]]; then
+  LINKARGS+=(--admin-seed "$ADMIN_SEED" --admin-port "$ADMIN_PORT")
+fi
 LINK="$("$DIR/bin/citadel-linkgen" "${LINKARGS[@]}" 2>/dev/null)" \
-  || die "citadel-linkgen не сгенерировал ссылку"
+  || die "citadel-linkgen не сгенерировал мастер-ссылку"
 
 umask 077
 printf '%s\n' "$LINK" > "$DIR/admin-link.txt"
+printf '%s\n' "$CLIENT_LINK" > "$DIR/client-link.txt"
 
 cat <<EOF
 
@@ -309,13 +353,22 @@ cat <<EOF
 ║  CitadelPQVPN exit развёрнут ✓   ($SERVER_HOST:$UDP_PORT udp / $TCP_PORT tcp)
 ╚══════════════════════════════════════════════════════════════════╝
 
-Админская ссылка (СЕКРЕТ — кто её имеет, тот подключается):
+МАСТЕР-ссылка (СЕКРЕТ, ТОЛЬКО АДМИНУ — даёт управление реестром абонентов по туннелю):
 
 $LINK
 
-Сохранена: $DIR/admin-link.txt (chmod 600). Раздавай по защищённому каналу.
+Сохранена: $DIR/admin-link.txt (chmod 600). НЕ раздавать абонентам.
 Управление: docker compose -f $DIR/etc/compose.yml {ps,logs,down}
 EOF
+
+if [[ "$ISSUER_ON" == 1 ]]; then
+cat <<EOF
+
+Клиентская ссылка (для абонента — без admin-прав), сохранена $DIR/client-link.txt:
+
+$CLIENT_LINK
+EOF
+fi
 
 if [[ "$ISSUER_ON" == 1 ]]; then
 cat <<EOF
@@ -323,13 +376,15 @@ cat <<EOF
 Двухслойная идентичность включена:
   • Издатель (Layer-1 реестр + epoch-токены) слушает $SERVER_HOST:$ISSUER_PORT/tcp —
     ОТКРОЙ этот порт в firewall/облачной security-group, иначе клиент не получит токен.
-  • Управление абонентами (admin-CLI, действует со следующего коннекта, C5.5):
+  • Управление абонентами — ИЗ ПРИЛОЖЕНИЯ по мастер-ссылке (C7): подключись мастер-ссылкой,
+    меню «Абоненты» → добавить/отозвать. Канал идёт по туннелю → PQ-TLS(pin) → admin-подпись;
+    порт :$ADMIN_PORT НАРУЖУ НЕ ОТКРЫТ (в firewall его открывать НЕ нужно — доступ только из туннеля).
+  • Break-glass (admin-CLI на сервере, если приложение недоступно / self-lockout, C5.5):
       добавить:  Citadel_TOKEN_DIR=$DIR/keys $DIR/bin/citadel-token registry add-seed <seed> [+30d]
       отозвать:  Citadel_TOKEN_DIR=$DIR/keys $DIR/bin/citadel-token registry revoke <client_id>
       список:    Citadel_TOKEN_DIR=$DIR/keys $DIR/bin/citadel-token registry list
-    Новому абоненту: сгенерируй seed → citadel-linkgen --client-seed <seed> … (его ссылка) +
-    registry add-seed <seed> (в реестр идёт только pub — seed остаётся у абонента). Отзыв действует
-    ≤ длины эпохи (${EPOCH_SECS}s), переживает рестарт контейнера. Массовый отзыв — сменить эпоху.
+    Отзыв действует ≤ длины эпохи (${EPOCH_SECS}s), переживает рестарт контейнера. Массовый отзыв —
+    сменить эпоху. Ротация admin-ключа: замени $DIR/keys/admin.seed + admin_id, перевыпусти мастер-ссылку.
   • Издатель на :$ISSUER_PORT работает поверх PQ-TLS с пиннингом серта (S2.1/A1): Layer-1 и слепая
     выдача идут в шифре с целостностью, client_id скрыт, серт издателя пиннится клиентом (анти-MITM).
     ⚠ Остаётся: TLS-хендшейк на выделенном порту фингерпринтируем цензором (obfs-обёртка — follow-up).

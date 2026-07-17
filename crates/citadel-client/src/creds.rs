@@ -14,7 +14,16 @@ use serde::{Deserialize, Serialize};
 
 /// Версия формата бандла (растёт при несовместимых изменениях схемы).
 /// v2 (S2.1/A1): добавлен `issuer_pin` — pin TLS-серта издателя (PQ-TLS канал к issuer'у).
-pub const BUNDLE_VERSION: u8 = 2;
+/// v3 (C7.2): добавлены `admin_seed`/`admin_port` (admin-плоскость, только мастер-ссылка);
+/// оба поля `#[serde(default)]` → v2-ссылки/бандлы читаются без изменений (см. `MIN_READ_VERSION`).
+pub const BUNDLE_VERSION: u8 = 3;
+
+/// Минимальная версия формата, которую ещё разбираем (совместимость уже розданных ссылок).
+/// Новые поля v3 — `Option` + `serde(default)`, поэтому старший разбор v2 корректен (admin = None).
+const MIN_READ_VERSION: u8 = 2;
+
+/// Дефолтный порт admin-канала (за туннелем), если в ссылке `admin_port` не задан.
+pub const DEFAULT_ADMIN_PORT: &str = "7001";
 
 /// Полный набор кред для подключения к exit'ам — всё инлайн.
 ///
@@ -53,6 +62,14 @@ pub struct CredentialBundle {
     /// Ed25519 client-seed (Layer-1 «абонемент», C5); `None` → анонимный режим без идентичности.
     #[serde(with = "serde_bytes")]
     pub client_seed: Option<[u8; 32]>,
+    /// C7.2 (v3): Ed25519 admin-seed для admin-плоскости (управление реестром абонентов по туннелю).
+    /// Несёт ТОЛЬКО мастер-ссылка; клиентские ссылки — `None`. Секрет (как `client_seed`) → инлайн,
+    /// затирается в `Drop`. Отдельный ключ от `client_seed` (домен-разделение auth, см. citadel-token).
+    #[serde(default, with = "serde_bytes")]
+    pub admin_seed: Option<[u8; 32]>,
+    /// C7.2 (v3): порт admin-канала (за туннелем; хост = шлюз туннеля). `None` → [`DEFAULT_ADMIN_PORT`].
+    #[serde(default)]
+    pub admin_port: Option<String>,
     /// Маршруты в туннель (через пробел).
     pub routes: String,
     /// DNS-резолвер (F6); `None` → не настраивать.
@@ -60,13 +77,16 @@ pub struct CredentialBundle {
 }
 
 impl Drop for CredentialBundle {
-    /// S1.3/M7: затираем инлайн-секреты (obfs PSK, Layer-1 seed) при дропе бандла.
+    /// S1.3/M7: затираем инлайн-секреты (obfs PSK, Layer-1 seed, admin-seed) при дропе бандла.
     fn drop(&mut self) {
         use zeroize::Zeroize;
         if let Some(p) = self.obfs_psk.as_mut() {
             p.zeroize();
         }
         if let Some(s) = self.client_seed.as_mut() {
+            s.zeroize();
+        }
+        if let Some(s) = self.admin_seed.as_mut() {
             s.zeroize();
         }
     }
@@ -80,12 +100,12 @@ impl CredentialBundle {
         Ok(buf)
     }
 
-    /// Разобрать из CBOR (проверяет версию формата).
+    /// Разобрать из CBOR (проверяет версию формата; читает v2..=v3, см. [`MIN_READ_VERSION`]).
     pub fn from_cbor(bytes: &[u8]) -> Result<Self> {
         let b: CredentialBundle = ciborium::from_reader(bytes).context("CBOR-разбор бандла")?;
-        if b.version != BUNDLE_VERSION {
+        if b.version < MIN_READ_VERSION || b.version > BUNDLE_VERSION {
             anyhow::bail!(
-                "несовместимая версия бандла: {} (ожидалась {BUNDLE_VERSION})",
+                "несовместимая версия бандла: {} (поддерживается {MIN_READ_VERSION}..={BUNDLE_VERSION})",
                 b.version
             );
         }
@@ -189,18 +209,27 @@ pub struct CredentialLink {
     /// Ed25519 client-seed (секрет Layer-1 — инлайн).
     #[serde(with = "serde_bytes")]
     pub client_seed: Option<[u8; 32]>,
+    /// C7.2 (v3): Ed25519 admin-seed (admin-плоскость) — секрет, инлайн; только мастер-ссылка.
+    #[serde(default, with = "serde_bytes")]
+    pub admin_seed: Option<[u8; 32]>,
+    /// C7.2 (v3): порт admin-канала за туннелем; `None` → [`DEFAULT_ADMIN_PORT`].
+    #[serde(default)]
+    pub admin_port: Option<String>,
     pub routes: String,
     pub dns: Option<String>,
 }
 
 impl Drop for CredentialLink {
-    /// S1.3/M7: затираем инлайн-секреты (obfs PSK, Layer-1 seed) при дропе ссылки.
+    /// S1.3/M7: затираем инлайн-секреты (obfs PSK, Layer-1 seed, admin-seed) при дропе ссылки.
     fn drop(&mut self) {
         use zeroize::Zeroize;
         if let Some(p) = self.obfs_psk.as_mut() {
             p.zeroize();
         }
         if let Some(s) = self.client_seed.as_mut() {
+            s.zeroize();
+        }
+        if let Some(s) = self.admin_seed.as_mut() {
             s.zeroize();
         }
     }
@@ -222,6 +251,8 @@ impl CredentialLink {
             issuer_commit: b.issuer_pub.as_deref().map(sha256),
             issuer_pin: b.issuer_pin,
             client_seed: b.client_seed,
+            admin_seed: b.admin_seed,
+            admin_port: b.admin_port.clone(),
             routes: b.routes.clone(),
             dns: b.dns.clone(),
         }
@@ -250,9 +281,9 @@ impl CredentialLink {
             .context("base64url-декод ссылки")?;
         let link: CredentialLink =
             ciborium::from_reader(&cbor[..]).context("CBOR-разбор ссылки")?;
-        if link.version != BUNDLE_VERSION {
+        if link.version < MIN_READ_VERSION || link.version > BUNDLE_VERSION {
             anyhow::bail!(
-                "несовместимая версия ссылки: {} (ожидалась {BUNDLE_VERSION})",
+                "несовместимая версия ссылки: {} (поддерживается {MIN_READ_VERSION}..={BUNDLE_VERSION})",
                 link.version
             );
         }
@@ -271,6 +302,17 @@ impl CredentialLink {
     /// Сверить дотянутый pub издателя с обязательством.
     pub fn verify_issuer(&self, pub_key: &[u8]) -> bool {
         self.issuer_commit.is_none_or(|c| sha256(pub_key) == c)
+    }
+
+    /// C7.2: ссылка несёт admin-идентичность (мастер-ссылка) → в GUI доступна admin-плоскость.
+    /// Реальный барьер — проверка `admin_id` на сервере; это лишь UX-гейт (см. SECURITY-ROADMAP §C7 R2).
+    pub fn is_admin(&self) -> bool {
+        self.admin_seed.is_some()
+    }
+
+    /// C7.2: порт admin-канала (за туннелем), дефолт [`DEFAULT_ADMIN_PORT`].
+    pub fn admin_port(&self) -> String {
+        self.admin_port.clone().unwrap_or_else(|| DEFAULT_ADMIN_PORT.to_string())
     }
 
     /// Сгенерировать QR компактной ссылки как **SVG** (EC=M). UI рисует напрямую; декод
@@ -328,6 +370,8 @@ mod tests {
             issuer_pub: Some(vec![0x44; 270]),
             issuer_pin: Some([0x66; 32]),
             client_seed: Some([0x55; 32]),
+            admin_seed: Some([0x77; 32]),
+            admin_port: Some("7001".into()),
             routes: "1.1.1.1/32 0.0.0.0/0".into(),
             dns: Some("1.1.1.1".into()),
         }
@@ -356,6 +400,8 @@ mod tests {
             issuer_pub: None,
             issuer_pin: None,
             client_seed: None,
+            admin_seed: None,
+            admin_port: None,
             routes: String::new(),
             dns: None,
         };
@@ -387,6 +433,84 @@ mod tests {
         let uri = link.to_uri().unwrap();
         assert!(uri.starts_with("citadel://"));
         assert_eq!(link, CredentialLink::from_uri(&uri).unwrap());
+    }
+
+    /// C7.2: admin-поля переживают bundle→link→uri→link и `is_admin`/`admin_port` их видят;
+    /// клиентская ссылка (без admin-seed) — `is_admin()==false`, порт дефолтит на 7001.
+    #[test]
+    fn admin_fields_roundtrip_and_accessors() {
+        let master = CredentialLink::from_bundle(&sample());
+        assert!(master.is_admin());
+        assert_eq!(master.admin_port(), "7001");
+        let back = CredentialLink::from_uri(&master.to_uri().unwrap()).unwrap();
+        assert_eq!(back.admin_seed, Some([0x77; 32]));
+        assert!(back.is_admin());
+        // клиентская ссылка: тот же bundle без admin-полей
+        let mut b = sample();
+        b.admin_seed = None;
+        b.admin_port = None;
+        let client = CredentialLink::from_bundle(&b);
+        assert!(!client.is_admin());
+        assert_eq!(client.admin_port(), DEFAULT_ADMIN_PORT); // дефолт при отсутствии
+    }
+
+    /// C7.2 совместимость: ссылка СТАРОГО формата v2 (без admin-полей, version=2) читается новым
+    /// кодом (admin=None). Эмулируем реальные v2-байты структурой без admin-полей — если бы
+    /// ciborium кодировал позиционным массивом, а не map'ом по именам, разбор бы упал.
+    #[test]
+    fn v2_link_parses_under_v3() {
+        use base64::Engine;
+        // точная форма CredentialLink ДО C7.2 (v3): те же поля минус admin_seed/admin_port.
+        #[derive(Serialize)]
+        struct LegacyLink {
+            version: u8,
+            servers: Vec<String>,
+            server_name: String,
+            kx_suite: String,
+            #[serde(with = "serde_bytes")]
+            cert_pin: Option<[u8; 32]>,
+            #[serde(with = "serde_bytes")]
+            mldsa_commit: Option<[u8; 32]>,
+            #[serde(with = "serde_bytes")]
+            obfs_psk: Option<[u8; 32]>,
+            tcp_port: Option<String>,
+            issuer: Option<String>,
+            #[serde(with = "serde_bytes")]
+            issuer_commit: Option<[u8; 32]>,
+            #[serde(with = "serde_bytes")]
+            issuer_pin: Option<[u8; 32]>,
+            #[serde(with = "serde_bytes")]
+            client_seed: Option<[u8; 32]>,
+            routes: String,
+            dns: Option<String>,
+        }
+        let legacy = LegacyLink {
+            version: 2, // старая версия
+            servers: vec!["exit.example:4433".into()],
+            server_name: "citadel.exit".into(),
+            kx_suite: "pq".into(),
+            cert_pin: Some([1; 32]),
+            mldsa_commit: None,
+            obfs_psk: Some([2; 32]),
+            tcp_port: None,
+            issuer: Some("issuer.example:7000".into()),
+            issuer_commit: None,
+            issuer_pin: Some([3; 32]),
+            client_seed: Some([4; 32]),
+            routes: "0.0.0.0/0".into(),
+            dns: None,
+        };
+        let mut cbor = Vec::new();
+        ciborium::into_writer(&legacy, &mut cbor).unwrap();
+        let uri = format!(
+            "{URI_PREFIX}{}",
+            base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(&cbor)
+        );
+        let parsed = CredentialLink::from_uri(&uri).expect("v2-ссылка читается новым кодом");
+        assert_eq!(parsed.version, 2);
+        assert_eq!(parsed.client_seed, Some([4; 32]));
+        assert!(!parsed.is_admin(), "v2 не несёт admin — не мастер");
+        assert_eq!(parsed.admin_seed, None);
     }
 
     #[test]
