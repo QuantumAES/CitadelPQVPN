@@ -78,6 +78,42 @@ Security-пуш на 40+ юнит + 15 docker-тестов без страхов
 - **C6 (упаковка)** = fail-closed kill-switch (desktop-firewall + Android `setBlocking`/always-on, закрывает **M9**) + нотаризация + **Argon2id** для vault (L1).
   - **Известное ограничение (2026-07-12, боевой тест APK):** реконнект при смене сети (toggle WiFi) работает только на **переднем плане**. Причина — детект-сети (NetworkCallback) и цикл реконнекта привязаны к Activity/Flutter-движку; при уходе app в фон (а именно так пользователь переключает WiFi) Activity гасится → событие сети теряется, движок не крутит ретраи, и передний план это не восстанавливает (событие уже прошло). Фикс архитектурный и входит в C6 «always-on»: увести детект-сети + реконнект (и сам движок) в **нативный `CitadelVpnService`** (переживает смерть Activity) либо в фоновый Flutter-isolate. Тестируется только на устройстве. Первый Dart-driven срез (2026-07-05) закрывает foreground-случай.
 
+### C7 — Admin-plane v2: выдача/отзыв доступа по туннелю (спроектирован 2026-07-17; заменяет SSH-путь GUI из C5.5)
+
+**Мотивация.** Управление реестром абонентов из GUI сейчас идёт по SSH (`api/admin.rs` → russh → `citadel-token registry` на сервере): (а) в GUI вводятся **root-креды сервера** — чрезмерная привилегия для операции «добавить абонента» и лишний долгоживущий секрет в приложении; (б) host-key — TOFU без персиста (MITM first-use); (в) russh не собирается в мобильный APK → функция desktop-only; (г) UX — отдельный экран с SSH-полями вместо меню серверов. Одновременно «админская ссылка» инсталлера — обычная абонентская: понятия «мастер-ссылка» в формате кред нет, роль админа держится на знании SSH-пароля.
+
+**Дизайн — admin-роль поверх существующего PQ-TLS канала issuer** (та же машинерия, что S2.1/A1 + Layer-1):
+
+1. **Admin-идентичность.** Инсталлер генерит отдельный Ed25519 `admin.seed`; на сервере (том issuer) остаётся ТОЛЬКО pub (`admin_id`), seed уходит в мастер-ссылку. Формат кред **v3**: поля `admin_seed` (+ `admin_port`, дефолт 7001) с `#[serde(default)]` → v2-ссылки продолжают читаться (admin_seed=None). Мастер-ссылка = обычная абонентская + admin_seed; клиентские ссылки этих полей **не несут**.
+2. **Протокол.** Тот же PQ-TLS (пин из ссылки, X25519MLKEM768): после серверного challenge админ отвечает кадром `0x01 ‖ pub(32) ‖ sig(64)`, где `sig = Ed25519(admin_seed, "citadel-admin/v1" ‖ challenge ‖ EKM)`, EKM — TLS exporter сессии. Domain-separation отделяет admin-auth от Layer-1-auth (кросс-протокольный replay подписи невозможен: ключи разные И контексты разные), EKM привязывает подпись к конкретной TLS-сессии (channel binding — закрывает A3-класс для admin-плоскости). Абонентский кадр остаётся 96 Б → wire аддитивен, старые клиенты не затронуты. Дальше — CBOR-кадры команд `list` / `add(client_id, valid_until)` / `revoke(client_id)`; правки реестра — существующими атомарными `registry_apply_add/revoke` (вынести из main.rs в lib).
+3. **Достижимость — только из туннеля.** Admin-listener на отдельном порту (:7001) **без публикации наружу**: compose-порт не публикуется; exit добавляет DNAT `10.7.0.1:7001 → issuer:7001` только для пакетов с `-i Citadel0`. Итого admin-плоскость не видна WAN-сканам, а команды идут в **трёх** слоях защиты: PQ-QUIC туннель → PQ-TLS с пином → admin-подпись. Публичным остаётся только :7000 (token-fetch, ему это необходимо: токен нужен ДО туннеля).
+4. **Выдача доступа новому абоненту — целиком на устройстве админа.** Ядро генерит свежий `client_seed` (CSPRNG) → по admin-каналу регистрирует только pub (client_id) → клиентскую ссылку собирает **локально** (бандл админа минус admin_seed, с новым client_seed) → QR/копирование. Issuer seed нового абонента не видит (модель C5.4b сохранена). Метки «кому выдано» — локально в vault админа, **не на сервере** (не заводим серверную БД деанонимизации).
+5. **Enforcement — на сервере; UI-гейтинг — вторичен.** Пункт «Абоненты» рендерится только для admin-профиля (`isAdmin` = наличие admin_seed), но реальный барьер — проверка `admin_id` на issuer: клиентская ссылка не даёт admin-операций даже из модифицированного приложения.
+6. **Все платформы.** Admin-клиент — тот же sync-rustls код, что `fetch_tokens` (`spawn_blocking`) → Android/iOS/десктопы без russh. SSH-экран (`AdminRegistryPage`) и russh-бэкенд `api/admin.rs` удаляются из app; russh остаётся только в `citadel_client::deploy` (C4, вне GUI). Break-glass — bootstrap-скрипт по SSH руками на сервер (как при установке).
+
+**Риски и митигейты:**
+
+| # | Риск | Митигейт |
+|---|---|---|
+| R1 | Кража мастер-ссылки = контроль admin-плоскости | vault-шифрование + zeroize; канал только из туннеля; UI-бейдж «Admin» и предупреждение «не раздавать»; ротация admin.seed через break-glass SSH |
+| R2 | Эскалация клиент → админ | Протокольно невозможна: `admin_id` проверяет сервер; скрытие меню — только UX |
+| R3 | Кросс-протокольный replay подписи (Layer-1 ↔ admin) | Разные ключи + domain-separation `"citadel-admin/v1"` + EKM channel-binding |
+| R4 | MITM/replay admin-команд | Pinned PQ-TLS (fail-closed) + fresh challenge per-connection + EKM |
+| R5 | DoS/скан admin-порта | Порт недостижим извне туннеля (доступ уже требует валидной VPN-сессии); throttle неуспешных auth |
+| R6 | Self-lockout (админ отозвал собственный client_id) | Issuer отказывает revoke для client_id из `admin.client_id` (пишет инсталлер); break-glass SSH |
+| R7 | Гонка записи реестра (admin-канал ∥ CLI) | Атомарный tmp+rename уже есть; last-writer-wins приемлем для однофайлового реестра (документировать) |
+| R8 | Приватность метаданных абонентов | На сервере только pub+срок+статус (как сейчас); имена/метки — только в vault админа |
+| R9 | Совместимость розданных ссылок | v3 читает v2 (`serde(default)`); issuer-wire аддитивен (96 Б = абонент, 97 Б = админ) |
+
+**Этапы:**
+- **C7.1 citadel-token: admin-протокол — ✅ (2026-07-17).** Registry-ops вынесены в `citadel_token::admin` (общие для CLI и канала); отдельный admin-listener (`Citadel_ADMIN_LISTEN`, не смешан с :7000 — там по-прежнему только 96-байтовый Layer-1 кадр) с `AdminServer::serve_conn`: challenge → кадр `0x01‖pub‖sig` (домен `citadel-admin/v1` + EKM `EXPORTER-citadel-admin/v1`) → CBOR-команды; чтение `admin_id`/`admin.client_id` на каждую операцию (ротация без рестарта); throttle 1с на провал auth, отказ без ack (не оракул); `AdminClient` (sync, для C7.3). *Тесты (9):* e2e list/add/revoke + lockout-guard + дефолтный срок + «прошлое → отказ»; негативы — чужой ключ, отсутствие admin_id (secure default), Layer-1-кадр (даже если ключ = admin_id), подпись без домена/без EKM/чужой EKM/подделка; CBOR roundtrip; parse_registry.
+- **C7.2 креды v3 + installer.** `admin_seed`/`admin_port` в bundle/link (+совместимость v2), `citadel-linkgen --admin-seed`; инсталлер: keygen admin.seed, `admin_id`+`admin.client_id` на том issuer, DNAT+iface-фильтр на exit, мастер-ссылка с admin_seed (клиентские — без). *Тест:* v2-ссылка парсится, admin-порт снаружи закрыт (nmap-негатив в харнесе).
+- **C7.3 citadel-client: AdminClient + минт ссылок.** Sync-клиент admin-канала (`spawn_blocking`); `mint_client_link(profile)` — свежий seed + сборка клиентской ссылки; локальные метки выданного в vault. *Тесты:* против in-process issuer (как `fetch_tokens_layer1_roundtrip`); минт не содержит admin_seed.
+- **C7.4 FFI + GUI.** `ProfileDto.isAdmin`/`LinkSummaryDto.isAdmin`; пункт «Абоненты» в меню профиля (рядом с Подключить/Отключить/Удалить, только для admin-профиля); экран абонентов: список/добавить(QR)/отозвать, требует активной сессии профиля; удалить `AdminRegistryPage` + russh-бэкенд `api/admin.rs`. Мобильные платформы получают функцию этим же коммитом (бэкенд единый).
+- **C7.5 e2e + доки.** Docker-харнес: add по каналу → новый клиент коннектится; revoke → отказ ≤ эпохи; admin-порт извне закрыт; клиентский ключ в admin-кадре → отказ. Сверка SPEC/CLIENT-ARCH/THREAT-MODEL (admin-plane, роли ссылок).
+
+**Гейт:** C7 не добавляет публичной поверхности (admin-плоскость за туннелем; наружу по-прежнему только 4433/udp, 443/tcp, 7000/tcp). Слома wire нет — правило «один слом wire в S0.3» не нарушается.
+
 ### S3 — Сверка доков с кодом (непрерывно)
 По мере фиксов приводить в соответствие claims: SPEC (QUIC-in-TCP, anti-replay, KX-policy), PHASE0 (векторы), creds (SPKI-pin vs blake3-DER), THREAT-MODEL (статусы S4/E1/kill-switch), CLIENT-ARCH.
 

@@ -505,11 +505,13 @@ dependencies = [
  "aws-lc-rs",
  "blake3",
  "blind-rsa-signatures",
+ "ciborium",
  "criterion",
  "hex",
  "rand 0.8.6",
  "rcgen",
  "rustls",
+ "serde",
 ]
 
 [[package]]

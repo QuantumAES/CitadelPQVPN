@@ -19,6 +19,7 @@ use rand::RngCore;
 use std::io::{self, Read, Write};
 use std::net::TcpStream;
 
+pub mod admin; // C7.1: admin-плоскость (реестр по PQ-TLS: domain-sep Ed25519 + EKM channel binding)
 pub mod pqtls; // S2.1/A1: PQ-TLS + pin канал к издателю (анти-MITM, анти-деанон client_id)
 
 pub const NONCE_LEN: usize = 32;

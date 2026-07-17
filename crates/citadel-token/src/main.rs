@@ -38,20 +38,15 @@ fn registry_path(dir: &str) -> String {
 
 /// Реестр — строки `<pub_hex> <valid_until_unix> <status>`. Возвращает true, если pub найден,
 /// `active` и не истёк. Читается на КАЖДЫЙ auth → отзыв/добавление действуют сразу (≤ след. коннект).
+/// C7.1: разбор строк — общий `admin::parse_registry` (первое совпадение решает, как раньше).
 fn registry_allows(dir: &str, pub_key: &[u8], now: u64) -> bool {
-    let want = hex::encode(pub_key);
     let Ok(content) = std::fs::read_to_string(registry_path(dir)) else {
         return false; // нет реестра → никто не авторизован (secure default)
     };
-    for line in content.lines() {
-        let mut it = line.split_whitespace();
-        if let (Some(p), Some(vu), Some(st)) = (it.next(), it.next(), it.next()) {
-            if p == want {
-                return st == "active" && now < vu.parse::<u64>().unwrap_or(0);
-            }
-        }
-    }
-    false
+    citadel_token::admin::parse_registry(&content)
+        .iter()
+        .find(|e| e.client_id[..] == *pub_key)
+        .is_some_and(|e| e.status == "active" && now < e.valid_until)
 }
 
 /// Bootstrap реестра Layer-1 из env (демо + installer, C5.4b):
@@ -122,8 +117,10 @@ fn merge_registry(existing: &str, pubs: &[[u8; 32]], valid_until: u64) -> String
 /// (замена ручного `sed` из installer'а). Каталог реестра — `Citadel_TOKEN_DIR` (том issuer'а).
 /// Issuer перечитывает реестр на КАЖДЫЙ auth ⇒ add/revoke действуют со следующего коннекта
 /// (отзыв — ≤ длины эпохи). Запись атомарна (temp+rename) — конкурентный читатель-issuer видит
-/// старый ИЛИ новый файл, не частичный.
+/// старый ИЛИ новый файл, не частичный. C7.1: логика реестра — общая `citadel_token::admin`
+/// (те же функции обслуживают admin-канал по туннелю).
 fn run_registry(args: &[String]) -> Result<()> {
+    use citadel_token::admin::{atomic_write, registry_apply_add, registry_apply_revoke};
     let path = registry_path(&token_dir());
     match args.get(2).map(String::as_str) {
         Some("add") => {
@@ -189,63 +186,6 @@ fn parse_valid_until(arg: Option<&str>) -> Result<u64> {
     }
 }
 
-/// Upsert строки реестра: если pub уже есть — заменяем (новый valid_until, статус `active`, в т.ч.
-/// «разотзыв»); иначе добавляем. Прочие строки сохраняются, дубликаты pub схлопываются, пустые
-/// строки убираются. Чистая логика (тестируемо, без I/O).
-fn registry_apply_add(existing: &str, pk: &[u8; 32], valid_until: u64) -> String {
-    let hexpk = hex::encode(pk);
-    let mut out = String::new();
-    let mut done = false;
-    for line in existing.lines() {
-        if line.split_whitespace().next() == Some(hexpk.as_str()) {
-            if !done {
-                out.push_str(&format!("{hexpk} {valid_until} active\n"));
-                done = true;
-            }
-        } else if !line.trim().is_empty() {
-            out.push_str(line);
-            out.push('\n');
-        }
-    }
-    if !done {
-        out.push_str(&format!("{hexpk} {valid_until} active\n"));
-    }
-    out
-}
-
-/// Отзыв: у строки pub статус → `revoked` (valid_until сохраняется). Если pub нет — ошибка
-/// (нечего отзывать; защищает от опечатки в client_id). Чистая логика.
-fn registry_apply_revoke(existing: &str, pk: &[u8; 32]) -> Result<String> {
-    let hexpk = hex::encode(pk);
-    let mut out = String::new();
-    let mut found = false;
-    for line in existing.lines() {
-        let mut it = line.split_whitespace();
-        if it.next() == Some(hexpk.as_str()) {
-            if !found {
-                let vu = it.next().unwrap_or("0");
-                out.push_str(&format!("{hexpk} {vu} revoked\n"));
-                found = true;
-            }
-        } else if !line.trim().is_empty() {
-            out.push_str(line);
-            out.push('\n');
-        }
-    }
-    if !found {
-        anyhow::bail!("client_id {hexpk} не найден в реестре — нечего отзывать");
-    }
-    Ok(out)
-}
-
-/// Атомарная запись файла реестра: temp в том же каталоге + rename (POSIX-атомарно на одной ФС).
-fn atomic_write(path: &str, content: &str) -> Result<()> {
-    let tmp = format!("{path}.tmp.{}", std::process::id());
-    std::fs::write(&tmp, content).with_context(|| format!("запись {tmp}"))?;
-    std::fs::rename(&tmp, path).with_context(|| format!("rename {tmp} → {path}"))?;
-    Ok(())
-}
-
 fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().collect();
     // C5.5 admin-CLI управления реестром — оффлайн-операция админа (add/revoke/list), не сетевая
@@ -299,6 +239,38 @@ fn run_issuer() -> Result<()> {
         hex::encode(identity.pin)
     );
     let scfg = identity.server_config()?;
+
+    // C7.1: admin-канал (управление реестром по PQ-TLS: domain-sep Ed25519 + EKM channel binding).
+    // Отдельный listener — в деплое наружу НЕ публикуется (доступ только из туннеля через DNAT
+    // exit'а, C7.2). TLS-идентичность общая с token-fetch → pin из ссылки валиден для обоих каналов.
+    if let Ok(admin_listen) = std::env::var("Citadel_ADMIN_LISTEN") {
+        let scfg = scfg.clone();
+        let dir = dir.clone();
+        std::thread::spawn(move || {
+            let listener = match TcpListener::bind(&admin_listen) {
+                Ok(l) => l,
+                Err(e) => return eprintln!("[issuer] admin-канал: bind {admin_listen}: {e}"),
+            };
+            eprintln!("[issuer] admin-канал на {admin_listen} (PQ-TLS+pin, Ed25519 домен+EKM)");
+            for conn in listener.incoming() {
+                match conn {
+                    Ok(tcp) => {
+                        let scfg = scfg.clone();
+                        let dir = dir.clone();
+                        std::thread::spawn(move || {
+                            let srv = citadel_token::admin::AdminServer { dir };
+                            let r = citadel_token::pqtls::accept_tls(tcp, scfg)
+                                .and_then(|tls| srv.serve_conn(tls));
+                            if let Err(e) = r {
+                                eprintln!("[issuer] admin-соединение завершено: {e}");
+                            }
+                        });
+                    }
+                    Err(e) => eprintln!("[issuer] admin accept: {e}"),
+                }
+            }
+        });
+    }
 
     let e = citadel_token::current_epoch(epoch_secs);
     eprintln!("[issuer] эпоха {e} (длина {epoch_secs}с); генерирую ключ (RSA-{bits}, ~10с)…");
@@ -524,42 +496,7 @@ mod tests {
         assert_eq!(first, second);
     }
 
-    // ── C5.5 admin-CLI реестра ──
-
-    /// add в пустой реестр, затем add того же pub «разотзывает» и обновляет срок; чужие строки целы.
-    #[test]
-    fn registry_add_upsert_and_unrevoke() {
-        let a = [0xAAu8; 32];
-        let b = [0xBBu8; 32];
-        let ha = hex::encode(a);
-        let hb = hex::encode(b);
-        // старт: A revoked, B active (B — «чужая» строка, не должна пострадать)
-        let start = format!("{ha} 100 revoked\n{hb} 200 active\n");
-        let out = super::registry_apply_add(&start, &a, 500);
-        assert!(out.contains(&format!("{ha} 500 active")), "A обновлён и разотозван");
-        assert!(out.contains(&format!("{hb} 200 active")), "B не тронут");
-        assert_eq!(out.matches(&ha).count(), 1, "A без дубликатов");
-    }
-
-    /// add схлопывает дубликаты одного pub в одну строку.
-    #[test]
-    fn registry_add_dedups() {
-        let a = [0x77u8; 32];
-        let ha = hex::encode(a);
-        let start = format!("{ha} 1 active\n{ha} 2 revoked\n");
-        let out = super::registry_apply_add(&start, &a, 9);
-        assert_eq!(out, format!("{ha} 9 active\n"));
-    }
-
-    /// revoke переводит статус в revoked, сохраняя valid_until; отсутствующий pub → ошибка.
-    #[test]
-    fn registry_revoke_and_missing() {
-        let a = [0xCCu8; 32];
-        let ha = hex::encode(a);
-        let ok = super::registry_apply_revoke(&format!("{ha} 42 active\n"), &a).unwrap();
-        assert_eq!(ok, format!("{ha} 42 revoked\n"), "срок сохранён, статус revoked");
-        assert!(super::registry_apply_revoke("", &a).is_err(), "нет pub → ошибка");
-    }
+    // ── C5.5 admin-CLI реестра: тесты registry_apply_* переехали в citadel_token::admin (C7.1) ──
 
     /// S2.4/A6: квота на client_id за эпоху — до потолка выдаём, дальше отказ; смена эпохи сбрасывает;
     /// разные client_id учитываются раздельно.

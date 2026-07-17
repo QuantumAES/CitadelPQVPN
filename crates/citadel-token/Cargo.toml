@@ -15,6 +15,9 @@ aws-lc-rs = "1.17"                 # C5.2 Layer-1: Ed25519 (тот же крип
 rustls = { version = "0.23", default-features = false, features = ["aws_lc_rs", "std"] }
 rcgen = "0.13"
 blake3 = "1"
+# C7.1 admin-плоскость: CBOR-кадры команд (те же версии, что в citadel-client)
+serde = { version = "1", features = ["derive"] }
+ciborium = "0.2"
 
 [dev-dependencies]
 criterion = { version = "0.5", default-features = false, features = ["cargo_bench_support"] }
