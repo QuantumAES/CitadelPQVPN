@@ -434,6 +434,7 @@ dependencies = [
  "citadel-quic",
  "citadel-token",
  "citadel-tun",
+ "hex",
  "libc",
  "qrcode",
  "russh",

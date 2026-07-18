@@ -49,9 +49,27 @@ pub struct Profile {
     pub last_exit: Option<String>,
 }
 
+/// C7.3: локальная метка выданного админом абонента. Живёт ТОЛЬКО в vault админа (на сервере —
+/// лишь pub+срок+статус, без имён): «кому какой client_id выдан». Не покидает устройство.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub struct IssuedRecord {
+    /// client_id абонента (Ed25519 pub, 64 hex) — связь с записью реестра на сервере.
+    pub client_id_hex: String,
+    /// Человеческая метка («телефон Али», «ноут»), заданная админом при выдаче.
+    pub label: String,
+    /// Когда выдан (unix-секунды).
+    pub created: u64,
+    /// Срок из реестра на момент выдачи (unix-секунды; 0 = серверный дефолт).
+    pub valid_until: u64,
+}
+
 #[derive(Serialize, Deserialize, Default)]
 struct VaultData {
     profiles: Vec<Profile>,
+    /// C7.3: admin-локальные метки выданных абонентов. `#[serde(default)]` → старые vault-файлы
+    /// (без этого поля) читаются как пустой список (та же map-совместимость CBOR, что и creds v3).
+    #[serde(default)]
+    issued: Vec<IssuedRecord>,
 }
 
 /// Разблокированное хранилище профилей. Держит производный ключ в памяти, пока открыто;
@@ -163,6 +181,38 @@ impl Vault {
     pub fn set_last_exit(&mut self, id: &str, exit: &str) -> Result<()> {
         if let Some(p) = self.data.profiles.iter_mut().find(|p| p.id == id) {
             p.last_exit = Some(exit.to_string());
+            self.save()?;
+        }
+        Ok(())
+    }
+
+    // ── C7.3: admin-локальные метки выданных абонентов (только устройство админа) ──
+
+    /// Список выданных абонентов (метки), копия для UI.
+    pub fn list_issued(&self) -> Vec<IssuedRecord> {
+        self.data.issued.clone()
+    }
+
+    /// Записать/обновить метку выданного абонента (upsert по client_id). Возвращает запись.
+    pub fn add_issued(&mut self, client_id_hex: &str, label: &str, valid_until: u64) -> Result<IssuedRecord> {
+        let rec = IssuedRecord {
+            client_id_hex: client_id_hex.trim().to_lowercase(),
+            label: label.trim().to_string(),
+            created: now_unix(),
+            valid_until,
+        };
+        self.data.issued.retain(|r| r.client_id_hex != rec.client_id_hex); // upsert
+        self.data.issued.push(rec.clone());
+        self.save()?;
+        Ok(rec)
+    }
+
+    /// Удалить метку выданного абонента по client_id (например, после отзыва). Нет записи — no-op.
+    pub fn remove_issued(&mut self, client_id_hex: &str) -> Result<()> {
+        let want = client_id_hex.trim().to_lowercase();
+        let before = self.data.issued.len();
+        self.data.issued.retain(|r| r.client_id_hex != want);
+        if self.data.issued.len() != before {
             self.save()?;
         }
         Ok(())
@@ -332,6 +382,31 @@ mod tests {
         assert!(Vault::open(&path, "old").is_err());
         let v = Vault::open(&path, "new").unwrap();
         assert_eq!(v.list().len(), 1);
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// C7.3: метки выданных абонентов переживают переоткрытие, upsert по client_id схлопывает,
+    /// remove чистит. Профили и метки независимы.
+    #[test]
+    fn issued_records_roundtrip_and_upsert() {
+        let path = tmp_path("issued");
+        {
+            let mut v = Vault::create(&path, "pw").unwrap();
+            v.add("prof", &sample_uri()).unwrap(); // профиль отдельно
+            v.add_issued("aa", "телефон", 100).unwrap();
+            v.add_issued("bb", "ноут", 200).unwrap();
+            v.add_issued("AA", "телефон-2", 300).unwrap(); // upsert того же id (нормализуется в lower)
+            assert_eq!(v.list_issued().len(), 2, "AA==aa → апдейт, не дубль");
+            assert_eq!(v.list_issued().iter().find(|r| r.client_id_hex == "aa").unwrap().label, "телефон-2");
+        }
+        // переоткрытие видит метки И профиль
+        let mut v = Vault::open(&path, "pw").unwrap();
+        assert_eq!(v.list_issued().len(), 2);
+        assert_eq!(v.list().len(), 1);
+        v.remove_issued("bb").unwrap();
+        assert_eq!(v.list_issued().len(), 1);
+        v.remove_issued("nope").unwrap(); // no-op
+        assert_eq!(v.list_issued().len(), 1);
         std::fs::remove_file(&path).ok();
     }
 

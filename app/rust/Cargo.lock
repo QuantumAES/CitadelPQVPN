@@ -492,6 +492,7 @@ dependencies = [
  "citadel-quic",
  "citadel-token",
  "citadel-tun",
+ "hex",
  "qrcode",
  "russh",
  "sendfd",
@@ -544,9 +545,14 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "aws-lc-rs",
+ "blake3",
  "blind-rsa-signatures",
+ "ciborium",
  "hex",
  "rand 0.8.6",
+ "rcgen",
+ "rustls",
+ "serde",
 ]
 
 [[package]]

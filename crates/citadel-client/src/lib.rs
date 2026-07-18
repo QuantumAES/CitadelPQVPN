@@ -12,6 +12,7 @@ pub mod api;
 pub mod creds;
 pub mod vault;
 pub mod token_agent; // C5.3: добыча Layer-1 epoch-токенов у issuer (async-обёртка над citadel_token)
+pub mod admin; // C7.3: admin-плоскость по туннелю (управление реестром + минт клиентских ссылок), все платформы
 // gui_tun компилируется и на Android (unix SCM_RIGHTS/UnixSocket), но там НЕ используется —
 // мобильный путь идёт через VpnService (android_establish/run_data_plane). Нужно, чтобы
 // frb_generated.rs (ссылается на vpn_connect → GuiTunProvider) собирался под android.
@@ -34,7 +35,10 @@ pub use citadel_quic::vpn::{
 };
 pub use citadel_tun::TunIo;
 pub use creds::{CredentialBundle, CredentialLink, BUNDLE_VERSION, DEFAULT_ADMIN_PORT};
-pub use vault::{Profile, Vault};
+pub use admin::{
+    admin_issue, admin_list, admin_revoke, build_subscriber_link, IssuedLink, SubscriberEntry,
+};
+pub use vault::{IssuedRecord, Profile, Vault};
 #[cfg(any(target_os = "linux", target_os = "android"))]
 pub use gui_tun::GuiTunProvider;
 #[cfg(not(any(target_os = "android", target_os = "ios")))]

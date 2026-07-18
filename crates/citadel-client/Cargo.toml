@@ -17,6 +17,7 @@ serde = { version = "1", features = ["derive"] }
 serde_bytes = "0.11"        # CBOR byte-string для ключей/хэшей (компактный QR, иначе [u8;32]→массив int)
 ciborium = "0.2"            # CBOR (чистый Rust, serde) — формат бандла кред
 base64 = "0.22"             # URL_SAFE_NO_PAD для citadel://-ссылки
+hex = "0.4"                 # C7.3: client_id ↔ hex для admin-плоскости
 sha2 = "0.10"               # SHA-256 обязательства к публичным ключам (§9.3)
 aws-lc-rs = "1.17"          # vault: PBKDF2-HMAC-SHA256 + AES-256-GCM (то же ядро крипты, что в движке)
 zeroize = "1"               # S1.3/M7: затирание секретов (vault-ключ, plaintext профилей, PSK, seed)
