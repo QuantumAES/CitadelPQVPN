@@ -79,30 +79,43 @@ class CitadelVpnService : VpnService() {
     fun establishTun(addr: String, prefix: Int, routes: String, dns: String, mtu: Int): Int {
         val routeList = routes.split(" ").filter { it.isNotEmpty() }
         val fullTunnel = routeList.isEmpty() || routeList.any { it == "0.0.0.0/0" }
-        val b = Builder()
-            .setSession("CitadelPQVPN")
-            .setMtu(mtu)
-            .addAddress(addr, prefix)
-        for (r in routeList) {
-            val s = splitCidr(r)
-            b.addRoute(s.first, s.second)
-        }
-        for (d in dns.split(" ").filter { it.isNotEmpty() }) b.addDnsServer(d)
-        if (routeList.isEmpty()) b.addRoute("0.0.0.0", 0) // нет split-маршрутов → full-tunnel
-        // S2.2/A2: full-tunnel — захватить IPv6 в туннель (blackhole), иначе нативный IPv6 утечёт
-        // мимо IPv4-only туннеля (деанон на dual-stack). Dummy ULA-адрес + ::/0 (как WireGuard):
-        // v6-пакеты уходят в tun, движок форвардит их exit'у, тот дропает (S0.2 default-deny не-IPv4)
-        // → на проводе открытого IPv6 нет. try/catch — если устройство отвергнет v6, establish не
-        // ломаем (fallback — системный always-on lockdown, который тоже режет не-VPN трафик).
-        if (fullTunnel) {
-            try {
+
+        // Собрать VpnService.Builder. `withV6Blackhole` — захватить весь IPv6 в туннель (S2.2/A2):
+        // туннель IPv4-only, поэтому нативный IPv6 иначе утекает мимо него (деанон на dual-stack).
+        // Dummy ULA + ::/0 (как WireGuard) → v6-пакеты уходят в tun, движок форвардит их exit'у, тот
+        // дропает (S0.2 default-deny не-IPv4) — открытого IPv6 на проводе нет.
+        fun build(withV6Blackhole: Boolean): android.os.ParcelFileDescriptor? {
+            val b = Builder()
+                .setSession("CitadelPQVPN")
+                .setMtu(mtu)
+                .addAddress(addr, prefix)
+            for (r in routeList) {
+                val s = splitCidr(r)
+                b.addRoute(s.first, s.second)
+            }
+            for (d in dns.split(" ").filter { it.isNotEmpty() }) b.addDnsServer(d)
+            if (routeList.isEmpty()) b.addRoute("0.0.0.0", 0) // нет split-маршрутов → full-tunnel
+            if (withV6Blackhole) {
                 b.addAddress("fd00:cade:1::1", 128)
                 b.addRoute("::", 0)
+            }
+            return b.establish()
+        }
+
+        // Пробуем с IPv6-blackhole (только full-tunnel). НЕ все устройства/версии принимают v6-адрес
+        // или ::/0 на VpnService — тогда establish() бросает («Cannot set address») ЛИБО возвращает
+        // null; в этом случае пересобираем БЕЗ blackhole (fallback → системный always-on lockdown,
+        // который тоже режет не-VPN трафик). Так establish не ломается там, где v6 не поддержан.
+        if (fullTunnel) {
+            try {
+                val fd = build(true)
+                if (fd != null) return fd.detachFd()
+                android.util.Log.w("CitadelVpn", "S2.2/A2: establish с IPv6-blackhole вернул null — пробую без него")
             } catch (e: Exception) {
-                android.util.Log.w("CitadelVpn", "S2.2/A2: IPv6-blackhole не применён (${e.message}); полагаемся на OS lockdown")
+                android.util.Log.w("CitadelVpn", "S2.2/A2: IPv6-blackhole отвергнут устройством (${e.message}); fallback без него (OS lockdown)")
             }
         }
-        val fd = b.establish() ?: throw IllegalStateException("VpnService.establish() == null (нет разрешения VPN?)")
+        val fd = build(false) ?: throw IllegalStateException("VpnService.establish() == null (нет разрешения VPN?)")
         return fd.detachFd() // владение переходит в Rust
     }
 
