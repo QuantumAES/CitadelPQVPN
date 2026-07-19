@@ -18,6 +18,13 @@ export Citadel_TCP_LISTEN=0.0.0.0:443   # M4: obfs-over-TCP fallback (когда
 export Citadel_KX=all   # M6 crypto-agility: exit принимает PQ и classical (negotiate с клиентом)
 export Citadel_MLDSA=1   # M7 PQ-auth: гибрид Ed25519 + ML-DSA-65 (квантово-стойкая подпись сервера)
 export Citadel_MLDSA_PUB_FILE=${Citadel_MLDSA_PUB_FILE:-/shared/exit.mldsa}   # exit2 переопределяет
+# C7.2 admin-плоскость: data-plane пропускает TCP к ADMIN_VIP:7001 из туннеля (после анти-спуфинга),
+# ядро DNAT'ит на issuer (-i Citadel0 → порт на ВНЕШНЕМ интерфейсе exit НЕ открывается — ТЕСТ 22).
+export Citadel_ADMIN_VIP=10.7.0.1   # = шлюз Citadel_TUN_ADDR (инвариант ADMIN_VIP)
+export Citadel_ADMIN_PORT=7001
+ISSUER_IP=$(getent hosts issuer | awk '{print $1; exit}')
+export Citadel_ADMIN_DNAT="${ISSUER_IP}:7001"
+echo "[exit] admin-plane: DNAT ${Citadel_ADMIN_VIP}:${Citadel_ADMIN_PORT} -> ${Citadel_ADMIN_DNAT} (только из туннеля)"
 rm -f /shared/exit.pin   # убрать устаревший pin от прошлого запуска
 echo "[exit] старт citadel-m1 (server, PQ X25519MLKEM768)…"
 exec citadel-m1

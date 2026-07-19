@@ -17,7 +17,7 @@ docker compose -f docker/compose.yml build
 echo "[3/5] поднимаю exit + client…"
 docker compose -f docker/compose.yml up -d
 
-echo "[4/5] жду тестов (issuance + миграция + fallback + failover + agility + PQ-auth, ~120с)…"
+echo "[4/5] жду тестов (issuance + миграция + fallback + failover + agility + PQ-auth + admin-plane, ~130с)…"
 for _ in $(seq 1 280); do
     docker compose -f docker/compose.yml logs client 2>/dev/null | grep -q "Готово." && break
     sleep 1
@@ -28,8 +28,8 @@ echo "===== EXIT (F2/F7 дропы) ====="
 docker compose -f docker/compose.yml logs --no-log-prefix exit | grep -E "F2:|F7:" | tail -n 12 || true
 echo "===== EXIT (хвост) ====="
 docker compose -f docker/compose.yml logs --no-log-prefix exit | tail -n 6 || true
-echo "===== ISSUER (M5 split — слепое подписание) ====="
-docker compose -f docker/compose.yml logs --no-log-prefix issuer | grep -E "ключ сгенерирован|слепое подписание|подписано вслепую" | tail -n 5 || true
+echo "===== ISSUER (M5 split — слепое подписание; C7 admin-канал) ====="
+docker compose -f docker/compose.yml logs --no-log-prefix issuer | grep -E "ключ сгенерирован|слепое подписание|подписано вслепую|admin" | tail -n 10 || true
 echo "===== CLIENT ====="
 docker compose -f docker/compose.yml logs --no-log-prefix client | sed -n '/ТЕСТ 1/,/Готово/p' || true
 

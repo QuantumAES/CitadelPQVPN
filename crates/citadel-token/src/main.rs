@@ -7,6 +7,10 @@
 //!              записать в файл. Издатель не может связать выданное с предъявленным на exit.
 //!   `batch`  — (legacy) выпустить N токенов в одном процессе → файл (для локального демо/тестов).
 //!
+//! CLI-подкоманды (arg[1], вне env-роли): `registry` — оффлайн-правка Layer-1 реестра на сервере
+//! (C5.5); `admin` — те же операции ПО СЕТЕВОМУ admin-каналу (PQ-TLS+pin, домен+EKM; C7.5) — путь
+//! GUI, обычно через туннель к ADMIN_VIP.
+//!
 //! Сетевой формат: кадр `u32(len, BE) ‖ payload`; запрос — blind_msg, ответ — blind_sig.
 
 use std::collections::HashMap;
@@ -156,6 +160,60 @@ fn run_registry(args: &[String]) -> Result<()> {
     Ok(())
 }
 
+// ===================== C7.5: admin-CLI ПО КАНАЛУ (туннелю) =====================
+
+/// `citadel-token admin <list|add <pub> [valid_until]|revoke <pub>>` — управление реестром через
+/// СЕТЕВОЙ admin-канал issuer'а (PQ-TLS+pin, Ed25519 домен+EKM) — тот же путь, что GUI (C7.3/C7.4),
+/// в отличие от `registry` (оффлайн-правка файла на сервере). Для харнеса C7.5 и ops/break-glass
+/// с любой машины, у которой есть мастер-креды и туннель.
+///
+/// Env: `Citadel_ADMIN_ADDR` (host:port; из туннеля — `10.7.0.1:<admin_port>`),
+///      `Citadel_ISSUER_PIN` (hex32 — тот же TLS-pin issuer'а, что для token-fetch),
+///      `Citadel_ADMIN_SEED` (hex32 — admin-seed из мастер-ссылки).
+fn run_admin_channel(args: &[String]) -> Result<()> {
+    let addr = std::env::var("Citadel_ADMIN_ADDR")
+        .context("нужен Citadel_ADMIN_ADDR (host:port admin-канала; из туннеля — ADMIN_VIP:порт)")?;
+    let pin = parse_hex32(
+        std::env::var("Citadel_ISSUER_PIN").ok().as_ref(),
+        "Citadel_ISSUER_PIN (TLS-pin issuer, 64 hex)",
+    )?;
+    let seed = parse_hex32(
+        std::env::var("Citadel_ADMIN_SEED").ok().as_ref(),
+        "Citadel_ADMIN_SEED (admin-seed, 64 hex)",
+    )?;
+    let mut c = citadel_token::admin::AdminClient::connect(&addr, &pin, &seed)
+        .context("admin-канал: connect/auth")?;
+    match args.get(2).map(String::as_str) {
+        Some("list") => {
+            for e in c.list()? {
+                println!("{} {} {}", hex::encode(e.client_id), e.valid_until, e.status);
+            }
+        }
+        Some("add") => {
+            let pk = parse_hex32(args.get(3), "pub (client_id, 64 hex)")?;
+            // Без аргумента шлём 0 → срок назначает СЕРВЕР (+365d), как GUI-путь admin_issue.
+            let vu = match args.get(4) {
+                None => 0,
+                Some(s) => parse_valid_until(Some(s))?,
+            };
+            c.add(pk, vu)?;
+            eprintln!("[admin] add {} по каналу (срок: {})", hex::encode(pk),
+                if vu == 0 { "серверный дефолт".into() } else { vu.to_string() });
+        }
+        Some("revoke") => {
+            let pk = parse_hex32(args.get(3), "pub (client_id, 64 hex)")?;
+            c.revoke(pk)?;
+            eprintln!("[admin] revoke {} по каналу (действует ≤ длины эпохи)", hex::encode(pk));
+        }
+        _ => anyhow::bail!(
+            "citadel-token admin <list|add <pub> [valid_until]|revoke <pub>>\n  \
+             env: Citadel_ADMIN_ADDR, Citadel_ISSUER_PIN, Citadel_ADMIN_SEED.  \
+             Операции идут по PQ-TLS admin-каналу (обычно — через туннель к ADMIN_VIP)."
+        ),
+    }
+    Ok(())
+}
+
 /// Разобрать 32-байтный hex-аргумент (pub/seed) или дать понятную ошибку.
 fn parse_hex32(arg: Option<&String>, what: &str) -> Result<[u8; 32]> {
     let s = arg.with_context(|| format!("нужен <{what}>"))?;
@@ -192,6 +250,10 @@ fn main() -> Result<()> {
     // роль, поэтому маршрутизируем по arg[1] ДО env-роли (Citadel_TOKEN_ROLE её не задаёт).
     if args.get(1).map(String::as_str) == Some("registry") {
         return run_registry(&args);
+    }
+    // C7.5: сетевой admin-канал (list/add/revoke по туннелю) — тот же путь, что GUI.
+    if args.get(1).map(String::as_str) == Some("admin") {
+        return run_admin_channel(&args);
     }
     let role = std::env::var("Citadel_TOKEN_ROLE")
         .ok()

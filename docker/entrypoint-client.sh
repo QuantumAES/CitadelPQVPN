@@ -19,6 +19,10 @@ export Citadel_TOKENS=/shared/tokens   # анонимный токен для п
 EXIT_IP=$(getent hosts exit 2>/dev/null | awk '{print $1; exit}')
 EXIT_IP=${EXIT_IP:-exit}
 echo "[client] exit резолвится в $EXIT_IP"
+# IP issuer — для ТЕСТ 20 (фетч токенов новым абонентом ПОСЛЕ DNS-lock: hostname уже не резолвится)
+ISSUER_IP=$(getent hosts issuer 2>/dev/null | awk '{print $1; exit}')
+ISSUER_IP=${ISSUER_IP:-issuer}
+echo "[client] issuer резолвится в $ISSUER_IP"
 
 # S2.1/A1: pin TLS-серта издателя для PQ-TLS канала фетча токенов (издатель пишет его в /shared).
 for _ in $(seq 1 30); do [ -s /shared/issuer-tls.pin ] && break; sleep 1; done
@@ -356,7 +360,78 @@ fi
 
 echo
 echo "===================================================================="
+echo "  ТЕСТ 20 (C7) — admin-плоскость ПО ТУННЕЛЮ: add → новый абонент получает токены; revoke → отказ"
+echo "  канал: TCP 10.7.0.1:7001 из-под туннеля → exit DNAT → issuer (PQ-TLS+pin, Ed25519 домен+EKM)"
+echo "===================================================================="
+ADMIN_SEED=$(printf 'ad%.0s' {1..32})
+export Citadel_ADMIN_ADDR=10.7.0.1:7001
+# 20a: list по каналу — демо-абонент (c5) виден в реестре
+DEMO_PUB=$(Citadel_CLIENT_SEED=$(printf 'c5%.0s' {1..32}) citadel-token pubkey)
+if Citadel_ISSUER_PIN=$ISSUER_PIN Citadel_ADMIN_SEED=$ADMIN_SEED timeout 20 citadel-token admin list 2>/dev/null | grep -q "^$DEMO_PUB .* active"; then
+    echo "  OK ✔ list по туннелю: реестр читается, демо-абонент active"
+else
+    echo "  [!] list по admin-каналу не прошёл ✗"
+fi
+# 20b: add НОВОГО абонента по каналу (только pub — seed остаётся «у абонента») → Layer-1 пускает:
+# новый seed получает epoch-токены у issuer = пропуск на exit (токены универсальны per-epoch)
+NEW_SEED=$(head -c 32 /dev/urandom | od -An -tx1 | tr -d ' \n')
+NEW_PUB=$(Citadel_CLIENT_SEED=$NEW_SEED citadel-token pubkey)
+Citadel_ISSUER_PIN=$ISSUER_PIN Citadel_ADMIN_SEED=$ADMIN_SEED timeout 20 citadel-token admin add "$NEW_PUB" 2>/dev/null \
+    && echo "  add ${NEW_PUB:0:12}… по каналу: OK" || echo "  [!] add по каналу не прошёл ✗"
+rm -rf /tmp/t20; mkdir -p /tmp/t20
+Citadel_TOKEN_ROLE=client Citadel_TOKEN_ISSUER=$ISSUER_IP:7000 Citadel_ISSUER_PIN=$ISSUER_PIN Citadel_TOKEN_DIR=/tmp/t20 Citadel_TOKEN_COUNT=1 \
+    Citadel_CLIENT_SEED=$NEW_SEED timeout 15 citadel-token >/tmp/t20/o1 2>&1 || true
+if [ -s /tmp/t20/tokens ]; then
+    echo "  OK ✔ добавленный по туннелю абонент получил epoch-токен (допущен к exit)"
+else
+    echo "  [!] новый абонент НЕ получил токены после add ✗"
+fi
+# 20c: revoke по каналу → отказ в выдаче (действует ≤ длины эпохи)
+Citadel_ISSUER_PIN=$ISSUER_PIN Citadel_ADMIN_SEED=$ADMIN_SEED timeout 20 citadel-token admin revoke "$NEW_PUB" 2>/dev/null || true
+rm -f /tmp/t20/tokens
+Citadel_TOKEN_ROLE=client Citadel_TOKEN_ISSUER=$ISSUER_IP:7000 Citadel_ISSUER_PIN=$ISSUER_PIN Citadel_TOKEN_DIR=/tmp/t20 Citadel_TOKEN_COUNT=1 \
+    Citadel_CLIENT_SEED=$NEW_SEED timeout 15 citadel-token >/tmp/t20/o2 2>&1 || true
+if [ ! -s /tmp/t20/tokens ]; then
+    echo "  OK ✔ после revoke по туннелю — отказ в токенах (отзыв ≤ длины эпохи)"
+else
+    echo "  [!] отозванный абонент ПОЛУЧИЛ токены ✗"
+fi
+
+echo
+echo "===================================================================="
+echo "  ТЕСТ 21 (C7 негатив) — чужой ключ в admin-кадре → отказ; self-revoke админа → отказ (R6)"
+echo "===================================================================="
+# клиентский Layer-1 seed (c5 — валидный АБОНЕНТ) в роли admin-ключа: домен-разделение auth —
+# подписка не даёт админских прав; issuer рвёт канал без ack (не оракул)
+if Citadel_ISSUER_PIN=$ISSUER_PIN Citadel_ADMIN_SEED=$(printf 'c5%.0s' {1..32}) timeout 20 citadel-token admin list >/dev/null 2>&1; then
+    echo "  [!] КЛИЕНТСКИЙ ключ прошёл в admin-канал ✗"
+else
+    echo "  OK ✔ клиентский (не-admin) ключ отвергнут admin-каналом"
+fi
+# R6: отзыв Layer-1 client_id САМОГО админа настоящим админом → сервер отклоняет (анти-self-lockout)
+if Citadel_ISSUER_PIN=$ISSUER_PIN Citadel_ADMIN_SEED=$ADMIN_SEED timeout 20 citadel-token admin revoke "$DEMO_PUB" >/dev/null 2>&1; then
+    echo "  [!] self-revoke client_id админа ПРОШЁЛ ✗"
+else
+    echo "  OK ✔ self-revoke отклонён сервером (R6 — админ не может запереть сам себя)"
+fi
+
+echo
+echo "===================================================================="
+echo "  ТЕСТ 22 (C7.2) — admin-порт СНАРУЖИ туннеля ЗАКРЫТ (DNAT только -i Citadel0)"
+echo "===================================================================="
+# прямой TCP к внешнему интерфейсу exit (docker-bridge, мимо туннеля): m1 на :7001 не слушает,
+# DNAT-правило матчит только пакеты ИЗ туннельного интерфейса → извне порт закрыт.
+# (доступность того же порта ИЗ туннеля доказана операциями ТЕСТ 20)
+if timeout 3 bash -c "echo > /dev/tcp/$EXIT_IP/7001" 2>/dev/null; then
+    echo "  [!] admin-порт exit ОТКРЫТ снаружи туннеля ✗"
+else
+    echo "  OK ✔ TCP $EXIT_IP:7001 снаружи туннеля недоступен (публичная поверхность не выросла)"
+fi
+
+echo
+echo "===================================================================="
 echo "  Готово. M1-M7 + STRIDE F1-F7: pinning, egress, obfs L1, drop-priv, DNS-leak, rate-limit,"
-echo "  миграция, TCP-fallback, split-issuance, multi-server, crypto-agility, PQ-auth, commitment-fetch."
+echo "  миграция, TCP-fallback, split-issuance, multi-server, crypto-agility, PQ-auth, commitment-fetch,"
+echo "  admin-plane по туннелю (C7: add/revoke, домен-auth, порт снаружи закрыт)."
 echo "===================================================================="
 wait "$M1E" 2>/dev/null || true
