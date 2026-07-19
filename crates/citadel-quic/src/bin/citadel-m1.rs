@@ -17,7 +17,7 @@ use std::collections::HashSet;
 use std::process::Command;
 use std::sync::atomic::{AtomicU16, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, Context, Result};
 use rand::RngCore;
@@ -169,7 +169,12 @@ fn server_setup_net(ifname: &str) {
     // (F2 покрывает RFC1918/10.x — приватные, но не публичный IP самого exit). Data-plane читает
     // TUN через userspace-fd, ядровый INPUT с туннеля ему не нужен ⇒ дропаем весь INPUT с ifname.
     // Закрывает пивот туннельного клиента на сервисы exit-хоста (аудит-2/A4).
-    run("iptables", &["-A", "INPUT", "-i", ifname, "-j", "DROP"]);
+    // `-I INPUT 1` (в НАЧАЛО цепочки, не `-A`): на хосте с уже существующим firewall (типовой VPS,
+    // где SSH:22 разрешён правилом без `-i`-фильтра) append встал бы ПОСЛЕ такого ACCEPT и пакет из
+    // туннеля сматчил бы его раньше нашего DROP. Insert гарантирует fail-closed независимо от
+    // окружения (как `-I OUTPUT 1` в kill-switch). Admin-DNAT (C7.2) этим не задет: он в PREROUTING
+    // до routing-decision → DNAT'нутый пакет уходит в FORWARD, а не в INPUT.
+    run("iptables", &["-I", "INPUT", "1", "-i", ifname, "-j", "DROP"]);
     let _ = std::fs::write("/proc/sys/net/ipv4/conf/all/rp_filter", b"1");
     // MSS-clamp: ограничить TCP-сегменты под PMTU туннеля. Без него крупные ответные
     // сегменты (TLS ServerHello/cert) не влезают в QUIC-датаграмму и теряются — PMTUD
@@ -519,6 +524,11 @@ async fn run_server(tun: Arc<Tun>) -> Result<()> {
         // мгновенный дроп) + таймаут на сам хендшейк (idle-коннект не висит вечно). Слот держим
         // только на время хендшейка — established-сессии его не занимают.
         let tcp_sema = Arc::new(tokio::sync::Semaphore::new(TCP_FALLBACK_MAX_INFLIGHT));
+        // A5: лог отклонений throttl'им (агрегат раз в секунду). Иначе TCP-флуд, упёршийся в
+        // семафор, породил бы строку stderr на КАЖДЫЙ отбитый коннект → лог-амплификация (рост
+        // docker json-log/диска) = вторичный DoS поверх уже закрытого исчерпания endpoint'ов.
+        let mut rejected: u64 = 0;
+        let mut last_reject_log = Instant::now();
         tokio::spawn(async move {
             loop {
                 match listener.accept().await {
@@ -526,8 +536,13 @@ async fn run_server(tun: Arc<Tun>) -> Result<()> {
                         let permit = match tcp_sema.clone().try_acquire_owned() {
                             Ok(p) => p,
                             Err(_) => {
-                                eprintln!("[citadel-m1:server] TCP-fallback: лимит {TCP_FALLBACK_MAX_INFLIGHT} одновременных хендшейков — соединение отклонено (A5)");
-                                drop(stream);
+                                drop(stream); // мгновенно закрываем — pre-auth слотов нет
+                                rejected += 1;
+                                if last_reject_log.elapsed() >= Duration::from_secs(1) {
+                                    eprintln!("[citadel-m1:server] TCP-fallback: лимит {TCP_FALLBACK_MAX_INFLIGHT} одновременных хендшейков — отклонено {rejected} соединений за последнюю секунду (A5)");
+                                    rejected = 0;
+                                    last_reject_log = Instant::now();
+                                }
                                 continue;
                             }
                         };
