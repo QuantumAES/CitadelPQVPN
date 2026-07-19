@@ -4,11 +4,11 @@ import 'dart:io' show Platform;
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 
-import 'package:app/admin_registry_page.dart';
 import 'package:app/android_vpn.dart';
 import 'package:app/app_state.dart';
 import 'package:app/debug_panel.dart';
 import 'package:app/src/rust/api/citadel.dart';
+import 'package:app/subscribers_page.dart';
 
 /// Версия сборки для экрана «О приложении». Задаётся `--dart-define=CITADEL_VERSION=<tag>` в
 /// mk-client-release.sh (совпадает с тегом релиза, напр. v0.3.0-pre2); для локальных `flutter run`
@@ -76,6 +76,7 @@ class _HomePageState extends State<HomePage> {
         hasPin: false,
         hasPqAuth: false,
         hasObfs: false,
+        isAdmin: false,
         lastExit: '',
       );
 
@@ -162,12 +163,22 @@ class _HomePageState extends State<HomePage> {
                       onTap: () => _tapProfile(p),
                       onDelete: () => _deleteProfile(p),
                       onDisconnect: s.disconnect,
+                      onSubscribers:
+                          p.isAdmin ? () => _openSubscribers(p) : null,
                     )),
               ],
             ],
           );
         },
       ),
+    );
+  }
+
+  /// C7.4: экран абонентов admin-профиля (управление реестром по туннелю).
+  void _openSubscribers(ProfileDto p) {
+    Navigator.push(
+      context,
+      MaterialPageRoute(builder: (_) => SubscribersPage(state: s, profile: p)),
     );
   }
 
@@ -243,20 +254,8 @@ class _HomePageState extends State<HomePage> {
                   _showAlwaysOnGuide();
                 },
               ),
-            // Admin-режим — десктоп-функция (SSH-управление сервером; на мобилке скрыт).
-            if (!Platform.isAndroid && !Platform.isIOS)
-              ListTile(
-                leading: const Icon(Icons.dns_outlined),
-                title: const Text('Admin: реестр абонентов'),
-                subtitle: const Text('Доступ на развёрнутом сервере (SSH)'),
-                onTap: () {
-                  Navigator.pop(sheetCtx);
-                  Navigator.push(
-                    context,
-                    MaterialPageRoute(builder: (_) => const AdminRegistryPage()),
-                  );
-                },
-              ),
+            // Admin (C7.4): реестр абонентов живёт в меню admin-профиля («Абоненты»), не здесь —
+            // операции идут по туннелю этого профиля, SSH-путь удалён.
             ListTile(
               leading: const Icon(Icons.info_outline),
               title: const Text('О приложении'),
@@ -681,6 +680,7 @@ class _ProfileTile extends StatelessWidget {
     required this.onTap,
     required this.onDelete,
     required this.onDisconnect,
+    this.onSubscribers,
   });
   final ProfileDto profile;
   final bool active;
@@ -688,6 +688,8 @@ class _ProfileTile extends StatelessWidget {
   final VoidCallback onTap;
   final VoidCallback onDelete;
   final VoidCallback onDisconnect;
+  /// C7.4: открыть экран абонентов (не null только у admin-профиля).
+  final VoidCallback? onSubscribers;
 
   @override
   Widget build(BuildContext context) {
@@ -702,6 +704,8 @@ class _ProfileTile extends StatelessWidget {
     }
 
     final chips = <Widget>[
+      if (profile.isAdmin)
+        _featChip(context, Icons.admin_panel_settings_outlined, 'admin'),
       if (profile.hasPqAuth)
         _featChip(context, Icons.verified_user_outlined, 'PQ-auth'),
       if (profile.hasObfs) _featChip(context, Icons.blur_on, 'obfs'),
@@ -735,12 +739,15 @@ class _ProfileTile extends StatelessWidget {
             if (v == 'delete') onDelete();
             if (v == 'connect') onTap();
             if (v == 'disconnect') onDisconnect();
+            if (v == 'subscribers') onSubscribers?.call();
           },
           itemBuilder: (_) => [
             if (active && (phase == VpnPhase.up || phase == VpnPhase.connecting))
               const PopupMenuItem(value: 'disconnect', child: Text('Отключить'))
             else
               const PopupMenuItem(value: 'connect', child: Text('Подключить')),
+            if (onSubscribers != null)
+              const PopupMenuItem(value: 'subscribers', child: Text('Абоненты')),
             const PopupMenuItem(value: 'delete', child: Text('Удалить')),
           ],
         ),
@@ -922,6 +929,7 @@ class _LinkPreview extends StatelessWidget {
       );
     }
     final feats = <String>[
+      if (summary.isAdmin) 'admin (мастер)',
       if (summary.hasPqAuth) 'PQ-auth',
       if (summary.hasObfs) 'обфускация',
       if (summary.hasPin) 'cert-pin',
@@ -959,6 +967,27 @@ class _LinkPreview extends StatelessWidget {
                               MaterialTapTargetSize.shrinkWrap,
                         ))
                     .toList(),
+              ),
+            ),
+          // C7.4: мастер-ссылка несёт admin_seed — предупредить, что раздавать её нельзя
+          // (абонентам выдаются отдельные ссылки с экрана «Абоненты»).
+          if (summary.isAdmin)
+            Padding(
+              padding: const EdgeInsets.only(top: 8),
+              child: Row(
+                children: [
+                  Icon(Icons.warning_amber_rounded, size: 16, color: cs.error),
+                  const SizedBox(width: 6),
+                  Expanded(
+                    child: Text(
+                      'Мастер-ссылка: даёт управление абонентами. Не передавайте её никому.',
+                      style: Theme.of(context)
+                          .textTheme
+                          .bodySmall
+                          ?.copyWith(color: cs.error),
+                    ),
+                  ),
+                ],
               ),
             ),
         ],

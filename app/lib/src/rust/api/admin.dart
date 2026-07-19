@@ -6,82 +6,59 @@
 import '../frb_generated.dart';
 import 'package:flutter_rust_bridge/flutter_rust_bridge_for_generated.dart';
 
-/// Список абонентов реестра развёрнутого сервера (SSH → `citadel-token registry list`).
-Future<List<RegistryEntryDto>> adminRegistryList({required AdminConn conn}) =>
-    RustLib.instance.api.crateApiAdminAdminRegistryList(conn: conn);
+/// Список абонентов реестра сервера admin-профиля (по туннелю), с локальными метками.
+/// Требует разблокированного vault; канал достижим только при поднятой сессии этого профиля.
+Future<List<SubscriberDto>> adminSubscribers({required String profileId}) =>
+    RustLib.instance.api.crateApiAdminAdminSubscribers(profileId: profileId);
 
-/// Зарегистрировать абонента. `client_id` — Ed25519 pub (64 hex). `valid_until` — `+<N>d`/`+<N>h`/
-/// unix-секунды или пусто (дефолт +365d на сервере). Ввод валидируется в ядре (анти-инъекция).
-Future<void> adminRegistryAdd({
-  required AdminConn conn,
-  required String clientId,
+/// Выдать доступ новому абоненту: свежий seed → регистрация pub по каналу → клиентская ссылка
+/// (собирается локально, issuer seed не видит — модель C5.4b). `valid_until`: пусто → серверный
+/// дефолт (+365d), `+30d`/`+12h`/unix-секунды. `label` — локальная метка (только vault админа).
+Future<IssuedLinkDto> adminIssueSubscriber({
+  required String profileId,
+  required String label,
   required String validUntil,
-}) => RustLib.instance.api.crateApiAdminAdminRegistryAdd(
-  conn: conn,
-  clientId: clientId,
+}) => RustLib.instance.api.crateApiAdminAdminIssueSubscriber(
+  profileId: profileId,
+  label: label,
   validUntil: validUntil,
 );
 
-/// Отозвать абонента по `client_id` (status=revoked; действует ≤ длины эпохи).
-Future<void> adminRegistryRevoke({
-  required AdminConn conn,
-  required String clientId,
-}) => RustLib.instance.api.crateApiAdminAdminRegistryRevoke(
-  conn: conn,
-  clientId: clientId,
+/// Отозвать абонента по client_id (status=revoked; действует ≤ длины эпохи). Отзыв собственного
+/// admin client_id сервер отклонит (анти-self-lockout, R6). Метку в vault НЕ удаляем — «кому был
+/// выдан отозванный id» остаётся видно в списке.
+Future<void> adminRevokeSubscriber({
+  required String profileId,
+  required String clientIdHex,
+}) => RustLib.instance.api.crateApiAdminAdminRevokeSubscriber(
+  profileId: profileId,
+  clientIdHex: clientIdHex,
 );
 
-/// Параметры SSH-подключения к серверу для Admin-операций.
-class AdminConn {
-  final String host;
-  final int port;
-  final String user;
+/// Результат выдачи доступа: client_id + готовая КЛИЕНТСКАЯ ссылка (без admin-полей).
+/// `uri` показывается один раз (QR/копирование) — seed абонента у админа НЕ сохраняется.
+class IssuedLinkDto {
+  final String clientIdHex;
+  final String uri;
 
-  /// Пароль (используется, если `key_path` пуст).
-  final String password;
-
-  /// Путь к приватному SSH-ключу (OpenSSH-PEM). Не пуст → key-auth вместо пароля. Ключ читается
-  /// в ядре, в Dart не передаётся.
-  final String keyPath;
-
-  /// Passphrase ключа (пусто → без passphrase).
-  final String keyPassphrase;
-
-  const AdminConn({
-    required this.host,
-    required this.port,
-    required this.user,
-    required this.password,
-    required this.keyPath,
-    required this.keyPassphrase,
-  });
+  const IssuedLinkDto({required this.clientIdHex, required this.uri});
 
   @override
-  int get hashCode =>
-      host.hashCode ^
-      port.hashCode ^
-      user.hashCode ^
-      password.hashCode ^
-      keyPath.hashCode ^
-      keyPassphrase.hashCode;
+  int get hashCode => clientIdHex.hashCode ^ uri.hashCode;
 
   @override
   bool operator ==(Object other) =>
       identical(this, other) ||
-      other is AdminConn &&
+      other is IssuedLinkDto &&
           runtimeType == other.runtimeType &&
-          host == other.host &&
-          port == other.port &&
-          user == other.user &&
-          password == other.password &&
-          keyPath == other.keyPath &&
-          keyPassphrase == other.keyPassphrase;
+          clientIdHex == other.clientIdHex &&
+          uri == other.uri;
 }
 
-/// Запись Layer-1 реестра для Admin-UI.
-class RegistryEntryDto {
+/// Абонент Layer-1 реестра для UI: серверная запись + локальная метка админа.
+class SubscriberDto {
   /// client_id абонента (Ed25519 pub, 64 hex).
-  final String clientId;
+  final String clientIdHex;
 
   /// Срок действия (unix-секунды).
   final PlatformInt64 validUntilUnix;
@@ -92,27 +69,33 @@ class RegistryEntryDto {
   /// Удобный флаг для UI: строка активна (`status == "active"`).
   final bool active;
 
-  const RegistryEntryDto({
-    required this.clientId,
+  /// Метка админа из vault («телефон Али»); пусто — если не сохранена (выдан вне этого устройства).
+  final String label;
+
+  const SubscriberDto({
+    required this.clientIdHex,
     required this.validUntilUnix,
     required this.status,
     required this.active,
+    required this.label,
   });
 
   @override
   int get hashCode =>
-      clientId.hashCode ^
+      clientIdHex.hashCode ^
       validUntilUnix.hashCode ^
       status.hashCode ^
-      active.hashCode;
+      active.hashCode ^
+      label.hashCode;
 
   @override
   bool operator ==(Object other) =>
       identical(this, other) ||
-      other is RegistryEntryDto &&
+      other is SubscriberDto &&
           runtimeType == other.runtimeType &&
-          clientId == other.clientId &&
+          clientIdHex == other.clientIdHex &&
           validUntilUnix == other.validUntilUnix &&
           status == other.status &&
-          active == other.active;
+          active == other.active &&
+          label == other.label;
 }

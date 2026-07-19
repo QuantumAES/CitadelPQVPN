@@ -50,6 +50,8 @@ pub struct ProfileDto {
     pub has_pin: bool,
     pub has_pq_auth: bool,
     pub has_obfs: bool,
+    /// C7.4: мастер-профиль (ссылка несёт admin_seed) — UI показывает пункт «Абоненты».
+    pub is_admin: bool,
     pub last_exit: String,
 }
 
@@ -63,6 +65,15 @@ pub struct LinkSummaryDto {
     pub has_pin: bool,
     pub has_pq_auth: bool,
     pub has_obfs: bool,
+    /// C7.4: мастер-ссылка (admin) — UI предупреждает: такую нельзя раздавать абонентам.
+    pub is_admin: bool,
+}
+
+/// C7.4: QR-код ссылки как битовая матрица `size × size` (1 = тёмный модуль) — рендер в UI
+/// кастомным painter'ом, без SVG-зависимости на Dart-стороне.
+pub struct QrDto {
+    pub size: u32,
+    pub cells: Vec<u8>,
 }
 
 /// Снимок статуса живой Android-сессии для UI при перезапуске (нюанс 2: натив переживает смерть
@@ -190,8 +201,29 @@ fn profile_to_dto(p: &Profile) -> ProfileDto {
         has_pin: link.as_ref().map(|l| l.cert_pin.is_some()).unwrap_or(false),
         has_pq_auth: link.as_ref().map(|l| l.mldsa_commit.is_some()).unwrap_or(false),
         has_obfs: link.as_ref().map(|l| l.obfs_psk.is_some()).unwrap_or(false),
+        is_admin: link.as_ref().map(|l| l.is_admin()).unwrap_or(false),
         last_exit: p.last_exit.clone().unwrap_or_default(),
     }
+}
+
+/// Ссылка сохранённого профиля из vault (общая для connect/diag/admin-путей).
+/// Ошибка — если vault заблокирован или профиль не найден. Секрет не покидает Rust-ядро.
+pub(crate) fn profile_uri(id: &str) -> Result<String> {
+    let g = VAULT.lock().unwrap();
+    let v = g.as_ref().ok_or_else(|| anyhow!("хранилище заблокировано"))?;
+    v.list()
+        .into_iter()
+        .find(|p| p.id == id)
+        .map(|p| p.uri)
+        .ok_or_else(|| anyhow!("профиль не найден"))
+}
+
+/// Выполнить операцию над разблокированным vault (для admin-модуля: метки выданных абонентов).
+/// Лок берётся только на время `f` — НЕ держать через await.
+pub(crate) fn with_vault<T>(f: impl FnOnce(&mut Vault) -> Result<T>) -> Result<T> {
+    let mut g = VAULT.lock().unwrap();
+    let v = g.as_mut().ok_or_else(|| anyhow!("хранилище заблокировано"))?;
+    f(v)
 }
 
 // ───────────────────────────── vault FFI ─────────────────────────────
@@ -270,9 +302,18 @@ pub fn parse_link_summary(uri: String) -> LinkSummaryDto {
             has_pin: s.has_pin,
             has_pq_auth: s.has_pq_auth,
             has_obfs: s.has_obfs,
+            is_admin: s.is_admin,
         },
         Err(_) => LinkSummaryDto::default(),
     }
+}
+
+/// C7.4: QR-матрица `citadel://`-ссылки (экран выдачи доступа абоненту). Sync — кодирование QR
+/// дёшево, а ссылка и так уже в Dart-памяти (только что выдана).
+#[frb(sync)]
+pub fn link_qr(uri: String) -> Result<QrDto> {
+    let (size, cells) = citadel_client::api::link_qr_matrix(uri)?;
+    Ok(QrDto { size, cells })
 }
 
 // ───────────────────────────── vpn FFI ─────────────────────────────
@@ -428,15 +469,7 @@ pub fn vpn_connect(link: String, sink: StreamSink<VpnEventDto>) -> Result<()> {
 
 /// Подключить по сохранённому профилю (ссылка достаётся из vault, не покидает ядро).
 pub fn vpn_connect_profile(id: String, sink: StreamSink<VpnEventDto>) -> Result<()> {
-    let uri = {
-        let g = VAULT.lock().unwrap();
-        let v = g.as_ref().ok_or_else(|| anyhow!("хранилище заблокировано"))?;
-        v.list()
-            .into_iter()
-            .find(|p| p.id == id)
-            .map(|p| p.uri)
-            .ok_or_else(|| anyhow!("профиль не найден"))?
-    };
+    let uri = profile_uri(&id)?;
     start_connect(&uri, Some(id), sink)
 }
 
@@ -515,15 +548,7 @@ pub fn android_start_session(link: String, sink: StreamSink<VpnEventDto>) -> Res
 
 /// Android: старт нативной сессии по сохранённому профилю (ссылка не покидает ядро).
 pub fn android_start_session_profile(id: String, sink: StreamSink<VpnEventDto>) -> Result<()> {
-    let uri = {
-        let g = VAULT.lock().unwrap();
-        let v = g.as_ref().ok_or_else(|| anyhow!("хранилище заблокировано"))?;
-        v.list()
-            .into_iter()
-            .find(|p| p.id == id)
-            .map(|p| p.uri)
-            .ok_or_else(|| anyhow!("профиль не найден"))?
-    };
+    let uri = profile_uri(&id)?;
     android_start(&uri, Some(id), sink)
 }
 
@@ -608,15 +633,7 @@ pub struct DiagLineDto {
 /// (нужны issuer+client_seed для добычи Layer-1 токена в диагностике, не только `ClientConfig`).
 fn link_from(profile_id: Option<String>, link: Option<String>) -> Result<CredentialLink> {
     let uri = match (profile_id, link) {
-        (Some(id), _) => {
-            let g = VAULT.lock().unwrap();
-            let v = g.as_ref().ok_or_else(|| anyhow!("хранилище заблокировано"))?;
-            v.list()
-                .into_iter()
-                .find(|p| p.id == id)
-                .map(|p| p.uri)
-                .ok_or_else(|| anyhow!("профиль не найден"))?
-        }
+        (Some(id), _) => profile_uri(&id)?,
         (None, Some(l)) => l,
         (None, None) => return Err(anyhow!("нужен profile_id или link")),
     };

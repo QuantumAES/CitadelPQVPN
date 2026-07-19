@@ -328,6 +328,18 @@ impl CredentialLink {
             .build())
     }
 
+    /// C7.4: QR той же ссылки как битовая матрица `size × size` (1 = тёмный модуль) — для рендера
+    /// в GUI кастомным painter'ом (без SVG-зависимости на стороне Flutter).
+    pub fn to_qr_matrix(&self) -> Result<(u32, Vec<u8>)> {
+        let uri = self.to_uri()?;
+        let code = qrcode::QrCode::with_error_correction_level(uri.as_bytes(), qrcode::EcLevel::M)
+            .context("QR-кодирование citadel://-ссылки")?;
+        let size = code.width() as u32;
+        let cells =
+            code.to_colors().iter().map(|c| u8::from(*c == qrcode::Color::Dark)).collect();
+        Ok((size, cells))
+    }
+
     /// Преобразовать компактную ссылку в `ClientConfig` для подключения. pin берётся из
     /// инлайн-`cert_pin`, obfs_psk инлайн. `mldsa` = обязательство `H(pub)` из ссылки →
     /// `MldsaSource::Commit`: полный pub exit дотягивается по control-каналу и сверяется с commit

@@ -43,22 +43,19 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   String dco_decode_String(dynamic raw);
 
   @protected
-  AdminConn dco_decode_admin_conn(dynamic raw);
-
-  @protected
   AndroidStatusDto dco_decode_android_status_dto(dynamic raw);
 
   @protected
   bool dco_decode_bool(dynamic raw);
 
   @protected
-  AdminConn dco_decode_box_autoadd_admin_conn(dynamic raw);
-
-  @protected
   DiagLineDto dco_decode_diag_line_dto(dynamic raw);
 
   @protected
   PlatformInt64 dco_decode_i_64(dynamic raw);
+
+  @protected
+  IssuedLinkDto dco_decode_issued_link_dto(dynamic raw);
 
   @protected
   LinkSummaryDto dco_decode_link_summary_dto(dynamic raw);
@@ -73,7 +70,7 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   List<ProfileDto> dco_decode_list_profile_dto(dynamic raw);
 
   @protected
-  List<RegistryEntryDto> dco_decode_list_registry_entry_dto(dynamic raw);
+  List<SubscriberDto> dco_decode_list_subscriber_dto(dynamic raw);
 
   @protected
   String? dco_decode_opt_String(dynamic raw);
@@ -82,10 +79,13 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   ProfileDto dco_decode_profile_dto(dynamic raw);
 
   @protected
-  RegistryEntryDto dco_decode_registry_entry_dto(dynamic raw);
+  QrDto dco_decode_qr_dto(dynamic raw);
 
   @protected
-  int dco_decode_u_16(dynamic raw);
+  SubscriberDto dco_decode_subscriber_dto(dynamic raw);
+
+  @protected
+  int dco_decode_u_32(dynamic raw);
 
   @protected
   int dco_decode_u_8(dynamic raw);
@@ -118,22 +118,19 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   String sse_decode_String(SseDeserializer deserializer);
 
   @protected
-  AdminConn sse_decode_admin_conn(SseDeserializer deserializer);
-
-  @protected
   AndroidStatusDto sse_decode_android_status_dto(SseDeserializer deserializer);
 
   @protected
   bool sse_decode_bool(SseDeserializer deserializer);
 
   @protected
-  AdminConn sse_decode_box_autoadd_admin_conn(SseDeserializer deserializer);
-
-  @protected
   DiagLineDto sse_decode_diag_line_dto(SseDeserializer deserializer);
 
   @protected
   PlatformInt64 sse_decode_i_64(SseDeserializer deserializer);
+
+  @protected
+  IssuedLinkDto sse_decode_issued_link_dto(SseDeserializer deserializer);
 
   @protected
   LinkSummaryDto sse_decode_link_summary_dto(SseDeserializer deserializer);
@@ -148,7 +145,7 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   List<ProfileDto> sse_decode_list_profile_dto(SseDeserializer deserializer);
 
   @protected
-  List<RegistryEntryDto> sse_decode_list_registry_entry_dto(
+  List<SubscriberDto> sse_decode_list_subscriber_dto(
     SseDeserializer deserializer,
   );
 
@@ -159,10 +156,13 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   ProfileDto sse_decode_profile_dto(SseDeserializer deserializer);
 
   @protected
-  RegistryEntryDto sse_decode_registry_entry_dto(SseDeserializer deserializer);
+  QrDto sse_decode_qr_dto(SseDeserializer deserializer);
 
   @protected
-  int sse_decode_u_16(SseDeserializer deserializer);
+  SubscriberDto sse_decode_subscriber_dto(SseDeserializer deserializer);
+
+  @protected
+  int sse_decode_u_32(SseDeserializer deserializer);
 
   @protected
   int sse_decode_u_8(SseDeserializer deserializer);
@@ -204,9 +204,6 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   void sse_encode_String(String self, SseSerializer serializer);
 
   @protected
-  void sse_encode_admin_conn(AdminConn self, SseSerializer serializer);
-
-  @protected
   void sse_encode_android_status_dto(
     AndroidStatusDto self,
     SseSerializer serializer,
@@ -216,16 +213,13 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   void sse_encode_bool(bool self, SseSerializer serializer);
 
   @protected
-  void sse_encode_box_autoadd_admin_conn(
-    AdminConn self,
-    SseSerializer serializer,
-  );
-
-  @protected
   void sse_encode_diag_line_dto(DiagLineDto self, SseSerializer serializer);
 
   @protected
   void sse_encode_i_64(PlatformInt64 self, SseSerializer serializer);
+
+  @protected
+  void sse_encode_issued_link_dto(IssuedLinkDto self, SseSerializer serializer);
 
   @protected
   void sse_encode_link_summary_dto(
@@ -249,8 +243,8 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   );
 
   @protected
-  void sse_encode_list_registry_entry_dto(
-    List<RegistryEntryDto> self,
+  void sse_encode_list_subscriber_dto(
+    List<SubscriberDto> self,
     SseSerializer serializer,
   );
 
@@ -261,13 +255,13 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   void sse_encode_profile_dto(ProfileDto self, SseSerializer serializer);
 
   @protected
-  void sse_encode_registry_entry_dto(
-    RegistryEntryDto self,
-    SseSerializer serializer,
-  );
+  void sse_encode_qr_dto(QrDto self, SseSerializer serializer);
 
   @protected
-  void sse_encode_u_16(int self, SseSerializer serializer);
+  void sse_encode_subscriber_dto(SubscriberDto self, SseSerializer serializer);
+
+  @protected
+  void sse_encode_u_32(int self, SseSerializer serializer);
 
   @protected
   void sse_encode_u_8(int self, SseSerializer serializer);

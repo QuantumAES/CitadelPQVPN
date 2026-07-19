@@ -11,7 +11,8 @@
 //! деплоем (C7.2: DNAT с `-i Citadel0`, порт наружу не публикуется) — этот модуль даёт
 //! криптографический слой, который держит и без неё (defense in depth).
 
-use std::net::TcpStream;
+use std::net::{TcpStream, ToSocketAddrs};
+use std::time::Duration;
 
 use anyhow::{anyhow, bail, Context, Result};
 use serde::{Deserialize, Serialize};
@@ -323,10 +324,24 @@ pub struct AdminClient {
 }
 
 impl AdminClient {
+    /// Таймаут TCP-connect к admin-каналу. VIP маршрутизируем только из-под туннеля: без него
+    /// SYN может молча тонуть (blackhole) до OS-таймаута ~2 мин — GUI обязан получить отказ быстро.
+    const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+    /// Таймаут каждой read/write операции канала (handshake и CBOR-команды; операции короткие).
+    const IO_TIMEOUT: Duration = Duration::from_secs(15);
+
     /// Подключиться и аутентифицироваться. `addr` — host:port admin-канала (за туннелем, C7.2);
     /// `issuer_pin` — тот же pin PQ-TLS, что для token-fetch (одна TLS-идентичность issuer'а).
     pub fn connect(addr: &str, issuer_pin: &[u8; 32], admin_seed: &[u8; 32]) -> Result<Self> {
-        let tcp = TcpStream::connect(addr).with_context(|| format!("admin-канал {addr} недоступен"))?;
+        let sa = addr
+            .to_socket_addrs()
+            .with_context(|| format!("разбор адреса admin-канала {addr}"))?
+            .next()
+            .ok_or_else(|| anyhow!("admin-канал {addr}: адрес не резолвится"))?;
+        let tcp = TcpStream::connect_timeout(&sa, Self::CONNECT_TIMEOUT)
+            .with_context(|| format!("admin-канал {addr} недоступен (туннель поднят?)"))?;
+        tcp.set_read_timeout(Some(Self::IO_TIMEOUT)).context("set_read_timeout")?;
+        tcp.set_write_timeout(Some(Self::IO_TIMEOUT)).context("set_write_timeout")?;
         let mut tls = crate::pqtls::connect_tls(tcp, *issuer_pin)?;
         let challenge = read_frame(&mut tls).context("admin-канал: нет challenge (pin mismatch?)")?;
         let ekm = ekm_client(&tls)?;

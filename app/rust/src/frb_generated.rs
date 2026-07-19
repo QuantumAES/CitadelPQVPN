@@ -38,7 +38,7 @@ flutter_rust_bridge::frb_generated_boilerplate!(
     default_rust_auto_opaque = RustAutoOpaqueMoi,
 );
 pub(crate) const FLUTTER_RUST_BRIDGE_CODEGEN_VERSION: &str = "2.12.0";
-pub(crate) const FLUTTER_RUST_BRIDGE_CODEGEN_CONTENT_HASH: i32 = -1701023498;
+pub(crate) const FLUTTER_RUST_BRIDGE_CODEGEN_CONTENT_HASH: i32 = -1482628275;
 
 // Section: executor
 
@@ -46,7 +46,7 @@ flutter_rust_bridge::frb_generated_default_handler!();
 
 // Section: wire_funcs
 
-fn wire__crate__api__admin__admin_registry_add_impl(
+fn wire__crate__api__admin__admin_issue_subscriber_impl(
     port_: flutter_rust_bridge::for_generated::MessagePort,
     ptr_: flutter_rust_bridge::for_generated::PlatformGeneralizedUint8ListPtr,
     rust_vec_len_: i32,
@@ -54,7 +54,7 @@ fn wire__crate__api__admin__admin_registry_add_impl(
 ) {
     FLUTTER_RUST_BRIDGE_HANDLER.wrap_async::<flutter_rust_bridge::for_generated::SseCodec, _, _, _>(
         flutter_rust_bridge::for_generated::TaskInfo {
-            debug_name: "admin_registry_add",
+            debug_name: "admin_issue_subscriber",
             port: Some(port_),
             mode: flutter_rust_bridge::for_generated::FfiCallMode::Normal,
         },
@@ -68,16 +68,16 @@ fn wire__crate__api__admin__admin_registry_add_impl(
             };
             let mut deserializer =
                 flutter_rust_bridge::for_generated::SseDeserializer::new(message);
-            let api_conn = <crate::api::admin::AdminConn>::sse_decode(&mut deserializer);
-            let api_client_id = <String>::sse_decode(&mut deserializer);
+            let api_profile_id = <String>::sse_decode(&mut deserializer);
+            let api_label = <String>::sse_decode(&mut deserializer);
             let api_valid_until = <String>::sse_decode(&mut deserializer);
             deserializer.end();
             move |context| async move {
                 transform_result_sse::<_, flutter_rust_bridge::for_generated::anyhow::Error>(
                     (move || async move {
-                        let output_ok = crate::api::admin::admin_registry_add(
-                            api_conn,
-                            api_client_id,
+                        let output_ok = crate::api::admin::admin_issue_subscriber(
+                            api_profile_id,
+                            api_label,
                             api_valid_until,
                         )
                         .await?;
@@ -89,7 +89,7 @@ fn wire__crate__api__admin__admin_registry_add_impl(
         },
     )
 }
-fn wire__crate__api__admin__admin_registry_list_impl(
+fn wire__crate__api__admin__admin_revoke_subscriber_impl(
     port_: flutter_rust_bridge::for_generated::MessagePort,
     ptr_: flutter_rust_bridge::for_generated::PlatformGeneralizedUint8ListPtr,
     rust_vec_len_: i32,
@@ -97,7 +97,7 @@ fn wire__crate__api__admin__admin_registry_list_impl(
 ) {
     FLUTTER_RUST_BRIDGE_HANDLER.wrap_async::<flutter_rust_bridge::for_generated::SseCodec, _, _, _>(
         flutter_rust_bridge::for_generated::TaskInfo {
-            debug_name: "admin_registry_list",
+            debug_name: "admin_revoke_subscriber",
             port: Some(port_),
             mode: flutter_rust_bridge::for_generated::FfiCallMode::Normal,
         },
@@ -111,12 +111,17 @@ fn wire__crate__api__admin__admin_registry_list_impl(
             };
             let mut deserializer =
                 flutter_rust_bridge::for_generated::SseDeserializer::new(message);
-            let api_conn = <crate::api::admin::AdminConn>::sse_decode(&mut deserializer);
+            let api_profile_id = <String>::sse_decode(&mut deserializer);
+            let api_client_id_hex = <String>::sse_decode(&mut deserializer);
             deserializer.end();
             move |context| async move {
                 transform_result_sse::<_, flutter_rust_bridge::for_generated::anyhow::Error>(
                     (move || async move {
-                        let output_ok = crate::api::admin::admin_registry_list(api_conn).await?;
+                        let output_ok = crate::api::admin::admin_revoke_subscriber(
+                            api_profile_id,
+                            api_client_id_hex,
+                        )
+                        .await?;
                         Ok(output_ok)
                     })()
                     .await,
@@ -125,7 +130,7 @@ fn wire__crate__api__admin__admin_registry_list_impl(
         },
     )
 }
-fn wire__crate__api__admin__admin_registry_revoke_impl(
+fn wire__crate__api__admin__admin_subscribers_impl(
     port_: flutter_rust_bridge::for_generated::MessagePort,
     ptr_: flutter_rust_bridge::for_generated::PlatformGeneralizedUint8ListPtr,
     rust_vec_len_: i32,
@@ -133,7 +138,7 @@ fn wire__crate__api__admin__admin_registry_revoke_impl(
 ) {
     FLUTTER_RUST_BRIDGE_HANDLER.wrap_async::<flutter_rust_bridge::for_generated::SseCodec, _, _, _>(
         flutter_rust_bridge::for_generated::TaskInfo {
-            debug_name: "admin_registry_revoke",
+            debug_name: "admin_subscribers",
             port: Some(port_),
             mode: flutter_rust_bridge::for_generated::FfiCallMode::Normal,
         },
@@ -147,15 +152,13 @@ fn wire__crate__api__admin__admin_registry_revoke_impl(
             };
             let mut deserializer =
                 flutter_rust_bridge::for_generated::SseDeserializer::new(message);
-            let api_conn = <crate::api::admin::AdminConn>::sse_decode(&mut deserializer);
-            let api_client_id = <String>::sse_decode(&mut deserializer);
+            let api_profile_id = <String>::sse_decode(&mut deserializer);
             deserializer.end();
             move |context| async move {
                 transform_result_sse::<_, flutter_rust_bridge::for_generated::anyhow::Error>(
                     (move || async move {
                         let output_ok =
-                            crate::api::admin::admin_registry_revoke(api_conn, api_client_id)
-                                .await?;
+                            crate::api::admin::admin_subscribers(api_profile_id).await?;
                         Ok(output_ok)
                     })()
                     .await,
@@ -559,6 +562,38 @@ fn wire__crate__api__citadel__killswitch_enabled_impl(
                 let output_ok = Result::<_, ()>::Ok(crate::api::citadel::killswitch_enabled())?;
                 Ok(output_ok)
             })())
+        },
+    )
+}
+fn wire__crate__api__citadel__link_qr_impl(
+    ptr_: flutter_rust_bridge::for_generated::PlatformGeneralizedUint8ListPtr,
+    rust_vec_len_: i32,
+    data_len_: i32,
+) -> flutter_rust_bridge::for_generated::WireSyncRust2DartSse {
+    FLUTTER_RUST_BRIDGE_HANDLER.wrap_sync::<flutter_rust_bridge::for_generated::SseCodec, _>(
+        flutter_rust_bridge::for_generated::TaskInfo {
+            debug_name: "link_qr",
+            port: None,
+            mode: flutter_rust_bridge::for_generated::FfiCallMode::Sync,
+        },
+        move || {
+            let message = unsafe {
+                flutter_rust_bridge::for_generated::Dart2RustMessageSse::from_wire(
+                    ptr_,
+                    rust_vec_len_,
+                    data_len_,
+                )
+            };
+            let mut deserializer =
+                flutter_rust_bridge::for_generated::SseDeserializer::new(message);
+            let api_uri = <String>::sse_decode(&mut deserializer);
+            deserializer.end();
+            transform_result_sse::<_, flutter_rust_bridge::for_generated::anyhow::Error>(
+                (move || {
+                    let output_ok = crate::api::citadel::link_qr(api_uri)?;
+                    Ok(output_ok)
+                })(),
+            )
         },
     )
 }
@@ -1245,26 +1280,6 @@ impl SseDecode for String {
     }
 }
 
-impl SseDecode for crate::api::admin::AdminConn {
-    // Codec=Sse (Serialization based), see doc to use other codecs
-    fn sse_decode(deserializer: &mut flutter_rust_bridge::for_generated::SseDeserializer) -> Self {
-        let mut var_host = <String>::sse_decode(deserializer);
-        let mut var_port = <u16>::sse_decode(deserializer);
-        let mut var_user = <String>::sse_decode(deserializer);
-        let mut var_password = <String>::sse_decode(deserializer);
-        let mut var_keyPath = <String>::sse_decode(deserializer);
-        let mut var_keyPassphrase = <String>::sse_decode(deserializer);
-        return crate::api::admin::AdminConn {
-            host: var_host,
-            port: var_port,
-            user: var_user,
-            password: var_password,
-            key_path: var_keyPath,
-            key_passphrase: var_keyPassphrase,
-        };
-    }
-}
-
 impl SseDecode for crate::api::citadel::AndroidStatusDto {
     // Codec=Sse (Serialization based), see doc to use other codecs
     fn sse_decode(deserializer: &mut flutter_rust_bridge::for_generated::SseDeserializer) -> Self {
@@ -1311,6 +1326,18 @@ impl SseDecode for i64 {
     }
 }
 
+impl SseDecode for crate::api::admin::IssuedLinkDto {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    fn sse_decode(deserializer: &mut flutter_rust_bridge::for_generated::SseDeserializer) -> Self {
+        let mut var_clientIdHex = <String>::sse_decode(deserializer);
+        let mut var_uri = <String>::sse_decode(deserializer);
+        return crate::api::admin::IssuedLinkDto {
+            client_id_hex: var_clientIdHex,
+            uri: var_uri,
+        };
+    }
+}
+
 impl SseDecode for crate::api::citadel::LinkSummaryDto {
     // Codec=Sse (Serialization based), see doc to use other codecs
     fn sse_decode(deserializer: &mut flutter_rust_bridge::for_generated::SseDeserializer) -> Self {
@@ -1321,6 +1348,7 @@ impl SseDecode for crate::api::citadel::LinkSummaryDto {
         let mut var_hasPin = <bool>::sse_decode(deserializer);
         let mut var_hasPqAuth = <bool>::sse_decode(deserializer);
         let mut var_hasObfs = <bool>::sse_decode(deserializer);
+        let mut var_isAdmin = <bool>::sse_decode(deserializer);
         return crate::api::citadel::LinkSummaryDto {
             valid: var_valid,
             servers: var_servers,
@@ -1329,6 +1357,7 @@ impl SseDecode for crate::api::citadel::LinkSummaryDto {
             has_pin: var_hasPin,
             has_pq_auth: var_hasPqAuth,
             has_obfs: var_hasObfs,
+            is_admin: var_isAdmin,
         };
     }
 }
@@ -1369,15 +1398,13 @@ impl SseDecode for Vec<crate::api::citadel::ProfileDto> {
     }
 }
 
-impl SseDecode for Vec<crate::api::admin::RegistryEntryDto> {
+impl SseDecode for Vec<crate::api::admin::SubscriberDto> {
     // Codec=Sse (Serialization based), see doc to use other codecs
     fn sse_decode(deserializer: &mut flutter_rust_bridge::for_generated::SseDeserializer) -> Self {
         let mut len_ = <i32>::sse_decode(deserializer);
         let mut ans_ = Vec::with_capacity(len_ as usize);
         for idx_ in 0..len_ {
-            ans_.push(<crate::api::admin::RegistryEntryDto>::sse_decode(
-                deserializer,
-            ));
+            ans_.push(<crate::api::admin::SubscriberDto>::sse_decode(deserializer));
         }
         return ans_;
     }
@@ -1403,6 +1430,7 @@ impl SseDecode for crate::api::citadel::ProfileDto {
         let mut var_hasPin = <bool>::sse_decode(deserializer);
         let mut var_hasPqAuth = <bool>::sse_decode(deserializer);
         let mut var_hasObfs = <bool>::sse_decode(deserializer);
+        let mut var_isAdmin = <bool>::sse_decode(deserializer);
         let mut var_lastExit = <String>::sse_decode(deserializer);
         return crate::api::citadel::ProfileDto {
             id: var_id,
@@ -1411,31 +1439,46 @@ impl SseDecode for crate::api::citadel::ProfileDto {
             has_pin: var_hasPin,
             has_pq_auth: var_hasPqAuth,
             has_obfs: var_hasObfs,
+            is_admin: var_isAdmin,
             last_exit: var_lastExit,
         };
     }
 }
 
-impl SseDecode for crate::api::admin::RegistryEntryDto {
+impl SseDecode for crate::api::citadel::QrDto {
     // Codec=Sse (Serialization based), see doc to use other codecs
     fn sse_decode(deserializer: &mut flutter_rust_bridge::for_generated::SseDeserializer) -> Self {
-        let mut var_clientId = <String>::sse_decode(deserializer);
-        let mut var_validUntilUnix = <i64>::sse_decode(deserializer);
-        let mut var_status = <String>::sse_decode(deserializer);
-        let mut var_active = <bool>::sse_decode(deserializer);
-        return crate::api::admin::RegistryEntryDto {
-            client_id: var_clientId,
-            valid_until_unix: var_validUntilUnix,
-            status: var_status,
-            active: var_active,
+        let mut var_size = <u32>::sse_decode(deserializer);
+        let mut var_cells = <Vec<u8>>::sse_decode(deserializer);
+        return crate::api::citadel::QrDto {
+            size: var_size,
+            cells: var_cells,
         };
     }
 }
 
-impl SseDecode for u16 {
+impl SseDecode for crate::api::admin::SubscriberDto {
     // Codec=Sse (Serialization based), see doc to use other codecs
     fn sse_decode(deserializer: &mut flutter_rust_bridge::for_generated::SseDeserializer) -> Self {
-        deserializer.cursor.read_u16::<NativeEndian>().unwrap()
+        let mut var_clientIdHex = <String>::sse_decode(deserializer);
+        let mut var_validUntilUnix = <i64>::sse_decode(deserializer);
+        let mut var_status = <String>::sse_decode(deserializer);
+        let mut var_active = <bool>::sse_decode(deserializer);
+        let mut var_label = <String>::sse_decode(deserializer);
+        return crate::api::admin::SubscriberDto {
+            client_id_hex: var_clientIdHex,
+            valid_until_unix: var_validUntilUnix,
+            status: var_status,
+            active: var_active,
+            label: var_label,
+        };
+    }
+}
+
+impl SseDecode for u32 {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    fn sse_decode(deserializer: &mut flutter_rust_bridge::for_generated::SseDeserializer) -> Self {
+        deserializer.cursor.read_u32::<NativeEndian>().unwrap()
     }
 }
 
@@ -1487,9 +1530,13 @@ fn pde_ffi_dispatcher_primary_impl(
 ) {
     // Codec=Pde (Serialization + dispatch), see doc to use other codecs
     match func_id {
-        1 => wire__crate__api__admin__admin_registry_add_impl(port, ptr, rust_vec_len, data_len),
-        2 => wire__crate__api__admin__admin_registry_list_impl(port, ptr, rust_vec_len, data_len),
-        3 => wire__crate__api__admin__admin_registry_revoke_impl(port, ptr, rust_vec_len, data_len),
+        1 => {
+            wire__crate__api__admin__admin_issue_subscriber_impl(port, ptr, rust_vec_len, data_len)
+        }
+        2 => {
+            wire__crate__api__admin__admin_revoke_subscriber_impl(port, ptr, rust_vec_len, data_len)
+        }
+        3 => wire__crate__api__admin__admin_subscribers_impl(port, ptr, rust_vec_len, data_len),
         4 => {
             wire__crate__api__citadel__android_attach_events_impl(port, ptr, rust_vec_len, data_len)
         }
@@ -1504,20 +1551,20 @@ fn pde_ffi_dispatcher_primary_impl(
         ),
         12 => wire__crate__api__diag__debug_log_stream_impl(port, ptr, rust_vec_len, data_len),
         14 => wire__crate__api__simple__init_app_impl(port, ptr, rust_vec_len, data_len),
-        16 => wire__crate__api__citadel__link_summary_dto_default_impl(
+        17 => wire__crate__api__citadel__link_summary_dto_default_impl(
             port,
             ptr,
             rust_vec_len,
             data_len,
         ),
-        18 => wire__crate__api__citadel__run_diagnostics_impl(port, ptr, rust_vec_len, data_len),
-        24 => {
+        19 => wire__crate__api__citadel__run_diagnostics_impl(port, ptr, rust_vec_len, data_len),
+        25 => {
             wire__crate__api__citadel__vault_change_password_impl(port, ptr, rust_vec_len, data_len)
         }
-        25 => wire__crate__api__citadel__vault_create_impl(port, ptr, rust_vec_len, data_len),
-        31 => wire__crate__api__citadel__vault_unlock_impl(port, ptr, rust_vec_len, data_len),
-        32 => wire__crate__api__citadel__vpn_connect_impl(port, ptr, rust_vec_len, data_len),
-        33 => {
+        26 => wire__crate__api__citadel__vault_create_impl(port, ptr, rust_vec_len, data_len),
+        32 => wire__crate__api__citadel__vault_unlock_impl(port, ptr, rust_vec_len, data_len),
+        33 => wire__crate__api__citadel__vpn_connect_impl(port, ptr, rust_vec_len, data_len),
+        34 => {
             wire__crate__api__citadel__vpn_connect_profile_impl(port, ptr, rust_vec_len, data_len)
         }
         _ => unreachable!(),
@@ -1539,46 +1586,25 @@ fn pde_ffi_dispatcher_sync_impl(
         11 => wire__crate__api__diag__debug_log_snapshot_impl(ptr, rust_vec_len, data_len),
         13 => wire__crate__api__simple__greet_impl(ptr, rust_vec_len, data_len),
         15 => wire__crate__api__citadel__killswitch_enabled_impl(ptr, rust_vec_len, data_len),
-        17 => wire__crate__api__citadel__parse_link_summary_impl(ptr, rust_vec_len, data_len),
-        19 => wire__crate__api__citadel__set_data_dir_impl(ptr, rust_vec_len, data_len),
-        20 => wire__crate__api__citadel__set_killswitch_impl(ptr, rust_vec_len, data_len),
-        21 => wire__crate__api__diag__set_log_file_impl(ptr, rust_vec_len, data_len),
-        22 => wire__crate__api__diag__start_log_capture_impl(ptr, rust_vec_len, data_len),
-        23 => wire__crate__api__citadel__vault_add_impl(ptr, rust_vec_len, data_len),
-        26 => wire__crate__api__citadel__vault_exists_impl(ptr, rust_vec_len, data_len),
-        27 => wire__crate__api__citadel__vault_is_unlocked_impl(ptr, rust_vec_len, data_len),
-        28 => wire__crate__api__citadel__vault_list_impl(ptr, rust_vec_len, data_len),
-        29 => wire__crate__api__citadel__vault_lock_impl(ptr, rust_vec_len, data_len),
-        30 => wire__crate__api__citadel__vault_remove_impl(ptr, rust_vec_len, data_len),
-        34 => wire__crate__api__citadel__vpn_disconnect_impl(ptr, rust_vec_len, data_len),
+        16 => wire__crate__api__citadel__link_qr_impl(ptr, rust_vec_len, data_len),
+        18 => wire__crate__api__citadel__parse_link_summary_impl(ptr, rust_vec_len, data_len),
+        20 => wire__crate__api__citadel__set_data_dir_impl(ptr, rust_vec_len, data_len),
+        21 => wire__crate__api__citadel__set_killswitch_impl(ptr, rust_vec_len, data_len),
+        22 => wire__crate__api__diag__set_log_file_impl(ptr, rust_vec_len, data_len),
+        23 => wire__crate__api__diag__start_log_capture_impl(ptr, rust_vec_len, data_len),
+        24 => wire__crate__api__citadel__vault_add_impl(ptr, rust_vec_len, data_len),
+        27 => wire__crate__api__citadel__vault_exists_impl(ptr, rust_vec_len, data_len),
+        28 => wire__crate__api__citadel__vault_is_unlocked_impl(ptr, rust_vec_len, data_len),
+        29 => wire__crate__api__citadel__vault_list_impl(ptr, rust_vec_len, data_len),
+        30 => wire__crate__api__citadel__vault_lock_impl(ptr, rust_vec_len, data_len),
+        31 => wire__crate__api__citadel__vault_remove_impl(ptr, rust_vec_len, data_len),
+        35 => wire__crate__api__citadel__vpn_disconnect_impl(ptr, rust_vec_len, data_len),
         _ => unreachable!(),
     }
 }
 
 // Section: rust2dart
 
-// Codec=Dco (DartCObject based), see doc to use other codecs
-impl flutter_rust_bridge::IntoDart for crate::api::admin::AdminConn {
-    fn into_dart(self) -> flutter_rust_bridge::for_generated::DartAbi {
-        [
-            self.host.into_into_dart().into_dart(),
-            self.port.into_into_dart().into_dart(),
-            self.user.into_into_dart().into_dart(),
-            self.password.into_into_dart().into_dart(),
-            self.key_path.into_into_dart().into_dart(),
-            self.key_passphrase.into_into_dart().into_dart(),
-        ]
-        .into_dart()
-    }
-}
-impl flutter_rust_bridge::for_generated::IntoDartExceptPrimitive for crate::api::admin::AdminConn {}
-impl flutter_rust_bridge::IntoIntoDart<crate::api::admin::AdminConn>
-    for crate::api::admin::AdminConn
-{
-    fn into_into_dart(self) -> crate::api::admin::AdminConn {
-        self
-    }
-}
 // Codec=Dco (DartCObject based), see doc to use other codecs
 impl flutter_rust_bridge::IntoDart for crate::api::citadel::AndroidStatusDto {
     fn into_dart(self) -> flutter_rust_bridge::for_generated::DartAbi {
@@ -1626,6 +1652,27 @@ impl flutter_rust_bridge::IntoIntoDart<crate::api::citadel::DiagLineDto>
     }
 }
 // Codec=Dco (DartCObject based), see doc to use other codecs
+impl flutter_rust_bridge::IntoDart for crate::api::admin::IssuedLinkDto {
+    fn into_dart(self) -> flutter_rust_bridge::for_generated::DartAbi {
+        [
+            self.client_id_hex.into_into_dart().into_dart(),
+            self.uri.into_into_dart().into_dart(),
+        ]
+        .into_dart()
+    }
+}
+impl flutter_rust_bridge::for_generated::IntoDartExceptPrimitive
+    for crate::api::admin::IssuedLinkDto
+{
+}
+impl flutter_rust_bridge::IntoIntoDart<crate::api::admin::IssuedLinkDto>
+    for crate::api::admin::IssuedLinkDto
+{
+    fn into_into_dart(self) -> crate::api::admin::IssuedLinkDto {
+        self
+    }
+}
+// Codec=Dco (DartCObject based), see doc to use other codecs
 impl flutter_rust_bridge::IntoDart for crate::api::citadel::LinkSummaryDto {
     fn into_dart(self) -> flutter_rust_bridge::for_generated::DartAbi {
         [
@@ -1636,6 +1683,7 @@ impl flutter_rust_bridge::IntoDart for crate::api::citadel::LinkSummaryDto {
             self.has_pin.into_into_dart().into_dart(),
             self.has_pq_auth.into_into_dart().into_dart(),
             self.has_obfs.into_into_dart().into_dart(),
+            self.is_admin.into_into_dart().into_dart(),
         ]
         .into_dart()
     }
@@ -1661,6 +1709,7 @@ impl flutter_rust_bridge::IntoDart for crate::api::citadel::ProfileDto {
             self.has_pin.into_into_dart().into_dart(),
             self.has_pq_auth.into_into_dart().into_dart(),
             self.has_obfs.into_into_dart().into_dart(),
+            self.is_admin.into_into_dart().into_dart(),
             self.last_exit.into_into_dart().into_dart(),
         ]
         .into_dart()
@@ -1678,25 +1727,42 @@ impl flutter_rust_bridge::IntoIntoDart<crate::api::citadel::ProfileDto>
     }
 }
 // Codec=Dco (DartCObject based), see doc to use other codecs
-impl flutter_rust_bridge::IntoDart for crate::api::admin::RegistryEntryDto {
+impl flutter_rust_bridge::IntoDart for crate::api::citadel::QrDto {
     fn into_dart(self) -> flutter_rust_bridge::for_generated::DartAbi {
         [
-            self.client_id.into_into_dart().into_dart(),
+            self.size.into_into_dart().into_dart(),
+            self.cells.into_into_dart().into_dart(),
+        ]
+        .into_dart()
+    }
+}
+impl flutter_rust_bridge::for_generated::IntoDartExceptPrimitive for crate::api::citadel::QrDto {}
+impl flutter_rust_bridge::IntoIntoDart<crate::api::citadel::QrDto> for crate::api::citadel::QrDto {
+    fn into_into_dart(self) -> crate::api::citadel::QrDto {
+        self
+    }
+}
+// Codec=Dco (DartCObject based), see doc to use other codecs
+impl flutter_rust_bridge::IntoDart for crate::api::admin::SubscriberDto {
+    fn into_dart(self) -> flutter_rust_bridge::for_generated::DartAbi {
+        [
+            self.client_id_hex.into_into_dart().into_dart(),
             self.valid_until_unix.into_into_dart().into_dart(),
             self.status.into_into_dart().into_dart(),
             self.active.into_into_dart().into_dart(),
+            self.label.into_into_dart().into_dart(),
         ]
         .into_dart()
     }
 }
 impl flutter_rust_bridge::for_generated::IntoDartExceptPrimitive
-    for crate::api::admin::RegistryEntryDto
+    for crate::api::admin::SubscriberDto
 {
 }
-impl flutter_rust_bridge::IntoIntoDart<crate::api::admin::RegistryEntryDto>
-    for crate::api::admin::RegistryEntryDto
+impl flutter_rust_bridge::IntoIntoDart<crate::api::admin::SubscriberDto>
+    for crate::api::admin::SubscriberDto
 {
-    fn into_into_dart(self) -> crate::api::admin::RegistryEntryDto {
+    fn into_into_dart(self) -> crate::api::admin::SubscriberDto {
         self
     }
 }
@@ -1765,18 +1831,6 @@ impl SseEncode for String {
     }
 }
 
-impl SseEncode for crate::api::admin::AdminConn {
-    // Codec=Sse (Serialization based), see doc to use other codecs
-    fn sse_encode(self, serializer: &mut flutter_rust_bridge::for_generated::SseSerializer) {
-        <String>::sse_encode(self.host, serializer);
-        <u16>::sse_encode(self.port, serializer);
-        <String>::sse_encode(self.user, serializer);
-        <String>::sse_encode(self.password, serializer);
-        <String>::sse_encode(self.key_path, serializer);
-        <String>::sse_encode(self.key_passphrase, serializer);
-    }
-}
-
 impl SseEncode for crate::api::citadel::AndroidStatusDto {
     // Codec=Sse (Serialization based), see doc to use other codecs
     fn sse_encode(self, serializer: &mut flutter_rust_bridge::for_generated::SseSerializer) {
@@ -1811,6 +1865,14 @@ impl SseEncode for i64 {
     }
 }
 
+impl SseEncode for crate::api::admin::IssuedLinkDto {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    fn sse_encode(self, serializer: &mut flutter_rust_bridge::for_generated::SseSerializer) {
+        <String>::sse_encode(self.client_id_hex, serializer);
+        <String>::sse_encode(self.uri, serializer);
+    }
+}
+
 impl SseEncode for crate::api::citadel::LinkSummaryDto {
     // Codec=Sse (Serialization based), see doc to use other codecs
     fn sse_encode(self, serializer: &mut flutter_rust_bridge::for_generated::SseSerializer) {
@@ -1821,6 +1883,7 @@ impl SseEncode for crate::api::citadel::LinkSummaryDto {
         <bool>::sse_encode(self.has_pin, serializer);
         <bool>::sse_encode(self.has_pq_auth, serializer);
         <bool>::sse_encode(self.has_obfs, serializer);
+        <bool>::sse_encode(self.is_admin, serializer);
     }
 }
 
@@ -1854,12 +1917,12 @@ impl SseEncode for Vec<crate::api::citadel::ProfileDto> {
     }
 }
 
-impl SseEncode for Vec<crate::api::admin::RegistryEntryDto> {
+impl SseEncode for Vec<crate::api::admin::SubscriberDto> {
     // Codec=Sse (Serialization based), see doc to use other codecs
     fn sse_encode(self, serializer: &mut flutter_rust_bridge::for_generated::SseSerializer) {
         <i32>::sse_encode(self.len() as _, serializer);
         for item in self {
-            <crate::api::admin::RegistryEntryDto>::sse_encode(item, serializer);
+            <crate::api::admin::SubscriberDto>::sse_encode(item, serializer);
         }
     }
 }
@@ -1883,24 +1946,34 @@ impl SseEncode for crate::api::citadel::ProfileDto {
         <bool>::sse_encode(self.has_pin, serializer);
         <bool>::sse_encode(self.has_pq_auth, serializer);
         <bool>::sse_encode(self.has_obfs, serializer);
+        <bool>::sse_encode(self.is_admin, serializer);
         <String>::sse_encode(self.last_exit, serializer);
     }
 }
 
-impl SseEncode for crate::api::admin::RegistryEntryDto {
+impl SseEncode for crate::api::citadel::QrDto {
     // Codec=Sse (Serialization based), see doc to use other codecs
     fn sse_encode(self, serializer: &mut flutter_rust_bridge::for_generated::SseSerializer) {
-        <String>::sse_encode(self.client_id, serializer);
-        <i64>::sse_encode(self.valid_until_unix, serializer);
-        <String>::sse_encode(self.status, serializer);
-        <bool>::sse_encode(self.active, serializer);
+        <u32>::sse_encode(self.size, serializer);
+        <Vec<u8>>::sse_encode(self.cells, serializer);
     }
 }
 
-impl SseEncode for u16 {
+impl SseEncode for crate::api::admin::SubscriberDto {
     // Codec=Sse (Serialization based), see doc to use other codecs
     fn sse_encode(self, serializer: &mut flutter_rust_bridge::for_generated::SseSerializer) {
-        serializer.cursor.write_u16::<NativeEndian>(self).unwrap();
+        <String>::sse_encode(self.client_id_hex, serializer);
+        <i64>::sse_encode(self.valid_until_unix, serializer);
+        <String>::sse_encode(self.status, serializer);
+        <bool>::sse_encode(self.active, serializer);
+        <String>::sse_encode(self.label, serializer);
+    }
+}
+
+impl SseEncode for u32 {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    fn sse_encode(self, serializer: &mut flutter_rust_bridge::for_generated::SseSerializer) {
+        serializer.cursor.write_u32::<NativeEndian>(self).unwrap();
     }
 }
 

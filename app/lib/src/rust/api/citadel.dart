@@ -6,7 +6,7 @@
 import '../frb_generated.dart';
 import 'package:flutter_rust_bridge/flutter_rust_bridge_for_generated.dart';
 
-// These functions are ignored because they are not marked as `pub`: `android_start`, `idle`, `killswitch_file`, `link_from`, `profile_to_dto`, `rt`, `spawn_controller`, `start_connect`, `state_dto`, `to_dto`, `update_android_status`, `update_last_exit`, `vault_path`, `vpn_state_str`
+// These functions are ignored because they are not marked as `pub`: `android_start`, `idle`, `killswitch_file`, `link_from`, `profile_to_dto`, `profile_uri`, `rt`, `spawn_controller`, `start_connect`, `state_dto`, `to_dto`, `update_android_status`, `update_last_exit`, `vault_path`, `vpn_state_str`, `with_vault`
 // These types are ignored because they are neither used by any `pub` functions nor (for structs and enums) marked `#[frb(unignore)]`: `AndroidStatus`, `AndroidTunProvider`
 // These function are ignored because they are on traits that is not defined in current crate (put an empty `#[frb]` on it to unignore): `configure`
 
@@ -67,6 +67,11 @@ void vaultRemove({required String id}) =>
 /// Разобрать `citadel://`-ссылку → превью для UI (живая валидация при вставке).
 LinkSummaryDto parseLinkSummary({required String uri}) =>
     RustLib.instance.api.crateApiCitadelParseLinkSummary(uri: uri);
+
+/// C7.4: QR-матрица `citadel://`-ссылки (экран выдачи доступа абоненту). Sync — кодирование QR
+/// дёшево, а ссылка и так уже в Dart-памяти (только что выдана).
+QrDto linkQr({required String uri}) =>
+    RustLib.instance.api.crateApiCitadelLinkQr(uri: uri);
 
 /// Подключить по «сырой» ссылке (ещё не сохранённой — первый коннект перед сохранением).
 Stream<VpnEventDto> vpnConnect({required String link}) =>
@@ -185,6 +190,9 @@ class LinkSummaryDto {
   final bool hasPqAuth;
   final bool hasObfs;
 
+  /// C7.4: мастер-ссылка (admin) — UI предупреждает: такую нельзя раздавать абонентам.
+  final bool isAdmin;
+
   const LinkSummaryDto({
     required this.valid,
     required this.servers,
@@ -193,6 +201,7 @@ class LinkSummaryDto {
     required this.hasPin,
     required this.hasPqAuth,
     required this.hasObfs,
+    required this.isAdmin,
   });
 
   static Future<LinkSummaryDto> default_() =>
@@ -206,7 +215,8 @@ class LinkSummaryDto {
       kxSuite.hashCode ^
       hasPin.hashCode ^
       hasPqAuth.hashCode ^
-      hasObfs.hashCode;
+      hasObfs.hashCode ^
+      isAdmin.hashCode;
 
   @override
   bool operator ==(Object other) =>
@@ -219,7 +229,8 @@ class LinkSummaryDto {
           kxSuite == other.kxSuite &&
           hasPin == other.hasPin &&
           hasPqAuth == other.hasPqAuth &&
-          hasObfs == other.hasObfs;
+          hasObfs == other.hasObfs &&
+          isAdmin == other.isAdmin;
 }
 
 /// Профиль из хранилища (без секретов — только метаданные для списка/карточки).
@@ -230,6 +241,9 @@ class ProfileDto {
   final bool hasPin;
   final bool hasPqAuth;
   final bool hasObfs;
+
+  /// C7.4: мастер-профиль (ссылка несёт admin_seed) — UI показывает пункт «Абоненты».
+  final bool isAdmin;
   final String lastExit;
 
   const ProfileDto({
@@ -239,6 +253,7 @@ class ProfileDto {
     required this.hasPin,
     required this.hasPqAuth,
     required this.hasObfs,
+    required this.isAdmin,
     required this.lastExit,
   });
 
@@ -250,6 +265,7 @@ class ProfileDto {
       hasPin.hashCode ^
       hasPqAuth.hashCode ^
       hasObfs.hashCode ^
+      isAdmin.hashCode ^
       lastExit.hashCode;
 
   @override
@@ -263,7 +279,28 @@ class ProfileDto {
           hasPin == other.hasPin &&
           hasPqAuth == other.hasPqAuth &&
           hasObfs == other.hasObfs &&
+          isAdmin == other.isAdmin &&
           lastExit == other.lastExit;
+}
+
+/// C7.4: QR-код ссылки как битовая матрица `size × size` (1 = тёмный модуль) — рендер в UI
+/// кастомным painter'ом, без SVG-зависимости на Dart-стороне.
+class QrDto {
+  final int size;
+  final Uint8List cells;
+
+  const QrDto({required this.size, required this.cells});
+
+  @override
+  int get hashCode => size.hashCode ^ cells.hashCode;
+
+  @override
+  bool operator ==(Object other) =>
+      identical(this, other) ||
+      other is QrDto &&
+          runtimeType == other.runtimeType &&
+          size == other.size &&
+          cells == other.cells;
 }
 
 /// Событие VPN-сессии для UI. `kind`: `state` | `connected` | `error`.
