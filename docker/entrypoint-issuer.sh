@@ -12,6 +12,9 @@ rm -f /shared/registry
 # Для прода PSK доставляется в конфиге по аутентифицированному каналу (см. docs/PHASE0-OBFS §8).
 [ -f /shared/obfs.psk ] || { head -c 32 /dev/urandom | od -An -tx1 | tr -d ' \n' > /shared/obfs.psk; }
 echo "[issuer] общий obfs-PSK → /shared/obfs.psk"
+# S2.1/A1-остаток: issuer оборачивает token- и admin-каналы в obfs тем же PSK (probe-resistance:
+# issuer-порт молчит на не-obfs пробу и на проводе неотличим от туннеля). Клиент берёт PSK из ссылки.
+export Citadel_OBFS_PSK=$(cat /shared/obfs.psk)
 export Citadel_TOKEN_ROLE=issuer
 export Citadel_TOKEN_DIR=/shared
 export Citadel_TOKEN_LISTEN=0.0.0.0:7000

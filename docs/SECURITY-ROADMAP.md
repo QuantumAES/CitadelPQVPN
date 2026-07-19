@@ -114,6 +114,26 @@ Security-пуш на 40+ юнит + 15 docker-тестов без страхов
 
 **Гейт:** C7 не добавляет публичной поверхности (admin-плоскость за туннелем; наружу по-прежнему только 4433/udp, 443/tcp, 7000/tcp) — подтверждено харнесом (ТЕСТ 22). Слома wire нет — правило «один слом wire в S0.3» не нарушается. **Трек C7 закрыт целиком (C7.1–C7.5 ✅, 2026-07-17..19).**
 
+> **NB — коллизия нумерации «C7».** Здесь C7 = admin-plane v2 (реализовано). В `CLIENT-ARCH §14` под C7 значится другой трек — «Сетевой контроль User-mode» (split-tunnel / killswitch / DNSSEC, ещё не начат). Треки разные; при следующей правке нумерации развести (кандидат: сетевой контроль → C8).
+
+### S2-hardening — второй аудит (A1–A9, 2026-07-15..19)
+
+Второй red-team/DevSecOps-аудит (память `citadel-security-audit2-2026-07`) подтвердил S0/S1 закрытыми и дал 9 находок по C5/C6-поверхности. **Все закрыты в коде + docker-харнесе.** Сводка (детали и тест-привязки — в памяти и `THREAT-MODEL §5` для admin-канала):
+
+| ID | Находка | Severity | Фикс | Статус |
+|---|---|---|---|---|
+| **A1** | issuer-канал plaintext+неаутентифицирован (MITM-кража токенов, деанон client_id, импёрсонация) | HIGH | S2.1: issuer за PQ-TLS 1.3 (гибрид) + пиннинг серта (BLAKE3 DER); `fetch_tokens`/admin требуют pin (fail-closed). **Остаток (2026-07-19):** синхронная **obfs-обёртка** token-/admin-каналов (`citadel_token::obfs_stream`, тот же PSK, что туннель) — TLS-хендшейк на проводе не виден, issuer-порт молчит на не-obfs пробу и неотличим от туннеля | ✅ |
+| **A2** | IPv6-утечка мимо IPv4-туннеля/KS (deanon на dual-stack) | HIGH | S2.2: `citadel-helper` `ip6tables` KS-цепочка + IPv6:53 блок; Android `VpnService` `::/0`-blackhole. Linux ✅; Android — на устройстве | ✅ (Linux) / device-pending |
+| **A3** | M7 ML-DSA без channel-binding (relay-MITM под CRQC) | MED | S2.6: `bind_msg` += TLS-exporter (RFC 5705) — два TLS-плеча дают разные exporter'ы → подпись не проходит | ✅ |
+| **A4** | exit-хост достижим из туннеля (пивот на SSH/issuer/published-порты) | MED | S2.3: `INPUT -i <tun> DROP`. **Усилен (2026-07-19):** `-A` → `-I INPUT 1` (fail-closed поверх существующего firewall) | ✅ |
+| **A5** | TCP-fallback DoS (безлимитные pre-auth endpoints) | MED | S2.5: семафор 256 in-flight + таймаут хендшейка 10с. **Усилен (2026-07-19):** throttle лога отклонений (анти лог-амплификация) | ✅ |
+| **A6** | нет квоты токенов на подписчика (фарм фрирайдеров) | MED | S2.4: `quota_grant` per-(client_id,эпоха), env `Citadel_TOKEN_QUOTA` (default 64) | ✅ |
+| **A7** | exit регенерит cert/pin+ML-DSA на рестарт (розданные ссылки мрут) | LOW | персист идентичности (`ServerSigner::from_seed`, `Citadel_KEY_DIR`) | ✅ |
+| **A8** | M2-митигейт (случайный packet_id) только на TCP | LOW | `obfs_socket send_ctr = rand::random()` и в UDP-пути | ✅ |
+| **A9** | над-claim'ы в доках (anti-replay, SPKI-pin, TLS-session) | LOW/doc | правки SPEC §4 / creds / pqauth-комментов | ✅ |
+
+**Гейт S2:** BUNDLE_VERSION 1→2 (issuer_pin) — единственный слом issuer-канала; obfs-обёртка (A1-остаток) слома формата ссылок НЕ несёт (PSK уже в v2/v3), но требует **согласованного обновления сервера и клиента** (обе стороны включают obfs по наличию PSK; розданные ссылки валидны). Env-добавки: `Citadel_ISSUER_PIN`, `Citadel_TOKEN_QUOTA`, `Citadel_KEY_DIR`, `Citadel_OBFS_PSK` (issuer). Остаётся device-тест A2 (Android IPv6-blackhole).
+
 ### S3 — Сверка доков с кодом (непрерывно)
 По мере фиксов приводить в соответствие claims: SPEC (QUIC-in-TCP, anti-replay, KX-policy), PHASE0 (векторы), creds (SPKI-pin vs blake3-DER), THREAT-MODEL (статусы S4/E1/kill-switch), CLIENT-ARCH.
 

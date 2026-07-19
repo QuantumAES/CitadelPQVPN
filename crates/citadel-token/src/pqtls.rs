@@ -14,6 +14,8 @@
 use std::net::TcpStream;
 use std::sync::Arc;
 
+use crate::obfs_stream::ObfsMaybe;
+
 use anyhow::{anyhow, Context, Result};
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
 use rustls::crypto::aws_lc_rs;
@@ -29,9 +31,11 @@ const ALPN: &[u8] = b"citadel-issuer/1";
 /// SNI фиксирован (сервер пиннится → имя не проверяется, но `ClientConnection` требует `ServerName`).
 const SERVER_NAME: &str = "citadel.issuer";
 
-/// TLS-поток издателя (сервер) / клиента.
-pub type IssuerTlsStream = StreamOwned<ServerConnection, TcpStream>;
-pub type ClientTlsStream = StreamOwned<ClientConnection, TcpStream>;
+/// TLS-поток издателя (сервер) / клиента. Нижний транспорт — [`ObfsMaybe`]: голый TCP или obfs
+/// поверх TCP (probe-resistance, S2.1/A1-остаток). Downstream (admin/EKM) ссылается через эти alias
+/// и от выбора транспорта не зависит.
+pub type IssuerTlsStream = StreamOwned<ServerConnection, ObfsMaybe>;
+pub type ClientTlsStream = StreamOwned<ClientConnection, ObfsMaybe>;
 
 /// Крипто-провайдер с ЕДИНСТВЕННОЙ гибридной PQ-группой (`X25519MLKEM768`, тот же codepoint, что и
 /// в движке): классический X25519 не согласуется ⇒ канал издателя тоже пост-квантовый (анти-HNDL).
@@ -105,14 +109,22 @@ impl IssuerIdentity {
 }
 
 /// Издатель: обернуть accept'нутый TCP в TLS-сервер. Хендшейк ленивый (на первом read/write кадра).
-pub fn accept_tls(tcp: TcpStream, cfg: Arc<ServerConfig>) -> Result<IssuerTlsStream> {
+/// `obfs_psk`: `Some` → под TLS кладём obfs-слой (probe-resistance, S2.1/A1-остаток — issuer-порт
+/// молчит на не-obfs пробу и неотличим от туннеля); `None` → голый TLS. Клиент должен совпадать по
+/// наличию psk (иначе `open` первого record падает → разрыв, fail-closed).
+pub fn accept_tls(
+    tcp: TcpStream,
+    cfg: Arc<ServerConfig>,
+    obfs_psk: Option<[u8; 32]>,
+) -> Result<IssuerTlsStream> {
     let conn = ServerConnection::new(cfg).map_err(|e| anyhow!("TLS ServerConnection: {e}"))?;
-    Ok(StreamOwned::new(conn, tcp))
+    Ok(StreamOwned::new(conn, ObfsMaybe::wrap(tcp, obfs_psk)))
 }
 
 /// Клиент: обернуть установленный TCP в TLS-клиент, **пиннящий** серт издателя. Хендшейк ленивый;
-/// несовпадение pin (MITM/подмена) → ошибка на первом кадре (fail-closed).
-pub fn connect_tls(tcp: TcpStream, pin: [u8; 32]) -> Result<ClientTlsStream> {
+/// несовпадение pin (MITM/подмена) → ошибка на первом кадре (fail-closed). `obfs_psk` — см.
+/// [`accept_tls`] (должен совпадать с серверным).
+pub fn connect_tls(tcp: TcpStream, pin: [u8; 32], obfs_psk: Option<[u8; 32]>) -> Result<ClientTlsStream> {
     let cfg = rustls::ClientConfig::builder_with_provider(provider())
         .with_protocol_versions(&[&rustls::version::TLS13])?
         .dangerous()
@@ -123,7 +135,7 @@ pub fn connect_tls(tcp: TcpStream, pin: [u8; 32]) -> Result<ClientTlsStream> {
     let name = ServerName::try_from(SERVER_NAME)?.to_owned();
     let conn = ClientConnection::new(Arc::new(cfg), name)
         .map_err(|e| anyhow!("TLS ClientConnection: {e}"))?;
-    Ok(StreamOwned::new(conn, tcp))
+    Ok(StreamOwned::new(conn, ObfsMaybe::wrap(tcp, obfs_psk)))
 }
 
 /// Верификатор с пиннингом: сверяет pin серта И проверяет подпись хендшейка штатными алгоритмами
@@ -184,10 +196,11 @@ mod tests {
     use std::net::TcpListener;
 
     /// PQ-TLS канал издателя: рамочный обмен поверх TLS 1.3 (гибрид) с корректным pin проходит;
-    /// подменённый pin (MITM с другим сертом) — отказ на хендшейке (fail-closed).
-    #[test]
-    fn pqtls_roundtrip_and_pin_enforced() {
-        let dir = std::env::temp_dir().join(format!("citadel-pqtls-{}", std::process::id()));
+    /// подменённый pin (MITM с другим сертом) — отказ на хендшейке (fail-closed). Прогоняем в обоих
+    /// режимах транспорта: голый TLS и obfs-обёрнутый (S2.1/A1-остаток), формат кадров тот же.
+    fn pqtls_roundtrip_and_pin_enforced_impl(obfs_psk: Option<[u8; 32]>) {
+        let dir = std::env::temp_dir()
+            .join(format!("citadel-pqtls-{}-{}", std::process::id(), obfs_psk.is_some() as u8));
         std::fs::create_dir_all(&dir).unwrap();
         let dir = dir.to_str().unwrap();
         let id = IssuerIdentity::load_or_generate(dir).unwrap();
@@ -202,7 +215,7 @@ mod tests {
                 let (tcp, _) = listener.accept().unwrap();
                 let scfg = scfg.clone();
                 std::thread::spawn(move || {
-                    if let Ok(mut tls) = accept_tls(tcp, scfg) {
+                    if let Ok(mut tls) = accept_tls(tcp, scfg, obfs_psk) {
                         // хендшейк с чужим pin оборвётся здесь (write/handshake → Err) — это ок
                         if write_frame(&mut tls, b"challenge-ok").is_ok() {
                             let _ = read_frame(&mut tls);
@@ -214,18 +227,29 @@ mod tests {
 
         // (1) верный pin — обмен проходит
         let tcp = TcpStream::connect(addr).unwrap();
-        let mut tls = connect_tls(tcp, good_pin).unwrap();
+        let mut tls = connect_tls(tcp, good_pin, obfs_psk).unwrap();
         let got = read_frame(&mut tls).unwrap();
         assert_eq!(got, b"challenge-ok");
         write_frame(&mut tls, b"pub-and-sig").unwrap();
 
         // (2) чужой pin — хендшейк должен провалиться (pin mismatch), кадр не прочитается
         let tcp = TcpStream::connect(addr).unwrap();
-        let mut tls = connect_tls(tcp, [0xFFu8; 32]).unwrap();
+        let mut tls = connect_tls(tcp, [0xFFu8; 32], obfs_psk).unwrap();
         assert!(read_frame(&mut tls).is_err(), "MITM/чужой pin → отказ (fail-closed)");
 
         srv.join().unwrap();
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn pqtls_roundtrip_and_pin_enforced() {
+        pqtls_roundtrip_and_pin_enforced_impl(None); // голый TLS
+    }
+
+    /// S2.1/A1-остаток: тот же обмен/пиннинг работает и с obfs-обёрнутым каналом (probe-resistance).
+    #[test]
+    fn pqtls_over_obfs_roundtrip_and_pin_enforced() {
+        pqtls_roundtrip_and_pin_enforced_impl(Some([0x5a; 32]));
     }
 
     /// Идентичность издателя ПОСТОЯННА: повторный `load_or_generate` из того же каталога даёт тот же

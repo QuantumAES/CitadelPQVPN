@@ -331,8 +331,15 @@ impl AdminClient {
     const IO_TIMEOUT: Duration = Duration::from_secs(15);
 
     /// Подключиться и аутентифицироваться. `addr` — host:port admin-канала (за туннелем, C7.2);
-    /// `issuer_pin` — тот же pin PQ-TLS, что для token-fetch (одна TLS-идентичность issuer'а).
-    pub fn connect(addr: &str, issuer_pin: &[u8; 32], admin_seed: &[u8; 32]) -> Result<Self> {
+    /// `issuer_pin` — тот же pin PQ-TLS, что для token-fetch (одна TLS-идентичность issuer'а);
+    /// `obfs_psk` — S2.1/A1-остаток: `Some` → obfs-обёртка канала (probe-resistance; PSK из ссылки,
+    /// как у token-fetch и туннеля), `None` → голый TLS. Обязан совпадать с серверным.
+    pub fn connect(
+        addr: &str,
+        issuer_pin: &[u8; 32],
+        admin_seed: &[u8; 32],
+        obfs_psk: Option<[u8; 32]>,
+    ) -> Result<Self> {
         let sa = addr
             .to_socket_addrs()
             .with_context(|| format!("разбор адреса admin-канала {addr}"))?
@@ -342,7 +349,7 @@ impl AdminClient {
             .with_context(|| format!("admin-канал {addr} недоступен (туннель поднят?)"))?;
         tcp.set_read_timeout(Some(Self::IO_TIMEOUT)).context("set_read_timeout")?;
         tcp.set_write_timeout(Some(Self::IO_TIMEOUT)).context("set_write_timeout")?;
-        let mut tls = crate::pqtls::connect_tls(tcp, *issuer_pin)?;
+        let mut tls = crate::pqtls::connect_tls(tcp, *issuer_pin, obfs_psk)?;
         let challenge = read_frame(&mut tls).context("admin-канал: нет challenge (pin mismatch?)")?;
         let ekm = ekm_client(&tls)?;
         let frame = build_auth_frame(admin_seed, &challenge, &ekm)?;
@@ -535,7 +542,7 @@ mod tests {
                 let (tcp, _) = listener.accept().unwrap();
                 let srv = AdminServer { dir: dir.clone() };
                 // провал auth — ожидаемый исход негативных тестов, не паника сервера
-                if let Ok(tls) = pqtls::accept_tls(tcp, scfg.clone()) {
+                if let Ok(tls) = pqtls::accept_tls(tcp, scfg.clone(), None) {
                     let _ = srv.serve_conn(tls);
                 }
             }
@@ -563,7 +570,7 @@ mod tests {
         std::fs::write(format!("{dir}/registry"), format!("{} 9999999999 active\n", hex::encode(admin_cid))).unwrap();
 
         let (addr, pin, h) = spawn_admin_server(&dir, 1);
-        let mut c = AdminClient::connect(&addr, &pin, &admin_seed).unwrap();
+        let mut c = AdminClient::connect(&addr, &pin, &admin_seed, None).unwrap();
 
         // list: только запись админа
         let start = c.list().unwrap();
@@ -603,7 +610,7 @@ mod tests {
         std::fs::write(format!("{dir}/admin_id"), hex::encode(admin_id)).unwrap();
         let (addr, pin, h) = spawn_admin_server(&dir, 1);
         // валидная по формату подпись, но чужим seed'ом
-        assert!(AdminClient::connect(&addr, &pin, &[0x62u8; 32]).is_err());
+        assert!(AdminClient::connect(&addr, &pin, &[0x62u8; 32], None).is_err());
         h.join().unwrap();
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -613,7 +620,7 @@ mod tests {
     fn admin_auth_rejects_without_admin_id_file() {
         let dir = tmp_dir("noid");
         let (addr, pin, h) = spawn_admin_server(&dir, 1);
-        assert!(AdminClient::connect(&addr, &pin, &[0x63u8; 32]).is_err());
+        assert!(AdminClient::connect(&addr, &pin, &[0x63u8; 32], None).is_err());
         h.join().unwrap();
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -631,7 +638,7 @@ mod tests {
         let (addr, pin, h) = spawn_admin_server(&dir, 1);
 
         let tcp = TcpStream::connect(&addr).unwrap();
-        let mut tls = pqtls::connect_tls(tcp, pin).unwrap();
+        let mut tls = pqtls::connect_tls(tcp, pin, None).unwrap();
         let challenge = read_frame(&mut tls).unwrap();
         // ровно то, что шлёт Layer-1 клиент: pub(32) ‖ Ed25519(seed, сырой challenge)
         let sig = ed25519_sign(&seed, &challenge).unwrap();

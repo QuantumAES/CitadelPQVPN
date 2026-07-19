@@ -548,6 +548,7 @@ dependencies = [
  "blake3",
  "blind-rsa-signatures",
  "ciborium",
+ "citadel-obfs",
  "hex",
  "rand 0.8.6",
  "rcgen",

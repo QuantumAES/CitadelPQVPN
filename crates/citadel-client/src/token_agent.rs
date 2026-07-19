@@ -20,13 +20,16 @@ pub async fn fetch_tokens(
     client_seed: &[u8; 32],
     count: usize,
     retries: u32,
+    obfs_psk: Option<[u8; 32]>,
 ) -> Result<Vec<Vec<u8>>> {
     let issuer = issuer.to_string();
     let pin = *issuer_pin;
     let seed = *client_seed;
-    tokio::task::spawn_blocking(move || citadel_token::fetch_tokens(&issuer, &pin, &seed, count, retries))
-        .await
-        .context("token-fetch задача паникнула")?
+    tokio::task::spawn_blocking(move || {
+        citadel_token::fetch_tokens(&issuer, &pin, &seed, count, retries, obfs_psk)
+    })
+    .await
+    .context("token-fetch задача паникнула")?
 }
 
 /// C5.4: авто-фетч для connect-flow. Если бандл/ссылка несут `issuer`+`issuer_pin`+`client_seed`
@@ -44,7 +47,10 @@ pub async fn with_token(
         let pin = issuer_pin.ok_or_else(|| {
             anyhow::anyhow!("issuer задан без issuer_pin — небезопасный канал (A1); ссылка устарела?")
         })?;
-        let mut tokens = fetch_tokens(issuer, pin, seed, 1, 20).await?;
+        // S2.1/A1-остаток: obfs-обёртка issuer-канала берётся из того же ClientConfig.obfs_psk,
+        // что и туннель (probe-resistance; None → голый TLS для ссылок без obfs).
+        let obfs_psk = config.obfs_psk;
+        let mut tokens = fetch_tokens(issuer, pin, seed, 1, 20, obfs_psk).await?;
         if let Some(t) = tokens.pop() {
             config.token = t;
         }
@@ -57,7 +63,7 @@ mod tests {
     /// Недоступный issuer → Err (обёртка не паникует и не виснет); 1 попытка → быстро.
     #[tokio::test]
     async fn unreachable_issuer_errs() {
-        assert!(super::fetch_tokens("127.0.0.1:9", &[0u8; 32], &[7u8; 32], 1, 1).await.is_err());
+        assert!(super::fetch_tokens("127.0.0.1:9", &[0u8; 32], &[7u8; 32], 1, 1, None).await.is_err());
     }
 
     /// C5.4: без issuer/seed `with_token` возвращает config без токена (passthrough, не виснет).

@@ -24,6 +24,16 @@ use citadel_token::{read_frame, write_frame}; // C5.3: фрейминг выне
 fn token_dir() -> String {
     std::env::var("Citadel_TOKEN_DIR").unwrap_or_else(|_| "/shared".into())
 }
+
+/// S2.1/A1-остаток: obfs-PSK канала к издателю из `Citadel_OBFS_PSK` (hex32). `Some` → issuer/CLI
+/// оборачивают TLS в obfs (probe-resistance, неотличимость от туннеля); `None`/мусор → голый TLS.
+/// Тот же PSK, что у туннеля (в ссылке) — обе стороны обязаны совпадать, иначе `open` рвёт канал.
+fn obfs_psk_from_env() -> Option<[u8; 32]> {
+    std::env::var("Citadel_OBFS_PSK")
+        .ok()
+        .and_then(|s| hex::decode(s.trim()).ok())
+        .and_then(|v| v.try_into().ok())
+}
 fn token_count() -> usize {
     std::env::var("Citadel_TOKEN_COUNT").ok().and_then(|s| s.parse().ok()).unwrap_or(8)
 }
@@ -181,7 +191,9 @@ fn run_admin_channel(args: &[String]) -> Result<()> {
         std::env::var("Citadel_ADMIN_SEED").ok().as_ref(),
         "Citadel_ADMIN_SEED (admin-seed, 64 hex)",
     )?;
-    let mut c = citadel_token::admin::AdminClient::connect(&addr, &pin, &seed)
+    // S2.1/A1-остаток: obfs-обёртка admin-канала (probe-resistance) — PSK из env, как token-fetch.
+    let obfs_psk = obfs_psk_from_env();
+    let mut c = citadel_token::admin::AdminClient::connect(&addr, &pin, &seed, obfs_psk)
         .context("admin-канал: connect/auth")?;
     match args.get(2).map(String::as_str) {
         Some("list") => {
@@ -301,6 +313,13 @@ fn run_issuer() -> Result<()> {
         hex::encode(identity.pin)
     );
     let scfg = identity.server_config()?;
+    // S2.1/A1-остаток: obfs-обёртка issuer-канала (probe-resistance). При заданном PSK и token-, и
+    // admin-канал молчат на не-obfs пробу и на проводе неотличимы от туннеля (тот же PSK из ссылки).
+    let obfs_psk = obfs_psk_from_env();
+    eprintln!(
+        "[issuer] obfs-обёртка канала: {} (probe-resistance issuer-порта, A1-остаток)",
+        if obfs_psk.is_some() { "включена" } else { "выкл (голый TLS)" }
+    );
 
     // C7.1: admin-канал (управление реестром по PQ-TLS: domain-sep Ed25519 + EKM channel binding).
     // Отдельный listener — в деплое наружу НЕ публикуется (доступ только из туннеля через DNAT
@@ -321,7 +340,7 @@ fn run_issuer() -> Result<()> {
                         let dir = dir.clone();
                         std::thread::spawn(move || {
                             let srv = citadel_token::admin::AdminServer { dir };
-                            let r = citadel_token::pqtls::accept_tls(tcp, scfg)
+                            let r = citadel_token::pqtls::accept_tls(tcp, scfg, obfs_psk)
                                 .and_then(|tls| srv.serve_conn(tls));
                             if let Err(e) = r {
                                 eprintln!("[issuer] admin-соединение завершено: {e}");
@@ -383,7 +402,9 @@ fn run_issuer() -> Result<()> {
                 let scfg = scfg.clone();
                 let quota = quota.clone();
                 std::thread::spawn(move || {
-                    if let Err(e) = serve_client(stream, scfg, &state, &dir, &quota, max_per_epoch) {
+                    if let Err(e) =
+                        serve_client(stream, scfg, &state, &dir, &quota, max_per_epoch, obfs_psk)
+                    {
                         eprintln!("[issuer] соединение завершено: {e}");
                     }
                 });
@@ -421,11 +442,12 @@ fn serve_client(
     dir: &str,
     quota: &Mutex<QuotaMap>,
     max_per_epoch: u32,
+    obfs_psk: Option<[u8; 32]>,
 ) -> Result<()> {
     let peer = tcp.peer_addr().ok();
     // S2.1/A1: поднять PQ-TLS поверх TCP ДО любого обмена — Layer-1 и слепая выдача идут в шифре
     // с целостностью; клиент уже спиннил серт (MITM не подставит свои blind_msg, client_id скрыт).
-    let mut conn = citadel_token::pqtls::accept_tls(tcp, scfg)?;
+    let mut conn = citadel_token::pqtls::accept_tls(tcp, scfg, obfs_psk)?;
     // C5.2 Layer-1: challenge-response ДО слепой подписи (аутентификация «абонента»).
     let challenge: [u8; 32] = rand::random();
     write_frame(&mut conn, &challenge)?;
@@ -489,9 +511,12 @@ fn run_client_fetch() -> Result<()> {
         .context("Citadel_ISSUER_PIN (32 байта hex) обязателен для PQ-TLS канала к издателю")?;
     let count = token_count();
     let dir = token_dir();
-    eprintln!("[client] Layer-1 issuance у издателя {issuer} ({count} токенов, PQ-TLS+pin, blind epoch-scoped)…");
+    // S2.1/A1-остаток: obfs-обёртка канала (probe-resistance) — PSK из env, обязан совпасть с issuer.
+    let obfs_psk = obfs_psk_from_env();
+    eprintln!("[client] Layer-1 issuance у издателя {issuer} ({count} токенов, PQ-TLS+pin{}, blind epoch-scoped)…",
+        if obfs_psk.is_some() { "+obfs" } else { "" });
     // C5.3: весь протокол (Layer-1 auth + получение текущего epoch-pub + слепая выдача) — в citadel_token.
-    let tokens = citadel_token::fetch_tokens(&issuer, &issuer_pin, &seed, count, 20)?;
+    let tokens = citadel_token::fetch_tokens(&issuer, &issuer_pin, &seed, count, 20, obfs_psk)?;
 
     let mut f = std::fs::File::create(format!("{dir}/tokens")).context("запись tokens")?;
     for t in &tokens {

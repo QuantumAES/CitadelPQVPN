@@ -428,10 +428,13 @@ fn spawn_controller(
     if let (Some(iss), Some(pin), Some(seed)) =
         (link.issuer.clone(), link.issuer_pin, link.client_seed)
     {
+        // S2.1/A1-остаток: issuer-канал оборачиваем в obfs тем же PSK, что и туннель (probe-resistance;
+        // None для ссылок без obfs → голый TLS). Обязан совпадать с серверной обёрткой.
+        let obfs_psk = link.obfs_psk;
         controller.set_token_refresher(Arc::new(move || {
             let iss = iss.clone();
             Box::pin(async move {
-                citadel_client::token_agent::fetch_tokens(&iss, &pin, &seed, 1, 3)
+                citadel_client::token_agent::fetch_tokens(&iss, &pin, &seed, 1, 3, obfs_psk)
                     .await
                     .ok()
                     .and_then(|mut v| v.pop())

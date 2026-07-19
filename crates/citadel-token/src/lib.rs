@@ -21,6 +21,7 @@ use std::net::TcpStream;
 
 pub mod admin; // C7.1: admin-плоскость (реестр по PQ-TLS: domain-sep Ed25519 + EKM channel binding)
 pub mod pqtls; // S2.1/A1: PQ-TLS + pin канал к издателю (анти-MITM, анти-деанон client_id)
+pub mod obfs_stream; // S2.1/A1 (остаток): синхронная obfs-обёртка issuer-канала (probe-resistance, анти-DPI)
 
 pub const NONCE_LEN: usize = 32;
 pub const RAND_LEN: usize = 32;
@@ -108,6 +109,7 @@ pub fn fetch_tokens(
     seed: &[u8; 32],
     count: usize,
     retries: u32,
+    obfs_psk: Option<[u8; 32]>,
 ) -> Result<Vec<Vec<u8>>> {
     let mut tcp = None;
     for _ in 0..retries.max(1) {
@@ -121,7 +123,9 @@ pub fn fetch_tokens(
     }
     let tcp = tcp.ok_or_else(|| anyhow!("издатель {issuer_addr} недоступен"))?;
     // S2.1/A1: поднять PQ-TLS поверх TCP; серт издателя пиннится → канал аутентифицирован и скрыт.
-    let mut conn = pqtls::connect_tls(tcp, *issuer_pin)?;
+    // S2.1/A1-остаток: при заданном obfs_psk — под TLS obfs-слой (probe-resistance: issuer-порт
+    // молчит на не-obfs пробу, трафик неотличим от туннеля). psk обязан совпасть с серверным.
+    let mut conn = pqtls::connect_tls(tcp, *issuer_pin, obfs_psk)?;
 
     // Layer-1: челлендж → pub(32)‖sig(64)
     let challenge = read_frame(&mut conn)?;
@@ -314,7 +318,7 @@ mod tests {
         let issuer_pk_srv = issuer_pk.clone();
         let srv = std::thread::spawn(move || {
             let (tcp, _) = listener.accept().unwrap();
-            let mut conn = pqtls::accept_tls(tcp, scfg).unwrap();
+            let mut conn = pqtls::accept_tls(tcp, scfg, None).unwrap();
             let challenge = [0x77u8; 32];
             write_frame(&mut conn, &challenge).unwrap();
             let auth = read_frame(&mut conn).unwrap(); // pub(32)‖sig(64)
@@ -327,7 +331,7 @@ mod tests {
                 write_frame(&mut conn, &sig).unwrap();
             }
         });
-        let tokens = fetch_tokens(&addr, &issuer_pin, &seed, 3, 3).unwrap();
+        let tokens = fetch_tokens(&addr, &issuer_pin, &seed, 3, 3, None).unwrap();
         assert_eq!(tokens.len(), 3);
         for t in &tokens {
             assert!(verify_token(&issuer_pk, t).is_some(), "токен валиден под issuer pub");

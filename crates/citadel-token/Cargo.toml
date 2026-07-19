@@ -11,6 +11,7 @@ rand = "0.8"
 blind-rsa-signatures = "=0.15.0"   # =0.15.0: 0.15.1+ ломается (derive_more glob → PartialEq ambiguous, E0659)
 hex = "0.4"
 aws-lc-rs = "1.17"                 # C5.2 Layer-1: Ed25519 (тот же крипто-бэкенд, что в движке)
+citadel-obfs = { path = "../citadel-obfs" }   # S2.1/A1 (остаток): obfs-обёртка issuer-канала (анти-DPI)
 # S2.1/A1: защищённый (PQ-TLS + pin) канал к издателю. rustls/rcgen/blake3 — те же версии, что в движке.
 rustls = { version = "0.23", default-features = false, features = ["aws_lc_rs", "std"] }
 rcgen = "0.13"

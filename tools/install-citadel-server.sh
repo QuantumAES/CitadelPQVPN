@@ -252,6 +252,8 @@ cat <<EOF
     tmpfs: ["/tmp"]
     security_opt: ["no-new-privileges:true"]
     restart: unless-stopped
+    environment:
+      Citadel_OBFS_PSK: "$PSK"         # S2.1/A1-остаток: obfs-обёртка token-/admin-каналов (probe-resistance)
     ports:
       - "$ISSUER_PORT:7000/tcp"        # клиент фетчит epoch-токены сюда (Layer-1)
     volumes:
@@ -387,6 +389,7 @@ cat <<EOF
     сменить эпоху. Ротация admin-ключа: замени $DIR/keys/admin.seed + admin_id, перевыпусти мастер-ссылку.
   • Издатель на :$ISSUER_PORT работает поверх PQ-TLS с пиннингом серта (S2.1/A1): Layer-1 и слепая
     выдача идут в шифре с целостностью, client_id скрыт, серт издателя пиннится клиентом (анти-MITM).
-    ⚠ Остаётся: TLS-хендшейк на выделенном порту фингерпринтируем цензором (obfs-обёртка — follow-up).
+    Token- и admin-каналы обёрнуты в obfs тем же PSK, что туннель (A1-остаток): TLS-хендшейк на
+    проводе не виден, issuer-порт молчит на не-obfs пробу и неотличим от туннельного трафика.
 EOF
 fi

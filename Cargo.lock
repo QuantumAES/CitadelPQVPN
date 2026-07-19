@@ -507,6 +507,7 @@ dependencies = [
  "blake3",
  "blind-rsa-signatures",
  "ciborium",
+ "citadel-obfs",
  "criterion",
  "hex",
  "rand 0.8.6",
