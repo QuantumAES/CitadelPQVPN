@@ -121,6 +121,13 @@ class _HomePageState extends State<HomePage> {
       appBar: AppBar(
         title: const Text('CitadelPQVPN'),
         actions: [
+          // #0.3: «Добавить профиль» — в AppBar, а не FAB: плавающая кнопка перекрывала
+          // popup-меню (три точки) нижних плиток профилей.
+          IconButton(
+            icon: const Icon(Icons.add),
+            tooltip: 'Добавить профиль',
+            onPressed: _addProfile,
+          ),
           IconButton(
             icon: const Icon(Icons.settings_outlined),
             tooltip: 'Настройки',
@@ -128,18 +135,11 @@ class _HomePageState extends State<HomePage> {
           ),
         ],
       ),
-      floatingActionButton: s.profiles.isEmpty
-          ? null
-          : FloatingActionButton.extended(
-              onPressed: _addProfile,
-              icon: const Icon(Icons.add),
-              label: const Text('Профиль'),
-            ),
       body: AnimatedBuilder(
         animation: s,
         builder: (context, _) {
           return ListView(
-            padding: const EdgeInsets.fromLTRB(16, 16, 16, 96),
+            padding: const EdgeInsets.fromLTRB(16, 16, 16, 24),
             children: [
               _StatusCard(state: s, onDisconnect: s.disconnect),
               if (s.debugEnabled) ...[

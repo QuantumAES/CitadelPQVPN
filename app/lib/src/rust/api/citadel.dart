@@ -6,7 +6,7 @@
 import '../frb_generated.dart';
 import 'package:flutter_rust_bridge/flutter_rust_bridge_for_generated.dart';
 
-// These functions are ignored because they are not marked as `pub`: `android_start`, `idle`, `killswitch_file`, `link_from`, `profile_to_dto`, `profile_uri`, `rt`, `spawn_controller`, `start_connect`, `state_dto`, `to_dto`, `update_android_status`, `update_last_exit`, `vault_path`, `vpn_state_str`, `with_vault`
+// These functions are ignored because they are not marked as `pub`: `android_start`, `debug_flag_file`, `idle`, `killswitch_file`, `link_from`, `profile_to_dto`, `profile_uri`, `rt`, `spawn_controller`, `start_connect`, `state_dto`, `to_dto`, `update_android_status`, `update_last_exit`, `vault_path`, `vpn_state_str`, `with_vault`
 // These types are ignored because they are neither used by any `pub` functions nor (for structs and enums) marked `#[frb(unignore)]`: `AndroidStatus`, `AndroidTunProvider`
 // These function are ignored because they are on traits that is not defined in current crate (put an empty `#[frb]` on it to unignore): `configure`
 
@@ -22,6 +22,16 @@ void setKillswitch({required bool on_}) =>
 /// при первом обращении — персист между запусками.
 bool killswitchEnabled() =>
     RustLib.instance.api.crateApiCitadelKillswitchEnabled();
+
+/// Сохранить настройку режима отладки (GUI-тумблер) на диск — переживает рестарт приложения.
+void setDebugEnabled({required bool on_}) =>
+    RustLib.instance.api.crateApiCitadelSetDebugEnabled(on_: on_);
+
+/// Сохранённое состояние режима отладки (инициализация тумблера). Ленивая подгрузка при первом
+/// обращении; файла нет → дефолт (включён). Имя `*_persisted` — чтобы Dart-обёртка не конфликтовала
+/// с полем `AppState.debugEnabled`.
+bool debugEnabledPersisted() =>
+    RustLib.instance.api.crateApiCitadelDebugEnabledPersisted();
 
 /// Задать каталог данных приложения (вызывается из Dart на старте, до любых vault-операций).
 /// На Android — `getApplicationSupportDirectory()`; на десктопе можно не вызывать. Идемпотентно:

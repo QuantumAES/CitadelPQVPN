@@ -22,12 +22,13 @@ class AppState extends ChangeNotifier {
 
   VpnPhase phase = VpnPhase.off;
 
-  /// Режим отладки: показывает журнал ядра и кнопку диагностики. Для предрелиза — включён,
-  /// чтобы упростить диагностику коннекта в бою. Хранится в памяти (сбрасывается при рестарте).
-  bool debugEnabled = true;
+  /// Режим отладки: показывает журнал ядра и кнопку диагностики. Персистится ядром в файл рядом
+  /// с vault (переживает рестарт); дефолт (файла нет) — включён (предрелиз).
+  bool debugEnabled = debugEnabledPersisted();
 
   void toggleDebug() {
     debugEnabled = !debugEnabled;
+    setDebugEnabled(on_: debugEnabled);
     notifyListeners();
   }
 

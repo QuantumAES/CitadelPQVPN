@@ -170,6 +170,42 @@ pub fn killswitch_enabled() -> bool {
     KILLSWITCH.load(Relaxed)
 }
 
+/// Режим отладки (журнал ядра + диагностика в UI). Персистится в файл рядом с vault (как kill-switch),
+/// иначе тумблер сбрасывался бы в дефолт при каждом рестарте. Дефолт (файла нет) — включён (предрелиз).
+static DEBUG_ENABLED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+static DEBUG_LOADED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+fn debug_flag_file() -> PathBuf {
+    vault_path().with_file_name("debug")
+}
+
+/// Сохранить настройку режима отладки (GUI-тумблер) на диск — переживает рестарт приложения.
+#[frb(sync)]
+pub fn set_debug_enabled(on: bool) {
+    use std::sync::atomic::Ordering::Relaxed;
+    DEBUG_ENABLED.store(on, Relaxed);
+    DEBUG_LOADED.store(true, Relaxed);
+    let f = debug_flag_file();
+    if let Some(d) = f.parent() {
+        let _ = std::fs::create_dir_all(d);
+    }
+    let _ = std::fs::write(f, if on { "1" } else { "0" });
+}
+
+/// Сохранённое состояние режима отладки (инициализация тумблера). Ленивая подгрузка при первом
+/// обращении; файла нет → дефолт (включён). Имя `*_persisted` — чтобы Dart-обёртка не конфликтовала
+/// с полем `AppState.debugEnabled`.
+#[frb(sync)]
+pub fn debug_enabled_persisted() -> bool {
+    use std::sync::atomic::Ordering::Relaxed;
+    if !DEBUG_LOADED.swap(true, Relaxed) {
+        if let Ok(s) = std::fs::read_to_string(debug_flag_file()) {
+            DEBUG_ENABLED.store(s.trim() == "1", Relaxed);
+        }
+    }
+    DEBUG_ENABLED.load(Relaxed)
+}
+
 /// Каталог данных, заданный платформой (Android передаёт filesDir через [`set_data_dir`]).
 /// Если задан — хранилище кладём прямо в него (он уже приватный и writable, без подпапки `.config`).
 /// Иначе (десктоп) — `$XDG_CONFIG_HOME|~/.config/citadel-pqvpn`.
