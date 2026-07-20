@@ -294,8 +294,8 @@ CitadelPQVPN/
 | **C4** ✅ | **Admin-deploy**: bootstrap-скрипт на сервере (`tools/install-citadel-server.sh`: авто-установка Docker, серверный keygen, рендер `compose`/entrypoints, `docker compose up`, чтение pin/pubkeys, минт мастер-/клиентской ссылок). SSH-деплой из GUI (`russh`) — дизайн на будущее (§8) | C0, C1 |
 | **C5** ✅ | **Идентичность и доступ**: двухслойная (epoch-ключи в `citadel-token` + issuer client-registry + Ed25519-auth), `TokenAgent` авто-рефреш; **«выдать/отозвать»** — по туннелю (admin-plane, ниже) | C4 |
 | **C6** ✅ (частично) | **Упаковка/секреты**: kill-switch (Linux firewall + Android always-on) ✅; vault (AES-256-GCM) ✅; APK ✅; `SecretStore` keychain / msix/dmg / нотаризация macOS — остаток | C2–C5 |
-| **admin-plane v2** ✅ | **Управление абонентами по туннелю** (в `SECURITY-ROADMAP` — трек **C7**): PQ-TLS admin-канал к issuer из-под туннеля, роли ссылок (мастер/клиент), GUI «Абоненты», CLI `citadel-token admin`. Заменил SSH-путь C5.5 (§8/§10) | C5 |
-| **C7 (сетевой контроль)** | **Сетевой контроль User-mode** *(ещё не начат; NB: одноимённый номер с admin-plane в SECURITY-ROADMAP — развести при следующей правке нумерации)*: **split-tunnel** — *per-app* (Android `VpnService.addAllowed/DisallowedApplication`; десктоп позже) + *per-domain* (DNS-перехватчик: DoH-резолв → динамич. маршруты); **DNSSEC + DoH** | C3 |
+| **C7** ✅ | **Admin-plane v2** — управление абонентами по туннелю: PQ-TLS admin-канал к issuer из-под туннеля, роли ссылок (мастер/клиент), GUI «Абоненты», CLI `citadel-token admin`. Заменил SSH-путь C5.5 (§8/§10). *Единая нумерация с `SECURITY-ROADMAP` §C7* | C5 |
+| **C8** | **Сетевой контроль User-mode** *(ещё не начат; бывш. «C7» здесь — переименован, чтобы развести коллизию с admin-plane)*: **split-tunnel** — *per-app* (Android `VpnService.addAllowed/DisallowedApplication`; десктоп позже) + *per-domain* (DNS-перехватчик: DoH-резолв → динамич. маршруты); **DNSSEC + DoH** | C3 |
 
 ---
 
