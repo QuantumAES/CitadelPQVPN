@@ -41,6 +41,9 @@ ISSUER_PORT="${CITADEL_ISSUER_PORT:-7000}"   # публичный порт из�
 ADMIN_PORT="${CITADEL_ADMIN_PORT:-7001}"     # C7.2: порт admin-канала — НЕ публикуется наружу (только из туннеля)
 ADMIN_VIP="${CITADEL_ADMIN_VIP:-10.7.0.1}"   # C7.2: admin-VIP = шлюз туннеля (= Citadel_TUN_ADDR exit'а)
 EPOCH_SECS="${CITADEL_EPOCH_SECS:-3600}"     # длина эпохи токенов (exit и issuer ДОЛЖНЫ совпадать)
+LEASE_SECS="${CITADEL_LEASE_SECS:-0}"        # задача 4/B: single-session — окно аренды на абонента (с);
+                                             # 0 = выкл. >0 ⇒ одна ссылка открывает новую сессию не чаще
+                                             # раза в N с (ограничивает шеринг; реконнект в окне ждёт)
 
 log()  { printf '\033[1;36m[citadel]\033[0m %s\n' "$*"; }
 warn() { printf '\033[1;33m[citadel] ⚠ %s\033[0m\n' "$*" >&2; }
@@ -249,6 +252,7 @@ export Citadel_TOKEN_LISTEN=0.0.0.0:7000
 # → достижим только из туннеля (exit DNAT'ит). admin_id/admin.client_id читаются из /shared.
 export Citadel_ADMIN_LISTEN=0.0.0.0:$ADMIN_PORT
 export Citadel_EPOCH_SECS=$EPOCH_SECS
+export Citadel_TOKEN_LEASE_SECS=$LEASE_SECS   # задача 4/B: single-session (0=выкл; см. CITADEL_LEASE_SECS)
 export Citadel_REGISTER_PUBS="$CLIENT_PUB"   # client_id админа (issuer НЕ получает seed)
 rm -f /shared/issuer.pub /shared/issuer-*.pub /shared/tokens
 echo "[citadel-issuer] Layer-1 registry + слепая выдача epoch-токенов (epoch=${EPOCH_SECS}s, :7000) + admin-канал :$ADMIN_PORT…"
@@ -366,33 +370,32 @@ fi
 LINK="$("$DIR/bin/citadel-linkgen" "${LINKARGS[@]}" 2>/dev/null)" \
   || die "citadel-linkgen не сгенерировал мастер-ссылку"
 
-umask 077
-printf '%s\n' "$LINK" > "$DIR/admin-link.txt"
-printf '%s\n' "$CLIENT_LINK" > "$DIR/client-link.txt"
-
+# Задача 3: ссылки НЕ сохраняем на диск сервера — печатаем ОДИН РАЗ здесь. Секретные креды
+# (obfs_psk/pin/issuer_pin/seed'ы инлайн) не должны лежать в файле на VPS (кража диска/бэкапа =
+# кража доступа). Забыл скопировать / нужно вспомнить → переустановка (задача 2: ротация даст НОВЫЕ
+# ссылки, старые всё равно мертвы). На диске остаются только серверные секреты в keys/ (600/711).
 cat <<EOF
 
 ╔══════════════════════════════════════════════════════════════════╗
 ║  CitadelPQVPN exit развёрнут ✓   ($SERVER_HOST:$UDP_PORT udp / $TCP_PORT tcp)
 ╚══════════════════════════════════════════════════════════════════╝
 
-⚠ Эта установка/обновление задала НОВУЮ идентичность сервера. Любые ссылки, розданные ДО неё,
-  больше НЕ подключаются (obfs/pin/Layer-1 сменились) — раздай ссылки НИЖЕ заново. Плановый
-  docker-рестарт/ребут VPS ключи НЕ меняет; их меняет только повторный запуск этого скрипта
-  (сохранить прежние: CITADEL_KEEP_KEYS=1).
+⚠ Ссылки печатаются ЗДЕСЬ и НИГДЕ не сохраняются. Скопируй их СЕЙЧАС. Забыл / потерял →
+  запусти скрипт снова: он ротирует идентичность и выдаст НОВЫЕ ссылки (прежние, розданные до
+  этого, всё равно уже недействительны — obfs/pin/Layer-1 сменились). docker-рестарт/ребут VPS
+  ключи НЕ меняет; сохранить прежние при повторном запуске: CITADEL_KEEP_KEYS=1.
 
 МАСТЕР-ссылка (СЕКРЕТ, ТОЛЬКО АДМИНУ — даёт управление реестром абонентов по туннелю):
 
 $LINK
 
-Сохранена: $DIR/admin-link.txt (chmod 600). НЕ раздавать абонентам.
-Управление: docker compose -f $DIR/etc/compose.yml {ps,logs,down}
+НЕ раздавать абонентам. Управление: docker compose -f $DIR/etc/compose.yml {ps,logs,down}
 EOF
 
 if [[ "$ISSUER_ON" == 1 ]]; then
 cat <<EOF
 
-Клиентская ссылка (для абонента — без admin-прав), сохранена $DIR/client-link.txt:
+Клиентская ссылка (для абонента — без admin-прав):
 
 $CLIENT_LINK
 EOF

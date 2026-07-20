@@ -290,6 +290,12 @@ type EpochKey = (u64, Vec<u8>, Vec<u8>);
 /// S2.4/A6: счётчик выданных токенов `client_id → (эпоха, число)` (анти-фарминг, per-epoch).
 type QuotaMap = HashMap<[u8; 32], (u64, u32)>;
 
+/// Задача 4 (вариант B — мягкий single-session): время, до которого client_id УЖЕ обслужен и не
+/// получит новую выдачу (`client_id → expiry_unix`). Ограничивает открытие ПАРАЛЛЕЛЬНЫХ сессий с
+/// одной ссылки, не ломая unlinkability (exit по-прежнему не знает client_id — контроль на issuer,
+/// который видит его при Layer-1).
+type LeaseMap = HashMap<[u8; 32], u64>;
+
 /// Опубликовать pub эпохи (`issuer-<epoch>.pub`) + `issuer.pub` (= current, back-compat не-epoch exit).
 fn publish_epoch_pub(dir: &str, epoch: u64, pk: &[u8]) -> Result<()> {
     std::fs::write(format!("{dir}/{}", citadel_token::epoch_pub_name(epoch)), pk)
@@ -391,6 +397,17 @@ fn run_issuer() -> Result<()> {
     let quota: Arc<Mutex<QuotaMap>> = Arc::new(Mutex::new(HashMap::new()));
     eprintln!("[issuer] квота выдачи: {max_per_epoch} токен(ов) на абонента в эпоху (A6)");
 
+    // Задача 4 (вариант B): мягкий single-session — client_id получает новую выдачу не чаще раза в
+    // `Citadel_TOKEN_LEASE_SECS` (0 = выкл). Ограничивает параллельные сессии с одной ссылки;
+    // компромисс — реконнект в пределах окна ждёт истечения аренды (см. `lease_grant`).
+    let lease_secs: u64 =
+        std::env::var("Citadel_TOKEN_LEASE_SECS").ok().and_then(|s| s.parse().ok()).unwrap_or(0);
+    let lease: Arc<Mutex<LeaseMap>> = Arc::new(Mutex::new(HashMap::new()));
+    eprintln!(
+        "[issuer] single-session (задача 4/B): {}",
+        if lease_secs == 0 { "выкл".into() } else { format!("аренда {lease_secs}с на абонента") }
+    );
+
     let listen = std::env::var("Citadel_TOKEN_LISTEN").unwrap_or_else(|_| "0.0.0.0:7000".into());
     let listener = TcpListener::bind(&listen).with_context(|| format!("bind {listen}"))?;
     eprintln!("[issuer] слепое подписание на {listen} (blind RSA-{bits}, epoch-scoped, PQ-TLS+pin)");
@@ -401,10 +418,12 @@ fn run_issuer() -> Result<()> {
                 let dir = dir.clone();
                 let scfg = scfg.clone();
                 let quota = quota.clone();
+                let lease = lease.clone();
                 std::thread::spawn(move || {
-                    if let Err(e) =
-                        serve_client(stream, scfg, &state, &dir, &quota, max_per_epoch, obfs_psk)
-                    {
+                    if let Err(e) = serve_client(
+                        stream, scfg, &state, &dir, &quota, max_per_epoch, &lease, lease_secs,
+                        obfs_psk,
+                    ) {
                         eprintln!("[issuer] соединение завершено: {e}");
                     }
                 });
@@ -434,6 +453,26 @@ fn quota_grant(
     true
 }
 
+/// Задача 4 (вариант B): под локом решить, можно ли НАЧАТЬ новую выдачу `client_id` (одна ссылка →
+/// одна свежая сессия в окне `lease_secs`). `lease_secs == 0` → механизм выключен (всегда `true`).
+/// Иначе: если предыдущая выдача ещё «активна» (`now < expiry`) → `false` (второе устройство / слишком
+/// частый реконнект отклоняются); иначе ставим новую аренду `now + lease_secs` и разрешаем. Чистая
+/// логика (тестируемо). NB: уже поднятая QUIC-сессия живёт независимо — это МЯГКИЙ контроль (лимит
+/// на открытие новых параллельных сессий), не жёсткий kill уже активной (тот требует exit-tracking
+/// → слом unlinkability, отвергнут в пользу B).
+fn lease_grant(map: &mut LeaseMap, client_id: [u8; 32], now: u64, lease_secs: u64) -> bool {
+    if lease_secs == 0 {
+        return true;
+    }
+    match map.get(&client_id) {
+        Some(&expiry) if now < expiry => false, // аренда ещё активна — новую сессию не открываем
+        _ => {
+            map.insert(client_id, now + lease_secs);
+            true
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn serve_client(
     tcp: TcpStream,
@@ -442,6 +481,8 @@ fn serve_client(
     dir: &str,
     quota: &Mutex<QuotaMap>,
     max_per_epoch: u32,
+    lease: &Mutex<LeaseMap>,
+    lease_secs: u64,
     obfs_psk: Option<[u8; 32]>,
 ) -> Result<()> {
     let peer = tcp.peer_addr().ok();
@@ -464,6 +505,17 @@ fn serve_client(
     }
     let client_id: [u8; 32] = pk.try_into().expect("pk = auth[..32], ровно 32 байта");
     eprintln!("[issuer] Layer-1 ✔ абонент {}… авторизован", &hex::encode(pk)[..12]);
+    // Задача 4/B (мягкий single-session): аренда client_id ещё активна → отклоняем новую выдачу
+    // (второе устройство с той же ссылки / слишком частый реконнект). Клиент получит 0 токенов →
+    // establish без токена → exit откажет → клиент подождёт истечения аренды и переподключится.
+    // Закрываем соединение ДО отправки epoch-pub (ничего лишнего не раскрываем).
+    if !lease_grant(&mut lease.lock().unwrap(), client_id, now_unix(), lease_secs) {
+        eprintln!(
+            "[issuer] single-session (4/B): {}… держит активную аренду — новая сессия отклонена",
+            &hex::encode(client_id)[..12]
+        );
+        return Ok(());
+    }
     // C5.3: отдаём клиенту ТЕКУЩИЙ epoch-pub (клиент ослепляет под актуальным ключом).
     let cur_pub = state.lock().unwrap().1.clone();
     write_frame(&mut conn, &cur_pub)?;
@@ -604,6 +656,30 @@ mod tests {
         // смена эпохи сбрасывает счётчик a
         assert!(quota_grant(&mut m, a, 101, 3));
         assert!(quota_grant(&mut m, a, 101, 3));
+    }
+
+    /// Задача 4/B: аренда client_id блокирует новую выдачу в окне; истекла → снова разрешена;
+    /// `lease_secs == 0` — механизм выключен (всегда разрешает).
+    #[test]
+    fn lease_grant_single_session_window() {
+        use super::lease_grant;
+        let mut m = std::collections::HashMap::new();
+        let a = [0xAAu8; 32];
+        let b = [0xBBu8; 32];
+        // первая выдача в now=1000, аренда 300с (до 1300)
+        assert!(lease_grant(&mut m, a, 1000, 300));
+        // повторная попытка в окне (now=1100 < 1300) — отказ (второе устройство/частый реконнект)
+        assert!(!lease_grant(&mut m, a, 1100, 300));
+        assert!(!lease_grant(&mut m, a, 1299, 300));
+        // другой абонент — своя аренда, не задет
+        assert!(lease_grant(&mut m, b, 1100, 300));
+        // аренда истекла (now=1300 >= expiry) — снова разрешено (реконнект после окна)
+        assert!(lease_grant(&mut m, a, 1300, 300));
+        // выключено (lease_secs=0) — всегда true, карта не растёт
+        let mut off = std::collections::HashMap::new();
+        assert!(lease_grant(&mut off, a, 1, 0));
+        assert!(lease_grant(&mut off, a, 1, 0));
+        assert!(off.is_empty());
     }
 
     /// valid_until: относительные формы и абсолют.
