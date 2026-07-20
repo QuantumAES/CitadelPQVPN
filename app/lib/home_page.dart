@@ -7,6 +7,7 @@ import 'package:flutter/services.dart';
 import 'package:app/android_vpn.dart';
 import 'package:app/app_state.dart';
 import 'package:app/debug_panel.dart';
+import 'package:app/qr_scan_page.dart';
 import 'package:app/src/rust/api/citadel.dart';
 import 'package:app/subscribers_page.dart';
 
@@ -832,6 +833,22 @@ class _AddProfileSheetState extends State<AddProfileSheet> {
     }
   }
 
+  /// #0.2: платформы с камерой-сканером (mobile_scanner). На Linux/Windows плагина нет → только вставка.
+  static bool get _canScan =>
+      Platform.isAndroid || Platform.isIOS || Platform.isMacOS;
+
+  Future<void> _scanQr() async {
+    final uri = await Navigator.push<String>(
+      context,
+      MaterialPageRoute(builder: (_) => const QrScanPage()),
+    );
+    final t = uri?.trim();
+    if (t != null && t.isNotEmpty && mounted) {
+      _link.text = t;
+      _onLinkChanged(t);
+    }
+  }
+
   void _submit() {
     final uri = _link.text.trim();
     Navigator.pop<({String name, String uri})>(
@@ -869,7 +886,7 @@ class _AddProfileSheetState extends State<AddProfileSheet> {
             maxLines: 3,
             decoration: InputDecoration(
               labelText: 'citadel://-ссылка',
-              hintText: 'вставьте ссылку или QR-данные',
+              hintText: _canScan ? 'вставьте ссылку или отсканируйте QR' : 'вставьте ссылку или QR-данные',
               border: const OutlineInputBorder(),
               suffixIcon: IconButton(
                 icon: const Icon(Icons.content_paste),
@@ -878,6 +895,15 @@ class _AddProfileSheetState extends State<AddProfileSheet> {
               ),
             ),
           ),
+          // #0.2: сканирование QR камерой — на платформах с камерой (мобильные/macOS).
+          if (_canScan) ...[
+            const SizedBox(height: 12),
+            OutlinedButton.icon(
+              onPressed: _scanQr,
+              icon: const Icon(Icons.qr_code_scanner),
+              label: const Text('Сканировать QR камерой'),
+            ),
+          ],
           if (_summary != null) ...[
             const SizedBox(height: 12),
             _LinkPreview(summary: _summary!),

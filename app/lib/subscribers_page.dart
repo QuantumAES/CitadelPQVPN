@@ -50,24 +50,41 @@ class _SubscribersPageState extends State<SubscribersPage> {
   }
 
   /// Обёртка операции: занятость + ошибка в баннер.
-  Future<T?> _run<T>(Future<T> Function() op) async {
+  /// Обёртка операции: занятость + ошибка в баннер. `retries` — повторы при сбое (для авто-загрузки
+  /// списка: #0.1 — сразу после подъёма туннеля admin-путь к ADMIN_VIP:порт, DNAT/маршрут, может
+  /// быть ещё не проложен → connect/challenge падает; короткий ретрай устраняет ложную ошибку).
+  Future<T?> _run<T>(
+    Future<T> Function() op, {
+    int retries = 0,
+    Duration delay = const Duration(milliseconds: 1500),
+  }) async {
     setState(() {
       _busy = true;
       _error = null;
     });
     try {
-      return await op();
-    } catch (e) {
-      if (mounted) setState(() => _error = _short('$e'));
-      return null;
+      for (var attempt = 0;; attempt++) {
+        try {
+          return await op();
+        } catch (e) {
+          if (attempt >= retries || !mounted) {
+            if (mounted) setState(() => _error = _short('$e'));
+            return null;
+          }
+          await Future.delayed(delay); // admin-путь после туннеля мог ещё не подняться
+        }
+      }
     } finally {
       if (mounted) setState(() => _busy = false);
     }
   }
 
   Future<void> _refresh() async {
-    final list =
-        await _run(() => adminSubscribers(profileId: widget.profile.id));
+    // #0.1: авто-загрузка после подъёма туннеля — до 3 повторов, пока admin-путь стабилизируется.
+    final list = await _run(
+      () => adminSubscribers(profileId: widget.profile.id),
+      retries: 3,
+    );
     if (list != null && mounted) {
       // активные сверху, внутри групп — по убыванию срока (свежевыданные видны сразу)
       list.sort((a, b) {

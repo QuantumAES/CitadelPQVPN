@@ -39,6 +39,9 @@ dependencies:
   flutter_rust_bridge: 2.12.0
   # Приватный writable каталог приложения (Android filesDir) для файла хранилища.
   path_provider: ^2.1.4
+  # #0.2: сканирование QR камерой при добавлении профиля (Android/iOS/macOS; на Linux/Windows
+  # плагина нет → кнопка сканера гейтится по платформе, остаётся вставка ссылки).
+  mobile_scanner: ^5.2.3
 
 dev_dependencies:
   flutter_test:

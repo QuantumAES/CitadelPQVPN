@@ -10,6 +10,10 @@
     <!-- S2: registerNetworkCallback в CitadelVpnService требует ACCESS_NETWORK_STATE — без него
          callback молча падает (SecurityException в try/catch) и смена сети не форсит реконнект. -->
     <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE"/>
+    <!-- #0.2: сканирование QR-ссылки камерой при добавлении профиля (mobile_scanner). Камера НЕ
+         обязательна для работы VPN → required=false, чтобы не отсекать устройства без камеры. -->
+    <uses-permission android:name="android.permission.CAMERA"/>
+    <uses-feature android:name="android.hardware.camera" android:required="false"/>
     <application
         android:label="CitadelPQVPN"
         android:name="${applicationName}"
