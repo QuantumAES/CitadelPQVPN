@@ -112,6 +112,27 @@ for name in citadel-m1 citadel-linkgen citadel-token; do
   chmod +x "$DIR/bin/$name"
 done
 
+# ─── 3.5 ротация идентичности при ОБНОВЛЕНИИ (задача 2) ───
+# Обновление сервера ОБЯЗАНO инвалидировать ВСЕ ранее розданные ссылки — и клиентские, и мастер:
+# перегенерим все вшитые-в-ссылку секреты (obfs_psk, cert/pin, ML-DSA, issuer-TLS-pin, epoch-RSA,
+# client.seed, admin.seed) + сотрём реестр. Старая ссылка после этого не пройдёт НИ obfs (новый PSK
+# → probe-reject), НИ cert-pin (новый серт), НИ Layer-1 (client_id не в новом реестре) — туннель не
+# поднимется ни у клиента, ни у админа. Персист (A7) защищает только docker-restart/ребут VPS (том
+# цел, ключи те же); СМЕНА ключей происходит РОВНО при (пере)запуске installer. Opt-out:
+# CITADEL_KEEP_KEYS=1 — сохранить креды (правка конфигурации без смены розданных ссылок).
+if [[ -f "$DIR/keys/obfs.psk" && "${CITADEL_KEEP_KEYS:-0}" != 1 ]]; then
+  warn "ОБНОВЛЕНИЕ: ротирую идентичность сервера — ВСЕ прежние ссылки (клиентские и мастер) станут"
+  warn "недействительны. Раздай новые ссылки из вывода ниже. (CITADEL_KEEP_KEYS=1 — сохранить старые.)"
+  # остановить контейнеры, держащие старые ключи в RAM — при up перечитают свежие из тома
+  [[ -f "$DIR/etc/compose.yml" ]] && docker compose -f "$DIR/etc/compose.yml" down >/dev/null 2>&1 || true
+  rm -f "$DIR/keys/"obfs.psk "$DIR/keys/"client.seed "$DIR/keys/"admin.seed \
+        "$DIR/keys/"admin_id "$DIR/keys/"admin.client_id "$DIR/keys/"registry "$DIR/keys/"tokens \
+        "$DIR/keys/"exit.pin "$DIR/keys/"exit-cert.der "$DIR/keys/"exit-key.der \
+        "$DIR/keys/"exit-mldsa.seed "$DIR/keys/"exit.mldsa "$DIR/keys/"exit2.pin "$DIR/keys/"exit2.mldsa \
+        "$DIR/keys/"issuer-tls.crt "$DIR/keys/"issuer-tls.key "$DIR/keys/"issuer-tls.pin \
+        "$DIR/keys/"issuer.pub "$DIR"/keys/issuer-*.pub 2>/dev/null || true
+fi
+
 # ─── 4. keygen на сервере: obfs PSK + (issuer) client_seed «абонента» ───
 PSK_FILE="$DIR/keys/obfs.psk"
 if [[ ! -f "$PSK_FILE" ]]; then
@@ -354,6 +375,11 @@ cat <<EOF
 ╔══════════════════════════════════════════════════════════════════╗
 ║  CitadelPQVPN exit развёрнут ✓   ($SERVER_HOST:$UDP_PORT udp / $TCP_PORT tcp)
 ╚══════════════════════════════════════════════════════════════════╝
+
+⚠ Эта установка/обновление задала НОВУЮ идентичность сервера. Любые ссылки, розданные ДО неё,
+  больше НЕ подключаются (obfs/pin/Layer-1 сменились) — раздай ссылки НИЖЕ заново. Плановый
+  docker-рестарт/ребут VPS ключи НЕ меняет; их меняет только повторный запуск этого скрипта
+  (сохранить прежние: CITADEL_KEEP_KEYS=1).
 
 МАСТЕР-ссылка (СЕКРЕТ, ТОЛЬКО АДМИНУ — даёт управление реестром абонентов по туннелю):
 
