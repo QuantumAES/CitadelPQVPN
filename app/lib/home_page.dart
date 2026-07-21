@@ -9,6 +9,7 @@ import 'package:app/app_state.dart';
 import 'package:app/debug_panel.dart';
 import 'package:app/qr_scan_page.dart';
 import 'package:app/src/rust/api/citadel.dart';
+import 'package:app/split_tunnel_page.dart';
 import 'package:app/subscribers_page.dart';
 
 /// Версия сборки для экрана «О приложении». Задаётся `--dart-define=CITADEL_VERSION=<tag>` в
@@ -253,6 +254,19 @@ class _HomePageState extends State<HomePage> {
                 onTap: () {
                   Navigator.pop(sheetCtx);
                   _showAlwaysOnGuide();
+                },
+              ),
+            // C8.3 split-tunnel — только Android (движок применяет через VpnService).
+            if (Platform.isAndroid)
+              ListTile(
+                leading: const Icon(Icons.alt_route),
+                title: const Text('Split-туннель'),
+                subtitle: const Text('По приложениям и адресам: через туннель / в обход'),
+                onTap: () {
+                  Navigator.pop(sheetCtx);
+                  Navigator.of(context).push(
+                    MaterialPageRoute(builder: (_) => const SplitTunnelPage()),
+                  );
                 },
               ),
             // Admin (C7.4): реестр абонентов живёт в меню admin-профиля («Абоненты»), не здесь —

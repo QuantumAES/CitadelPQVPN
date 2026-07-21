@@ -24,4 +24,16 @@ class AndroidVpn {
   /// Открыть системные настройки VPN (там включается always-on + «блокировать без VPN» —
   /// Android kill-switch, C6). Приложение не может форсить его само.
   static Future<void> openVpnSettings() => _ch.invokeMethod('openVpnSettings');
+
+  /// C8.3: список запускаемых приложений для split-tunnel picker'а. Каждый элемент — `(package, label)`.
+  static Future<List<({String package, String label})>> listInstalledApps() async {
+    final raw = await _ch.invokeMethod<List<dynamic>>('listInstalledApps') ?? const [];
+    return raw
+        .map((e) => (
+              package: (e['package'] ?? '').toString(),
+              label: (e['label'] ?? '').toString(),
+            ))
+        .where((e) => e.package.isNotEmpty)
+        .toList();
+  }
 }

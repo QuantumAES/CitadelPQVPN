@@ -17,8 +17,8 @@ use flutter_rust_bridge::frb;
 use crate::frb_generated::StreamSink;
 
 use citadel_client::{
-    CredentialLink, GuiTunProvider, Profile, TunIo, TunParams, TunProvider, Vault, VpnController,
-    VpnEvent, VpnState,
+    CredentialLink, GuiTunProvider, Profile, SplitMode, SplitTunnel, TunIo, TunParams, TunProvider,
+    Vault, VpnController, VpnEvent, VpnState,
 };
 
 /// Версия PQ-VPN-ядра (about-экран).
@@ -204,6 +204,110 @@ pub fn debug_enabled_persisted() -> bool {
         }
     }
     DEBUG_ENABLED.load(Relaxed)
+}
+
+// ─────────────────────────── C8.3 split-tunneling (Android) ───────────────────────────
+// Клиентская настройка (не из ссылки): фильтр по приложениям (package-имена) и/или по назначениям
+// (домен/IP/CIDR, в т.ч. локальная подсеть). Персистится текстовым файлом рядом с vault (как
+// kill-switch/debug), накатывается в `spawn_controller` на `ClientConfig.split`. Применяет её только
+// Android-провайдер (VpnService); desktop игнорирует (Linux split-tunnel — позже, C8.3-Linux).
+
+/// Плоское DTO split-настройки для FFI. `*_mode` = "off"|"include"|"exclude".
+#[derive(Clone)]
+pub struct SplitTunnelDto {
+    pub app_mode: String,
+    pub apps: Vec<String>,
+    pub dest_mode: String,
+    pub dests: Vec<String>,
+}
+
+impl SplitTunnelDto {
+    fn off() -> Self {
+        Self { app_mode: "off".into(), apps: vec![], dest_mode: "off".into(), dests: vec![] }
+    }
+}
+
+fn split_file() -> PathBuf {
+    vault_path().with_file_name("split")
+}
+
+/// Сериализация в простой построчный формат (без новых зависимостей, человекочитаемо):
+/// `app_mode=…` / `app=…`(×N) / `dest_mode=…` / `dest=…`(×N).
+fn serialize_split(c: &SplitTunnelDto) -> String {
+    let mut s = format!("app_mode={}\n", c.app_mode.trim());
+    for a in &c.apps {
+        let a = a.trim();
+        if !a.is_empty() {
+            s.push_str(&format!("app={a}\n"));
+        }
+    }
+    s.push_str(&format!("dest_mode={}\n", c.dest_mode.trim()));
+    for d in &c.dests {
+        let d = d.trim();
+        if !d.is_empty() {
+            s.push_str(&format!("dest={d}\n"));
+        }
+    }
+    s
+}
+
+fn parse_split(text: &str) -> SplitTunnelDto {
+    let mut c = SplitTunnelDto::off();
+    for line in text.lines() {
+        let line = line.trim();
+        // длинные префиксы (app_mode/dest_mode) проверяем ДО коротких (app/dest)
+        if let Some(v) = line.strip_prefix("app_mode=") {
+            c.app_mode = v.trim().to_string();
+        } else if let Some(v) = line.strip_prefix("dest_mode=") {
+            c.dest_mode = v.trim().to_string();
+        } else if let Some(v) = line.strip_prefix("app=") {
+            let v = v.trim();
+            if !v.is_empty() {
+                c.apps.push(v.to_string());
+            }
+        } else if let Some(v) = line.strip_prefix("dest=") {
+            let v = v.trim();
+            if !v.is_empty() {
+                c.dests.push(v.to_string());
+            }
+        }
+    }
+    c
+}
+
+fn dto_to_split(c: &SplitTunnelDto) -> SplitTunnel {
+    SplitTunnel {
+        app_mode: SplitMode::parse(&c.app_mode),
+        apps: c.apps.clone(),
+        dest_mode: SplitMode::parse(&c.dest_mode),
+        dests: c.dests.clone(),
+    }
+}
+
+/// Загрузить сохранённую split-настройку (для `spawn_controller`). Файла нет / ошибка → Off.
+fn load_split_config() -> SplitTunnel {
+    match std::fs::read_to_string(split_file()) {
+        Ok(text) => dto_to_split(&parse_split(&text)),
+        Err(_) => SplitTunnel::default(),
+    }
+}
+
+/// Сохранить split-настройку (GUI). Применяется со СЛЕДУЮЩЕГО подключения; переживает рестарт.
+#[frb(sync)]
+pub fn set_split_config(cfg: SplitTunnelDto) {
+    let f = split_file();
+    if let Some(d) = f.parent() {
+        let _ = std::fs::create_dir_all(d);
+    }
+    let _ = std::fs::write(f, serialize_split(&cfg));
+}
+
+/// Прочитать сохранённую split-настройку (инициализация GUI). Файла нет → всё "off".
+#[frb(sync)]
+pub fn split_config() -> SplitTunnelDto {
+    std::fs::read_to_string(split_file())
+        .map(|t| parse_split(&t))
+        .unwrap_or_else(|_| SplitTunnelDto::off())
 }
 
 /// Каталог данных, заданный платформой (Android передаёт filesDir через [`set_data_dir`]).
@@ -451,6 +555,7 @@ fn spawn_controller(
     let link = CredentialLink::from_uri(uri)?;
     let mut cfg = link.to_client_config();
     cfg.killswitch = killswitch_enabled(); // C6/M9: kill-switch по GUI-тумблеру (desktop; Android — OS-level)
+    cfg.split = load_split_config(); // C8.3: split-tunnel по приложениям/назначениям (Android; desktop игнорит)
     // Остановить прошлую сессию перед новой (анти-double-connect): её loop глушим, иначе он продолжит
     // держать/реконнектить старый туннель параллельно новому. Берём Arc и disconnect() вне лока.
     let prev = ACTIVE.lock().unwrap().take();

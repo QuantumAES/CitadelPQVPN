@@ -134,17 +134,27 @@ pub fn establish_tun(p: &TunParams) -> anyhow::Result<i32> {
     let addr_j = env.new_string(&addr)?;
     let routes_j = env.new_string(&p.routes)?;
     let dns_j = env.new_string(p.dns.as_deref().unwrap_or(""))?;
+    // C8.3 split-tunnel: режимы строкой, списки — через пробел (package-имена и CIDR пробелов не
+    // содержат → безопасно join'ить). Kotlin применяет фильтр приложений и/или маршрутов назначений.
+    let app_mode_j = env.new_string(p.app_mode.as_str())?;
+    let apps_j = env.new_string(p.apps.join(" "))?;
+    let dest_mode_j = env.new_string(p.dest_mode.as_str())?;
+    let dest_routes_j = env.new_string(p.dest_routes.join(" "))?;
 
     let res = env.call_method(
         service.as_obj(),
         "establishTun",
-        "(Ljava/lang/String;ILjava/lang/String;Ljava/lang/String;I)I",
+        "(Ljava/lang/String;ILjava/lang/String;Ljava/lang/String;ILjava/lang/String;Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;)I",
         &[
             JValue::Object(&addr_j),
             JValue::Int(p.prefix as i32),
             JValue::Object(&routes_j),
             JValue::Object(&dns_j),
             JValue::Int(mtu),
+            JValue::Object(&app_mode_j),
+            JValue::Object(&apps_j),
+            JValue::Object(&dest_mode_j),
+            JValue::Object(&dest_routes_j),
         ],
     );
     // Очистить любое ожидающее Java-исключение ДО дропа env (detach потока с висящим исключением →

@@ -54,6 +54,26 @@ class MainActivity : FlutterActivity() {
                     CitadelVpnService.instance?.stopTun()
                     result.success(true)
                 }
+                "listInstalledApps" -> {
+                    // C8.3: список запускаемых приложений (для split-tunnel picker). Только те, что
+                    // имеют LAUNCHER-активность (пользовательские, не системные службы). Видимость
+                    // даёт <queries> в манифесте (без чувствительного QUERY_ALL_PACKAGES).
+                    try {
+                        val pm = packageManager
+                        val intent = Intent(Intent.ACTION_MAIN, null).addCategory(Intent.CATEGORY_LAUNCHER)
+                        val seen = HashSet<String>()
+                        val out = ArrayList<Map<String, String>>()
+                        for (ri in pm.queryIntentActivities(intent, 0)) {
+                            val pkg = ri.activityInfo.packageName
+                            if (pkg == packageName || !seen.add(pkg)) continue // сам клиент/дубликаты — мимо
+                            out.add(mapOf("package" to pkg, "label" to ri.loadLabel(pm).toString()))
+                        }
+                        out.sortBy { it["label"]?.lowercase() }
+                        result.success(out)
+                    } catch (e: Exception) {
+                        result.error("apps", e.message, null)
+                    }
+                }
                 "openVpnSettings" -> {
                     // C6 Android kill-switch = СИСТЕМНЫЙ always-on + «блокировать без VPN» (lockdown).
                     // Приложение не может форсить его (iptables-аналога у VpnService нет), но ведёт сюда.

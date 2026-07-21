@@ -76,9 +76,36 @@ class CitadelVpnService : VpnService() {
     /** Построить TUN по параметрам, назначенным движком, вернуть detached fd для Rust. Зовётся из
      *  Rust через JNI (`AndroidTunProvider::configure` в нативном connect-loop) на КАЖДЫЙ (ре)коннект,
      *  НЕ из Dart. routes/dns приходят строкой через пробел (Rust шлёт TunParams как есть, без массивов). */
-    fun establishTun(addr: String, prefix: Int, routes: String, dns: String, mtu: Int): Int {
-        val routeList = routes.split(" ").filter { it.isNotEmpty() }
-        val fullTunnel = routeList.isEmpty() || routeList.any { it == "0.0.0.0/0" }
+    fun establishTun(
+        addr: String, prefix: Int, routes: String, dns: String, mtu: Int,
+        appMode: String, apps: String, destMode: String, destRoutes: String,
+    ): Int {
+        val linkRoutes = routes.split(" ").filter { it.isNotEmpty() }
+        val appList = apps.split(" ").filter { it.isNotEmpty() }
+        val destList = destRoutes.split(" ").filter { it.isNotEmpty() }
+        // C8.3 назначения: include → только они в туннель (остальное, вкл. IPv6, напрямую);
+        //                  exclude → full-tunnel минус они (excludeRoute, Android 13+/API33).
+        val destInclude = destMode == "include" && destList.isNotEmpty()
+        val destExclude = destMode == "exclude" && destList.isNotEmpty()
+        val tunnelRoutes = if (destInclude) destList else linkRoutes
+        // full-tunnel (→ IPv6-blackhole применим) только когда НЕ селективный include и маршруты полны
+        val fullTunnel = !destInclude && (tunnelRoutes.isEmpty() || tunnelRoutes.any { it == "0.0.0.0/0" })
+
+        // C8.3 приложения: include → только выбранные пакеты в туннель; exclude → все, кроме них.
+        // addAllowed/DisallowedApplication взаимоисключающи; несуществующий пакет бросает — ловим
+        // пер-пакет, чтобы один удалённый пакет не завалил establish целиком.
+        fun applyAppFilter(b: Builder) {
+            for (pkg in appList) {
+                try {
+                    when (appMode) {
+                        "include" -> b.addAllowedApplication(pkg)
+                        "exclude" -> b.addDisallowedApplication(pkg)
+                    }
+                } catch (e: Exception) {
+                    android.util.Log.w("CitadelVpn", "C8.3 split-app: пакет пропущен ($pkg): ${e.message}")
+                }
+            }
+        }
 
         // Собрать VpnService.Builder. `withV6Blackhole` — захватить весь IPv6 в туннель (S2.2/A2):
         // туннель IPv4-only, поэтому нативный IPv6 иначе утекает мимо него (деанон на dual-stack).
@@ -89,12 +116,24 @@ class CitadelVpnService : VpnService() {
                 .setSession("CitadelPQVPN")
                 .setMtu(mtu)
                 .addAddress(addr, prefix)
-            for (r in routeList) {
+            applyAppFilter(b)
+            for (r in tunnelRoutes) {
                 val s = splitCidr(r)
                 b.addRoute(s.first, s.second)
             }
             for (d in dns.split(" ").filter { it.isNotEmpty() }) b.addDnsServer(d)
-            if (routeList.isEmpty()) b.addRoute("0.0.0.0", 0) // нет split-маршрутов → full-tunnel
+            if (tunnelRoutes.isEmpty()) b.addRoute("0.0.0.0", 0) // нет split-маршрутов → full-tunnel
+            // C8.3 exclude: вырезать выбранные назначения из full-tunnel (Android 13+/API33)
+            if (destExclude) {
+                if (Build.VERSION.SDK_INT >= 33) {
+                    for (d in destList) {
+                        val s = splitCidr(d)
+                        b.excludeRoute(android.net.IpPrefix(java.net.InetAddress.getByName(s.first), s.second))
+                    }
+                } else {
+                    android.util.Log.w("CitadelVpn", "C8.3 split-dest exclude требует Android 13+ (API33); назначения НЕ исключены (остаются в туннеле)")
+                }
+            }
             if (withV6Blackhole) {
                 b.addAddress("fd00:cade:1::1", 128)
                 b.addRoute("::", 0)

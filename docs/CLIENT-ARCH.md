@@ -295,7 +295,7 @@ CitadelPQVPN/
 | **C5** ✅ | **Идентичность и доступ**: двухслойная (epoch-ключи в `citadel-token` + issuer client-registry + Ed25519-auth), `TokenAgent` авто-рефреш; **«выдать/отозвать»** — по туннелю (admin-plane, ниже) | C4 |
 | **C6** ✅ (частично) | **Упаковка/секреты**: kill-switch (Linux firewall + Android always-on) ✅; vault (AES-256-GCM) ✅; APK ✅; `SecretStore` keychain / msix/dmg / нотаризация macOS — остаток | C2–C5 |
 | **C7** ✅ | **Admin-plane v2** — управление абонентами по туннелю: PQ-TLS admin-канал к issuer из-под туннеля, роли ссылок (мастер/клиент), GUI «Абоненты», CLI `citadel-token admin`. Заменил SSH-путь C5.5 (§8/§10). *Единая нумерация с `SECURITY-ROADMAP` §C7* | C5 |
-| **C8** | **Сетевой контроль User-mode** *(бывш. «C7» здесь — переименован, чтобы развести коллизию с admin-plane)*. Разбит на C8.0–C8.4, см. §14.1 ниже | C3 |
+| **C8** | **Сетевой контроль User-mode** *(бывш. «C7» здесь)*. C8.3 split-tunnel (Android) ✅ реализован; C8.1 отменён (свёрнут в C8.3); C8.0/C8.2 — план. См. §14.1 | C3 |
 
 ---
 
@@ -310,13 +310,8 @@ CitadelPQVPN/
 - Тесты: `registry_apply_remove_{ok,missing,self_lockout}`. Формат реестра НЕ меняется (backward-compat), но новый enum-вариант → согласованное обновление сервер+клиент.
 - **Break-glass до C8.0:** на VPS `docker exec <issuer> sed -i '/<hexprefix>/d' /shared/registry` (реестр перечитывается на каждую операцию — рестарт не нужен).
 
-### C8.1 — Killswitch-исключения для локальной подсети (LAN-bypass)
-**Цель:** при активном kill-switch пускать трафик к локальным устройствам (NAS/принтер/роутер/DLNA), не ломая fail-closed для интернета.
-- `ClientConfig.lan_bypass: bool` (+ опц. явные CIDR); дефолт **off** (KS строг). При on — bypass **только приватных** диапазонов: `10/8, 172.16/12, 192.168/16, 169.254/16` (IPv4) + `fc00::/7, fe80::/10` (IPv6). Произвольные публичные CIDR запрещены (валидатор) — иначе дыра в fail-closed.
-- **Linux (`citadel-helper`):** в цепочки `CITADEL_KS`/`CITADEL_KS6` вставить `-d <cidr> -j RETURN` **до** финального DROP и **после** lo/tunnel/exit-IP правил. Directly-connected LAN-маршруты (link scope) и так обходят TUN по longest-prefix — bypass в KS лишь снимает DROP.
-- **DNS:** LAN-резолвер по умолчанию НЕ разрешается (DNS остаётся через туннель/DoH, F6 fail-closed); отдельная опция `lan_dns` для тех, кому нужен локальный DNS.
-- **Android:** VpnService — LAN исключается из `routes` (не добавлять приватные CIDR в туннель) либо `excludeRoute` (API 33+); плюс UI-тумблер.
-- Red-team: LAN-bypass = контролируемое ослабление (приватные адреса не роутятся в интернет; риск — злонамеренный LAN-релей). UI-предупреждение. Тесты: `lan_bypass_rules_shape` (RETURN до DROP), негатив (публичный CIDR отклонён).
+### C8.1 — ~~Killswitch-исключения для локальной подсети~~ ОТМЕНЁН (2026-07-21, решение пользователя)
+Kill-switch решено **не трогать** (он остаётся строгим fail-closed). Доступ к локальной сети/отдельным адресам обеспечивается через **C8.3 (обход туннеля по назначению)** — пользователь добавляет локальную подсеть (или домен/IP) в список «в обход», и её трафик просто не заходит в туннель. Это чище: не ослабляем KS, а маршрутизируем мимо.
 
 ### C8.2 — Linux: при закрытии окна спросить «фон / разорвать»
 **Цель:** закрытие окна (X) при живом туннеле не рвёт его молча — диалог «Оставить в фоне» / «Отключить и выйти».
@@ -325,12 +320,18 @@ CitadelPQVPN/
   - «Отключить и выйти» → `vpnDisconnect()` (clean_shutdown снимает KS) → `windowManager.destroy()`.
 - Опция «запомнить выбор» (не спрашивать). Только desktop (`Platform.isLinux/Windows/macOS`); Android не затронут (S3 уже держит сессию через сервис). DevSecOps-нюанс: фон без трея запрещён; при SIGKILL процесса в фоне KS держится helper'ом (persist на краш, как сейчас).
 
-### C8.3 — Split-tunneling по приложениям
-**Режимы:** `Off | Include(apps)` (только выбранные — в туннель) `| Exclude(apps)` (все, кроме выбранных — в туннель). Config `SplitTunnel { mode, apps: Vec<AppId> }` (AppId = package на Android / exe-path|cgroup на Linux).
-- **Android (нативно, делаем первым):** `VpnService.Builder.addAllowedApplication` (Include) / `addDisallowedApplication` (Exclude) — взаимоисключающи. UI-список из `PackageManager` (нужен `<queries>`/`QUERY_ALL_PACKAGES`). Пакеты → `establishTun` через JNI.
-- **Linux (позже):** нативного per-app VPN нет. План — **cgroup v2 + fwmark + policy routing**: выбранные процессы в cgroup, `nftables … meta cgroup` метит fwmark, `ip rule fwmark → таблица туннеля` (Include) либо `→ main в обход` (Exclude). Требует launcher-обёртки (запуск приложения в нужной cgroup). Альтернативы: `-m owner --uid-owner` (по UID) или netns. MVP-решение зафиксировать при старте C8.3.
-- **Windows/macOS:** WFP по AppID / NE `NEAppProxyProvider` — отдельный трек (сложность драйвера/entitlements).
-- **Взаимодействие:** bypassed-приложения (Exclude) идут напрямую всегда → KS их не дропает; LAN-bypass (C8.1) и split-tunnel согласуются на уровне маркировки/маршрутов. Red-team: split-tunnel — поверхность деанона (выбранное приложение светит реальный IP) → UI-предупреждение.
+### C8.3 — Split-tunneling (Android ✅ реализован 2026-07-21; Linux/Win/macOS — позже)
+**Две независимые оси** (компонуются — Android разрешает фильтр приложений И набор маршрутов одновременно):
+- **Ось приложений:** `app_mode: Off | Include | Exclude` + `apps: Vec<String>` (package-имена). Include = только выбранные через туннель; Exclude = все, кроме выбранных.
+- **Ось назначений:** `dest_mode: Off | Include | Exclude` + `dests: Vec<String>` (запись = **домен | IP | CIDR**, в т.ч. локальная подсеть). Include = только эти назначения в туннель; Exclude = full-tunnel минус эти (в обход, напр. локальная сеть).
+
+**Реализация (Android, `SplitTunnel` в `citadel-quic::config`):**
+- Ядро: `SplitMode`{Off,Include,Exclude} + `SplitTunnel`{app_mode,apps,dest_mode,dests} в `ClientConfig`; `vpn::resolve_dests` раскрывает домены→A-записи→`/32`, IP→`/32`, CIDR как есть (IPv4; v6 — future), на каждый establish (реконнект перерезолвит CDN). `TunParams` несёт split-поля.
+- FFI: `SplitTunnelDto` + `set_split_config`/`split_config`, персист текстовым файлом `split` рядом с vault (как kill-switch), накат в `spawn_controller`.
+- JNI→Kotlin `establishTun(...appMode,apps,destMode,destRoutes)`: приложения — `addAllowedApplication`(Include)/`addDisallowedApplication`(Exclude), несуществующий пакет ловится пер-пакет; назначения — Include → `addRoute` только их (не full, без IPv6-blackhole), Exclude → full-tunnel + `excludeRoute` (Android 13+/API33; ниже — лог, назначение остаётся в туннеле).
+- UI: `split_tunnel_page.dart` (две секции с `SegmentedButton`, app-picker из `MainActivity.listInstalledApps` через `<queries>` LAUNCHER, редактор назначений + «Добавить локальную подсеть» из `NetworkInterface`). Гейт: `cargo ndk check aarch64` + `flutter analyze` + unit-тесты + `flutter build apk`. **Device-тест за пользователем.**
+- **Linux (позже):** нативного per-app VPN нет. План — **cgroup v2 + fwmark + policy routing** (выбранные процессы в cgroup, `nftables … meta cgroup` метит fwmark, `ip rule fwmark → таблица туннеля`/`main`); либо `-m owner --uid-owner` / netns. По назначениям на Linux — обычные split-маршруты в helper. **Windows/macOS:** WFP по AppID / NE `NEAppProxyProvider` — отдельный трек.
+- Red-team: split — поверхность деанона (выбранное «в обход» светит реальный IP); домены у CDN с меняющимися IP могут «протекать» между реконнектами. UI-предупреждение добавлено.
 
 ---
 

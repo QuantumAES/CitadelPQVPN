@@ -25,7 +25,7 @@ pub mod deploy;
 
 // Поверхность движка для FFI/UI: один крейт, чтобы биндинг-генератор видел всё в одном месте.
 pub use citadel_quic::config::{
-    parse_obfs_psk, parse_pin, ClientConfig, MldsaSource, PinMode, PinSource,
+    parse_obfs_psk, parse_pin, ClientConfig, MldsaSource, PinMode, PinSource, SplitMode, SplitTunnel,
 };
 pub use citadel_quic::client::{establish_session, run_data_plane, Session};
 pub use citadel_quic::diag::{run_diagnostics, DiagStep};

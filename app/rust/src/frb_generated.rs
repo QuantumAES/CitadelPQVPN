@@ -38,7 +38,7 @@ flutter_rust_bridge::frb_generated_boilerplate!(
     default_rust_auto_opaque = RustAutoOpaqueMoi,
 );
 pub(crate) const FLUTTER_RUST_BRIDGE_CODEGEN_VERSION: &str = "2.12.0";
-pub(crate) const FLUTTER_RUST_BRIDGE_CODEGEN_CONTENT_HASH: i32 = 1435467483;
+pub(crate) const FLUTTER_RUST_BRIDGE_CODEGEN_CONTENT_HASH: i32 = 1608831684;
 
 // Section: executor
 
@@ -863,6 +863,67 @@ fn wire__crate__api__diag__set_log_file_impl(
         },
     )
 }
+fn wire__crate__api__citadel__set_split_config_impl(
+    ptr_: flutter_rust_bridge::for_generated::PlatformGeneralizedUint8ListPtr,
+    rust_vec_len_: i32,
+    data_len_: i32,
+) -> flutter_rust_bridge::for_generated::WireSyncRust2DartSse {
+    FLUTTER_RUST_BRIDGE_HANDLER.wrap_sync::<flutter_rust_bridge::for_generated::SseCodec, _>(
+        flutter_rust_bridge::for_generated::TaskInfo {
+            debug_name: "set_split_config",
+            port: None,
+            mode: flutter_rust_bridge::for_generated::FfiCallMode::Sync,
+        },
+        move || {
+            let message = unsafe {
+                flutter_rust_bridge::for_generated::Dart2RustMessageSse::from_wire(
+                    ptr_,
+                    rust_vec_len_,
+                    data_len_,
+                )
+            };
+            let mut deserializer =
+                flutter_rust_bridge::for_generated::SseDeserializer::new(message);
+            let api_cfg = <crate::api::citadel::SplitTunnelDto>::sse_decode(&mut deserializer);
+            deserializer.end();
+            transform_result_sse::<_, ()>((move || {
+                let output_ok = Result::<_, ()>::Ok({
+                    crate::api::citadel::set_split_config(api_cfg);
+                })?;
+                Ok(output_ok)
+            })())
+        },
+    )
+}
+fn wire__crate__api__citadel__split_config_impl(
+    ptr_: flutter_rust_bridge::for_generated::PlatformGeneralizedUint8ListPtr,
+    rust_vec_len_: i32,
+    data_len_: i32,
+) -> flutter_rust_bridge::for_generated::WireSyncRust2DartSse {
+    FLUTTER_RUST_BRIDGE_HANDLER.wrap_sync::<flutter_rust_bridge::for_generated::SseCodec, _>(
+        flutter_rust_bridge::for_generated::TaskInfo {
+            debug_name: "split_config",
+            port: None,
+            mode: flutter_rust_bridge::for_generated::FfiCallMode::Sync,
+        },
+        move || {
+            let message = unsafe {
+                flutter_rust_bridge::for_generated::Dart2RustMessageSse::from_wire(
+                    ptr_,
+                    rust_vec_len_,
+                    data_len_,
+                )
+            };
+            let mut deserializer =
+                flutter_rust_bridge::for_generated::SseDeserializer::new(message);
+            deserializer.end();
+            transform_result_sse::<_, ()>((move || {
+                let output_ok = Result::<_, ()>::Ok(crate::api::citadel::split_config())?;
+                Ok(output_ok)
+            })())
+        },
+    )
+}
 fn wire__crate__api__diag__start_log_capture_impl(
     ptr_: flutter_rust_bridge::for_generated::PlatformGeneralizedUint8ListPtr,
     rust_vec_len_: i32,
@@ -1519,6 +1580,22 @@ impl SseDecode for crate::api::citadel::QrDto {
     }
 }
 
+impl SseDecode for crate::api::citadel::SplitTunnelDto {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    fn sse_decode(deserializer: &mut flutter_rust_bridge::for_generated::SseDeserializer) -> Self {
+        let mut var_appMode = <String>::sse_decode(deserializer);
+        let mut var_apps = <Vec<String>>::sse_decode(deserializer);
+        let mut var_destMode = <String>::sse_decode(deserializer);
+        let mut var_dests = <Vec<String>>::sse_decode(deserializer);
+        return crate::api::citadel::SplitTunnelDto {
+            app_mode: var_appMode,
+            apps: var_apps,
+            dest_mode: var_destMode,
+            dests: var_dests,
+        };
+    }
+}
+
 impl SseDecode for crate::api::admin::SubscriberDto {
     // Codec=Sse (Serialization based), see doc to use other codecs
     fn sse_decode(deserializer: &mut flutter_rust_bridge::for_generated::SseDeserializer) -> Self {
@@ -1620,13 +1697,13 @@ fn pde_ffi_dispatcher_primary_impl(
             data_len,
         ),
         20 => wire__crate__api__citadel__run_diagnostics_impl(port, ptr, rust_vec_len, data_len),
-        27 => {
+        29 => {
             wire__crate__api__citadel__vault_change_password_impl(port, ptr, rust_vec_len, data_len)
         }
-        28 => wire__crate__api__citadel__vault_create_impl(port, ptr, rust_vec_len, data_len),
-        34 => wire__crate__api__citadel__vault_unlock_impl(port, ptr, rust_vec_len, data_len),
-        35 => wire__crate__api__citadel__vpn_connect_impl(port, ptr, rust_vec_len, data_len),
-        36 => {
+        30 => wire__crate__api__citadel__vault_create_impl(port, ptr, rust_vec_len, data_len),
+        36 => wire__crate__api__citadel__vault_unlock_impl(port, ptr, rust_vec_len, data_len),
+        37 => wire__crate__api__citadel__vpn_connect_impl(port, ptr, rust_vec_len, data_len),
+        38 => {
             wire__crate__api__citadel__vpn_connect_profile_impl(port, ptr, rust_vec_len, data_len)
         }
         _ => unreachable!(),
@@ -1655,14 +1732,16 @@ fn pde_ffi_dispatcher_sync_impl(
         22 => wire__crate__api__citadel__set_debug_enabled_impl(ptr, rust_vec_len, data_len),
         23 => wire__crate__api__citadel__set_killswitch_impl(ptr, rust_vec_len, data_len),
         24 => wire__crate__api__diag__set_log_file_impl(ptr, rust_vec_len, data_len),
-        25 => wire__crate__api__diag__start_log_capture_impl(ptr, rust_vec_len, data_len),
-        26 => wire__crate__api__citadel__vault_add_impl(ptr, rust_vec_len, data_len),
-        29 => wire__crate__api__citadel__vault_exists_impl(ptr, rust_vec_len, data_len),
-        30 => wire__crate__api__citadel__vault_is_unlocked_impl(ptr, rust_vec_len, data_len),
-        31 => wire__crate__api__citadel__vault_list_impl(ptr, rust_vec_len, data_len),
-        32 => wire__crate__api__citadel__vault_lock_impl(ptr, rust_vec_len, data_len),
-        33 => wire__crate__api__citadel__vault_remove_impl(ptr, rust_vec_len, data_len),
-        37 => wire__crate__api__citadel__vpn_disconnect_impl(ptr, rust_vec_len, data_len),
+        25 => wire__crate__api__citadel__set_split_config_impl(ptr, rust_vec_len, data_len),
+        26 => wire__crate__api__citadel__split_config_impl(ptr, rust_vec_len, data_len),
+        27 => wire__crate__api__diag__start_log_capture_impl(ptr, rust_vec_len, data_len),
+        28 => wire__crate__api__citadel__vault_add_impl(ptr, rust_vec_len, data_len),
+        31 => wire__crate__api__citadel__vault_exists_impl(ptr, rust_vec_len, data_len),
+        32 => wire__crate__api__citadel__vault_is_unlocked_impl(ptr, rust_vec_len, data_len),
+        33 => wire__crate__api__citadel__vault_list_impl(ptr, rust_vec_len, data_len),
+        34 => wire__crate__api__citadel__vault_lock_impl(ptr, rust_vec_len, data_len),
+        35 => wire__crate__api__citadel__vault_remove_impl(ptr, rust_vec_len, data_len),
+        39 => wire__crate__api__citadel__vpn_disconnect_impl(ptr, rust_vec_len, data_len),
         _ => unreachable!(),
     }
 }
@@ -1803,6 +1882,29 @@ impl flutter_rust_bridge::IntoDart for crate::api::citadel::QrDto {
 impl flutter_rust_bridge::for_generated::IntoDartExceptPrimitive for crate::api::citadel::QrDto {}
 impl flutter_rust_bridge::IntoIntoDart<crate::api::citadel::QrDto> for crate::api::citadel::QrDto {
     fn into_into_dart(self) -> crate::api::citadel::QrDto {
+        self
+    }
+}
+// Codec=Dco (DartCObject based), see doc to use other codecs
+impl flutter_rust_bridge::IntoDart for crate::api::citadel::SplitTunnelDto {
+    fn into_dart(self) -> flutter_rust_bridge::for_generated::DartAbi {
+        [
+            self.app_mode.into_into_dart().into_dart(),
+            self.apps.into_into_dart().into_dart(),
+            self.dest_mode.into_into_dart().into_dart(),
+            self.dests.into_into_dart().into_dart(),
+        ]
+        .into_dart()
+    }
+}
+impl flutter_rust_bridge::for_generated::IntoDartExceptPrimitive
+    for crate::api::citadel::SplitTunnelDto
+{
+}
+impl flutter_rust_bridge::IntoIntoDart<crate::api::citadel::SplitTunnelDto>
+    for crate::api::citadel::SplitTunnelDto
+{
+    fn into_into_dart(self) -> crate::api::citadel::SplitTunnelDto {
         self
     }
 }
@@ -2020,6 +2122,16 @@ impl SseEncode for crate::api::citadel::QrDto {
     fn sse_encode(self, serializer: &mut flutter_rust_bridge::for_generated::SseSerializer) {
         <u32>::sse_encode(self.size, serializer);
         <Vec<u8>>::sse_encode(self.cells, serializer);
+    }
+}
+
+impl SseEncode for crate::api::citadel::SplitTunnelDto {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    fn sse_encode(self, serializer: &mut flutter_rust_bridge::for_generated::SseSerializer) {
+        <String>::sse_encode(self.app_mode, serializer);
+        <Vec<String>>::sse_encode(self.apps, serializer);
+        <String>::sse_encode(self.dest_mode, serializer);
+        <Vec<String>>::sse_encode(self.dests, serializer);
     }
 }
 

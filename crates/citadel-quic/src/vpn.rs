@@ -16,7 +16,7 @@ use tokio::sync::{broadcast, Notify};
 use citadel_tun::TunIo;
 
 use crate::client::{establish_session, run_data_plane};
-use crate::config::ClientConfig;
+use crate::config::{is_cidr, ClientConfig, SplitMode};
 
 /// Стартовый интервал backoff между попытками восстановления соединения.
 const RECONNECT_BACKOFF_START: Duration = Duration::from_secs(1);
@@ -64,6 +64,57 @@ pub struct TunParams {
     /// C6/M9 kill-switch: провайдер (Linux `citadel-helper`) ставит fail-closed firewall —
     /// не-туннельный трафик блокируется, пока туннель активен; переживает краш движка.
     pub killswitch: bool,
+    /// C8.3 split-tunneling по приложениям (Android): режим + package-имена. Desktop игнорирует.
+    pub app_mode: SplitMode,
+    pub apps: Vec<String>,
+    /// C8.3 split-tunneling по назначениям (Android): режим + УЖЕ РЕЗОЛВНУТЫЕ в CIDR назначения
+    /// (домены раскрыты в `resolve_dests` до конфигурации TUN). Desktop игнорирует.
+    pub dest_mode: SplitMode,
+    pub dest_routes: Vec<String>,
+}
+
+/// C8.3: раскрыть записи назначений split-tunnel (`domain` | `IP` | `IP/prefix`) в список
+/// **IPv4-CIDR** для маршрутов туннеля. CIDR/голый IP — напрямую (IP→`/32`); домен — резолв A-записей
+/// → `/32` на каждый адрес. IPv6-назначения в MVP пропускаются (Android-маршруты v4; v6 — future).
+/// Битые/нерезолвнутые записи молча отбрасываются. Зовётся на каждый establish (реконнект
+/// перерезолвит — подхватит смену IP у CDN). Дубликаты схлопываются.
+pub async fn resolve_dests(dests: &[String]) -> Vec<String> {
+    use std::net::IpAddr;
+    let mut out: Vec<String> = Vec::new();
+    let push = |c: String, out: &mut Vec<String>| {
+        if !out.contains(&c) {
+            out.push(c);
+        }
+    };
+    for raw in dests {
+        let d = raw.trim();
+        if d.is_empty() {
+            continue;
+        }
+        if d.contains('/') {
+            // CIDR (только IPv4)
+            if is_cidr(d) {
+                if let Some((ip, _)) = d.split_once('/') {
+                    if ip.parse::<IpAddr>().map(|a| a.is_ipv4()).unwrap_or(false) {
+                        push(d.to_string(), &mut out);
+                    }
+                }
+            }
+        } else if let Ok(a) = d.parse::<IpAddr>() {
+            // голый IP
+            if a.is_ipv4() {
+                push(format!("{d}/32"), &mut out);
+            }
+        } else if let Ok(addrs) = tokio::net::lookup_host((d, 0u16)).await {
+            // домен → A-записи
+            for a in addrs {
+                if let IpAddr::V4(v4) = a.ip() {
+                    push(format!("{v4}/32"), &mut out);
+                }
+            }
+        }
+    }
+    out
 }
 
 /// Платформенный провайдер туннеля: по назначенному адресу строит/конфигурирует TUN и
@@ -234,6 +285,16 @@ impl VpnController {
                 }
             }
 
+            // C8.3: раскрыть домены назначений в CIDR (на каждый establish — реконнект перерезолвит).
+            // Пустой результат Include/Exclude → трактуем как Off (не строим туннель, который ничего
+            // не маршрутизирует / нечего исключать).
+            let dest_routes = if cfg.split.dest_mode != SplitMode::Off {
+                resolve_dests(&cfg.split.dests).await
+            } else {
+                Vec::new()
+            };
+            let dest_mode = if dest_routes.is_empty() { SplitMode::Off } else { cfg.split.dest_mode };
+
             // Конфигурируем туннель ПОД назначенный адрес (на Android — VpnService.Builder).
             // На реконнекте адрес может смениться — TUN пере-конфигурируется под новый; polkit с
             // auth_admin_keep не переспрашивает пароль в пределах сессии.
@@ -245,6 +306,10 @@ impl VpnController {
                 dns: cfg.dns.clone(),
                 exit_ips: exit_ips.into_iter().collect(),
                 killswitch: cfg.killswitch,
+                app_mode: cfg.split.app_mode,
+                apps: cfg.split.apps.clone(),
+                dest_mode,
+                dest_routes,
             };
             let tun = match provider.configure(&params) {
                 Ok(t) => t,
@@ -370,6 +435,22 @@ pub fn clamp_tun_mtu(cfg_mtu: &str, budget: Option<usize>) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// C8.3: резолв назначений — CIDR как есть, голый IP → /32, дубликаты схлопываются, IPv6 и
+    /// мусор отбрасываются. Домены не тестируем (нужна сеть) — только детерминированные входы.
+    #[tokio::test]
+    async fn resolve_dests_cidr_ip_dedup_and_skips() {
+        let got = resolve_dests(&[
+            "192.168.0.0/16".into(), // CIDR — как есть
+            "10.0.0.5".into(),       // голый IP → /32
+            "10.0.0.5".into(),       // дубликат → схлопнуть
+            "1.2.3.4/33".into(),     // битый префикс → скип
+            "fd00::1/64".into(),     // IPv6 CIDR → скип (MVP IPv4)
+            "::1".into(),            // IPv6 IP → скип
+        ])
+        .await;
+        assert_eq!(got, vec!["192.168.0.0/16".to_string(), "10.0.0.5/32".to_string()]);
+    }
 
     #[tokio::test]
     async fn state_transitions_and_events() {

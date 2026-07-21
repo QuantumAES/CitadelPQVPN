@@ -47,6 +47,9 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   bool dco_decode_bool(dynamic raw);
 
   @protected
+  SplitTunnelDto dco_decode_box_autoadd_split_tunnel_dto(dynamic raw);
+
+  @protected
   DiagLineDto dco_decode_diag_line_dto(dynamic raw);
 
   @protected
@@ -78,6 +81,9 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
 
   @protected
   QrDto dco_decode_qr_dto(dynamic raw);
+
+  @protected
+  SplitTunnelDto dco_decode_split_tunnel_dto(dynamic raw);
 
   @protected
   SubscriberDto dco_decode_subscriber_dto(dynamic raw);
@@ -122,6 +128,11 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   bool sse_decode_bool(SseDeserializer deserializer);
 
   @protected
+  SplitTunnelDto sse_decode_box_autoadd_split_tunnel_dto(
+    SseDeserializer deserializer,
+  );
+
+  @protected
   DiagLineDto sse_decode_diag_line_dto(SseDeserializer deserializer);
 
   @protected
@@ -155,6 +166,9 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
 
   @protected
   QrDto sse_decode_qr_dto(SseDeserializer deserializer);
+
+  @protected
+  SplitTunnelDto sse_decode_split_tunnel_dto(SseDeserializer deserializer);
 
   @protected
   SubscriberDto sse_decode_subscriber_dto(SseDeserializer deserializer);
@@ -211,6 +225,12 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   void sse_encode_bool(bool self, SseSerializer serializer);
 
   @protected
+  void sse_encode_box_autoadd_split_tunnel_dto(
+    SplitTunnelDto self,
+    SseSerializer serializer,
+  );
+
+  @protected
   void sse_encode_diag_line_dto(DiagLineDto self, SseSerializer serializer);
 
   @protected
@@ -254,6 +274,12 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
 
   @protected
   void sse_encode_qr_dto(QrDto self, SseSerializer serializer);
+
+  @protected
+  void sse_encode_split_tunnel_dto(
+    SplitTunnelDto self,
+    SseSerializer serializer,
+  );
 
   @protected
   void sse_encode_subscriber_dto(SubscriberDto self, SseSerializer serializer);

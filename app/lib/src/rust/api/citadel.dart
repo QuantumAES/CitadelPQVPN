@@ -6,9 +6,9 @@
 import '../frb_generated.dart';
 import 'package:flutter_rust_bridge/flutter_rust_bridge_for_generated.dart';
 
-// These functions are ignored because they are not marked as `pub`: `android_start`, `debug_flag_file`, `idle`, `killswitch_file`, `link_from`, `profile_to_dto`, `profile_uri`, `rt`, `spawn_controller`, `start_connect`, `state_dto`, `to_dto`, `update_android_status`, `update_last_exit`, `vault_path`, `vpn_state_str`, `with_vault`
+// These functions are ignored because they are not marked as `pub`: `android_start`, `debug_flag_file`, `dto_to_split`, `idle`, `killswitch_file`, `link_from`, `load_split_config`, `off`, `parse_split`, `profile_to_dto`, `profile_uri`, `rt`, `serialize_split`, `spawn_controller`, `split_file`, `start_connect`, `state_dto`, `to_dto`, `update_android_status`, `update_last_exit`, `vault_path`, `vpn_state_str`, `with_vault`
 // These types are ignored because they are neither used by any `pub` functions nor (for structs and enums) marked `#[frb(unignore)]`: `AndroidStatus`, `AndroidTunProvider`
-// These function are ignored because they are on traits that is not defined in current crate (put an empty `#[frb]` on it to unignore): `configure`
+// These function are ignored because they are on traits that is not defined in current crate (put an empty `#[frb]` on it to unignore): `clone`, `configure`
 
 /// Версия PQ-VPN-ядра (about-экран).
 String coreVersion() => RustLib.instance.api.crateApiCitadelCoreVersion();
@@ -32,6 +32,14 @@ void setDebugEnabled({required bool on_}) =>
 /// с полем `AppState.debugEnabled`.
 bool debugEnabledPersisted() =>
     RustLib.instance.api.crateApiCitadelDebugEnabledPersisted();
+
+/// Сохранить split-настройку (GUI). Применяется со СЛЕДУЮЩЕГО подключения; переживает рестарт.
+void setSplitConfig({required SplitTunnelDto cfg}) =>
+    RustLib.instance.api.crateApiCitadelSetSplitConfig(cfg: cfg);
+
+/// Прочитать сохранённую split-настройку (инициализация GUI). Файла нет → всё "off".
+SplitTunnelDto splitConfig() =>
+    RustLib.instance.api.crateApiCitadelSplitConfig();
 
 /// Задать каталог данных приложения (вызывается из Dart на старте, до любых vault-операций).
 /// На Android — `getApplicationSupportDirectory()`; на десктопе можно не вызывать. Идемпотентно:
@@ -311,6 +319,35 @@ class QrDto {
           runtimeType == other.runtimeType &&
           size == other.size &&
           cells == other.cells;
+}
+
+/// Плоское DTO split-настройки для FFI. `*_mode` = "off"|"include"|"exclude".
+class SplitTunnelDto {
+  final String appMode;
+  final List<String> apps;
+  final String destMode;
+  final List<String> dests;
+
+  const SplitTunnelDto({
+    required this.appMode,
+    required this.apps,
+    required this.destMode,
+    required this.dests,
+  });
+
+  @override
+  int get hashCode =>
+      appMode.hashCode ^ apps.hashCode ^ destMode.hashCode ^ dests.hashCode;
+
+  @override
+  bool operator ==(Object other) =>
+      identical(this, other) ||
+      other is SplitTunnelDto &&
+          runtimeType == other.runtimeType &&
+          appMode == other.appMode &&
+          apps == other.apps &&
+          destMode == other.destMode &&
+          dests == other.dests;
 }
 
 /// Событие VPN-сессии для UI. `kind`: `state` | `connected` | `error`.

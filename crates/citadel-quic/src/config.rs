@@ -47,6 +47,58 @@ pub enum MldsaExpect {
     Commit([u8; 32]),
 }
 
+/// C8.3 split-tunneling: как применяется список (приложений или назначений).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum SplitMode {
+    /// Правило выключено — весь трафик по обычным маршрутам.
+    #[default]
+    Off,
+    /// Только перечисленные — через туннель (остальное в обход).
+    Include,
+    /// Перечисленные — в обход туннеля (остальное через туннель).
+    Exclude,
+}
+
+impl SplitMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            SplitMode::Off => "off",
+            SplitMode::Include => "include",
+            SplitMode::Exclude => "exclude",
+        }
+    }
+    pub fn parse(s: &str) -> SplitMode {
+        match s.trim() {
+            "include" => SplitMode::Include,
+            "exclude" => SplitMode::Exclude,
+            _ => SplitMode::Off,
+        }
+    }
+}
+
+/// C8.3 split-tunneling (Android): две независимые оси — по приложениям (package-имена) и по
+/// назначениям (домен/IP/CIDR, в т.ч. локальная подсеть). Клиентская настройка (не из ссылки).
+#[derive(Clone, Debug, Default)]
+pub struct SplitTunnel {
+    /// Режим фильтра приложений.
+    pub app_mode: SplitMode,
+    /// Package-имена приложений (Android).
+    pub apps: Vec<String>,
+    /// Режим фильтра назначений.
+    pub dest_mode: SplitMode,
+    /// Записи назначений как их ввёл пользователь: `domain` | `IP` | `IP/prefix` (CIDR).
+    /// Домены резолвятся в CIDR перед конфигурацией туннеля (см. `vpn::resolve_dests`).
+    pub dests: Vec<String>,
+}
+
+impl SplitTunnel {
+    /// Есть ли что применять (иначе TUN строится как обычно).
+    pub fn is_active(&self) -> bool {
+        (self.app_mode != SplitMode::Off && !self.apps.is_empty())
+            || (self.dest_mode != SplitMode::Off && !self.dests.is_empty())
+    }
+}
+
 /// Конфигурация клиента: всё, что нужно движку для подключения к exit'ам.
 #[derive(Clone)]
 pub struct ClientConfig {
@@ -78,6 +130,9 @@ pub struct ClientConfig {
     /// C6/M9 kill-switch: блокировать не-туннельный трафик, пока туннель активен (fail-closed при
     /// краше движка). Клиентская настройка (не из ссылки); env `Citadel_KILLSWITCH=1` / GUI-тумблер.
     pub killswitch: bool,
+    /// C8.3 split-tunneling (Android): фильтр по приложениям и/или назначениям. Клиентская настройка
+    /// (не из ссылки); дефолт `Off`. Desktop-провайдер поле игнорирует (Linux split — позже).
+    pub split: SplitTunnel,
 }
 
 impl Drop for ClientConfig {
@@ -219,6 +274,7 @@ impl ClientConfig {
             killswitch: std::env::var("Citadel_KILLSWITCH")
                 .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
                 .unwrap_or(false),
+            split: Default::default(), // C8.3 split-tunnel — только клиентское GUI (Android), не env
         })
     }
 
@@ -274,6 +330,23 @@ mod tests {
     use super::*;
 
     #[test]
+    fn split_mode_roundtrip_and_active() {
+        for m in [SplitMode::Off, SplitMode::Include, SplitMode::Exclude] {
+            assert_eq!(SplitMode::parse(m.as_str()), m);
+        }
+        assert_eq!(SplitMode::parse("garbage"), SplitMode::Off); // неизвестное → Off (fail-safe)
+        // is_active: активна, только если режим не Off И список непуст
+        let mut s = SplitTunnel::default();
+        assert!(!s.is_active());
+        s.app_mode = SplitMode::Include; // режим есть, список пуст → не активна
+        assert!(!s.is_active());
+        s.apps = vec!["com.example.app".into()];
+        assert!(s.is_active());
+        let d = SplitTunnel { dest_mode: SplitMode::Exclude, dests: vec!["192.168.0.0/16".into()], ..Default::default() };
+        assert!(d.is_active());
+    }
+
+    #[test]
     fn parse_pin_cases() {
         let p = [0xABu8; 32];
         assert_eq!(parse_pin(&hex::encode(p)), Some(p));
@@ -310,6 +383,7 @@ mod tests {
             mldsa: MldsaSource::None,
             allow_insecure_no_pin: false,
             killswitch: false,
+            split: Default::default(),
         };
         assert!(matches!(mk(PinSource::None).pin_for("h"), PinMode::NoPin));
         let p = [3u8; 32];
@@ -334,6 +408,7 @@ mod tests {
             mldsa: MldsaSource::Bytes(vec![1, 2, 3]),
             allow_insecure_no_pin: false,
             killswitch: false,
+            split: Default::default(),
         };
         assert_eq!(cfg.mldsa_for("any"), Some(vec![1, 2, 3]));
     }
