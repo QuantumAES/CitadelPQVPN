@@ -66,11 +66,11 @@ impl ObfsTcpSocket {
             }
         });
 
-        // writer: канал отправки → TCP-record'ы. Случайный per-session `sid`; старт `packet_id`
-        // со случайного u64 (S0.3 дешёвый M2-митигейт: снижает шанс (key,nonce)-коллизии при
-        // совпадении sid под общим PSK, без слома wire-формата obfs).
+        // writer: канал отправки → TCP-record'ы. Случайный per-session `sid` (16 байт, obfs v2 —
+        // 128-битная per-session соль в k_sess, закрывает body-AEAD nonce-reuse под общим PSK);
+        // старт `packet_id` со случайного u64 (доп. запас).
         let (send_tx, mut send_rx) = mpsc::channel::<Vec<u8>>(SEND_CAP);
-        let mut sid = [0u8; 8];
+        let mut sid = [0u8; citadel_obfs::SID_LEN];
         rand::thread_rng().fill_bytes(&mut sid);
         let mut pid: u64 = rand::random();
         tokio::spawn(async move {

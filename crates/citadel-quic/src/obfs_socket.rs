@@ -133,16 +133,15 @@ impl ObfsUdpSocket {
     fn new(std_sock: std::net::UdpSocket, psk: [u8; 32], pacing: Pacing) -> io::Result<Self> {
         std_sock.set_nonblocking(true)?;
         let inner = tokio::net::UdpSocket::from_std(std_sock)?;
-        let mut sid = [0u8; 8];
+        let mut sid = [0u8; citadel_obfs::SID_LEN];
         rand::thread_rng().fill_bytes(&mut sid);
         Ok(Self {
             inner: ArcSwap::from_pointee(inner),
             sealer: citadel_obfs::Sealer::new(&psk, &sid),
             opener: Mutex::new(citadel_obfs::Opener::new(&psk)),
-            // S2/A8: старт packet_id со случайного u64 (как в obfs_tcp) — снижает шанс (key,nonce)-
-            // коллизии body-AEAD при совпадении 8-байтного sid под общим PSK (birthday ~2^32).
-            // Wire-формат не меняется (packet_id и так на проводе). Полный фикс (per-session соль/
-            // больше sid) остаётся отдельной wire-ломающей задачей.
+            // M2-full (obfs v2): 16-байтный случайный sid — 128-битная per-session соль в k_sess
+            // → per-session ключ уникален (коллизия 2^-128), body-AEAD nonce-reuse под общим PSK
+            // закрыт by-construction. Старт packet_id со случайного u64 сохраняем (доп. запас).
             send_ctr: AtomicU64::new(rand::random()),
             padding: citadel_obfs::Padding::Bucket(citadel_obfs::DEFAULT_BUCKETS),
             pacing,

@@ -22,7 +22,7 @@ const MAX_RECORD: usize = 8192;
 pub async fn write_record<W: AsyncWriteExt + Unpin>(
     w: &mut W,
     psk: &[u8; 32],
-    sid: &[u8; 8],
+    sid: &[u8; citadel_obfs::SID_LEN],
     pid: u64,
     payload: &[u8],
 ) -> io::Result<()> {
@@ -60,7 +60,7 @@ mod tests {
     fn psk() -> [u8; 32] {
         [0x42; 32]
     }
-    const SID: [u8; 8] = [1, 2, 3, 4, 5, 6, 7, 8];
+    const SID: [u8; citadel_obfs::SID_LEN] = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16];
 
     #[tokio::test]
     async fn record_roundtrip() {

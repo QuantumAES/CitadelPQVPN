@@ -1,14 +1,21 @@
-//! CitadelPQVPN — obfs L1 (Фаза 0), протокол v1.
+//! CitadelPQVPN — obfs L1 (Фаза 0), протокол **v2**.
 //!
 //! Симметричная, на pre-shared key, обёртка датаграмм QUIC в стиле Shadowsocks-2022.
 //! Нормативный формат, KDF и тест-векторы — в `docs/PHASE0-OBFS.md`.
 //!
 //! Это L1: обфускация + probe-resistance, НЕ замена реальной конфиденциальности L2.
 //!
+//! **v2 (M2-full, слом wire относительно v1):** `sid` расширен 8→16 байт и служит
+//! 128-битной **per-session солью** в `k_sess`. Это закрывает nonce-reuse тела AEAD
+//! под общим PSK: раньше при коллизии 64-битного `sid` (birthday ~2³²) два сеанса
+//! делили один `k_sess` → пересечение `packet_id` = повтор (ключ, nonce) ChaCha20Poly1305.
+//! 16-байтный случайный `sid` даёт коллизию 2⁻¹²⁸ → per-session ключ уникален.
+//! KDF-контексты подняты `v1`→`v2` (старое/новое взаимно нерасшифровываемы).
+//!
 //! Формат пакета:
 //! ```text
-//! nonce_pkt(12) ‖ enc_header(16) ‖ aead_body(var)
-//!   enc_header = (sid(8) ‖ packet_id(8 BE)) XOR ChaCha20(K_hdr, nonce_pkt)[0:16]
+//! nonce_pkt(12) ‖ enc_header(24) ‖ aead_body(var)
+//!   enc_header = (sid(16) ‖ packet_id(8 BE)) XOR ChaCha20(K_hdr, nonce_pkt)[0:24]
 //!   aead_body  = ChaCha20Poly1305(K_sess(sid), body_nonce, AAD=nonce_pkt‖enc_header)(inner)
 //! ```
 #![forbid(unsafe_code)]
@@ -18,9 +25,12 @@ use chacha20::ChaCha20;
 use chacha20poly1305::aead::{Aead, Payload};
 use chacha20poly1305::{ChaCha20Poly1305, KeyInit, Nonce};
 
-// --- доменно-разделённые контексты KDF (фиксированы протоколом) ---
-pub const CTX_HDR: &str = "CitadelPQVPN/obfs/v1/header";
-pub const CTX_SESSION: &str = "CitadelPQVPN/obfs/v1/session";
+// --- доменно-разделённые контексты KDF (фиксированы протоколом, v2) ---
+pub const CTX_HDR: &str = "CitadelPQVPN/obfs/v2/header";
+pub const CTX_SESSION: &str = "CitadelPQVPN/obfs/v2/session";
+
+/// Длина session_id (v2): 128-битная per-session соль для `k_sess`. Был 8 (v1).
+pub const SID_LEN: usize = 16;
 
 // --- типы пакетов ---
 pub const TYPE_INIT_C: u8 = 0x01; // первый пакет клиента (несёт timestamp)
@@ -28,8 +38,11 @@ pub const TYPE_INIT_S: u8 = 0x02; // первый пакет сервера (tim
 pub const TYPE_DATA: u8 = 0x03; // последующие пакеты
 pub const TYPE_PAD: u8 = 0x04; // chaff/dummy (тайминг-шейпинг): приёмник отбрасывает до QUIC
 
-pub const HDR_LEN: usize = 12 + 16; // nonce_pkt + enc_header
+pub const HDR_LEN: usize = 12 + SID_LEN + 8; // nonce_pkt(12) + enc_header(sid16 ‖ pid8 = 24) = 36
 pub const TAG_LEN: usize = 16;
+
+// Длина открытого текста заголовка (sid ‖ packet_id) = длина enc_header и keystream.
+const HDR_PT_LEN: usize = SID_LEN + 8; // 24
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum ObfsError {
@@ -39,7 +52,7 @@ pub enum ObfsError {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Opened {
-    pub sid: [u8; 8],
+    pub sid: [u8; SID_LEN],
     pub packet_id: u64,
     pub inner: Vec<u8>,
 }
@@ -49,17 +62,17 @@ pub fn k_hdr(psk_obf: &[u8; 32]) -> [u8; 32] {
     blake3::derive_key(CTX_HDR, psk_obf)
 }
 
-pub fn k_sess(psk_obf: &[u8; 32], sid: &[u8; 8]) -> [u8; 32] {
-    let mut km = [0u8; 40];
+pub fn k_sess(psk_obf: &[u8; 32], sid: &[u8; SID_LEN]) -> [u8; 32] {
+    let mut km = [0u8; 32 + SID_LEN];
     km[..32].copy_from_slice(psk_obf);
     km[32..].copy_from_slice(sid);
     blake3::derive_key(CTX_SESSION, &km)
 }
 
-// 16-байтовый keystream ChaCha20 (counter=0) для шифрования заголовка
-fn ks_hdr(k_hdr: &[u8; 32], nonce_pkt: &[u8]) -> [u8; 16] {
+// keystream ChaCha20 (counter=0) для шифрования заголовка (HDR_PT_LEN=24 байта)
+fn ks_hdr(k_hdr: &[u8; 32], nonce_pkt: &[u8]) -> [u8; HDR_PT_LEN] {
     let mut c = ChaCha20::new_from_slices(k_hdr, nonce_pkt).expect("len 32/12");
-    let mut buf = [0u8; 16];
+    let mut buf = [0u8; HDR_PT_LEN];
     c.apply_keystream(&mut buf);
     buf
 }
@@ -74,7 +87,7 @@ fn body_nonce(packet_id: u64) -> [u8; 12] {
 pub fn build_inner(
     ptype: u8,
     timestamp: Option<u64>,
-    echo_csid: Option<&[u8; 8]>,
+    echo_csid: Option<&[u8; SID_LEN]>,
     padding: &[u8],
     quic_payload: &[u8],
 ) -> Vec<u8> {
@@ -100,8 +113,8 @@ pub fn build_chaff(padding: &[u8]) -> Vec<u8> {
 }
 
 /// Полный фрейминг-оверхед DATA-пакета на проводе:
-/// nonce_pkt(12) + enc_header(16) + type(1) + pad_len(2) + tag(16) = 47.
-pub const FRAMING_OVERHEAD: usize = 12 + 16 + 1 + 2 + 16;
+/// nonce_pkt(12) + enc_header(24) + type(1) + pad_len(2) + tag(16) = 55 (v2; было 47 в v1).
+pub const FRAMING_OVERHEAD: usize = 12 + HDR_PT_LEN + 1 + 2 + 16;
 
 /// Бакеты размеров пакета НА ПРОВОДЕ по умолчанию (анти-fingerprint по длине, I5).
 pub const DEFAULT_BUCKETS: &[usize] = &[256, 512, 1024, 1280];
@@ -138,7 +151,7 @@ pub fn parse_inner(inner: &[u8]) -> Option<(u8, &[u8])> {
         pos = pos.checked_add(8)?; // timestamp
     }
     if t == TYPE_INIT_S {
-        pos = pos.checked_add(8)?; // echo_csid
+        pos = pos.checked_add(SID_LEN)?; // echo_csid (16 в v2)
     }
     let pad_len = u16::from_be_bytes([*inner.get(pos)?, *inner.get(pos + 1)?]) as usize;
     pos = pos.checked_add(2)?.checked_add(pad_len)?;
@@ -154,26 +167,26 @@ pub fn parse_inner(inner: &[u8]) -> Option<(u8, &[u8])> {
 /// Один `sid` (наш). Hot-path в `ObfsUdpSocket`.
 pub struct Sealer {
     k_hdr: [u8; 32],
-    sid: [u8; 8],
+    sid: [u8; SID_LEN],
     cipher: ChaCha20Poly1305,
 }
 
 impl Sealer {
-    pub fn new(psk_obf: &[u8; 32], sid: &[u8; 8]) -> Self {
+    pub fn new(psk_obf: &[u8; 32], sid: &[u8; SID_LEN]) -> Self {
         let cipher = ChaCha20Poly1305::new_from_slice(&k_sess(psk_obf, sid)).expect("len 32");
         Self { k_hdr: k_hdr(psk_obf), sid: *sid, cipher }
     }
 
     pub fn seal(&self, packet_id: u64, nonce_pkt: &[u8; 12], inner: &[u8]) -> Vec<u8> {
         let ks = ks_hdr(&self.k_hdr, nonce_pkt);
-        let mut hdr_pt = [0u8; 16];
-        hdr_pt[..8].copy_from_slice(&self.sid);
-        hdr_pt[8..].copy_from_slice(&packet_id.to_be_bytes());
-        let mut enc_header = [0u8; 16];
-        for i in 0..16 {
+        let mut hdr_pt = [0u8; HDR_PT_LEN];
+        hdr_pt[..SID_LEN].copy_from_slice(&self.sid);
+        hdr_pt[SID_LEN..].copy_from_slice(&packet_id.to_be_bytes());
+        let mut enc_header = [0u8; HDR_PT_LEN];
+        for i in 0..HDR_PT_LEN {
             enc_header[i] = hdr_pt[i] ^ ks[i];
         }
-        let mut aad = [0u8; 28];
+        let mut aad = [0u8; 12 + HDR_PT_LEN];
         aad[..12].copy_from_slice(nonce_pkt);
         aad[12..].copy_from_slice(&enc_header);
         let ct = self
@@ -193,7 +206,7 @@ impl Sealer {
 pub struct Opener {
     psk: [u8; 32],
     k_hdr: [u8; 32],
-    cache: Option<([u8; 8], ChaCha20Poly1305)>,
+    cache: Option<([u8; SID_LEN], ChaCha20Poly1305)>,
 }
 
 impl Opener {
@@ -206,17 +219,17 @@ impl Opener {
             return Err(ObfsError::TooShort);
         }
         let nonce_pkt = &packet[..12];
-        let enc_header = &packet[12..28];
-        let aead_body = &packet[28..];
+        let enc_header = &packet[12..HDR_LEN];
+        let aead_body = &packet[HDR_LEN..];
 
         let ks = ks_hdr(&self.k_hdr, nonce_pkt);
-        let mut hdr_pt = [0u8; 16];
-        for i in 0..16 {
+        let mut hdr_pt = [0u8; HDR_PT_LEN];
+        for i in 0..HDR_PT_LEN {
             hdr_pt[i] = enc_header[i] ^ ks[i];
         }
-        let mut sid = [0u8; 8];
-        sid.copy_from_slice(&hdr_pt[..8]);
-        let packet_id = u64::from_be_bytes(hdr_pt[8..16].try_into().unwrap());
+        let mut sid = [0u8; SID_LEN];
+        sid.copy_from_slice(&hdr_pt[..SID_LEN]);
+        let packet_id = u64::from_be_bytes(hdr_pt[SID_LEN..HDR_PT_LEN].try_into().unwrap());
 
         // cipher по sid: переиспользуем кеш при совпадении; иначе derive k_sess и кешируем
         if !matches!(&self.cache, Some((csid, _)) if *csid == sid) {
@@ -225,7 +238,7 @@ impl Opener {
         }
         let cipher = &self.cache.as_ref().unwrap().1;
 
-        let mut aad = [0u8; 28];
+        let mut aad = [0u8; 12 + HDR_PT_LEN];
         aad[..12].copy_from_slice(nonce_pkt);
         aad[12..].copy_from_slice(enc_header);
         let inner = cipher
@@ -238,7 +251,7 @@ impl Opener {
 /// Stateless `seal` (тест-векторы / разовый вызов) — делегирует [`Sealer`]. Hot-path: держать `Sealer`.
 pub fn seal(
     psk_obf: &[u8; 32],
-    sid: &[u8; 8],
+    sid: &[u8; SID_LEN],
     packet_id: u64,
     nonce_pkt: &[u8; 12],
     inner: &[u8],
@@ -264,8 +277,13 @@ mod tests {
         }
         p
     }
-    const CSID: [u8; 8] = [0xa1, 0xa2, 0xa3, 0xa4, 0xa5, 0xa6, 0xa7, 0xa8];
-    const SSID: [u8; 8] = [0xb1, 0xb2, 0xb3, 0xb4, 0xb5, 0xb6, 0xb7, 0xb8];
+    // session_id v2 — 16 байт (см. tools/obfs_ref.py)
+    const CSID: [u8; SID_LEN] = [
+        0xa1, 0xa2, 0xa3, 0xa4, 0xa5, 0xa6, 0xa7, 0xa8, 0xa9, 0xaa, 0xab, 0xac, 0xad, 0xae, 0xaf, 0xb0,
+    ];
+    const SSID: [u8; SID_LEN] = [
+        0xb1, 0xb2, 0xb3, 0xb4, 0xb5, 0xb6, 0xb7, 0xb8, 0xb9, 0xba, 0xbb, 0xbc, 0xbd, 0xbe, 0xbf, 0xc0,
+    ];
 
     fn arr12(h: &str) -> [u8; 12] {
         hex::decode(h).unwrap().try_into().unwrap()
@@ -275,15 +293,15 @@ mod tests {
     fn kdf_matches_python_reference() {
         assert_eq!(
             hex::encode(k_hdr(&psk())),
-            "9738885e419c4ffe00280490919669ca6a0e5b30341e9e624178143113e3b626"
+            "7c18a6102af38008d307e13c375d87bc523536982b26b95405c3c13788997885"
         );
         assert_eq!(
             hex::encode(k_sess(&psk(), &CSID)),
-            "8a34bf5432d8e103b92f63c0a44b2e6e9c3b15a119d58f33febd98e16a0e9e7e"
+            "08d562d215bf14dc6296ebdc5f56a7e95c7f10fb12ba605e12635b1122efd129"
         );
         assert_eq!(
             hex::encode(k_sess(&psk(), &SSID)),
-            "592daf07bb9bc25882c51b6860309e1137973a9e39a55ff5eaf1280753443a00"
+            "bb80f8542266f71b52a24b31813e16f71cb37512396f63f701dbd2a59db4a87b"
         );
     }
 
@@ -300,8 +318,8 @@ mod tests {
         let pkt = seal(&psk(), &CSID, 0, &arr12("000102030405060708090a0b"), &inner);
         assert_eq!(
             hex::encode(&pkt),
-            "000102030405060708090a0bace0fdb7fa9e87a1c38469396d1269d1\
-             e3feb33fd51837d9a70d5269110e53e06a6602470e525cc2f74fb44eadcc8eae204e60a6"
+            "000102030405060708090a0b095fde1f42d8c31ebb03bd82332b5d0a7d37c49224c62dfc\
+             237fc535a9603560f4ee23d27c67859a0e2844a7fd22d25cc5c47d9b18fb2591072beabf"
                 .replace(' ', "")
         );
         let o = open(&psk(), &pkt).unwrap();
@@ -319,12 +337,15 @@ mod tests {
             &[],
             &hex::decode("c000000001").unwrap(),
         );
-        assert_eq!(hex::encode(&inner), "0200000000684ee181a1a2a3a4a5a6a7a80000c000000001");
+        assert_eq!(
+            hex::encode(&inner),
+            "0200000000684ee181a1a2a3a4a5a6a7a8a9aaabacadaeafb00000c000000001"
+        );
         let pkt = seal(&psk(), &SSID, 0, &arr12("101112131415161718191a1b"), &inner);
         assert_eq!(
             hex::encode(&pkt),
-            "101112131415161718191a1b86669d5a598713d88a6270cbae9f60fe\
-             d225c50c76c6691cb151c987c94ee9ad97bc31763830b1efaf1f9e71dbb30f1a8031c31cb73d3ace"
+            "101112131415161718191a1b2a28e1349daf788167ba1f313ee8c6849edf68bbab5a56e6\
+             0b1a44bc18851e9fda38c8a152ccbbe95b3766fff0bda94739a6574d2d54f184e514b9d8f54cc370103b9f94a80a2ff0"
                 .replace(' ', "")
         );
         let o = open(&psk(), &pkt).unwrap();
@@ -339,8 +360,8 @@ mod tests {
         let pkt = seal(&psk(), &CSID, 1, &arr12("202122232425262728292a2b"), &inner);
         assert_eq!(
             hex::encode(&pkt),
-            "202122232425262728292a2b48b1192cd8a464221dc88806b9cbe084\
-             0a2ca9318102feabdeb60a063d4f1e738aef2833953f"
+            "202122232425262728292a2bee3be35a8b422a5ee78fad3493fb174e1d60d7939039b304\
+             4cd451497a8ca41ed0db72ab7fc0cceafb96b2051118"
                 .replace(' ', "")
         );
         let o = open(&psk(), &pkt).unwrap();
@@ -376,7 +397,7 @@ mod tests {
         let i = build_inner(TYPE_INIT_C, Some(1_750_000_000), None, &[], &quic);
         assert_eq!(parse_inner(&i), Some((TYPE_INIT_C, &quic[..])));
         // INIT_S (timestamp + echo)
-        let i = build_inner(TYPE_INIT_S, Some(1), Some(&[1, 2, 3, 4, 5, 6, 7, 8]), &[9], &quic);
+        let i = build_inner(TYPE_INIT_S, Some(1), Some(&[1u8; SID_LEN]), &[9], &quic);
         assert_eq!(parse_inner(&i), Some((TYPE_INIT_S, &quic[..])));
     }
 
@@ -443,7 +464,8 @@ mod tests {
     #[test]
     fn pad_then_seal_lands_on_bucket_and_strips_clean() {
         let p = Padding::Bucket(DEFAULT_BUCKETS);
-        for q in [0usize, 3, 50, 209, 210, 600, 977, 1233] {
+        // верхняя граница = максимальный бакет − FRAMING_OVERHEAD (1280−55=1225 в v2)
+        for q in [0usize, 3, 50, 209, 210, 600, 977, 1225] {
             let quic: Vec<u8> = (0..q).map(|i| i as u8).collect();
             let padding = vec![0u8; pad_len_for(p, q)];
             let inner = build_inner(TYPE_DATA, None, None, &padding, &quic);
@@ -548,7 +570,7 @@ mod tests {
         let valids = [
             build_inner(TYPE_DATA, None, None, &[1, 2], b"x"),
             build_inner(TYPE_INIT_C, Some(1_700_000_000), None, &[3], b"yz"),
-            build_inner(TYPE_INIT_S, Some(1), Some(&[1, 2, 3, 4, 5, 6, 7, 8]), &[], b"q"),
+            build_inner(TYPE_INIT_S, Some(1), Some(&[1u8; SID_LEN]), &[], b"q"),
             build_chaff(&[9, 9, 9]),
         ];
         for _ in 0..30_000 {

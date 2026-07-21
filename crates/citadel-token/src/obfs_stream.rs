@@ -31,8 +31,8 @@ pub struct ObfsStream<S> {
     inner: S,
     psk: [u8; 32],
     /// sid исходящего направления (случайный на соединение; демукс не нужен — канал point-to-point,
-    /// `open` возвращает sid из record и его не сверяет).
-    send_sid: [u8; 8],
+    /// `open` возвращает sid из record и его не сверяет). 16 байт (obfs v2).
+    send_sid: [u8; citadel_obfs::SID_LEN],
     /// Счётчик packet_id исходящих record'ов (как send_ctr туннеля).
     send_pid: u64,
     /// Распакованный, ещё не отданный `read`'ом plaintext текущего record, и позиция в нём.
@@ -42,7 +42,7 @@ pub struct ObfsStream<S> {
 
 impl<S: Read + Write> ObfsStream<S> {
     pub fn new(inner: S, psk: [u8; 32]) -> Self {
-        let mut send_sid = [0u8; 8];
+        let mut send_sid = [0u8; citadel_obfs::SID_LEN];
         rand::thread_rng().fill_bytes(&mut send_sid);
         Self { inner, psk, send_sid, send_pid: 0, rx: Vec::new(), rx_pos: 0 }
     }

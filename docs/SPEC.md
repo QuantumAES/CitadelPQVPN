@@ -161,15 +161,16 @@ sequenceDiagram
 
 > **Актуальный нормативный формат, тест-векторы и KDF — в [docs/PHASE0-OBFS.md](PHASE0-OBFS.md).** Ниже — сводка; этот раздел не дублирует детали, чтобы не было двух источников правды.
 
-Каждая UDP-датаграмма = один obfs-пакет (конструкция в стиле Shadowsocks-2022, симметричная, на PSK):
+Каждая UDP-датаграмма = один obfs-пакет (конструкция в стиле Shadowsocks-2022, симметричная, на PSK; **протокол v2**):
 ```
-nonce_pkt(12, открыто) ‖ enc_header(16) ‖ aead_body(var)
-  enc_header = (sid(8) ‖ packet_id(8 BE)) XOR ChaCha20(K_hdr, nonce_pkt)[0:16]
+nonce_pkt(12, открыто) ‖ enc_header(24) ‖ aead_body(var)
+  enc_header = (sid(16) ‖ packet_id(8 BE)) XOR ChaCha20(K_hdr, nonce_pkt)[0:24]
   aead_body  = ChaCha20Poly1305(K_sess(sid), body_nonce, AAD=nonce_pkt‖enc_header)(inner)
-  inner      = type(1) ‖ [timestamp(8)|INIT] ‖ [echo_csid(8)|INIT_S] ‖ pad_len(2) ‖ pad ‖ quic_payload
+  inner      = type(1) ‖ [timestamp(8)|INIT] ‖ [echo_csid(16)|INIT_S] ‖ pad_len(2) ‖ pad ‖ quic_payload
 ```
+- **v2 (M2-full):** `sid` — 16 байт, служит 128-битной per-session солью в `K_sess` (закрывает body-AEAD nonce-reuse под общим PSK: коллизия ключа 2⁻¹²⁸). KDF-контексты `obfs/v2/*`; wire несовместим с v1.
 - Демультиплексирование — по зашифрованному `sid` (не по 4-tuple) → бесшовная миграция при смене сети.
-- Probe-resistance: невалидный тег AEAD → молчание/decoy. Накладные расходы DATA: 47 Б + padding.
+- Probe-resistance: невалидный тег AEAD → молчание/decoy. Накладные расходы DATA: 55 Б + padding (было 47 в v1).
 
 ### 5.2 QUIC (L0/L2) — стандарт
 - Long header (Initial/Handshake) и short header (1-RTT) по RFC 9000; крипто по RFC 9001; DATAGRAM по RFC 9221. **Своего не изобретаем** — берём как есть (важно для неотличимости и для переиспользования аудированной реализации).
