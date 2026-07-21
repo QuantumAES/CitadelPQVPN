@@ -256,12 +256,14 @@ class _HomePageState extends State<HomePage> {
                   _showAlwaysOnGuide();
                 },
               ),
-            // C8.3 split-tunnel — только Android (движок применяет через VpnService).
-            if (Platform.isAndroid)
+            // C8.3 split-tunnel — Android (приложения+назначения) и Linux (только назначения).
+            if (Platform.isAndroid || Platform.isLinux)
               ListTile(
                 leading: const Icon(Icons.alt_route),
                 title: const Text('Split-туннель'),
-                subtitle: const Text('По приложениям и адресам: через туннель / в обход'),
+                subtitle: Text(Platform.isAndroid
+                    ? 'По приложениям и адресам: через туннель / в обход'
+                    : 'По адресам назначения: через туннель / в обход'),
                 onTap: () {
                   Navigator.pop(sheetCtx);
                   Navigator.of(context).push(

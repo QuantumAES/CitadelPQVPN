@@ -120,37 +120,36 @@ class _SplitTunnelPageState extends State<SplitTunnelPage> {
       body: ListView(
         padding: const EdgeInsets.symmetric(vertical: 8),
         children: [
-          if (!Platform.isAndroid)
-            const Padding(
-              padding: EdgeInsets.all(16),
-              child: Text('Split-туннель применяется только на Android.'),
-            ),
-          _sectionHeader(context, Icons.apps, 'Приложения'),
-          _modeSelector(_appMode, (m) => setState(() => _appMode = m)),
-          if (_appMode != _modeOff) ...[
-            ListTile(
-              leading: const Icon(Icons.checklist),
-              title: Text('Выбрано приложений: ${_apps.length}'),
-              subtitle: const Text('Нажми, чтобы выбрать из установленных'),
-              trailing: const Icon(Icons.chevron_right),
-              onTap: _pickApps,
-            ),
-            if (_apps.isNotEmpty)
-              Padding(
-                padding: const EdgeInsets.fromLTRB(16, 0, 16, 8),
-                child: Wrap(
-                  spacing: 6,
-                  runSpacing: 6,
-                  children: _apps
-                      .map((p) => Chip(
-                            label: Text(p, overflow: TextOverflow.ellipsis),
-                            onDeleted: () => setState(() => _apps.remove(p)),
-                          ))
-                      .toList(),
-                ),
+          // Ось приложений — только Android (нативный VpnService per-app). На Linux per-app
+          // (cgroup2+fwmark) пока не реализован — показываем лишь ось назначений.
+          if (Platform.isAndroid) ...[
+            _sectionHeader(context, Icons.apps, 'Приложения'),
+            _modeSelector(_appMode, (m) => setState(() => _appMode = m)),
+            if (_appMode != _modeOff) ...[
+              ListTile(
+                leading: const Icon(Icons.checklist),
+                title: Text('Выбрано приложений: ${_apps.length}'),
+                subtitle: const Text('Нажми, чтобы выбрать из установленных'),
+                trailing: const Icon(Icons.chevron_right),
+                onTap: _pickApps,
               ),
+              if (_apps.isNotEmpty)
+                Padding(
+                  padding: const EdgeInsets.fromLTRB(16, 0, 16, 8),
+                  child: Wrap(
+                    spacing: 6,
+                    runSpacing: 6,
+                    children: _apps
+                        .map((p) => Chip(
+                              label: Text(p, overflow: TextOverflow.ellipsis),
+                              onDeleted: () => setState(() => _apps.remove(p)),
+                            ))
+                        .toList(),
+                  ),
+                ),
+            ],
+            const Divider(height: 24),
           ],
-          const Divider(height: 24),
           _sectionHeader(context, Icons.lan_outlined, 'Адреса назначения'),
           _modeSelector(_destMode, (m) => setState(() => _destMode = m)),
           if (_destMode != _modeOff) ...[

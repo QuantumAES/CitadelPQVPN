@@ -16,6 +16,7 @@ use std::time::{Duration, Instant};
 use anyhow::{anyhow, bail, Context, Result};
 use sendfd::RecvWithFd;
 
+use citadel_quic::config::SplitMode;
 use citadel_quic::vpn::{TunParams, TunProvider};
 use citadel_tun::{Tun, TunIo};
 
@@ -43,6 +44,17 @@ impl Default for GuiTunProvider {
     }
 }
 
+/// C8.3: из режима «по назначению» вычислить `(маршруты_в_туннель, CIDR_в_обход)` для helper'а.
+/// Include → в туннель только выбранные CIDR (default физический); Exclude → маршруты ссылки как
+/// есть + выбранные в обход; Off → маршруты ссылки, без обхода. Чистая функция (тестируемо).
+fn split_routes(mode: SplitMode, link_routes: &str, dest_routes: &[String]) -> (String, String) {
+    match mode {
+        SplitMode::Include => (dest_routes.join(" "), String::new()),
+        SplitMode::Exclude => (link_routes.to_string(), dest_routes.join(" ")),
+        SplitMode::Off => (link_routes.to_string(), String::new()),
+    }
+}
+
 impl TunProvider for GuiTunProvider {
     fn configure(&self, p: &TunParams) -> Result<Arc<dyn TunIo>> {
         let sock = control_socket_path();
@@ -51,6 +63,11 @@ impl TunProvider for GuiTunProvider {
         listener.set_nonblocking(true)?;
 
         let addr = format!("{}.{}.{}.{}", p.addr[0], p.addr[1], p.addr[2], p.addr[3]);
+        // C8.3 split-tunnel по назначению (ось приложений на Linux — позже):
+        //   Include → в туннель ТОЛЬКО выбранные CIDR (default остаётся физическим, без IPv6-блока);
+        //   Exclude → маршруты ссылки как есть + выбранные CIDR в обход (через физический шлюз);
+        //   Off     → как раньше (маршруты ссылки).
+        let (routes_str, bypass_str) = split_routes(p.dest_mode, &p.routes, &p.dest_routes);
         let mut cmd = Command::new("pkexec");
         cmd.arg(&self.helper_path).args([
             "--sock", &sock,
@@ -58,7 +75,7 @@ impl TunProvider for GuiTunProvider {
             "--addr", &addr,
             "--prefix", &p.prefix.to_string(),
             "--mtu", &p.mtu,
-            "--routes", &p.routes,
+            "--routes", &routes_str,
         ]);
         if let Some(dns) = &p.dns {
             cmd.args(["--dns", dns]);
@@ -66,6 +83,10 @@ impl TunProvider for GuiTunProvider {
         // bypass-маршрут: exit'ы не должны маршрутизироваться в туннель (анти-петля при full-tunnel)
         if !p.exit_ips.is_empty() {
             cmd.args(["--exit-ips", &p.exit_ips.join(" ")]);
+        }
+        // C8.3 «в обход»: выбранные CIDR назначений роутятся мимо туннеля (напр. локальная подсеть)
+        if !bypass_str.is_empty() {
+            cmd.args(["--bypass", &bypass_str]);
         }
         // C6/M9 kill-switch: армируем fail-closed firewall в хелпере (снимется только на чистый
         // disconnect через сигнал 'Q' от GuiTun::clean_shutdown).
@@ -165,6 +186,23 @@ impl TunIo for GuiTun {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn split_routes_by_dest_mode() {
+        let dests = vec!["192.168.0.0/16".to_string(), "10.0.0.5/32".to_string()];
+        // Off — маршруты ссылки как есть, обхода нет
+        assert_eq!(split_routes(SplitMode::Off, "0.0.0.0/0", &dests), ("0.0.0.0/0".into(), String::new()));
+        // Include — в туннель только назначения (default остаётся физическим)
+        assert_eq!(
+            split_routes(SplitMode::Include, "0.0.0.0/0", &dests),
+            ("192.168.0.0/16 10.0.0.5/32".into(), String::new())
+        );
+        // Exclude — маршруты ссылки + назначения в обход
+        assert_eq!(
+            split_routes(SplitMode::Exclude, "0.0.0.0/0", &dests),
+            ("0.0.0.0/0".into(), "192.168.0.0/16 10.0.0.5/32".into())
+        );
+    }
     use sendfd::SendWithFd;
     use std::io::{Read, Write};
     use std::os::fd::FromRawFd;

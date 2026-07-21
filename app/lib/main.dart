@@ -2,6 +2,7 @@ import 'dart:io' show Platform;
 
 import 'package:flutter/material.dart';
 import 'package:path_provider/path_provider.dart';
+import 'package:window_manager/window_manager.dart';
 
 import 'package:app/app_state.dart';
 import 'package:app/home_page.dart';
@@ -9,9 +10,18 @@ import 'package:app/src/rust/api/citadel.dart';
 import 'package:app/src/rust/api/diag.dart';
 import 'package:app/src/rust/frb_generated.dart';
 
+/// Desktop-платформы, где окно закрывается «красной кнопкой» (C8.2) и есть window_manager.
+bool get _isDesktop => Platform.isLinux || Platform.isWindows || Platform.isMacOS;
+
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
   await RustLib.init();
+  // C8.2: на desktop перехватываем закрытие окна — при активном туннеле спросим
+  // «оставить в фоне / отключить и выйти», а не рвать сессию молча.
+  if (_isDesktop) {
+    await windowManager.ensureInitialized();
+    await windowManager.setPreventClose(true);
+  }
   // На Android cwd=`/` (песочница не writable) и нет XDG/HOME — путь хранилища должна
   // задать платформа (приватный filesDir). На десктопе путь резолвится из XDG/HOME, и
   // трогать его нельзя: это сменило бы расположение уже существующих vault'ов.
@@ -43,18 +53,69 @@ class CitadelApp extends StatefulWidget {
   State<CitadelApp> createState() => _CitadelAppState();
 }
 
-class _CitadelAppState extends State<CitadelApp> {
+class _CitadelAppState extends State<CitadelApp> with WindowListener {
   final AppState state = AppState();
+  final GlobalKey<NavigatorState> _navKey = GlobalKey<NavigatorState>();
+
+  @override
+  void initState() {
+    super.initState();
+    if (_isDesktop) windowManager.addListener(this);
+  }
 
   @override
   void dispose() {
+    if (_isDesktop) windowManager.removeListener(this);
     state.dispose();
     super.dispose();
+  }
+
+  /// C8.2: пользователь нажал «крестик». Туннель неактивен → закрываемся сразу; активен → диалог
+  /// «Оставить в фоне» (свернуть, сессия жива) / «Отключить и выйти» (чистый disconnect → снятие KS).
+  @override
+  void onWindowClose() async {
+    if (!state.isBusy) {
+      await windowManager.destroy();
+      return;
+    }
+    final ctx = _navKey.currentContext;
+    if (ctx == null || !ctx.mounted) {
+      await windowManager.destroy();
+      return;
+    }
+    final choice = await showDialog<String>(
+      context: ctx,
+      builder: (d) => AlertDialog(
+        title: const Text('Туннель активен'),
+        content: const Text(
+          'VPN подключён. Что сделать при закрытии окна?\n\n'
+          '• Оставить в фоне — окно свернётся, соединение продолжит работать.\n'
+          '• Отключить и выйти — разорвать туннель и закрыть приложение.',
+        ),
+        actions: [
+          TextButton(onPressed: () => Navigator.pop(d, 'cancel'), child: const Text('Отмена')),
+          TextButton(onPressed: () => Navigator.pop(d, 'background'), child: const Text('Оставить в фоне')),
+          FilledButton(onPressed: () => Navigator.pop(d, 'quit'), child: const Text('Отключить и выйти')),
+        ],
+      ),
+    );
+    switch (choice) {
+      case 'background':
+        await windowManager.minimize();
+      case 'quit':
+        state.disconnect(); // vpnDisconnect → clean_shutdown ('Q' → helper снимет kill-switch)
+        // дать движку/хелперу снять сеть до выхода процесса (иначе EOF без 'Q' оставит KS)
+        await Future<void>.delayed(const Duration(milliseconds: 700));
+        await windowManager.destroy();
+      default:
+        break; // отмена — окно остаётся открытым
+    }
   }
 
   @override
   Widget build(BuildContext context) {
     return MaterialApp(
+      navigatorKey: _navKey,
       title: 'CitadelPQVPN',
       debugShowCheckedModeBanner: false,
       theme: _theme(Brightness.light),

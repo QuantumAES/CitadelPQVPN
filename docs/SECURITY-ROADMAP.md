@@ -168,7 +168,11 @@ Security-пуш на 40+ юнит + 15 docker-тестов без страхов
 - **C7 admin-plane v2:** ✅ ЗАКРЫТ (C7.1–C7.5; реестр по туннелю, GUI «Абоненты», CLI, russh удалён).
 - **Пакет фиксов 2026-07-19..20:** коллизия C7→C8 разведена; **ротация идентичности сервера при обновлении** (installer §3.5 — обновление инвалидирует все ссылки; `docker restart` не ротирует; opt-out `CITADEL_KEEP_KEYS=1`); ссылки не пишутся на диск VPS; **single-session вариант B** (issuer-lease `Citadel_TOKEN_LEASE_SECS`, мягкий, unlinkability цела); QR-скан камерой; персист режима отладки; UX-фиксы.
 
-**M2-full (задача 6) ✅ ЗАКРЫТ в коде (2026-07-21, obfs v2)** — см. §S0.3. Осталось операционно: согласованный re-release + переустановка сервера + новый клиент + раздача новых ссылок (слом wire; ротация §3.5 и так инвалидирует старые ссылки). **Трек C8 (сетевой контроль):** **C8.3 split-tunnel (Android) ✅ реализован** (2026-07-21) — две оси: по приложениям (`addAllowed/DisallowedApplication`) и по назначениям (домен/IP/CIDR, вкл. локальную подсеть; Include=через туннель / Exclude=в обход через `excludeRoute`). C8.1 (killswitch LAN-bypass) **отменён** — свёрнут в C8.3 (обход по назначению, KS не трогаем). Осталось: C8.0 хард-делит абонента (`AdminRequest::Remove`); C8.2 Linux window-close prompt; C8.3-Linux (cgroup2+fwmark). Мелочь: device-тест QR/lease + split-tunnel.
+**M2-full (задача 6) ✅ ЗАКРЫТ в коде (2026-07-21, obfs v2)** — см. §S0.3. Осталось операционно: согласованный re-release + переустановка сервера + новый клиент + раздача новых ссылок (слом wire; ротация §3.5 и так инвалидирует старые ссылки). **Трек C8 (сетевой контроль), статус 2026-07-21:**
+- **C8.3 split-tunnel ✅**: Android — обе оси (приложения `addAllowed/DisallowedApplication` + назначения домен/IP/CIDR через `addRoute`/`excludeRoute`); **Linux — ось назначений** (helper `--bypass` + `gui_tun::split_routes`; Include→в туннель только их, Exclude→в обход через физ.шлюз). Ось приложений на Linux — отложена (решение пользователя: «пока только по назначению»; план — cgroup2+fwmark+launcher).
+- **C8.2 ✅** Linux window-close prompt (`window_manager`, «Оставить в фоне»=minimize / «Отключить и выйти»=clean disconnect).
+- **C8.1 отменён** (свёрнут в C8.3 — KS не трогаем).
+- Осталось: **C8.0** хард-делит абонента (`AdminRequest::Remove`); Linux per-app; Win/macOS split. Мелочь: device-тест QR/lease + split-tunnel (Android) / desktop-тест C8.2/C8.3-Linux.
 
 **Верификация на сегодня:** 147 юнит-тестов + `clippy --workspace --all-targets` + `flutter analyze` чисто; docker-харнес 21/21.
 

@@ -37,6 +37,9 @@ struct Args {
     dns: Option<String>,
     /// IP exit'ов (через пробел) для bypass-маршрута — исключить из туннеля (анти-петля).
     exit_ips: String,
+    /// C8.3 split-tunnel «в обход»: CIDR назначений (через пробел), которые роутятся мимо туннеля
+    /// (через физический шлюз) — напр. локальная подсеть/домен/IP. Пусто, если exclude не задан.
+    bypass: String,
 }
 
 fn parse_args() -> Result<Args> {
@@ -92,6 +95,13 @@ fn parse_args() -> Result<Args> {
             bail!("--exit-ips: невалидный IP {e:?}");
         }
     }
+    // C8.3: обход по назначению — валидируем как CIDR (та же граница привилегий, что --routes).
+    let bypass = get("--bypass").unwrap_or_default();
+    for b in bypass.split_whitespace() {
+        if !is_cidr(b) {
+            bail!("--bypass: невалидный CIDR {b:?}");
+        }
+    }
     Ok(Args {
         sock: get("--sock").context("нужен --sock <path>")?,
         tun,
@@ -100,6 +110,7 @@ fn parse_args() -> Result<Args> {
         routes,
         dns,
         exit_ips,
+        bypass,
     })
 }
 
@@ -267,17 +278,28 @@ fn main() -> Result<()> {
     // exit должен идти физическим шлюзом, а не в citadel0 — иначе при full-tunnel (0.0.0.0/0)
     // пакеты к exit заворачиваются в туннель (петля) и egress встаёт. Захватываем шлюз ДО того,
     // как routes подменят default. Только IPv4 (деплой v4); IPv6-exit пропускаем.
+    // bypass-список хранит УЖЕ ГОТОВЫЕ CIDR-строки (для teardown). Нужен физический шлюз, если есть
+    // exit'ы (анти-петля) ИЛИ назначения «в обход» (C8.3). Захватываем default ДО подмены routes.
     let mut bypass: Vec<String> = Vec::new();
-    if args.exit_ips.split_whitespace().next().is_some() {
+    let need_gw = args.exit_ips.split_whitespace().next().is_some()
+        || args.bypass.split_whitespace().next().is_some();
+    if need_gw {
         match default_route() {
             Some((gw, dev)) => {
+                // exit-IP (IPv4) → host-route /32 мимо туннеля
                 for eip in args.exit_ips.split_whitespace().filter(|e| !e.contains(':')) {
-                    ip(&["route", "replace", &format!("{eip}/32"), "via", &gw, "dev", &dev]);
-                    bypass.push(eip.to_string());
+                    let cidr = format!("{eip}/32");
+                    ip(&["route", "replace", &cidr, "via", &gw, "dev", &dev]);
+                    bypass.push(cidr);
                 }
-                eprintln!("[helper] bypass exit'ов {:?} via {gw} dev {dev}", bypass);
+                // C8.3 «в обход»: CIDR назначений (IPv4) мимо туннеля через физический шлюз
+                for b in args.bypass.split_whitespace().filter(|b| !b.contains(':')) {
+                    ip(&["route", "replace", b, "via", &gw, "dev", &dev]);
+                    bypass.push(b.to_string());
+                }
+                eprintln!("[helper] bypass via {gw} dev {dev}: {:?}", bypass);
             }
-            None => eprintln!("[helper] WARN: нет default-route — bypass к exit не добавлен (риск петли)"),
+            None => eprintln!("[helper] WARN: нет default-route — bypass не добавлен (риск петли/утечки)"),
         }
     }
 
@@ -335,8 +357,8 @@ fn main() -> Result<()> {
     if args.dns.is_some() {
         teardown_dns(&ifn);
     }
-    for eip in &bypass {
-        ip(&["route", "del", &format!("{eip}/32")]);
+    for cidr in &bypass {
+        ip(&["route", "del", cidr]);
     }
     if killswitch {
         if clean {

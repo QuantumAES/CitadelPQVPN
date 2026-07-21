@@ -295,7 +295,7 @@ CitadelPQVPN/
 | **C5** ✅ | **Идентичность и доступ**: двухслойная (epoch-ключи в `citadel-token` + issuer client-registry + Ed25519-auth), `TokenAgent` авто-рефреш; **«выдать/отозвать»** — по туннелю (admin-plane, ниже) | C4 |
 | **C6** ✅ (частично) | **Упаковка/секреты**: kill-switch (Linux firewall + Android always-on) ✅; vault (AES-256-GCM) ✅; APK ✅; `SecretStore` keychain / msix/dmg / нотаризация macOS — остаток | C2–C5 |
 | **C7** ✅ | **Admin-plane v2** — управление абонентами по туннелю: PQ-TLS admin-канал к issuer из-под туннеля, роли ссылок (мастер/клиент), GUI «Абоненты», CLI `citadel-token admin`. Заменил SSH-путь C5.5 (§8/§10). *Единая нумерация с `SECURITY-ROADMAP` §C7* | C5 |
-| **C8** | **Сетевой контроль User-mode** *(бывш. «C7» здесь)*. C8.3 split-tunnel (Android) ✅ реализован; C8.1 отменён (свёрнут в C8.3); C8.0/C8.2 — план. См. §14.1 | C3 |
+| **C8** | **Сетевой контроль User-mode** *(бывш. «C7» здесь)*. C8.3 split-tunnel: Android (прил.+назнач.) ✅, Linux (назнач.) ✅; C8.2 window-close prompt (Linux) ✅; C8.1 отменён (свёрнут в C8.3); C8.0 + Linux per-app — план. См. §14.1 | C3 |
 
 ---
 
@@ -313,12 +313,13 @@ CitadelPQVPN/
 ### C8.1 — ~~Killswitch-исключения для локальной подсети~~ ОТМЕНЁН (2026-07-21, решение пользователя)
 Kill-switch решено **не трогать** (он остаётся строгим fail-closed). Доступ к локальной сети/отдельным адресам обеспечивается через **C8.3 (обход туннеля по назначению)** — пользователь добавляет локальную подсеть (или домен/IP) в список «в обход», и её трафик просто не заходит в туннель. Это чище: не ослабляем KS, а маршрутизируем мимо.
 
-### C8.2 — Linux: при закрытии окна спросить «фон / разорвать»
-**Цель:** закрытие окна (X) при живом туннеле не рвёт его молча — диалог «Оставить в фоне» / «Отключить и выйти».
-- Flutter desktop: `window_manager` (`setPreventClose(true)` → `onWindowClose`) + `tray_manager`/`system_tray` (иконка трея обязательна — иначе туннель незаметно живёт в фоне).
-  - «В фоне» → `windowManager.hide()`, трей-меню «Показать / Отключить и выйти», процесс+туннель живы.
-  - «Отключить и выйти» → `vpnDisconnect()` (clean_shutdown снимает KS) → `windowManager.destroy()`.
-- Опция «запомнить выбор» (не спрашивать). Только desktop (`Platform.isLinux/Windows/macOS`); Android не затронут (S3 уже держит сессию через сервис). DevSecOps-нюанс: фон без трея запрещён; при SIGKILL процесса в фоне KS держится helper'ом (persist на краш, как сейчас).
+### C8.2 — Linux: при закрытии окна спросить «фон / разорвать» ✅ реализован (2026-07-21)
+Закрытие окна (X) при живом туннеле больше не рвёт его молча — диалог «Оставить в фоне» / «Отключить и выйти».
+- `window_manager ^0.4.3`: `main()` на desktop → `ensureInitialized`+`setPreventClose(true)`; `_CitadelAppState with WindowListener`, `onWindowClose` через `navigatorKey`-контекст.
+  - Туннель неактивен (`!state.isBusy`) → `windowManager.destroy()` сразу.
+  - «Оставить в фоне» → `windowManager.minimize()` (окно в трее задач, сессия+реконнект живы; процесс жив).
+  - «Отключить и выйти» → `state.disconnect()` (`vpnDisconnect`→clean_shutdown, 'Q'→helper снимает KS) + пауза 700 мс на teardown → `windowManager.destroy()`.
+- Только desktop (`_isDesktop = Linux|Windows|macOS`); Android не затронут (S3 держит сессию через сервис). NB: при SIGKILL процесса в фоне KS остаётся (helper fail-closed на EOF без 'Q'). **Фон = свернуть** (не hide): без системного трея скрытое окно нечем вернуть; трей-иконка — future-улучшение. Гейт: `flutter analyze` 0 + `flutter build linux`.
 
 ### C8.3 — Split-tunneling (Android ✅ реализован 2026-07-21; Linux/Win/macOS — позже)
 **Две независимые оси** (компонуются — Android разрешает фильтр приложений И набор маршрутов одновременно):
@@ -330,7 +331,9 @@ Kill-switch решено **не трогать** (он остаётся стро
 - FFI: `SplitTunnelDto` + `set_split_config`/`split_config`, персист текстовым файлом `split` рядом с vault (как kill-switch), накат в `spawn_controller`.
 - JNI→Kotlin `establishTun(...appMode,apps,destMode,destRoutes)`: приложения — `addAllowedApplication`(Include)/`addDisallowedApplication`(Exclude), несуществующий пакет ловится пер-пакет; назначения — Include → `addRoute` только их (не full, без IPv6-blackhole), Exclude → full-tunnel + `excludeRoute` (Android 13+/API33; ниже — лог, назначение остаётся в туннеле).
 - UI: `split_tunnel_page.dart` (две секции с `SegmentedButton`, app-picker из `MainActivity.listInstalledApps` через `<queries>` LAUNCHER, редактор назначений + «Добавить локальную подсеть» из `NetworkInterface`). Гейт: `cargo ndk check aarch64` + `flutter analyze` + unit-тесты + `flutter build apk`. **Device-тест за пользователем.**
-- **Linux (позже):** нативного per-app VPN нет. План — **cgroup v2 + fwmark + policy routing** (выбранные процессы в cgroup, `nftables … meta cgroup` метит fwmark, `ip rule fwmark → таблица туннеля`/`main`); либо `-m owner --uid-owner` / netns. По назначениям на Linux — обычные split-маршруты в helper. **Windows/macOS:** WFP по AppID / NE `NEAppProxyProvider` — отдельный трек.
+- **Linux — ось назначений ✅ реализована (2026-07-21):** `gui_tun::split_routes(dest_mode, link_routes, dest_routes)` → helper. Include → `--routes <dest_routes>` (в туннель только они, default физический, без IPv6-блока); Exclude → `--routes <link>` + новый `--bypass <dest_routes>` (helper `ip route replace <cidr> via <phys-gw>`, тем же путём, что exit-IP bypass; teardown на выходе); Off → как раньше. `resolve_dests` (ядро) раскрывает домены→CIDR. Тест `split_routes_by_dest_mode`. UI: секция «Адреса назначения» показывается и на Linux (секция «Приложения» — только Android).
+- **Linux — ось приложений (per-app): отложена** (решение пользователя 2026-07-21 — «пока только по назначению»). План при возврате: **cgroup v2 + fwmark + policy routing** через launcher-обёртку `citadel-run <app>` (PID→cgroup, `iptables -t mangle -m cgroup … MARK`, `ip rule fwmark → bypass/tunnel table`) — как `mullvad-exclude`.
+- **Windows/macOS:** WFP по AppID / NE `NEAppProxyProvider` — отдельный трек.
 - Red-team: split — поверхность деанона (выбранное «в обход» светит реальный IP); домены у CDN с меняющимися IP могут «протекать» между реконнектами. UI-предупреждение добавлено.
 
 ---
