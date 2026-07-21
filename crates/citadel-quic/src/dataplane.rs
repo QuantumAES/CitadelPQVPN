@@ -7,8 +7,9 @@
 //! это и есть граница, через которую ОС отдаёт туннель в движок (Linux
 //! `/dev/net/tun`, Android `VpnService` fd, …). См. docs/CLIENT-ARCH.md §3–4.
 
+use std::collections::HashMap;
 use std::net::SocketAddr;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use anyhow::Result;
@@ -204,10 +205,14 @@ pub async fn pump(
     egress: Option<[u8; 4]>,
     rate_limit: Option<RateCfg>,
     admin_dst: Option<([u8; 4], u16)>,
+    // Источник return-пакетов (TUN→сеть). На КЛИЕНТЕ — `None`: pump сам читает свой TUN. На EXIT —
+    // `Some(rx)` из [`ExitTunRouter`]: единый reader общего exit-TUN демультиплексирует пакеты по
+    // inner-dst нужному клиенту. Без этого N pump'ов на общем TUN воровали бы друг у друга return-
+    // трафик (гонка multi-client → потеря/медленно/watchdog-шторм при >1 клиента).
+    return_rx: Option<tokio::sync::mpsc::Receiver<Vec<u8>>>,
 ) -> Result<()> {
     use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
     use tokio::sync::mpsc;
-    let (tun_to_net_tx, mut tun_to_net_rx) = mpsc::channel::<Vec<u8>>(1024);
     let (net_to_tun_tx, mut net_to_tun_rx) = mpsc::channel::<Vec<u8>>(1024);
 
     // Watchdog-счётчики датаграмм: tx — успешно отправленных в транспорт, rx — принятых из него.
@@ -222,12 +227,19 @@ pub async fn pump(
     // закрывается (утечка реконнекта на клиенте + гонка multi-client на exit).
     let stop = Arc::new(AtomicBool::new(false));
 
-    // TUN → сеть: прерываемое чтение (poll fd + stop) в отдельном потоке.
-    {
-        let tun = tun.clone();
-        let stop = stop.clone();
-        std::thread::spawn(move || tun_reader_loop(tun, stop, tun_to_net_tx));
-    }
+    // TUN → сеть: КЛИЕНТ читает свой TUN сам (свой reader-поток); EXIT берёт return-пакеты из
+    // демукса (return_rx), т.к. общий exit-TUN обслуживает всех клиентов — читать его должен ОДИН
+    // reader (ExitTunRouter), иначе несколько pump'ов воруют пакеты друг у друга (multi-client гонка).
+    let mut tun_to_net_rx = match return_rx {
+        Some(rx) => rx,
+        None => {
+            let (tun_to_net_tx, rx) = mpsc::channel::<Vec<u8>>(1024);
+            let tun = tun.clone();
+            let stop = stop.clone();
+            std::thread::spawn(move || tun_reader_loop(tun, stop, tun_to_net_tx));
+            rx
+        }
+    };
     // сеть → TUN
     {
         let tun = tun.clone();
@@ -338,8 +350,76 @@ pub async fn pump(
             watchdog.abort_handle(),
         ],
     };
-    let _ = tokio::try_join!(sender, receiver);
+    // pump живёт, пока жив ТРАНСПОРТ: ждём завершения receiver (закрытие conn watchdog'ом/peer'ом
+    // или отмену). sender и watchdog оборвёт CancelGuard при выходе (drop _guard). Важно НЕ ждать
+    // sender: на EXIT он читает return_rx из демукса, а tx там держится до unregister (ПОСЛЕ pump) —
+    // при закрытии транспорта его некому закрыть, try_join завис бы и pump не снял бы регистрацию.
+    let _ = receiver.await;
     Ok(())
+}
+
+/// EXIT: демультиплексор общего TUN. На сервере один TUN обслуживает ВСЕХ клиентов; читать его
+/// должен ОДИН reader, иначе несколько pump'ов (по одному на клиента) наперегонки забирают пакеты
+/// из общего fd и шлют их СВОЕМУ клиенту независимо от настоящего dst → return-трафик уходит не
+/// туда (при >1 клиента: потеря, низкая скорость, ложные срабатывания data-path watchdog →
+/// реконнект-шторм). Здесь единый reader парсит inner-dst IPv4 и кладёт пакет в канал ИМЕННО того
+/// клиента (кому адрес назначен). Клиент регистрирует свой адрес на время сессии.
+/// Таблица маршрутов демукса: назначенный клиенту адрес → канал его return-пакетов.
+type ClientRoutes = Arc<Mutex<HashMap<[u8; 4], tokio::sync::mpsc::Sender<Vec<u8>>>>>;
+
+#[derive(Clone)]
+pub struct ExitTunRouter {
+    routes: ClientRoutes,
+}
+
+impl ExitTunRouter {
+    /// Создать роутер над общим exit-TUN и запустить единый reader-поток демукса.
+    pub fn new(tun: Arc<dyn TunIo>) -> Self {
+        let routes: ClientRoutes = Arc::new(Mutex::new(HashMap::new()));
+        let r = routes.clone();
+        std::thread::spawn(move || exit_tun_demux_loop(tun, r));
+        Self { routes }
+    }
+
+    /// Зарегистрировать клиента (его назначенный адрес) → получить приёмник его return-пакетов
+    /// для передачи в [`pump`] (аргумент `return_rx`). Повторная регистрация адреса вытесняет старую.
+    pub fn register(&self, addr: [u8; 4]) -> tokio::sync::mpsc::Receiver<Vec<u8>> {
+        let (tx, rx) = tokio::sync::mpsc::channel::<Vec<u8>>(1024);
+        self.routes.lock().unwrap().insert(addr, tx);
+        rx
+    }
+
+    /// Снять регистрацию клиента (сессия завершилась) — пакеты на его адрес больше не маршрутизируем.
+    pub fn unregister(&self, addr: [u8; 4]) {
+        self.routes.lock().unwrap().remove(&addr);
+    }
+}
+
+/// Единый reader общего exit-TUN: читает return-пакет, парсит inner-dst IPv4 и кладёт его в канал
+/// зарегистрированного клиента с этим адресом. `try_send` (не blocking): переполненный канал одного
+/// (медленного) клиента НЕ должен стопорить весь демукс → его пакет дропается (как потеря UDP,
+/// транспорт ретрансмитит). Нет маршрута (клиент отключился) / не-IPv4 → дроп.
+fn exit_tun_demux_loop(tun: Arc<dyn TunIo>, routes: ClientRoutes) {
+    let mut buf = vec![0u8; 65536];
+    loop {
+        match tun.recv(&mut buf) {
+            Ok(n) if n > 0 => {
+                route_packet(&routes, &buf[..n]);
+            }
+            Ok(_) => {}
+            Err(ref e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(_) => break, // fd закрыт (exit завершается)
+        }
+    }
+}
+
+/// Маршрутный шаг демукса: по inner-dst IPv4 выбрать канал клиента и попытаться доставить (`try_send`
+/// — не блокируем весь демукс на медленном клиенте). `false`, если пакет не-IPv4, нет маршрута
+/// (клиент отключился) или канал полон/закрыт. Вынесено для юнит-теста.
+fn route_packet(routes: &ClientRoutes, pkt: &[u8]) -> bool {
+    let Some(v) = ip::parse_ipv4(pkt) else { return false };
+    let Some(tx) = routes.lock().unwrap().get(&v.dst).cloned() else { return false };
+    tx.try_send(pkt.to_vec()).is_ok()
 }
 
 /// Reader-петля TUN→сеть: прерываемое блокирующее чтение. На Unix — `poll` с коротким
@@ -425,6 +505,33 @@ mod tests {
         let mut seg = vec![0u8; 20];
         seg[2..4].copy_from_slice(&dport.to_be_bytes()); // dst-порт
         ip::build_ipv4(6, src, dst, &seg)
+    }
+
+    /// EXIT-демукс: return-пакет уходит ИМЕННО клиенту с этим dst, а не «первому попавшемуся»
+    /// pump'у (корень multi-client бага). Разные dst → разные каналы; неизвестный dst / не-IPv4 → дроп.
+    #[test]
+    fn exit_demux_routes_by_inner_dst() {
+        let a = [10, 7, 0, 109];
+        let b = [10, 7, 0, 110];
+        let routes: ClientRoutes = Arc::new(Mutex::new(HashMap::new()));
+        let (tx_a, mut rx_a) = tokio::sync::mpsc::channel::<Vec<u8>>(8);
+        let (tx_b, mut rx_b) = tokio::sync::mpsc::channel::<Vec<u8>>(8);
+        routes.lock().unwrap().insert(a, tx_a);
+        routes.lock().unwrap().insert(b, tx_b);
+
+        let pkt_to_a = ipv4([1, 1, 1, 1], a); // return-трафик клиенту A
+        let pkt_to_b = ipv4([8, 8, 8, 8], b);
+        let pkt_to_c = ipv4([1, 1, 1, 1], [10, 7, 0, 200]); // никто не зарегистрирован
+        assert!(route_packet(&routes, &pkt_to_a));
+        assert!(route_packet(&routes, &pkt_to_b));
+        assert!(!route_packet(&routes, &pkt_to_c)); // нет маршрута → дроп
+        assert!(!route_packet(&routes, &[0x60, 0, 0, 0])); // не-IPv4 → дроп
+
+        // A получил ТОЛЬКО свой пакет (не B), и наоборот — трафик не перепутан
+        assert_eq!(rx_a.try_recv().unwrap(), pkt_to_a);
+        assert!(rx_a.try_recv().is_err());
+        assert_eq!(rx_b.try_recv().unwrap(), pkt_to_b);
+        assert!(rx_b.try_recv().is_err());
     }
 
     /// S0.2/H3: exit-режим (`Some(assigned)`) — пропускает только src==назначенный на публичный

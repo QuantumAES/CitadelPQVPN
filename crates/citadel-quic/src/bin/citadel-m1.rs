@@ -24,7 +24,7 @@ use rand::RngCore;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
 use citadel_masque::capsule;
 use citadel_quic::config::{parse_pin, ClientConfig, PinMode};
-use citadel_quic::dataplane::{pump, Tunnel};
+use citadel_quic::dataplane::{pump, ExitTunRouter, Tunnel};
 use citadel_quic::ratelimit::RateCfg;
 use citadel_quic::vpn::VpnController;
 use citadel_tun::Tun;
@@ -422,6 +422,11 @@ fn persistent_mldsa_seed(dir: &str) -> Result<[u8; citadel_quic::pqauth::MLDSA_S
 async fn run_server(tun: Arc<Tun>) -> Result<()> {
     server_setup_net(tun.name());
 
+    // Демукс общего exit-TUN: единый reader маршрутизирует return-пакеты нужному клиенту по inner-dst.
+    // Без него несколько клиентских pump'ов на ОДНОМ TUN воруют пакеты друг у друга (multi-client
+    // гонка → потеря/медленно/watchdog-шторм при >1 клиента). Создаётся один раз на весь exit.
+    let router = ExitTunRouter::new(tun.clone() as Arc<dyn citadel_tun::TunIo>);
+
     let listen: std::net::SocketAddr = std::env::var("Citadel_LISTEN")
         .unwrap_or_else(|_| "0.0.0.0:4433".into())
         .parse()?;
@@ -518,6 +523,7 @@ async fn run_server(tun: Arc<Tun>) -> Result<()> {
         let issuer_auth = issuer_auth.clone();
         let spent = spent.clone();
         let signer = signer.clone();
+        let router = router.clone();
         // S2.5/A5: каждый accept'нутый TCP-стрим аллоцирует quinn-Endpoint + задачи ДО обфс/PQ-auth;
         // флуд «молчаливыми» коннектами (ничего не шлют) копил бы их безлимитно (DoS-исчерпание
         // fd/памяти). Ограничиваем число ОДНОВРЕМЕННЫХ pre-auth хендшейков семафором (нет слота →
@@ -546,12 +552,13 @@ async fn run_server(tun: Arc<Tun>) -> Result<()> {
                                 continue;
                             }
                         };
-                        let (tun, issuer_auth, spent, signer, scfg) = (
+                        let (tun, issuer_auth, spent, signer, scfg, router) = (
                             tun.clone(),
                             issuer_auth.clone(),
                             spent.clone(),
                             signer.clone(),
                             tcp_server_cfg.clone(),
+                            router.clone(),
                         );
                         tokio::spawn(async move {
                             let ep = match citadel_quic::server_endpoint_obfs_tcp(stream, scfg, psk) {
@@ -584,7 +591,7 @@ async fn run_server(tun: Arc<Tun>) -> Result<()> {
                             // established-сессия лимит одновременных хендшейков больше не держит.
                             drop(permit);
                             let (addr, prefix) = next_client_addr();
-                            handle_client(Tunnel::new(conn, true), tun, addr, prefix, issuer_auth, spent, rate_limit, admin_dst, signer, pin).await;
+                            handle_client(Tunnel::new(conn, true), tun, addr, prefix, issuer_auth, spent, rate_limit, admin_dst, signer, pin, router).await;
                             // ep жив до конца handle_client (в scope) → соединение не рвётся
                         });
                     }
@@ -603,11 +610,12 @@ async fn run_server(tun: Arc<Tun>) -> Result<()> {
         let issuer_auth = issuer_auth.clone();
         let spent = spent.clone();
         let signer = signer.clone();
+        let router = router.clone();
         tokio::spawn(async move {
             match incoming.await {
                 Ok(conn) => {
                     let (addr, prefix) = next_client_addr();
-                    handle_client(Tunnel::new(conn, false), tun, addr, prefix, issuer_auth, spent, rate_limit, admin_dst, signer, pin).await;
+                    handle_client(Tunnel::new(conn, false), tun, addr, prefix, issuer_auth, spent, rate_limit, admin_dst, signer, pin, router).await;
                 }
                 Err(e) => eprintln!("[citadel-m1:server] хендшейк не удался: {e}"),
             }
@@ -629,6 +637,7 @@ async fn handle_client(
     admin_dst: Option<([u8; 4], u16)>,
     signer: Arc<Option<citadel_quic::pqauth::ServerSigner>>,
     cert_pin: [u8; 32],
+    router: ExitTunRouter,
 ) {
     eprintln!("[citadel-m1:server] клиент {} ({}) подключён", tunnel.peer(), tunnel.kind());
     if let Err(e) =
@@ -639,7 +648,12 @@ async fn handle_client(
         return;
     }
     eprintln!("[citadel-m1:server] выдан {}.{}.{}.{}/{}", addr[0], addr[1], addr[2], addr[3], prefix);
-    if let Err(e) = pump(tunnel, tun, Some(addr), rate_limit, admin_dst).await {
+    // Регистрируем адрес в демуксе на время сессии → return-пакеты пойдут ИМЕННО этому клиенту
+    // (не «украдёт» соседний pump). Снимаем регистрацию по завершении pump (в т.ч. при разрыве).
+    let return_rx = router.register(addr);
+    let res = pump(tunnel, tun, Some(addr), rate_limit, admin_dst, Some(return_rx)).await;
+    router.unregister(addr);
+    if let Err(e) = res {
         eprintln!("[citadel-m1:server] pump завершён: {e}");
     }
 }

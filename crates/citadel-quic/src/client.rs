@@ -223,7 +223,8 @@ pub async fn establish_session(cfg: &ClientConfig) -> Result<Session> {
 /// (rate-limit F7 — забота exit). Поглощает `session` (транспорт уходит в `pump`).
 pub async fn run_data_plane(session: Session, tun: Arc<dyn TunIo>) -> Result<()> {
     // клиент: egress-фильтр/rate-limit/admin-VIP выключены (это политика exit-стороны).
-    pump(session.tunnel, tun, None, None, None).await
+    // return_rx=None — у клиента один TUN и одно соединение, читает свой TUN сам (демукс — только exit).
+    pump(session.tunnel, tun, None, None, None, None).await
 }
 
 /// Подключиться к ОДНОМУ exit'у: основной путь PQ-QUIC, при недоступности — obfs-over-TCP
