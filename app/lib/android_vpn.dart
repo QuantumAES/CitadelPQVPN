@@ -25,6 +25,10 @@ class AndroidVpn {
   /// Android kill-switch, C6). Приложение не может форсить его само.
   static Future<void> openVpnSettings() => _ch.invokeMethod('openVpnSettings');
 
+  /// C8.5: включить/снять FLAG_SECURE (запрет скриншотов/записи экрана). `true` — запрещено.
+  static Future<void> setSecureFlag(bool on) =>
+      _ch.invokeMethod('setSecureFlag', {'on': on});
+
   /// C8.3: список запускаемых приложений для split-tunnel picker'а. Каждый элемент — `(package, label)`.
   static Future<List<({String package, String label})>> listInstalledApps() async {
     final raw = await _ch.invokeMethod<List<dynamic>>('listInstalledApps') ?? const [];

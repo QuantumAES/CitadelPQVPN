@@ -6,7 +6,7 @@
 import '../frb_generated.dart';
 import 'package:flutter_rust_bridge/flutter_rust_bridge_for_generated.dart';
 
-// These functions are ignored because they are not marked as `pub`: `android_start`, `debug_flag_file`, `dto_to_split`, `idle`, `killswitch_file`, `link_from`, `load_split_config`, `off`, `parse_split`, `profile_to_dto`, `profile_uri`, `rt`, `serialize_split`, `spawn_controller`, `split_file`, `start_connect`, `state_dto`, `to_dto`, `update_android_status`, `update_last_exit`, `vault_path`, `vpn_state_str`, `with_vault`
+// These functions are ignored because they are not marked as `pub`: `android_start`, `debug_flag_file`, `dto_to_split`, `idle`, `killswitch_file`, `link_from`, `load_split_config`, `off`, `parse_split`, `profile_to_dto`, `profile_uri`, `rt`, `screenshot_block_file`, `serialize_split`, `spawn_controller`, `split_file`, `start_connect`, `state_dto`, `to_dto`, `update_android_status`, `update_last_exit`, `vault_path`, `vpn_state_str`, `with_vault`
 // These types are ignored because they are neither used by any `pub` functions nor (for structs and enums) marked `#[frb(unignore)]`: `AndroidStatus`, `AndroidTunProvider`
 // These function are ignored because they are on traits that is not defined in current crate (put an empty `#[frb]` on it to unignore): `clone`, `configure`
 
@@ -32,6 +32,15 @@ void setDebugEnabled({required bool on_}) =>
 /// с полем `AppState.debugEnabled`.
 bool debugEnabledPersisted() =>
     RustLib.instance.api.crateApiCitadelDebugEnabledPersisted();
+
+/// Сохранить настройку запрета скриншотов (GUI-тумблер) — переживает рестарт.
+void setScreenshotBlock({required bool on_}) =>
+    RustLib.instance.api.crateApiCitadelSetScreenshotBlock(on_: on_);
+
+/// Сохранённое состояние запрета скриншотов (инициализация тумблера/применения). Ленивая подгрузка;
+/// файла нет → **дефолт true** (запрет включён). Только "0" в файле выключает.
+bool screenshotBlockEnabled() =>
+    RustLib.instance.api.crateApiCitadelScreenshotBlockEnabled();
 
 /// Сохранить split-настройку (GUI). Применяется со СЛЕДУЮЩЕГО подключения; переживает рестарт.
 void setSplitConfig({required SplitTunnelDto cfg}) =>

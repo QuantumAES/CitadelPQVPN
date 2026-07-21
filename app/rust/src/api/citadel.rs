@@ -206,6 +206,44 @@ pub fn debug_enabled_persisted() -> bool {
     DEBUG_ENABLED.load(Relaxed)
 }
 
+// ─────────────────────────── C8.5 запрет скриншотов (Android FLAG_SECURE) ───────────────────────────
+// Блокировка скриншотов/записи экрана/каста и чёрный кадр в «Недавних». Персист рядом с vault (как
+// debug); **дефолт ВКЛЮЧЁН** (файла нет → true). Применяет флаг платформа (Android FLAG_SECURE через
+// MethodChannel); ядро только хранит настройку. На desktop не enforce'ится (тумблер гейтится Android).
+
+static SCREENSHOT_BLOCK: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+static SCREENSHOT_LOADED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+fn screenshot_block_file() -> PathBuf {
+    vault_path().with_file_name("screenshot_block")
+}
+
+/// Сохранить настройку запрета скриншотов (GUI-тумблер) — переживает рестарт.
+#[frb(sync)]
+pub fn set_screenshot_block(on: bool) {
+    use std::sync::atomic::Ordering::Relaxed;
+    SCREENSHOT_BLOCK.store(on, Relaxed);
+    SCREENSHOT_LOADED.store(true, Relaxed);
+    let f = screenshot_block_file();
+    if let Some(d) = f.parent() {
+        let _ = std::fs::create_dir_all(d);
+    }
+    let _ = std::fs::write(f, if on { "1" } else { "0" });
+}
+
+/// Сохранённое состояние запрета скриншотов (инициализация тумблера/применения). Ленивая подгрузка;
+/// файла нет → **дефолт true** (запрет включён). Только "0" в файле выключает.
+#[frb(sync)]
+pub fn screenshot_block_enabled() -> bool {
+    use std::sync::atomic::Ordering::Relaxed;
+    if !SCREENSHOT_LOADED.swap(true, Relaxed) {
+        if let Ok(s) = std::fs::read_to_string(screenshot_block_file()) {
+            SCREENSHOT_BLOCK.store(s.trim() != "0", Relaxed);
+        }
+    }
+    SCREENSHOT_BLOCK.load(Relaxed)
+}
+
 // ─────────────────────────── C8.3 split-tunneling (Android) ───────────────────────────
 // Клиентская настройка (не из ссылки): фильтр по приложениям (package-имена) и/или по назначениям
 // (домен/IP/CIDR, в т.ч. локальная подсеть). Персистится текстовым файлом рядом с vault (как

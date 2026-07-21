@@ -171,8 +171,9 @@ Security-пуш на 40+ юнит + 15 docker-тестов без страхов
 **M2-full (задача 6) ✅ ЗАКРЫТ в коде (2026-07-21, obfs v2)** — см. §S0.3. Осталось операционно: согласованный re-release + переустановка сервера + новый клиент + раздача новых ссылок (слом wire; ротация §3.5 и так инвалидирует старые ссылки). **Трек C8 (сетевой контроль), статус 2026-07-21:**
 - **C8.3 split-tunnel ✅**: Android — обе оси (приложения `addAllowed/DisallowedApplication` + назначения домен/IP/CIDR через `addRoute`/`excludeRoute`); **Linux — ось назначений** (helper `--bypass` + `gui_tun::split_routes`; Include→в туннель только их, Exclude→в обход через физ.шлюз). Ось приложений на Linux — отложена (решение пользователя: «пока только по назначению»; план — cgroup2+fwmark+launcher).
 - **C8.2 ✅** Linux window-close prompt (`window_manager`, «Оставить в фоне»=minimize / «Отключить и выйти»=clean disconnect).
+- **C8.5 ✅** запрет скриншотов приложения (Android `FLAG_SECURE`, дефолт ВКЛ): `onCreate` ставит флаг по умолчанию + MethodChannel `setSecureFlag`; персист `screenshot_block` рядом с vault (дефолт true). Desktop не enforce'ит (тумблер Android-only).
 - **C8.1 отменён** (свёрнут в C8.3 — KS не трогаем).
-- Осталось: **C8.0** хард-делит абонента (`AdminRequest::Remove`); Linux per-app; Win/macOS split. Мелочь: device-тест QR/lease + split-tunnel (Android) / desktop-тест C8.2/C8.3-Linux.
+- Осталось: **C8.0** хард-делит абонента (`AdminRequest::Remove`); Linux per-app; Win/macOS split/screenshot-block. Мелочь: device-тест QR/lease + split-tunnel/скриншот-блок (Android) / desktop-тест C8.2/C8.3-Linux.
 
 **Верификация на сегодня:** 147 юнит-тестов + `clippy --workspace --all-targets` + `flutter analyze` чисто; docker-харнес 21/21.
 

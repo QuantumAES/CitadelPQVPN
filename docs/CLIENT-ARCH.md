@@ -295,7 +295,7 @@ CitadelPQVPN/
 | **C5** ✅ | **Идентичность и доступ**: двухслойная (epoch-ключи в `citadel-token` + issuer client-registry + Ed25519-auth), `TokenAgent` авто-рефреш; **«выдать/отозвать»** — по туннелю (admin-plane, ниже) | C4 |
 | **C6** ✅ (частично) | **Упаковка/секреты**: kill-switch (Linux firewall + Android always-on) ✅; vault (AES-256-GCM) ✅; APK ✅; `SecretStore` keychain / msix/dmg / нотаризация macOS — остаток | C2–C5 |
 | **C7** ✅ | **Admin-plane v2** — управление абонентами по туннелю: PQ-TLS admin-канал к issuer из-под туннеля, роли ссылок (мастер/клиент), GUI «Абоненты», CLI `citadel-token admin`. Заменил SSH-путь C5.5 (§8/§10). *Единая нумерация с `SECURITY-ROADMAP` §C7* | C5 |
-| **C8** | **Сетевой контроль User-mode** *(бывш. «C7» здесь)*. C8.3 split-tunnel: Android (прил.+назнач.) ✅, Linux (назнач.) ✅; C8.2 window-close prompt (Linux) ✅; C8.1 отменён (свёрнут в C8.3); C8.0 + Linux per-app — план. См. §14.1 | C3 |
+| **C8** | **Сетевой контроль/приватность User-mode** *(бывш. «C7» здесь)*. C8.3 split-tunnel: Android (прил.+назнач.) ✅, Linux (назнач.) ✅; C8.2 window-close prompt (Linux) ✅; C8.5 запрет скриншотов (Android FLAG_SECURE, дефолт ВКЛ) ✅; C8.1 отменён; C8.0 + Linux per-app — план. См. §14.1 | C3 |
 
 ---
 
@@ -335,6 +335,12 @@ Kill-switch решено **не трогать** (он остаётся стро
 - **Linux — ось приложений (per-app): отложена** (решение пользователя 2026-07-21 — «пока только по назначению»). План при возврате: **cgroup v2 + fwmark + policy routing** через launcher-обёртку `citadel-run <app>` (PID→cgroup, `iptables -t mangle -m cgroup … MARK`, `ip rule fwmark → bypass/tunnel table`) — как `mullvad-exclude`.
 - **Windows/macOS:** WFP по AppID / NE `NEAppProxyProvider` — отдельный трек.
 - Red-team: split — поверхность деанона (выбранное «в обход» светит реальный IP); домены у CDN с меняющимися IP могут «протекать» между реконнектами. UI-предупреждение добавлено.
+
+### C8.5 — Запрет скриншотов приложения ✅ реализован (2026-07-21), дефолт ВКЛ
+Блокировка снимков/записи экрана/каста + чёрный кадр в «Недавних».
+- **Android (FLAG_SECURE):** `MainActivity.onCreate` ставит `FLAG_SECURE` по умолчанию (защищает ранний кадр и превью «Недавних»); MethodChannel `setSecureFlag(on)` add/clear с UI-потока; Dart зовёт на старте из сохранённой настройки (снимает, если выключено) и по тумблеру.
+- **Персист:** FFI `set_screenshot_block`/`screenshot_block_enabled` (файл `screenshot_block` рядом с vault, как kill-switch/debug); **дефолт true** (файла нет → запрет включён; только "0" выключает). `AppState.screenshotBlock`+`toggleScreenshotBlock`; тумблер «Запрет скриншотов» в настройках (Android-only).
+- **Desktop:** не enforce'ится стандартно (Linux X11/Wayland нет API для обычного приложения; macOS `NSWindow.sharingType=.none` / Windows `WDA_EXCLUDEFROMCAPTURE` — future). Тумблер гейтится Android. Гейт: flutter analyze 0 + clippy 0 + `flutter build apk`.
 
 ---
 

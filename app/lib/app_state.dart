@@ -42,6 +42,17 @@ class AppState extends ChangeNotifier {
     notifyListeners();
   }
 
+  /// C8.5 запрет скриншотов/записи экрана (Android FLAG_SECURE). Персистится ядром рядом с vault;
+  /// **дефолт включён** (файла нет → true). Флаг применяет платформа (Android); desktop не enforce'ит.
+  bool screenshotBlock = screenshotBlockEnabled();
+
+  void toggleScreenshotBlock() {
+    screenshotBlock = !screenshotBlock;
+    setScreenshotBlock(on_: screenshotBlock);
+    if (Platform.isAndroid) AndroidVpn.setSecureFlag(screenshotBlock);
+    notifyListeners();
+  }
+
   /// id сохранённого профиля в работе (null — «пробный» коннект ещё-не-сохранённой ссылки).
   String? activeProfileId;
   String exit = '';
@@ -57,6 +68,9 @@ class AppState extends ChangeNotifier {
   bool get isBusy => phase == VpnPhase.connecting || phase == VpnPhase.up;
 
   AppState() {
+    // C8.5: применить сохранённую настройку запрета скриншотов (onCreate уже поставил FLAG_SECURE
+    // по умолчанию; здесь СНИМАЕМ, если пользователь выключил). Дефолт — запрет включён.
+    if (Platform.isAndroid) AndroidVpn.setSecureFlag(screenshotBlock);
     // C6/S3 (нюанс 2): новый изолят при перезапуске может застать ЖИВУЮ нативную сессию (loop
     // пережил закрытие окна, процесс держит foreground-сервис) — отразить её, а не показать «off».
     if (Platform.isAndroid) _restoreAndroidSession();

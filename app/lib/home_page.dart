@@ -233,6 +233,18 @@ class _HomePageState extends State<HomePage> {
                 Navigator.pop(sheetCtx);
               },
             ),
+            // C8.5 запрет скриншотов (Android FLAG_SECURE) — по умолчанию включён; desktop не enforce'ит.
+            if (Platform.isAndroid)
+              SwitchListTile(
+                secondary: const Icon(Icons.screenshot_monitor_outlined),
+                title: const Text('Запрет скриншотов'),
+                subtitle: const Text('Блокировать снимки и запись экрана приложения'),
+                value: s.screenshotBlock,
+                onChanged: (_) {
+                  s.toggleScreenshotBlock();
+                  Navigator.pop(sheetCtx);
+                },
+              ),
             // Kill-switch — на десктопе тумблер (Linux-хелпер через firewall); на Android это
             // СИСТЕМНЫЙ always-on+lockdown (приложение не может форсить), поэтому — гайд в настройки.
             if (!Platform.isAndroid && !Platform.isIOS)

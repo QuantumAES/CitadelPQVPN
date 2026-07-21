@@ -4,6 +4,8 @@ import android.app.Activity
 import android.content.Intent
 import android.net.VpnService
 import android.os.Build
+import android.os.Bundle
+import android.view.WindowManager
 import io.flutter.embedding.android.FlutterActivity
 import io.flutter.embedding.engine.FlutterEngine
 import io.flutter.plugin.common.MethodChannel
@@ -22,6 +24,14 @@ class MainActivity : FlutterActivity() {
     private val channelName = "dev.citadelpqvpn/vpn"
     private val reqVpn = 0x1011
     private var prepareResult: MethodChannel.Result? = null
+
+    override fun onCreate(savedInstanceState: Bundle?) {
+        super.onCreate(savedInstanceState)
+        // C8.5: по умолчанию ЗАПРЕЩАЕМ скриншоты/запись экрана (FLAG_SECURE) — ставим в onCreate,
+        // чтобы защитить и самый ранний кадр, и превью в «Недавних». Dart снимет флаг, если юзер
+        // выключил (setSecureFlag(false)); дефолт (файла нет) — запрет включён.
+        window.addFlags(WindowManager.LayoutParams.FLAG_SECURE)
+    }
 
     override fun configureFlutterEngine(flutterEngine: FlutterEngine) {
         super.configureFlutterEngine(flutterEngine)
@@ -52,6 +62,19 @@ class MainActivity : FlutterActivity() {
                 }
                 "stopService" -> {
                     CitadelVpnService.instance?.stopTun()
+                    result.success(true)
+                }
+                "setSecureFlag" -> {
+                    // C8.5: включить/снять FLAG_SECURE (запрет скриншотов). Dart зовёт на старте
+                    // (из сохранённой настройки) и по тумблеру. Флаги окна — только с UI-потока.
+                    val on = call.argument<Boolean>("on") ?: true
+                    runOnUiThread {
+                        if (on) {
+                            window.addFlags(WindowManager.LayoutParams.FLAG_SECURE)
+                        } else {
+                            window.clearFlags(WindowManager.LayoutParams.FLAG_SECURE)
+                        }
+                    }
                     result.success(true)
                 }
                 "listInstalledApps" -> {
