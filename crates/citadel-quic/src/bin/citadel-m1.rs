@@ -162,6 +162,13 @@ fn server_setup_net(ifname: &str) {
     // Ядровый дубль app-layer анти-спуфинга в Inbound (defense-in-depth) + reverse-path фильтр.
     run("iptables", &["-A", "FORWARD", "-i", ifname, "-s", &nat, "-o", &eg, "-j", "ACCEPT"]);
     run("iptables", &["-A", "FORWARD", "-i", &eg, "-o", ifname, "-m", "state", "--state", "RELATED,ESTABLISHED", "-j", "ACCEPT"]);
+    // Изоляция клиентов (defense-in-depth): трафик клиент→клиент — это `-i ifname -o ifname`. На
+    // app-слое он уже дропается F2 (is_blocked_dst блокирует всю tun-подсеть 10.x как приватную), но
+    // ядровый FORWARD сам по себе перекинул бы такой пакет обратно в TUN (падает в default-policy,
+    // не матчит правила egress выше). Явный DROP гарантирует изоляцию даже если F2 будет ослаблен/
+    // обойдён (напр. будущее исключение приватного диапазона). Ставим ДО анти-спуфинг-DROP —
+    // назначение внутри пула ловится раньше, независимо от src.
+    run("iptables", &["-A", "FORWARD", "-i", ifname, "-o", ifname, "-j", "DROP"]);
     run("iptables", &["-A", "FORWARD", "-i", ifname, "!", "-s", &nat, "-j", "DROP"]);
     // S2.3/A4: клиент НЕ должен достукиваться до самого exit-хоста через туннель. Пакет с dst =
     // локальный адрес exit (его ПУБЛИЧНЫЙ IP, SSH:22, issuer:7000, docker-API, published-порты) идёт

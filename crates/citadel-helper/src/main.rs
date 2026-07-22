@@ -177,10 +177,16 @@ fn teardown_dns(ifn: &str) {
 
 /// C6/M9 kill-switch — правила fail-closed firewall (отдельными списками аргументов iptables, чтобы
 /// тестировать генерацию без root). Блокируем ВЕСЬ не-туннельный OUTPUT, кроме: lo, самого туннеля
-/// (`ifn`), зашифрованного пути к exit'ам (`-d <eip>`) и DHCP-аренды. Отдельная цепочка `CITADEL_KS`
-/// с хуком в начало `OUTPUT` — не трогаем чужую политику. RETURN = разрешено (продолжить OUTPUT),
-/// финальный DROP = утечка заблокирована.
-fn killswitch_rules(ifn: &str, exit_ips: &[&str]) -> Vec<Vec<String>> {
+/// (`ifn`), зашифрованного пути к exit'ам (`-d <eip>`), **split-tunnel «в обход» назначений**
+/// (`bypass`, C8.1) и DHCP-аренды. Отдельная цепочка `CITADEL_KS` с хуком в начало `OUTPUT` —
+/// не трогаем чужую политику. RETURN = разрешено (продолжить OUTPUT), финальный DROP = утечка
+/// заблокирована.
+///
+/// C8.1 (kill-switch ⇄ split-tunnel): назначения из `--bypass` (SplitMode::Exclude) роутятся мимо
+/// туннеля через ФИЗИЧЕСКИЙ шлюз, поэтому без RETURN-исключения упёрлись бы в финальный DROP — и
+/// сплит «не работал», пока пользователь не гасил kill-switch. RETURN по `-d <cidr>` пускает трафик
+/// именно к этим (и только этим) назначениям в обход, сохраняя fail-closed для всего остального.
+fn killswitch_rules(ifn: &str, exit_ips: &[&str], bypass: &[&str]) -> Vec<Vec<String>> {
     let a = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
     let mut r = vec![
         a(&["-N", "CITADEL_KS"]),
@@ -189,6 +195,11 @@ fn killswitch_rules(ifn: &str, exit_ips: &[&str]) -> Vec<Vec<String>> {
     ];
     for eip in exit_ips {
         r.push(a(&["-A", "CITADEL_KS", "-d", &format!("{eip}/32"), "-j", "RETURN"]));
+    }
+    // C8.1: split-tunnel «в обход» — разрешить физический путь ТОЛЬКО к выбранным назначениям.
+    // `bypass` — уже-валидированные CIDR/host (parse_args); `-d` iptables принимает и CIDR, и голый IP.
+    for b in bypass {
+        r.push(a(&["-A", "CITADEL_KS", "-d", b, "-j", "RETURN"]));
     }
     // DHCP-аренда (иначе можно потерять IP на физическом линке при full-tunnel)
     r.push(a(&["-A", "CITADEL_KS", "-p", "udp", "--dport", "67:68", "-j", "RETURN"]));
@@ -199,9 +210,9 @@ fn killswitch_rules(ifn: &str, exit_ips: &[&str]) -> Vec<Vec<String>> {
 
 /// Армировать kill-switch: сперва снять осиротевшую цепочку прошлой сессии (idempotent), затем
 /// применить правила.
-fn setup_killswitch(ifn: &str, exit_ips: &[&str]) {
+fn setup_killswitch(ifn: &str, exit_ips: &[&str], bypass: &[&str]) {
     teardown_killswitch();
-    for rule in killswitch_rules(ifn, exit_ips) {
+    for rule in killswitch_rules(ifn, exit_ips, bypass) {
         let args: Vec<&str> = rule.iter().map(String::as_str).collect();
         iptables(&args);
     }
@@ -320,8 +331,18 @@ fn main() -> Result<()> {
     }
     if killswitch {
         let eips: Vec<&str> = args.exit_ips.split_whitespace().collect();
-        setup_killswitch(&ifn, &eips);
-        eprintln!("[helper] kill-switch АРМИРОВАН (fail-closed): не-туннельный OUTPUT заблокирован");
+        // C8.1: split-tunnel «в обход» (Exclude) сосуществует с kill-switch — эти назначения идут
+        // физическим шлюзом и получают RETURN-исключение (иначе упёрлись бы в финальный DROP).
+        let bypass_dsts: Vec<&str> = args.bypass.split_whitespace().collect();
+        setup_killswitch(&ifn, &eips, &bypass_dsts);
+        eprintln!(
+            "[helper] kill-switch АРМИРОВАН (fail-closed): не-туннельный OUTPUT заблокирован{}",
+            if bypass_dsts.is_empty() {
+                String::new()
+            } else {
+                format!(" (сплит-обход разрешён к: {})", bypass_dsts.join(" "))
+            }
+        );
     }
     if block_ipv6 {
         setup_ipv6_block();
@@ -432,7 +453,7 @@ mod tests {
     /// C6/M9: правила kill-switch — форма и fail-closed порядок (DROP ПОСЛЕ всех RETURN; хук в OUTPUT).
     #[test]
     fn killswitch_rules_shape() {
-        let r = killswitch_rules("citadel0", &["1.2.3.4", "5.6.7.8"]);
+        let r = killswitch_rules("citadel0", &["1.2.3.4", "5.6.7.8"], &[]);
         fn s(v: &[String]) -> Vec<&str> {
             v.iter().map(String::as_str).collect()
         }
@@ -449,6 +470,31 @@ mod tests {
         let last_return =
             r.iter().rposition(|x| x.last().map(String::as_str) == Some("RETURN")).unwrap();
         assert!(drop_idx > last_return, "DROP должен быть после всех RETURN (fail-closed)");
+    }
+
+    /// C8.1: kill-switch ⇄ split-tunnel. Назначения «в обход» (Exclude) получают RETURN по `-d <cidr>`
+    /// (пускаются физическим шлюзом), при этом fail-closed сохранён (финальный DROP после всех RETURN).
+    #[test]
+    fn killswitch_bypass_coexists_with_split() {
+        let bypass = ["192.168.1.0/24", "203.0.113.7"];
+        let r = killswitch_rules("citadel0", &["1.2.3.4"], &bypass);
+        fn s(v: &[String]) -> Vec<&str> {
+            v.iter().map(String::as_str).collect()
+        }
+        // каждое split-назначение — отдельное RETURN-исключение по dst
+        for b in bypass {
+            assert!(
+                r.iter().any(|x| s(x) == vec!["-A", "CITADEL_KS", "-d", b, "-j", "RETURN"]),
+                "split-обход {b} должен быть RETURN (иначе сплит не работает при KS)"
+            );
+        }
+        // exit-IP по-прежнему разрешён; fail-closed не нарушен: DROP после всех RETURN (в т.ч. bypass)
+        let flat: Vec<&str> = r.iter().flatten().map(String::as_str).collect();
+        assert!(flat.contains(&"1.2.3.4/32"));
+        let drop_idx = r.iter().position(|x| x.last().map(String::as_str) == Some("DROP")).unwrap();
+        let last_return =
+            r.iter().rposition(|x| x.last().map(String::as_str) == Some("RETURN")).unwrap();
+        assert!(drop_idx > last_return, "DROP должен быть после всех RETURN, включая split-обход");
     }
 
     /// S2.2/A2: правила IPv6-блока — своя цепочка `CITADEL_KS6`, хук в OUTPUT, RETURN только для lo
