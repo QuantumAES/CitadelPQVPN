@@ -21,23 +21,45 @@ fn main() {
 
 #[cfg(windows)]
 fn main() -> anyhow::Result<()> {
-    windows_svc::run()
+    // install/uninstall — из инсталлятора приложения (elevated); --console — dev; без аргументов —
+    // запуск диспетчером SCM (как система стартует службу).
+    match std::env::args().nth(1).as_deref() {
+        Some("install") => windows_svc::install(),
+        Some("uninstall") => windows_svc::uninstall(),
+        Some("--console") => windows_svc::run_console(),
+        _ => windows_svc::dispatch(),
+    }
 }
 
 #[cfg(windows)]
 mod windows_svc {
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::ffi::OsString;
+    use std::sync::atomic::{AtomicBool, AtomicIsize, Ordering};
     use std::sync::Arc;
 
     use citadel_winnet::{
         decode_config, encode_packet, encode_ready_err, encode_ready_ok, TunReady, TunSetup,
         TAG_CONFIG,
     };
+    use windows_service::service::{
+        ServiceControl, ServiceControlAccept, ServiceExitCode, ServiceState, ServiceStatus,
+        ServiceType,
+    };
+    use windows_service::service_control_handler::{self, ServiceControlHandlerResult};
+    use windows_service::{define_windows_service, service_dispatcher};
     use windows_sys::Win32::Foundation::{CloseHandle, GetLastError, HANDLE, INVALID_HANDLE_VALUE};
     use windows_sys::Win32::Storage::FileSystem::{ReadFile, WriteFile};
     use windows_sys::Win32::System::Pipes::{ConnectNamedPipe, CreateNamedPipeW, DisconnectNamedPipe};
+    use windows_sys::Win32::System::IO::CancelIoEx;
 
     use crate::plan::{bypass_route_add, bypass_route_del, plan_session, SessionPlan, ADAPTER_NAME};
+
+    /// Имя службы в SCM.
+    const SERVICE_NAME: &str = "CitadelPQVPN";
+    /// Флаг остановки (ставит control-handler на Stop/Shutdown); serve-цикл его опрашивает.
+    static SHUTDOWN: AtomicBool = AtomicBool::new(false);
+    /// Текущий хэндл пайпа (для `cancel_accept` → CancelIoEx прерывает блокирующий accept/pump).
+    static CURRENT_PIPE: AtomicIsize = AtomicIsize::new(0);
 
     /// HANDLE (`*mut c_void`) не `Send` — обёртка для передачи пайпа в поток WinTUN→пайп. Named pipe
     /// полнодуплексный: одновременные WriteFile (этот поток) и ReadFile (поток пайп→WinTUN) корректны.
@@ -63,14 +85,117 @@ mod windows_svc {
         std::ffi::OsStr::new(s).encode_wide().chain(std::iter::once(0)).collect()
     }
 
-    /// Консольный dev-режим: слушать пайп и обслуживать сессии по одной. TODO(3c): регистрация как
-    /// SCM-служба (`windows-service`) + запуск диспетчером вместо этого цикла.
-    pub fn run() -> anyhow::Result<()> {
-        eprintln!("[svc] citadel-svc: слушаю {PIPE_NAME} (dev-console; SCM — TODO 3c)");
-        loop {
+    /// Запуск диспетчером SCM (служба стартует системой без аргументов). Блокирует поток до остановки.
+    pub fn dispatch() -> anyhow::Result<()> {
+        service_dispatcher::start(SERVICE_NAME, ffi_service_main)?;
+        Ok(())
+    }
+
+    /// Консольный dev-режим: тот же serve-цикл без SCM (работает до kill / Ctrl-C).
+    pub fn run_console() -> anyhow::Result<()> {
+        eprintln!("[svc] citadel-svc: dev-console режим");
+        serve(&SHUTDOWN)
+    }
+
+    // SCM-boilerplate: ffi_service_main парсит аргументы и зовёт service_main на фоновом потоке.
+    define_windows_service!(ffi_service_main, service_main);
+
+    fn service_main(_args: Vec<OsString>) {
+        if let Err(e) = run_service() {
+            eprintln!("[svc] служба завершилась с ошибкой: {e:#}");
+        }
+    }
+
+    fn status(state: ServiceState, accepted: ServiceControlAccept) -> ServiceStatus {
+        ServiceStatus {
+            service_type: ServiceType::OWN_PROCESS,
+            current_state: state,
+            controls_accepted: accepted,
+            exit_code: ServiceExitCode::Win32(0),
+            checkpoint: 0,
+            wait_hint: std::time::Duration::default(),
+            process_id: None,
+        }
+    }
+
+    fn run_service() -> anyhow::Result<()> {
+        // control-handler: Stop/Shutdown → флаг + прервать блокирующий accept/pump (CancelIoEx).
+        let handler = move |control| -> ServiceControlHandlerResult {
+            match control {
+                ServiceControl::Interrogate => ServiceControlHandlerResult::NoError,
+                ServiceControl::Stop | ServiceControl::Shutdown => {
+                    SHUTDOWN.store(true, Ordering::Release);
+                    cancel_accept();
+                    ServiceControlHandlerResult::NoError
+                }
+                _ => ServiceControlHandlerResult::NotImplemented,
+            }
+        };
+        let status_handle = service_control_handler::register(SERVICE_NAME, handler)?;
+        status_handle.set_service_status(status(
+            ServiceState::Running,
+            ServiceControlAccept::STOP | ServiceControlAccept::SHUTDOWN,
+        ))?;
+        let _ = serve(&SHUTDOWN);
+        status_handle
+            .set_service_status(status(ServiceState::Stopped, ServiceControlAccept::empty()))?;
+        Ok(())
+    }
+
+    /// Установить службу в SCM (нужна elevation). Запускается вручную инсталлятором приложения.
+    pub fn install() -> anyhow::Result<()> {
+        use windows_service::service::{
+            ServiceAccess, ServiceErrorControl, ServiceInfo, ServiceStartType,
+        };
+        use windows_service::service_manager::{ServiceManager, ServiceManagerAccess};
+        let manager = ServiceManager::local_computer(
+            None::<&str>,
+            ServiceManagerAccess::CONNECT | ServiceManagerAccess::CREATE_SERVICE,
+        )?;
+        let info = ServiceInfo {
+            name: SERVICE_NAME.into(),
+            display_name: "CitadelPQVPN Service".into(),
+            service_type: ServiceType::OWN_PROCESS,
+            start_type: ServiceStartType::OnDemand,
+            error_control: ServiceErrorControl::Normal,
+            executable_path: std::env::current_exe()?,
+            launch_arguments: vec![],
+            dependencies: vec![],
+            account_name: None, // LocalSystem
+            account_password: None,
+        };
+        let service = manager.create_service(&info, ServiceAccess::CHANGE_CONFIG)?;
+        service.set_description(
+            "CitadelPQVPN — постквантовый VPN: WinTUN + WFP kill-switch (модель W2)",
+        )?;
+        eprintln!("[svc] служба '{SERVICE_NAME}' установлена");
+        Ok(())
+    }
+
+    /// Удалить службу из SCM (нужна elevation).
+    pub fn uninstall() -> anyhow::Result<()> {
+        use windows_service::service::ServiceAccess;
+        use windows_service::service_manager::{ServiceManager, ServiceManagerAccess};
+        let manager =
+            ServiceManager::local_computer(None::<&str>, ServiceManagerAccess::CONNECT)?;
+        let service = manager.open_service(SERVICE_NAME, ServiceAccess::DELETE)?;
+        service.delete()?;
+        eprintln!("[svc] служба '{SERVICE_NAME}' удалена");
+        Ok(())
+    }
+
+    /// serve-цикл: принимать клиентов по одному, пока не выставлен `shutdown`. Прерывается на Stop
+    /// через `cancel_accept` (CancelIoEx на текущем пайпе разбудит блокирующий ConnectNamedPipe/pump).
+    fn serve(shutdown: &AtomicBool) -> anyhow::Result<()> {
+        eprintln!("[svc] слушаю {PIPE_NAME}");
+        while !shutdown.load(Ordering::Acquire) {
             let h = create_pipe_instance()?;
-            // ждём подключения приложения
+            CURRENT_PIPE.store(h as isize, Ordering::Release);
             let ok = unsafe { ConnectNamedPipe(h, std::ptr::null_mut()) };
+            if shutdown.load(Ordering::Acquire) {
+                unsafe { CloseHandle(h) };
+                break;
+            }
             if ok == 0 {
                 let e = unsafe { GetLastError() };
                 if e != ERROR_PIPE_CONNECTED {
@@ -80,10 +205,22 @@ mod windows_svc {
                 }
             }
             handle_client(h);
+            CURRENT_PIPE.store(0, Ordering::Release);
             unsafe {
                 DisconnectNamedPipe(h);
                 CloseHandle(h);
             }
+        }
+        eprintln!("[svc] serve остановлен");
+        Ok(())
+    }
+
+    /// Прервать блокирующий ConnectNamedPipe/ReadFile на текущем пайпе (control-handler на Stop).
+    fn cancel_accept() {
+        let h = CURRENT_PIPE.load(Ordering::Acquire);
+        if h != 0 {
+            // SAFETY: h — текущий валидный хэндл пайпа; CancelIoEx безопасен из другого потока.
+            unsafe { CancelIoEx(h as HANDLE, std::ptr::null()) };
         }
     }
 
