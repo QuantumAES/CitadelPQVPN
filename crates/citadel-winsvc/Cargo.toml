@@ -26,3 +26,10 @@ windows-sys = { version = "0.60", features = [
     "Win32_System_IO",      # OVERLAPPED — нужен для ReadFile/WriteFile/ConnectNamedPipe
     "Win32_Security",
 ] }
+# WFP kill-switch (FWPM) — windows-rs 0.62 (уже в lock): Result-обёртки безопаснее сырого FFI.
+windows = { version = "0.62", features = [
+    "Win32_Foundation",
+    "Win32_NetworkManagement_WindowsFilteringPlatform",
+    "Win32_Security",       # FWPM-структуры (FWPM_SESSION0/FILTER0/…) гейтятся этой фичей
+    "Win32_System_Rpc",     # RPC_C_AUTHN_WINNT + FwpmEngineOpen0
+] }

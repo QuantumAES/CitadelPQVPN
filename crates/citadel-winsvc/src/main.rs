@@ -10,6 +10,8 @@
 
 #[cfg_attr(not(windows), allow(dead_code))]
 mod plan;
+#[cfg(windows)]
+mod wfp;
 
 #[cfg(not(windows))]
 fn main() {
@@ -236,6 +238,19 @@ mod windows_svc {
                 .start_session(wintun::MAX_RING_CAPACITY)
                 .map_err(|e| anyhow::anyhow!("WinTUN start_session: {e}"))?,
         );
+
+        // WFP kill-switch (fail-closed): блокируем не-туннельный трафик, кроме permit'ов плана.
+        // Ошибка армирования = не поднимаем туннель без запрошенного KS (откат bypass перед выходом).
+        if let Some(wfp_filters) = &plan.wfp {
+            if let Err(e) = crate::wfp::arm(wfp_filters, luid) {
+                for dest in &bypass {
+                    let _ = std::process::Command::new("route").args(bypass_route_del(dest)).status();
+                }
+                return Err(anyhow::anyhow!("армировать WFP kill-switch: {e}"));
+            }
+            eprintln!("[svc] WFP kill-switch армирован ({} фильтров)", wfp_filters.len());
+        }
+
         eprintln!("[svc] WinTUN '{ADAPTER_NAME}' поднят (luid={luid}); bypass={bypass:?}");
         Ok(Session { session, _adapter: adapter, luid, bypass })
     }
@@ -349,10 +364,16 @@ mod windows_svc {
     }
 
     /// Свернуть сессию: откат bypass-маршрутов + drop адаптера (маршруты/DNS `store=active` исчезают
-    /// с ним). TODO(3c-2): при наличии WFP снимать его ТОЛЬКО при `clean` (иначе держим fail-closed).
-    fn teardown(s: Session, _clean: bool) {
+    /// с ним). WFP kill-switch снимаем ТОЛЬКО при чистом disconnect (`clean`); при аварийном разрыве
+    /// держим (fail-closed) — следующий `arm`/перезапуск службы его переармирует/снимет.
+    fn teardown(s: Session, clean: bool) {
         for dest in &s.bypass {
             let _ = std::process::Command::new("route").args(bypass_route_del(dest)).status();
+        }
+        if clean {
+            crate::wfp::disarm();
+        } else {
+            eprintln!("[svc] аварийный разрыв — WFP kill-switch ОСТАВЛЕН (fail-closed)");
         }
         // drop(s) закрывает WinTUN-сессию и адаптер.
     }
