@@ -47,7 +47,11 @@ mod windows_svc {
     };
     use windows_service::service_control_handler::{self, ServiceControlHandlerResult};
     use windows_service::{define_windows_service, service_dispatcher};
-    use windows_sys::Win32::Foundation::{CloseHandle, GetLastError, HANDLE, INVALID_HANDLE_VALUE};
+    use windows_sys::Win32::Foundation::{
+        CloseHandle, GetLastError, LocalFree, HANDLE, INVALID_HANDLE_VALUE,
+    };
+    use windows_sys::Win32::Security::Authorization::ConvertStringSecurityDescriptorToSecurityDescriptorW;
+    use windows_sys::Win32::Security::{PSECURITY_DESCRIPTOR, SECURITY_ATTRIBUTES};
     use windows_sys::Win32::Storage::FileSystem::{ReadFile, WriteFile};
     use windows_sys::Win32::System::Pipes::{ConnectNamedPipe, CreateNamedPipeW, DisconnectNamedPipe};
     use windows_sys::Win32::System::IO::CancelIoEx;
@@ -74,6 +78,10 @@ mod windows_svc {
     const PIPE_UNLIMITED_INSTANCES: u32 = 255;
 
     const PIPE_NAME: &str = r"\\.\pipe\citadel-svc";
+    /// ACL пайпа (SDDL): SYSTEM/Builtin-Admins — полный доступ (GA); интерактивные пользователи (IU) —
+    /// read+write (desktop-app коннектится под юзером). Сеть/аноним/сервисы — нет доступа. `P` —
+    /// protected DACL (без наследования). Закрывает: любой локальный процесс поднимал бы туннель.
+    const PIPE_SDDL: &str = "D:P(A;;GA;;;SY)(A;;GA;;;BA)(A;;GRGW;;;IU)";
     /// Верхняя граница config-кадра (анти-DoS при чтении из пайпа).
     const MAX_CONFIG: usize = 64 * 1024;
     /// `ERROR_PIPE_CONNECTED` — клиент успел подключиться до `ConnectNamedPipe` (не ошибка).
@@ -144,8 +152,10 @@ mod windows_svc {
 
     /// Установить службу в SCM (нужна elevation). Запускается вручную инсталлятором приложения.
     pub fn install() -> anyhow::Result<()> {
+        use std::time::Duration;
         use windows_service::service::{
-            ServiceAccess, ServiceErrorControl, ServiceInfo, ServiceStartType,
+            ServiceAccess, ServiceAction, ServiceActionType, ServiceErrorControl,
+            ServiceFailureActions, ServiceFailureResetPeriod, ServiceInfo, ServiceStartType,
         };
         use windows_service::service_manager::{ServiceManager, ServiceManagerAccess};
         let manager = ServiceManager::local_computer(
@@ -168,7 +178,19 @@ mod windows_svc {
         service.set_description(
             "CitadelPQVPN — постквантовый VPN: WinTUN + WFP kill-switch (модель W2)",
         )?;
-        eprintln!("[svc] служба '{SERVICE_NAME}' установлена");
+        // SCM-recovery: авто-рестарт при КРАШЕ (не чистом стопе) — смягчает окно fail-closed, если
+        // служба упадёт с активным туннелем; после рестарта WFP переармируется на следующем connect.
+        let restart = |secs| ServiceAction {
+            action_type: ServiceActionType::Restart,
+            delay: Duration::from_secs(secs),
+        };
+        service.update_failure_actions(ServiceFailureActions {
+            reset_period: ServiceFailureResetPeriod::After(Duration::from_secs(86400)),
+            reboot_msg: None,
+            command: None,
+            actions: Some(vec![restart(5), restart(5), restart(30)]),
+        })?;
+        eprintln!("[svc] служба '{SERVICE_NAME}' установлена (авто-рестарт при краше)");
         Ok(())
     }
 
@@ -228,7 +250,32 @@ mod windows_svc {
     /// сузить ACL до SYSTEM+администраторов (сейчас дефолтный дескриптор).
     fn create_pipe_instance() -> anyhow::Result<HANDLE> {
         let name = wide(PIPE_NAME);
-        // SAFETY: name — валидная нуль-терминированная UTF-16 строка; параметры по докам CreateNamedPipeW.
+        // ACL пайпа из SDDL (см. PIPE_SDDL). При неудаче построения — предупреждаем и НЕ падаем
+        // (дефолтный SD слабее, но служба работает).
+        let sddl = wide(PIPE_SDDL);
+        let mut psd: PSECURITY_DESCRIPTOR = std::ptr::null_mut();
+        // SAFETY: sddl — валидная UTF-16 строка; psd пишется API при успехе (LocalAlloc).
+        let sd_ok = unsafe {
+            ConvertStringSecurityDescriptorToSecurityDescriptorW(
+                sddl.as_ptr(),
+                1, // SDDL_REVISION_1
+                &mut psd,
+                std::ptr::null_mut(),
+            )
+        };
+        if sd_ok == 0 {
+            eprintln!(
+                "[svc] ⚠ SD пайпа не построен (err={}) — дефолтный ACL",
+                unsafe { GetLastError() }
+            );
+        }
+        let sa = SECURITY_ATTRIBUTES {
+            nLength: std::mem::size_of::<SECURITY_ATTRIBUTES>() as u32,
+            lpSecurityDescriptor: if sd_ok != 0 { psd } else { std::ptr::null_mut() },
+            bInheritHandle: 0,
+        };
+        let sa_ptr: *const SECURITY_ATTRIBUTES = if sd_ok != 0 { &sa } else { std::ptr::null() };
+        // SAFETY: name/sa валидны; SD (если построен) копируется внутрь объекта пайпа.
         let h = unsafe {
             CreateNamedPipeW(
                 name.as_ptr(),
@@ -238,9 +285,13 @@ mod windows_svc {
                 64 * 1024,
                 64 * 1024,
                 0,
-                std::ptr::null(),
+                sa_ptr,
             )
         };
+        // SD скопирован в объект пайпа → освобождаем нашу копию (ConvertString аллоцирует LocalAlloc).
+        if sd_ok != 0 {
+            unsafe { LocalFree(psd) };
+        }
         if h == INVALID_HANDLE_VALUE {
             anyhow::bail!("CreateNamedPipeW failed: err={}", unsafe { GetLastError() });
         }
