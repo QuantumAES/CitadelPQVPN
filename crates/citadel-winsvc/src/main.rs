@@ -24,14 +24,23 @@ fn main() -> anyhow::Result<()> {
 
 #[cfg(windows)]
 mod windows_svc {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+
     use citadel_winnet::{
-        decode_config, encode_ready_err, encode_ready_ok, TunReady, TunSetup, TAG_CONFIG,
+        decode_config, encode_packet, encode_ready_err, encode_ready_ok, TunReady, TunSetup,
+        TAG_CONFIG,
     };
     use windows_sys::Win32::Foundation::{CloseHandle, GetLastError, HANDLE, INVALID_HANDLE_VALUE};
     use windows_sys::Win32::Storage::FileSystem::{ReadFile, WriteFile};
     use windows_sys::Win32::System::Pipes::{ConnectNamedPipe, CreateNamedPipeW, DisconnectNamedPipe};
 
-    use crate::plan::{plan_session, SessionPlan, ADAPTER_NAME};
+    use crate::plan::{bypass_route_add, bypass_route_del, plan_session, SessionPlan, ADAPTER_NAME};
+
+    /// HANDLE (`*mut c_void`) не `Send` — обёртка для передачи пайпа в поток WinTUN→пайп. Named pipe
+    /// полнодуплексный: одновременные WriteFile (этот поток) и ReadFile (поток пайп→WinTUN) корректны.
+    struct SendHandle(HANDLE);
+    unsafe impl Send for SendHandle {}
 
     // Win32-константы CreateNamedPipeW (ABI-стабильны; локально — чтобы не гадать модуль в windows-sys).
     const PIPE_ACCESS_DUPLEX: u32 = 0x0000_0003;
@@ -119,8 +128,8 @@ mod windows_svc {
         match bring_up(&plan) {
             Ok(session) => {
                 let _ = write_all(h, &encode_ready_ok(&TunReady { adapter_luid: session.luid }));
-                pump(h, &session);
-                teardown(session);
+                let clean = pump(h, &session);
+                teardown(session, clean);
             }
             Err(e) => {
                 eprintln!("[svc] bring_up: {e:#}");
@@ -194,18 +203,18 @@ mod windows_svc {
         Ok(())
     }
 
-    /// Поднятая сессия: владеет WinTUN-адаптером + его пакетной сессией. Порядок полей = порядок
-    /// drop (сессия перед адаптером). TODO(3c): + WFP-хендл (держать fail-closed при аварии).
+    /// Поднятая сессия: владеет WinTUN-адаптером + пакетной сессией (в `Arc` — делится между потоками
+    /// pump'а) + список применённых bypass-маршрутов (для отката). Порядок полей = порядок drop.
     struct Session {
-        /// Пакетная сессия WinTUN: держит адаптер «в работе» (drop закрыл бы её). Читается pump'ом в 3c.
-        #[allow(dead_code)]
-        session: wintun::Session,
-        _adapter: std::sync::Arc<wintun::Adapter>,
+        session: Arc<wintun::Session>,
+        _adapter: Arc<wintun::Adapter>,
         luid: u64,
+        /// Успешно добавленные bypass-назначения (`route add …`) — откатываются в teardown.
+        bypass: Vec<String>,
     }
 
-    /// Поднять туннель: создать WinTUN-адаптер и применить адрес/MTU/маршруты/DNS (netsh).
-    /// TODO(3c): bypass-маршруты (default-gw), WFP kill-switch (`plan.wfp`), packet-pump.
+    /// Поднять туннель: WinTUN-адаптер → bypass-маршруты (мимо туннеля) → адрес/MTU/маршруты/DNS.
+    /// TODO(3c-2): WFP kill-switch (`plan.wfp`).
     fn bring_up(plan: &SessionPlan) -> anyhow::Result<Session> {
         // Грузим wintun.dll (кладётся рядом со службой при упаковке). SAFETY: доверенная DLL WireGuard.
         let wintun =
@@ -214,13 +223,21 @@ mod windows_svc {
             .map_err(|e| anyhow::anyhow!("создать WinTUN-адаптер '{ADAPTER_NAME}': {e}"))?;
         // get_luid() → NET_LUID_LH (union); .Value = u64-представление. SAFETY: чтение u64-поля union.
         let luid = unsafe { adapter.get_luid().Value };
+
+        // Физический шлюз ДО подмены маршрутов туннелем — для bypass (анти-петля + Q5 split).
+        let gw = default_gateway();
         // адрес/MTU/маршруты-в-туннель/DNS на адаптере (по имени ADAPTER_NAME)
         apply_netsh(&plan.netsh)?;
-        let session = adapter
-            .start_session(wintun::MAX_RING_CAPACITY)
-            .map_err(|e| anyhow::anyhow!("WinTUN start_session: {e}"))?;
-        eprintln!("[svc] WinTUN '{ADAPTER_NAME}' поднят (luid={luid}), сеть применена");
-        Ok(Session { session, _adapter: adapter, luid })
+        // bypass: exit-IP + split-Exclude мимо туннеля через физический шлюз (host-route специфичнее /1)
+        let bypass = apply_bypass(&plan.bypass, gw.as_deref());
+
+        let session = Arc::new(
+            adapter
+                .start_session(wintun::MAX_RING_CAPACITY)
+                .map_err(|e| anyhow::anyhow!("WinTUN start_session: {e}"))?,
+        );
+        eprintln!("[svc] WinTUN '{ADAPTER_NAME}' поднят (luid={luid}); bypass={bypass:?}");
+        Ok(Session { session, _adapter: adapter, luid, bypass })
     }
 
     /// Применить список netsh-команд (argv без ведущего `netsh`). Ошибка любой — прерывает bring_up.
@@ -237,12 +254,106 @@ mod windows_svc {
         Ok(())
     }
 
-    /// TODO(3c): два потока — WinTUN `session.receive_blocking()` → `encode_packet` → пайп; пайп
-    /// `parse_stream` → `session.allocate_send_packet`/`send_packet`. Маркер `clean_disconnect`
-    /// (len==0) → снять WFP (иначе держим — fail-closed).
-    fn pump(_h: HANDLE, _s: &Session) {}
+    /// Физический default-gateway из `route print -4` (чистый парсер [`crate::plan::parse_default_gateway`]).
+    fn default_gateway() -> Option<String> {
+        let out = std::process::Command::new("route").args(["print", "-4"]).output().ok()?;
+        crate::plan::parse_default_gateway(&String::from_utf8_lossy(&out.stdout))
+    }
 
-    /// Drop WinTUN-адаптера (маршруты/DNS `store=active` исчезают с ним). TODO(3c): при наличии
-    /// WFP — держать при аварийном разрыве (fail-closed), снимать только на чистый disconnect.
-    fn teardown(_s: Session) {}
+    /// Добавить bypass-маршруты (`route add <dst> mask <m> <gw>`). Возвращает УСПЕШНО добавленные
+    /// (для отката). Без gw — предупреждаем (риск петли при full-tunnel), ничего не ставим.
+    fn apply_bypass(dests: &[String], gw: Option<&str>) -> Vec<String> {
+        let Some(gw) = gw else {
+            if !dests.is_empty() {
+                eprintln!("[svc] WARN: default-gw не найден — bypass не добавлен (риск петли)");
+            }
+            return Vec::new();
+        };
+        let mut done = Vec::new();
+        for dest in dests {
+            let ok = std::process::Command::new("route")
+                .args(bypass_route_add(dest, gw))
+                .status()
+                .map(|s| s.success())
+                .unwrap_or(false);
+            if ok {
+                done.push(dest.clone());
+            } else {
+                eprintln!("[svc] route add {dest} via {gw} не удался");
+            }
+        }
+        done
+    }
+
+    /// Packet-pump: два потока поверх одного пайпа (полнодуплекс). Возвращает `true`, если получен
+    /// маркер чистого disconnect (len==0) — teardown снимет WFP; иначе (краш/реконнект) WFP держим.
+    fn pump(pipe: HANDLE, s: &Session) -> bool {
+        let stop = Arc::new(AtomicBool::new(false));
+        let clean = Arc::new(AtomicBool::new(false));
+
+        // Поток WinTUN → пайп: блокирующее чтение из адаптера, кадрирование, запись в пайп.
+        let t1 = {
+            let session = s.session.clone();
+            let pipe = SendHandle(pipe);
+            let stop = stop.clone();
+            std::thread::spawn(move || {
+                let pipe = pipe; // move обёртки в поток
+                while !stop.load(Ordering::Relaxed) {
+                    match session.receive_blocking() {
+                        Ok(packet) => {
+                            if write_all(pipe.0, &encode_packet(packet.bytes())).is_err() {
+                                break; // пайп закрыт
+                            }
+                        }
+                        Err(_) => break, // сессия закрыта (shutdown)
+                    }
+                }
+                stop.store(true, Ordering::Relaxed);
+            })
+        };
+
+        // Поток пайп → WinTUN (текущий): читаем кадры, отправляем в адаптер.
+        while !stop.load(Ordering::Relaxed) {
+            match read_frame(pipe) {
+                Ok(Some(pkt)) => {
+                    if let Ok(mut sp) = s.session.allocate_send_packet(pkt.len() as u16) {
+                        sp.bytes_mut().copy_from_slice(&pkt);
+                        s.session.send_packet(sp);
+                    }
+                }
+                Ok(None) => {
+                    clean.store(true, Ordering::Relaxed); // маркер чистого disconnect (len==0)
+                    break;
+                }
+                Err(_) => break, // пайп закрыт/ошибка
+            }
+        }
+        stop.store(true, Ordering::Relaxed);
+        let _ = s.session.shutdown(); // разбудить receive_blocking в t1 (иначе висит без пакетов)
+        let _ = t1.join();
+        clean.load(Ordering::Relaxed)
+    }
+
+    /// Прочитать один кадр пакета из пайпа: `u16(len,BE) ‖ payload`. `len==0` → `Ok(None)` (чистый
+    /// disconnect). EOF/ошибка → `Err`.
+    fn read_frame(h: HANDLE) -> anyhow::Result<Option<Vec<u8>>> {
+        let mut lenb = [0u8; 2];
+        read_exact(h, &mut lenb)?;
+        let len = u16::from_be_bytes(lenb) as usize;
+        if len == 0 {
+            return Ok(None);
+        }
+        let mut pkt = vec![0u8; len];
+        read_exact(h, &mut pkt)?;
+        Ok(Some(pkt))
+    }
+
+    /// Свернуть сессию: откат bypass-маршрутов + drop адаптера (маршруты/DNS `store=active` исчезают
+    /// с ним). TODO(3c-2): при наличии WFP снимать его ТОЛЬКО при `clean` (иначе держим fail-closed).
+    fn teardown(s: Session, _clean: bool) {
+        for dest in &s.bypass {
+            let _ = std::process::Command::new("route").args(bypass_route_del(dest)).status();
+        }
+        // drop(s) закрывает WinTUN-сессию и адаптер.
+    }
 }

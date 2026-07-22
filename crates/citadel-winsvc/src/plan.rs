@@ -63,6 +63,49 @@ fn ip4(a: &[u8; 4]) -> String {
     format!("{}.{}.{}.{}", a[0], a[1], a[2], a[3])
 }
 
+/// Распарсить IPv4 default-gateway из вывода `route print -4`. Ищем строки, где первые два токена =
+/// `0.0.0.0` (destination + netmask default-маршрута), третий — валидный IPv4 (шлюз, не «On-link»);
+/// среди них берём с наименьшей метрикой (последний токен). Данные-строки — числа, локаль-независимы
+/// (локализуются только заголовки). Чистая функция (тестируется на любой ОС).
+pub fn parse_default_gateway(route_print: &str) -> Option<String> {
+    let mut best: Option<(u32, String)> = None; // (метрика, шлюз)
+    for line in route_print.lines() {
+        let t: Vec<&str> = line.split_whitespace().collect();
+        if t.len() < 5 || t[0] != "0.0.0.0" || t[1] != "0.0.0.0" {
+            continue;
+        }
+        if t[2].parse::<std::net::Ipv4Addr>().is_err() {
+            continue; // «On-link» и прочее — не шлюз
+        }
+        let metric: u32 = t[4].parse().unwrap_or(u32::MAX);
+        if best.as_ref().is_none_or(|(m, _)| metric < *m) {
+            best = Some((metric, t[2].to_string()));
+        }
+    }
+    best.map(|(_, gw)| gw)
+}
+
+/// `dest` (CIDR `a.b.c.d/p` или голый IP = /32) → `(сеть, маска)` в точечной нотации для `route add`.
+pub fn dest_net_mask(dest: &str) -> (String, String) {
+    match dest.split_once('/') {
+        Some((net, p)) => (net.to_string(), mask(p.parse().unwrap_or(32))),
+        None => (dest.to_string(), "255.255.255.255".to_string()),
+    }
+}
+
+/// Аргументы legacy-команды `route` для bypass-маршрута мимо туннеля через физический шлюз `gw`
+/// (`route add <сеть> mask <маска> <gw>`). Legacy `route` сам подбирает интерфейс по шлюзу.
+pub fn bypass_route_add(dest: &str, gw: &str) -> Vec<String> {
+    let (net, m) = dest_net_mask(dest);
+    vec!["add".into(), net, "mask".into(), m, gw.into()]
+}
+
+/// Аргументы `route delete <сеть>` для отката bypass-маршрута на teardown.
+pub fn bypass_route_del(dest: &str) -> Vec<String> {
+    let (net, _) = dest_net_mask(dest);
+    vec!["delete".into(), net]
+}
+
 /// Префикс-длина → маска IPv4 в точечной нотации (`16` → `255.255.0.0`).
 fn mask(prefix: u8) -> String {
     let p = prefix.min(32) as u32;
@@ -113,5 +156,33 @@ mod tests {
         assert!(p.wfp.is_some());
         assert!(p.bypass.contains(&"203.0.113.9".to_string())); // exit-IP
         assert!(p.bypass.contains(&"192.168.1.0/24".to_string())); // split-обход (Q5)
+    }
+
+    /// Парсер default-gw из `route print -4`: берёт шлюз default-маршрута с наименьшей метрикой,
+    /// игнорирует «On-link» и не-default строки.
+    #[test]
+    fn default_gateway_from_route_print() {
+        let out = "\
+===========================================================================
+Active Routes:
+Network Destination        Netmask          Gateway       Interface  Metric
+          0.0.0.0          0.0.0.0      192.168.1.1     192.168.1.50     35
+          0.0.0.0          0.0.0.0       10.0.0.1        10.0.0.7        25
+      192.168.1.0    255.255.255.0         On-link      192.168.1.50    281
+===========================================================================";
+        assert_eq!(parse_default_gateway(out), Some("10.0.0.1".to_string())); // метрика 25 < 35
+        assert_eq!(parse_default_gateway("нет маршрутов"), None);
+    }
+
+    /// CIDR/host → (сеть, маска) и аргументы route add/delete.
+    #[test]
+    fn route_commands() {
+        assert_eq!(dest_net_mask("192.168.1.0/24"), ("192.168.1.0".into(), "255.255.255.0".into()));
+        assert_eq!(dest_net_mask("203.0.113.9"), ("203.0.113.9".into(), "255.255.255.255".into()));
+        assert_eq!(
+            bypass_route_add("203.0.113.9", "10.0.0.1"),
+            vec!["add", "203.0.113.9", "mask", "255.255.255.255", "10.0.0.1"]
+        );
+        assert_eq!(bypass_route_del("192.168.1.0/24"), vec!["delete", "192.168.1.0"]);
     }
 }
