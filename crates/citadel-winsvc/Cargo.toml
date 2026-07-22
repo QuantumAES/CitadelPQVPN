@@ -18,6 +18,7 @@ citadel-winnet = { path = "../citadel-winnet" }
 # Pipe-сервер (CreateNamedPipeW/ConnectNamedPipe/ReadFile/WriteFile). WinTUN-адаптер (крейт wintun),
 # WFP и SCM (windows-service) добавятся в 3b/3c — сейчас исполнители-заглушки за TODO.
 [target.'cfg(windows)'.dependencies]
+wintun = "0.5"              # WinTUN-адаптер (грузит wintun.dll от WireGuard рантаймом)
 windows-sys = { version = "0.60", features = [
     "Win32_Foundation",
     "Win32_System_Pipes",

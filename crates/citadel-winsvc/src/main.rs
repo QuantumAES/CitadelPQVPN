@@ -194,22 +194,55 @@ mod windows_svc {
         Ok(())
     }
 
-    /// Поднятая сессия (владеет адаптером/маршрутами/WFP). TODO(3b): реальные ресурсы WinTUN/WFP.
+    /// Поднятая сессия: владеет WinTUN-адаптером + его пакетной сессией. Порядок полей = порядок
+    /// drop (сессия перед адаптером). TODO(3c): + WFP-хендл (держать fail-closed при аварии).
     struct Session {
+        /// Пакетная сессия WinTUN: держит адаптер «в работе» (drop закрыл бы её). Читается pump'ом в 3c.
+        #[allow(dead_code)]
+        session: wintun::Session,
+        _adapter: std::sync::Arc<wintun::Adapter>,
         luid: u64,
     }
 
-    /// TODO(3b): создать WinTUN-адаптер (крейт `wintun` + wintun.dll), применить `plan.netsh`
-    /// (`Command::new("netsh")`), bypass-маршруты через физический шлюз (default-route lookup),
-    /// WFP-фильтры из `plan.wfp` (windows-crate FWPM). Пока не реализовано → READY-err.
-    fn bring_up(_plan: &SessionPlan) -> anyhow::Result<Session> {
-        anyhow::bail!("TODO(3b): WinTUN-адаптер / маршруты / WFP ещё не реализованы")
+    /// Поднять туннель: создать WinTUN-адаптер и применить адрес/MTU/маршруты/DNS (netsh).
+    /// TODO(3c): bypass-маршруты (default-gw), WFP kill-switch (`plan.wfp`), packet-pump.
+    fn bring_up(plan: &SessionPlan) -> anyhow::Result<Session> {
+        // Грузим wintun.dll (кладётся рядом со службой при упаковке). SAFETY: доверенная DLL WireGuard.
+        let wintun =
+            unsafe { wintun::load() }.map_err(|e| anyhow::anyhow!("загрузить wintun.dll: {e}"))?;
+        let adapter = wintun::Adapter::create(&wintun, ADAPTER_NAME, ADAPTER_NAME, None)
+            .map_err(|e| anyhow::anyhow!("создать WinTUN-адаптер '{ADAPTER_NAME}': {e}"))?;
+        // get_luid() → NET_LUID_LH (union); .Value = u64-представление. SAFETY: чтение u64-поля union.
+        let luid = unsafe { adapter.get_luid().Value };
+        // адрес/MTU/маршруты-в-туннель/DNS на адаптере (по имени ADAPTER_NAME)
+        apply_netsh(&plan.netsh)?;
+        let session = adapter
+            .start_session(wintun::MAX_RING_CAPACITY)
+            .map_err(|e| anyhow::anyhow!("WinTUN start_session: {e}"))?;
+        eprintln!("[svc] WinTUN '{ADAPTER_NAME}' поднят (luid={luid}), сеть применена");
+        Ok(Session { session, _adapter: adapter, luid })
     }
 
-    /// TODO(3c): два потока — WinTUN.recv → `encode_packet` → пайп; пайп → `parse_stream` →
-    /// WinTUN.send. Маркер `clean_disconnect` (len==0) → снять WFP (иначе держим — fail-closed).
+    /// Применить список netsh-команд (argv без ведущего `netsh`). Ошибка любой — прерывает bring_up.
+    fn apply_netsh(cmds: &[Vec<String>]) -> anyhow::Result<()> {
+        for c in cmds {
+            let status = std::process::Command::new("netsh")
+                .args(c)
+                .status()
+                .map_err(|e| anyhow::anyhow!("запустить netsh {c:?}: {e}"))?;
+            if !status.success() {
+                anyhow::bail!("netsh {c:?} → код {:?}", status.code());
+            }
+        }
+        Ok(())
+    }
+
+    /// TODO(3c): два потока — WinTUN `session.receive_blocking()` → `encode_packet` → пайп; пайп
+    /// `parse_stream` → `session.allocate_send_packet`/`send_packet`. Маркер `clean_disconnect`
+    /// (len==0) → снять WFP (иначе держим — fail-closed).
     fn pump(_h: HANDLE, _s: &Session) {}
 
-    /// TODO(3b): drop WinTUN-адаптера + откат маршрутов/DNS. WFP держим при аварийном разрыве.
+    /// Drop WinTUN-адаптера (маршруты/DNS `store=active` исчезают с ним). TODO(3c): при наличии
+    /// WFP — держать при аварийном разрыве (fail-closed), снимать только на чистый disconnect.
     fn teardown(_s: Session) {}
 }
