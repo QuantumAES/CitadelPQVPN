@@ -1,0 +1,99 @@
+name: windows
+
+# Валидация Windows-клиента (модель W2) на РЕАЛЬНОМ Windows/MSVC — то, что Linux
+# `x86_64-pc-windows-gnu` compile-check не покрывает полностью: WFP/FWPM, named-pipe,
+# SCM, CancelIoEx линкуются и типизируются под MSVC; пуре-тесты winnet/winsvc гоняются
+# на Windows. Установщик (Flutter-бандл + Inno) — отдельным job на push/dispatch.
+#
+# ВАЖНО: GitHub-hosted раннер НЕ создаёт WinTUN-адаптер / WFP-фильтры / службу вживую
+# (нет админ-сессии/драйвера/интерактива) — это только КОМПИЛЯЦИЯ + юнит-тесты.
+# Реальный device-E2E (adapter/WFP/SCM/reconnect) — на настоящей Windows-машине
+# (self-hosted admin-раннер или вручную), см. packaging/windows/README.md.
+
+on:
+  push:
+    branches: [main, dev]
+    paths:
+      - 'crates/**'
+      - 'app/**'
+      - 'packaging/windows/**'
+      - '.github/workflows/windows.yml'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+  pull_request:
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # Обязательный гейт: Windows-специфичный Rust собирается/тестируется/линтится под MSVC.
+  rust:
+    name: rust MSVC (test + build + clippy)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.96.0
+          targets: x86_64-pc-windows-msvc
+          components: clippy
+      # aws-lc-rs (через citadel-client → citadel-quic) на Windows требует nasm для asm-оптимизаций.
+      - name: nasm
+        uses: ilammy/setup-nasm@v1
+      - uses: Swatinem/rust-cache@v2
+      # Пуре-логика (IPC-кадры, WFP-план, маршруты, plan-оркестрация) — тесты на Windows.
+      # winnet/winsvc НЕ тянут aws-lc → быстро.
+      - name: test winnet + winsvc
+        run: cargo test -p citadel-winnet -p citadel-winsvc --locked
+      # Служба целиком под MSVC: WinTUN (wintun.dll грузится рантаймом) + WFP (FWPM) + SCM линкуются.
+      - name: build service (release)
+        run: cargo build -p citadel-winsvc --release --locked
+      # Провайдер (win_tun.rs: named pipe + CancelIoEx) + весь движок под MSVC, clippy как ошибка.
+      - name: clippy windows-gated (-D warnings)
+        run: cargo clippy -p citadel-winnet -p citadel-winsvc -p citadel-client --all-targets --locked -- -D warnings
+
+  # Полный установщик: Flutter-бандл (+ Rust-ядро citadel_client.dll) + служба + WinTUN + Inno.
+  # Не на каждый PR (тяжёлый; app/rust требует Flutter). Артефакт — НЕПОДПИСАННЫЙ (в CI нет cert).
+  installer:
+    name: build installer (Flutter + Inno)
+    runs-on: windows-latest
+    needs: rust
+    if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.96.0
+          targets: x86_64-pc-windows-msvc
+      - name: nasm
+        uses: ilammy/setup-nasm@v1
+      - uses: Swatinem/rust-cache@v2
+      - name: Flutter (stable)
+        uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          cache: true
+      - name: enable windows desktop
+        run: flutter config --enable-windows-desktop
+      # Если app/rust/src/frb_generated.rs НЕ закоммичен — здесь нужен шаг flutter_rust_bridge_codegen.
+      - name: flutter pub get
+        working-directory: app
+        run: flutter pub get
+      - name: Inno Setup
+        run: choco install innosetup --no-progress -y
+      - name: download WinTUN (amd64)
+        shell: pwsh
+        run: |
+          $ver = '0.14.1'
+          Invoke-WebRequest "https://www.wintun.net/builds/wintun-$ver.zip" -OutFile wintun.zip
+          Expand-Archive wintun.zip -DestinationPath wintun-extract
+          Copy-Item "wintun-extract\wintun\bin\amd64\wintun.dll" "packaging\windows\wintun.dll"
+      - name: build installer (unsigned)
+        shell: pwsh
+        run: .\packaging\windows\build-windows.ps1 -Version 1.0.0-ci
+      - uses: actions/upload-artifact@v4
+        with:
+          name: CitadelPQVPN-Setup-unsigned
+          path: packaging/windows/Output/*.exe
+          if-no-files-found: error

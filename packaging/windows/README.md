@@ -73,3 +73,47 @@ citadel-svc --console    # dev-режим (слушать пайп в консо
 - **ARM64**: сборка та же, таргеты `aarch64-pc-windows-msvc` + wintun arm64 + `ArchitecturesAllowed=arm64`.
 - **Альтернатива WiX**: MSI c нативными `<ServiceInstall>/<ServiceControl>` вместо `citadel-svc install` —
   лучше для GPO/enterprise-развёртывания; Inno выбран как быстрый путь, переиспользующий код службы.
+
+## 6. CI и раннеры
+
+Workflow **`.github/workflows/windows.yml`** (триггеры: push в `main`/`dev` по путям, PR, ручной):
+
+| Job | Что делает | Раннер |
+|-----|-----------|--------|
+| `rust` (обязательный) | `cargo test -p citadel-winnet -p citadel-winsvc` + `cargo build -p citadel-winsvc --release` + `cargo clippy` (winnet/winsvc/client) `-D warnings` под **MSVC** | `windows-latest` |
+| `installer` (push/dispatch) | Flutter-бандл + служба + WinTUN + Inno → артефакт `CitadelPQVPN-Setup-unsigned` | `windows-latest` |
+
+**Что CI ЛОВИТ:** компиляция и линковка под MSVC (WFP/FWPM, named-pipe, SCM, CancelIoEx — то, что
+Linux `windows-gnu` не покрывает полностью) + пуре-юнит-тесты winnet/winsvc на Windows.
+
+**Чего CI НЕ ловит (нужна настоящая машина):** создание WinTUN-адаптера, WFP-фильтры, регистрация/старт
+службы, packet-pump, reconnect — GitHub-hosted раннер это не запускает (нет админ-сессии, драйвера, интерактива).
+Полный **device-E2E** (§4) — только на реальном Windows с админом.
+
+### GitHub-hosted `windows-latest` (что уже есть / что доставляет workflow)
+- **Предустановлено:** VS2022 Build Tools (MSVC + Windows SDK), CMake, rustup, choco, git.
+- **Доставляет workflow:** `nasm` (для aws-lc-rs), Flutter (`subosito/flutter-action`), Inno Setup (`choco`),
+  `wintun.dll` (скачивается с wintun.net). MSVC-таргет — дефолт на Windows-раннере.
+
+### Self-hosted раннер (нужен для реального E2E)
+Если хотите гонять **рантайм-тесты WinTUN/WFP/службы** в CI — только self-hosted на реальной/VM Windows:
+1. **ОС:** Windows 10/11 x64 (или Server 2022), **не** Core (нужен GUI-стек для WinTUN/интерактива).
+2. **Поставить** всё из §1 (VS2022 C++, Flutter, rustup+msvc-target, Inno6, nasm) + положить `wintun.dll`.
+3. **Runner-агент:** GitHub → repo Settings → Actions → Runners → New self-hosted runner (Windows x64),
+   распаковать, `./config.cmd`, зарегистрировать с меткой (напр. `windows-e2e`).
+4. **Права:** для установки службы/создания адаптера раннер должен работать **с админ-правами** —
+   запускать агент **интерактивно от админа** (`./run.cmd`), НЕ как ограниченную службу (LocalService).
+   Драйвер WinTUN ставится при первом создании адаптера — нужен админ и подписанный `wintun.dll` (он подписан WireGuard).
+5. **Изоляция:** такой раннер меняет системную сеть (адаптер/маршруты/WFP) — держите на выделенной VM,
+   с snapshot-откатом; НЕ на shared-хосте.
+6. В workflow-job для E2E: `runs-on: [self-hosted, windows-e2e]` + шаги установки/старта службы и smoke-теста.
+
+> Рекомендация: обязательный гейт (`rust`) — на GitHub-hosted (дёшево, ловит компиляцию/линт); реальный
+> E2E — вручную по §4 ЛИБО на выделенном self-hosted admin-раннере (по желанию).
+
+## 7. Быстрая ручная итерация (без полного бандла)
+- Только служба (быстро, без Flutter): `cargo build -p citadel-winsvc --release --target x86_64-pc-windows-msvc`
+  → `target\x86_64-pc-windows-msvc\release\citadel-svc.exe`. Отладка: `citadel-svc --console` (elevated) —
+  слушает пайп в консоли без SCM; можно ткнуть тестовым клиентом.
+- Ядро-провайдер под MSVC-артефакт с Linux (для CI/compile-check без Windows): `cargo xwin build --target
+  x86_64-pc-windows-msvc -p citadel-client` (нужен `cargo-xwin`). Полный app-бандл — всё равно только на Windows.

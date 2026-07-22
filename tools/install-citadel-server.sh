@@ -4,6 +4,10 @@
 #
 #    ssh root@СЕРВЕР 'bash -s' -- vX.Y.Z  < tools/install-citadel-server.sh
 #    # или скопировать на сервер и:  CITADEL_VERSION=vX.Y.Z ./install-citadel-server.sh
+#    # локально (без скачивания релиза, dev/air-gapped): собрать бинари и указать каталог с ними —
+#    #   cargo build --release -p citadel-quic -p citadel-token -p citadel-client
+#    #   sudo CITADEL_LOCAL_BIN=$PWD/target/release ./install-citadel-server.sh
+#    #   (нужны citadel-m1, citadel-token, citadel-linkgen в этом каталоге; подпись НЕ проверяется)
 #
 #  Делает: авто-Docker → скачивает ПОДПИСАННЫЕ бинари релиза и ВЕРИФИЦИРУЕТ их
 #  (minisign вшитым ключом → sha256 → распаковка) → keygen на сервере →
@@ -36,6 +40,9 @@ TCP_PORT="${CITADEL_TCP_PORT:-443}"
 ROUTES="${CITADEL_ROUTES:-0.0.0.0/0}"        # что гнать в туннель (full-tunnel по умолчанию)
 DNS="${CITADEL_DNS:-1.1.1.1}"                # DNS, проталкиваемый клиенту (через туннель; анти-leak F6)
 DIR="${CITADEL_DIR:-/opt/citadel}"
+LOCAL_BIN="${CITADEL_LOCAL_BIN:-}"           # dir с УЖЕ СОБРАННЫМИ citadel-m1/token/linkgen →
+                                             # локальная установка БЕЗ скачивания релиза (dev/air-gapped;
+                                             # подпись НЕ проверяется). Пусто = штатно тянем релиз с GitHub.
 ISSUER_ON="${CITADEL_ISSUER:-1}"             # 1 = двухслойная идентичность (issuer+токены+ML-DSA); 0 = token-less
 ISSUER_PORT="${CITADEL_ISSUER_PORT:-7000}"   # публичный порт издателя (клиент фетчит токены сюда)
 ADMIN_PORT="${CITADEL_ADMIN_PORT:-7001}"     # C7.2: порт admin-канала — НЕ публикуется наружу (только из туннеля)
@@ -51,7 +58,12 @@ die()  { printf '\033[1;31m[citadel] ОШИБКА: %s\033[0m\n' "$*" >&2; exit 1
 
 # ─── 0. преконды ───
 [[ "$(id -u)" == "0" ]] || die "запусти от root (sudo)"
-[[ -n "$VERSION" ]] || die "укажи версию релиза: аргументом или CITADEL_VERSION=vX.Y.Z (pin версии, не «latest»)"
+if [[ -n "$LOCAL_BIN" ]]; then
+  [[ -d "$LOCAL_BIN" ]] || die "CITADEL_LOCAL_BIN не каталог: $LOCAL_BIN"
+  VERSION="${VERSION:-local-$(date +%Y%m%d%H%M%S)}"   # версия = тег образа (не для скачивания)
+else
+  [[ -n "$VERSION" ]] || die "укажи версию релиза: аргументом или CITADEL_VERSION=vX.Y.Z (pin версии, не «latest»); ИЛИ CITADEL_LOCAL_BIN=<dir> для локальной установки"
+fi
 case "$(uname -m)" in
   x86_64|amd64)  ARCH=x86_64 ;;
   aarch64|arm64) ARCH=aarch64 ;;
@@ -62,10 +74,13 @@ esac
 log "версия=$VERSION арка=$ARCH каталог=$DIR issuer=$ISSUER_ON"
 
 # ─── 1. базовые утилиты (curl/minisign/zstd) ───
+# minisign/zstd нужны ТОЛЬКО для скачивания+верификации релиза; при LOCAL_BIN их не ставим.
 pkgs=()
 command -v curl     >/dev/null || pkgs+=(curl ca-certificates)
-command -v minisign >/dev/null || pkgs+=(minisign)
-command -v zstd     >/dev/null || pkgs+=(zstd)
+if [[ -z "$LOCAL_BIN" ]]; then
+  command -v minisign >/dev/null || pkgs+=(minisign)
+  command -v zstd     >/dev/null || pkgs+=(zstd)
+fi
 if ((${#pkgs[@]})); then
   log "ставлю утилиты: ${pkgs[*]}"
   if   command -v apt-get >/dev/null; then apt-get update -qq && apt-get install -y -qq "${pkgs[@]}"
@@ -89,38 +104,50 @@ if ! docker info >/dev/null 2>&1; then
 fi
 log "Docker: $(docker --version)"
 
-# ─── 3. скачать + ВЕРИФИЦИРОВАТЬ релиз (подпись → sha256 → распаковка) ───
-# citadel-token нужен для issuer-контейнера; тянем всегда (образ общий), задействуем при ISSUER_ON.
+# ─── 3. получить бинари: скачать+ВЕРИФИЦИРОВАТЬ релиз ЛИБО скопировать локальные (LOCAL_BIN) ───
+# citadel-token нужен для issuer-контейнера; берём всегда (образ общий), задействуем при ISSUER_ON.
 work="$(mktemp -d)"; trap 'rm -rf "$work"' EXIT
-( cd "$work"
-  log "скачиваю релиз $VERSION ($ARCH)…"
-  for f in "citadel-m1-$ARCH.zst" "citadel-linkgen-$ARCH.zst" "citadel-token-$ARCH.zst" sha256sums sha256sums.minisig; do
-    curl -fsSL -o "$f" "$BASE_URL/$VERSION/$f" || die "не скачался: $f"
-  done
-  log "проверяю подпись sha256sums вшитым ключом…"
-  minisign -V -P "$RELEASE_PUBKEY" -m sha256sums >/dev/null \
-    || die "ПОДПИСЬ НЕ ПРОШЛА — артефакт подделан/повреждён. Остановка."
-  log "проверяю sha256 бинарей…"
-  sha256sum -c --ignore-missing sha256sums >/dev/null || die "sha256 не совпал. Остановка."
-)
-log "подпись и хеши OK — распаковываю"
 mkdir -p "$DIR/bin" "$DIR/keys" "$DIR/etc"
 # 711 (не 700!): exit сбрасывает привилегии до nobody (F4) и per-auth ЧИТАЕТ публичные issuer-<epoch>.pub
 # из этого каталога. При 700 nobody не может войти в каталог → чтение падает → verify_token видит
 # пустой список ключей → ВСЕ токены «невалидны» (тихо, docker-демо это не ловит — named volume там 0755).
 # 711 даёт traverse без листинга; секреты (obfs.psk/client.seed) остаются 600 и nobody недоступны.
 chmod 711 "$DIR/keys"
-for name in citadel-m1 citadel-token; do
-  zstd -q -d -f "$work/$name-$ARCH.zst" -o "$DIR/bin/$name"
-  chmod +x "$DIR/bin/$name"
-done
-# Q4: citadel-linkgen НЕ кладём на бокс — он нужен ТОЛЬКО для печати ссылок при установке.
-# Распаковываем во временный каталог (trap EXIT стирает его в конце). После установки на сервере
-# не остаётся инструмента для минта абонентских/мастер-ссылок → при компрометации root не сможет
-# «нарисовать» себе рабочую ссылку штатным тулом (остаток — RSA-ключ issuer, см. вывод/доки).
+# Q4: citadel-linkgen НЕ кладём на бокс (только tmp) — после установки нет инструмента минта ссылок.
 LINKGEN="$work/citadel-linkgen"
-zstd -q -d -f "$work/citadel-linkgen-$ARCH.zst" -o "$LINKGEN"
-chmod +x "$LINKGEN"
+
+if [[ -z "$LOCAL_BIN" ]]; then
+  # штатно: скачать подписанный релиз → проверить подпись+sha256 → распаковать .zst
+  ( cd "$work"
+    log "скачиваю релиз $VERSION ($ARCH)…"
+    for f in "citadel-m1-$ARCH.zst" "citadel-linkgen-$ARCH.zst" "citadel-token-$ARCH.zst" sha256sums sha256sums.minisig; do
+      curl -fsSL -o "$f" "$BASE_URL/$VERSION/$f" || die "не скачался: $f"
+    done
+    log "проверяю подпись sha256sums вшитым ключом…"
+    minisign -V -P "$RELEASE_PUBKEY" -m sha256sums >/dev/null \
+      || die "ПОДПИСЬ НЕ ПРОШЛА — артефакт подделан/повреждён. Остановка."
+    log "проверяю sha256 бинарей…"
+    sha256sum -c --ignore-missing sha256sums >/dev/null || die "sha256 не совпал. Остановка."
+  )
+  log "подпись и хеши OK — распаковываю"
+  for name in citadel-m1 citadel-token; do
+    zstd -q -d -f "$work/$name-$ARCH.zst" -o "$DIR/bin/$name"
+    chmod +x "$DIR/bin/$name"
+  done
+  zstd -q -d -f "$work/citadel-linkgen-$ARCH.zst" -o "$LINKGEN"
+  chmod +x "$LINKGEN"
+else
+  # локально: копируем УЖЕ СОБРАННЫЕ бинари из LOCAL_BIN (без скачивания/подписи). Для dev/air-gapped:
+  # cargo build --release -p citadel-quic -p citadel-token -p citadel-client → бинари в target/release.
+  warn "ЛОКАЛЬНАЯ установка из '$LOCAL_BIN' — БЕЗ проверки подписи (доверяй источнику; dev/air-gapped)."
+  for name in citadel-m1 citadel-token; do
+    [[ -x "$LOCAL_BIN/$name" ]] || die "нет исполняемого $LOCAL_BIN/$name (собери: cargo build --release)"
+    install -m 0755 "$LOCAL_BIN/$name" "$DIR/bin/$name"
+  done
+  [[ -x "$LOCAL_BIN/citadel-linkgen" ]] || die "нет исполняемого $LOCAL_BIN/citadel-linkgen"
+  install -m 0755 "$LOCAL_BIN/citadel-linkgen" "$LINKGEN"   # linkgen тоже в tmp (Q4), не на бокс
+  log "локальные бинари скопированы из '$LOCAL_BIN'"
+fi
 
 # ─── 3.5 ротация идентичности при ОБНОВЛЕНИИ (задача 2) ───
 # Обновление сервера ОБЯЗАНO инвалидировать ВСЕ ранее розданные ссылки — и клиентские, и мастер:
