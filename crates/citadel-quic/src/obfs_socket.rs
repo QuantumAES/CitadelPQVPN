@@ -16,7 +16,6 @@ use std::collections::VecDeque;
 use std::fmt;
 use std::io::{self, IoSliceMut};
 use std::net::SocketAddr;
-use std::os::fd::AsRawFd;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, Weak};
@@ -159,7 +158,7 @@ impl ObfsUdpSocket {
     fn rebind(&self) -> io::Result<()> {
         let std_sock = std::net::UdpSocket::bind("0.0.0.0:0")?;
         // после миграции новый сокет тоже исключаем из туннеля (Android); desktop — no-op
-        crate::protect::protect_socket(std_sock.as_raw_fd());
+        crate::protect::protect_socket(crate::protect::raw_socket_handle(&std_sock));
         std_sock.set_nonblocking(true)?;
         let new = tokio::net::UdpSocket::from_std(std_sock)?;
         let old = self.inner.load().local_addr().ok();
@@ -349,7 +348,7 @@ fn build_endpoint(
 ) -> Result<quinn::Endpoint> {
     // Android: исключить исходящий сокет движка из собственного туннеля (анти-петля).
     // На desktop/сервере протектор не установлен → no-op. Должно быть ДО connect.
-    crate::protect::protect_socket(std_sock.as_raw_fd());
+    crate::protect::protect_socket(crate::protect::raw_socket_handle(&std_sock));
     let pacing = pacing_from_env();
     let sock = Arc::new(ObfsUdpSocket::new(std_sock, psk, pacing)?);
     // Pacer спавним только при включённом пейсинге; держит Weak → не мешает дропу сокета.

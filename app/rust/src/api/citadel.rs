@@ -17,9 +17,15 @@ use flutter_rust_bridge::frb;
 use crate::frb_generated::StreamSink;
 
 use citadel_client::{
-    CredentialLink, GuiTunProvider, Profile, SplitMode, SplitTunnel, TunIo, TunParams, TunProvider,
+    CredentialLink, Profile, SplitMode, SplitTunnel, TunIo, TunParams, TunProvider,
     Vault, VpnController, VpnEvent, VpnState,
 };
+// Провайдер туннеля desktop зависит от ОС: Linux — polkit-helper (GuiTunProvider), Windows —
+// служба citadel-svc по named pipe (WindowsTunProvider). Каждый экспортится только на своей ОС.
+#[cfg(not(windows))]
+use citadel_client::GuiTunProvider;
+#[cfg(windows)]
+use citadel_client::WindowsTunProvider;
 
 /// Версия PQ-VPN-ядра (about-экран).
 #[frb(sync)]
@@ -632,7 +638,12 @@ fn spawn_controller(
 /// Desktop: старт через polkit-helper (`GuiTunProvider`) + прямая пересылка событий в `sink`
 /// (десктопный изолят живёт с процессом → swap-able sink не нужен, в отличие от Android).
 fn start_connect(uri: &str, profile_id: Option<String>, sink: StreamSink<VpnEventDto>) -> Result<()> {
-    let mut rx = spawn_controller(uri, Arc::new(GuiTunProvider::default()))?;
+    // Windows — служба citadel-svc (W2, named pipe); прочий desktop — polkit-helper.
+    #[cfg(windows)]
+    let provider: Arc<dyn TunProvider> = Arc::new(WindowsTunProvider::default());
+    #[cfg(not(windows))]
+    let provider: Arc<dyn TunProvider> = Arc::new(GuiTunProvider::default());
+    let mut rx = spawn_controller(uri, provider)?;
     rt().spawn(async move {
         while let Ok(ev) = rx.recv().await {
             update_last_exit(&profile_id, &ev);

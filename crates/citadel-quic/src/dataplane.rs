@@ -432,11 +432,11 @@ fn tun_reader_loop(
     stop: Arc<std::sync::atomic::AtomicBool>,
     tx: tokio::sync::mpsc::Sender<Vec<u8>>,
 ) {
-    use std::sync::atomic::Ordering;
     let mut buf = vec![0u8; 65536];
 
     #[cfg(unix)]
     if let Some(fd) = tun.raw_fd() {
+        use std::sync::atomic::Ordering;
         // неблокирующий fd + poll(timeout): просыпаемся на пакет ИЛИ каждые 200мс на stop.
         // SAFETY: fd валиден, пока жив tun (держим Arc); fcntl/poll без side-effects на память.
         unsafe {
@@ -476,6 +476,14 @@ fn tun_reader_loop(
         }
         return;
     }
+
+    // Windows/без-fd: прерываемая по `stop` отмена чтения пока НЕ реализована — reader выходит по
+    // ошибке recv / закрытию канала-приёмника. Для Windows-службы (named pipe, raw_fd()==None)
+    // отмену по `stop` реализуем в инкременте 3 (read-timeout или CancelIoEx через windows-crate);
+    // до этого чистый disconnect рвёт пайп через clean_shutdown, а reconnect полагается на разрыв
+    // пайпа службой. TODO(win-svc): интеграционный reconnect-тест на Windows-боксе.
+    #[cfg(not(unix))]
+    let _ = &stop;
 
     // fallback: без fd — обычное блокирующее чтение (прервётся по ошибке/закрытию канала).
     loop {

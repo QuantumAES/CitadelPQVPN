@@ -22,6 +22,14 @@ pub mod gui_tun;
 // гейт not(mobile) (исключает russh из APK). См. deploy.rs / Cargo.toml.
 #[cfg(not(any(target_os = "android", target_os = "ios")))]
 pub mod deploy;
+// C3-Windows (W2): платформо-нейтральное ядро сервис-модели (IPC-кадры app↔служба, WFP-план,
+// маршруты). Компилируется на ВСЕХ ОС (юнит-тесты гоняются на Linux); WinAPI живёт в cfg(windows)
+// провайдере/службе, что потребляют эти планы. Аналог чистых функций killswitch_rules в helper.
+pub mod winnet;
+// C3-Windows (W2): WindowsTunProvider — TunProvider поверх named pipe к службе citadel-svc.
+// Только Windows (WinAPI/пайп-путь); движок в приложении, как GuiTunProvider на Linux.
+#[cfg(windows)]
+pub mod win_tun;
 
 // Поверхность движка для FFI/UI: один крейт, чтобы биндинг-генератор видел всё в одном месте.
 pub use citadel_quic::config::{
@@ -41,6 +49,8 @@ pub use admin::{
 pub use vault::{IssuedRecord, Profile, Vault};
 #[cfg(any(target_os = "linux", target_os = "android"))]
 pub use gui_tun::GuiTunProvider;
+#[cfg(windows)]
+pub use win_tun::WindowsTunProvider;
 #[cfg(not(any(target_os = "android", target_os = "ios")))]
 pub use deploy::{
     AdminDeployer, CommandOutput, DeployConfig, HostKeyDecision, HostKeyVerifier, MemoryTofu,

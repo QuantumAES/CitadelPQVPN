@@ -7,13 +7,32 @@
 //! платформа (Android, через FFI) один раз ставит протектор глобально [`set_socket_protector`].
 //! На desktop/сервере протектор не установлен → [`protect_socket`] — no-op.
 
-use std::os::fd::RawFd;
 use std::sync::{Arc, Mutex};
+
+/// Сырой хэндл сокета для протектора: `RawFd` (Unix) / `RawSocket` (Windows). Абстрагирует
+/// платформу, чтобы движок кроссился и под Windows (там протектор — no-op: анти-петлю к exit
+/// держит WFP/маршрут-bypass, VpnService-аналога нет).
+#[cfg(unix)]
+pub type SocketHandle = std::os::fd::RawFd;
+#[cfg(windows)]
+pub type SocketHandle = std::os::windows::io::RawSocket;
+
+/// Сырой хэндл UDP-сокета для [`protect_socket`] (fd на Unix, SOCKET на Windows).
+#[cfg(unix)]
+pub fn raw_socket_handle(s: &std::net::UdpSocket) -> SocketHandle {
+    use std::os::fd::AsRawFd;
+    s.as_raw_fd()
+}
+#[cfg(windows)]
+pub fn raw_socket_handle(s: &std::net::UdpSocket) -> SocketHandle {
+    use std::os::windows::io::AsRawSocket;
+    s.as_raw_socket()
+}
 
 /// Платформенный протектор сокета (Android: обёртка над `VpnService.protect`).
 pub trait SocketProtector: Send + Sync {
-    /// Исключить сокет `fd` из VPN-маршрутизации. Возвращает `true` при успехе.
-    fn protect(&self, fd: RawFd) -> bool;
+    /// Исключить сокет из VPN-маршрутизации. Возвращает `true` при успехе.
+    fn protect(&self, sock: SocketHandle) -> bool;
 }
 
 static PROTECTOR: Mutex<Option<Arc<dyn SocketProtector>>> = Mutex::new(None);
@@ -30,10 +49,10 @@ pub fn clear_socket_protector() {
 
 /// Применить протектор к свежесозданному исходящему сокету. No-op, если не установлен (desktop).
 /// Вызывать ДО connect/первой отправки — иначе первые пакеты уйдут в туннель.
-pub fn protect_socket(fd: RawFd) {
+pub fn protect_socket(sock: SocketHandle) {
     if let Some(p) = PROTECTOR.lock().unwrap().as_ref() {
-        if !p.protect(fd) {
-            eprintln!("[protect] VpnService.protect(fd={fd}) вернул false — возможна маршрутная петля");
+        if !p.protect(sock) {
+            eprintln!("[protect] VpnService.protect({sock}) вернул false — возможна маршрутная петля");
         }
     }
 }
@@ -45,7 +64,7 @@ mod tests {
 
     struct Counter(Arc<AtomicUsize>);
     impl SocketProtector for Counter {
-        fn protect(&self, _fd: RawFd) -> bool {
+        fn protect(&self, _sock: SocketHandle) -> bool {
             self.0.fetch_add(1, Ordering::SeqCst);
             true
         }
