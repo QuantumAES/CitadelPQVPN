@@ -35,6 +35,13 @@ pub trait TunIo: Send + Sync + 'static {
     /// kill-switch (C6/M9): реконнект-разрыв сигнал НЕ шлёт → KS держится в разрыве (не утекает).
     /// По умолчанию — no-op (для TUN на основе fd, VpnService и т.п.).
     fn clean_shutdown(&self) {}
+
+    /// Прервать блокирующий `recv` из ДРУГОГО потока (реконнект/disconnect), чтобы reader-поток
+    /// вышел и отпустил `Arc<dyn TunIo>`. Нужно там, где `recv` не прерывается через `raw_fd`-poll
+    /// (Windows named pipe: `CancelIoEx`). После `cancel` последующие `recv` должны возвращать `Err`
+    /// (иначе гонка «отмена до входа в блокирующее чтение» оставила бы поток висеть). По умолчанию
+    /// no-op (fd-туннели прерываются poll'ом по `stop`; VpnService — закрытием интерфейса).
+    fn cancel(&self) {}
 }
 
 #[cfg(any(target_os = "linux", target_os = "android"))]

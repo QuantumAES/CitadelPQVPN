@@ -257,10 +257,15 @@ pub async fn pump(
     struct CancelGuard {
         stop: Arc<AtomicBool>,
         aborts: Vec<tokio::task::AbortHandle>,
+        /// Клон TUN — чтобы прервать блокирующий reader-recv, не прерываемый через `raw_fd`-poll
+        /// (Windows named pipe: `cancel` → CancelIoEx). На fd-туннелях `cancel` — no-op (будит poll).
+        tun: Arc<dyn TunIo>,
     }
     impl Drop for CancelGuard {
         fn drop(&mut self) {
             self.stop.store(true, std::sync::atomic::Ordering::Release);
+            // Прервать reader, висящий в блокирующем recv без раскрытия по stop-poll (Windows).
+            self.tun.cancel();
             for a in &self.aborts {
                 a.abort();
             }
@@ -349,6 +354,7 @@ pub async fn pump(
             receiver.abort_handle(),
             watchdog.abort_handle(),
         ],
+        tun: tun.clone(),
     };
     // pump живёт, пока жив ТРАНСПОРТ: ждём завершения receiver (закрытие conn watchdog'ом/peer'ом
     // или отмену). sender и watchdog оборвёт CancelGuard при выходе (drop _guard). Важно НЕ ждать
@@ -477,15 +483,15 @@ fn tun_reader_loop(
         return;
     }
 
-    // Windows/без-fd: прерываемая по `stop` отмена чтения пока НЕ реализована — reader выходит по
-    // ошибке recv / закрытию канала-приёмника. Для Windows-службы (named pipe, raw_fd()==None)
-    // отмену по `stop` реализуем в инкременте 3 (read-timeout или CancelIoEx через windows-crate);
-    // до этого чистый disconnect рвёт пайп через clean_shutdown, а reconnect полагается на разрыв
-    // пайпа службой. TODO(win-svc): интеграционный reconnect-тест на Windows-боксе.
+    // Windows/без-fd (named pipe, raw_fd()==None): reader выходит по Err из recv. Отмена на
+    // реконнект/disconnect — через `TunIo::cancel` (CancelGuard зовёт его → WindowsTun делает
+    // CancelIoEx + флаг), после чего recv возвращает Err и петля завершается. `stop` здесь не
+    // опрашивается (нет poll-таймаута); раскрытие идёт через cancel/ошибку recv/закрытие канала.
+    // Device-тест reconnect на Windows-боксе — за пользователем.
     #[cfg(not(unix))]
     let _ = &stop;
 
-    // fallback: без fd — обычное блокирующее чтение (прервётся по ошибке/закрытию канала).
+    // fallback: без fd — блокирующее чтение; прерывается Err из recv (в т.ч. по cancel) / закрытием канала.
     loop {
         match tun.recv(&mut buf) {
             Ok(n) if n > 0 => {

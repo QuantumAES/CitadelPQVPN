@@ -35,6 +35,10 @@ tokio = { version = "1", features = ["rt"] }
 [target.'cfg(any(target_os = "linux", target_os = "android"))'.dependencies]
 sendfd = "0.4"
 
+# WindowsTunProvider: CancelIoEx (прервать блокирующий recv на named pipe при реконнекте/disconnect).
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.60", features = ["Win32_Foundation", "Win32_System_IO"] }
+
 # AdminDeployer (C4): SSH-деплой сервера. russh — чистый Rust (backend aws-lc-rs, тот же, что в
 # движке), без OpenSSL-C → не ломает мобильную сборку единым ядром. Admin — десктоп-функция, на
 # мобильных (Android/iOS) деплоя нет, поэтому гейт not(mobile): экономит сборку APK от russh.

@@ -17,9 +17,13 @@
 
 use std::fs::{File, OpenOptions};
 use std::io::{self, Read, Write};
+use std::os::windows::io::AsRawHandle;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use anyhow::{bail, Context, Result};
+use windows_sys::Win32::Foundation::HANDLE;
+use windows_sys::Win32::System::IO::CancelIoEx;
 
 use citadel_quic::vpn::{TunParams, TunProvider};
 use citadel_tun::TunIo;
@@ -76,7 +80,13 @@ impl TunProvider for WindowsTunProvider {
         // Разделяем хендлы: recv и send идут по независимым дубликатам (Windows-пайп полнодуплексный),
         // чтобы блокирующее чтение не держало запись, и наоборот.
         let read = pipe.try_clone().context("клонировать read-хендл пайпа")?;
-        Ok(Arc::new(WindowsTun { read: Mutex::new(read), write: Mutex::new(pipe) }))
+        let read_handle = read.as_raw_handle() as isize;
+        Ok(Arc::new(WindowsTun {
+            read: Mutex::new(read),
+            write: Mutex::new(pipe),
+            read_handle,
+            cancelled: AtomicBool::new(false),
+        }))
     }
 }
 
@@ -107,10 +117,19 @@ fn read_ready(pipe: &mut File) -> Result<TunReady> {
 struct WindowsTun {
     read: Mutex<File>,
     write: Mutex<File>,
+    /// Сырое значение HANDLE read-пайпа для `CancelIoEx` — держим ВНЕ `read`-Mutex: recv удерживает
+    /// его во время блокирующего ReadFile, брать хэндл из-под Mutex в `cancel` = дедлок.
+    read_handle: isize,
+    /// Флаг отмены: recv проверяет ПЕРЕД чтением — закрывает гонку «cancel до входа в ReadFile»
+    /// (тогда CancelIoEx ничего не прерывает, но следующий recv увидит флаг и вернёт Err).
+    cancelled: AtomicBool,
 }
 
 impl TunIo for WindowsTun {
     fn recv(&self, buf: &mut [u8]) -> io::Result<usize> {
+        if self.cancelled.load(Ordering::Acquire) {
+            return Err(io::Error::new(io::ErrorKind::Interrupted, "recv отменён (disconnect)"));
+        }
         let mut r = self.read.lock().unwrap();
         let mut lenb = [0u8; 2];
         r.read_exact(&mut lenb)?;
@@ -146,6 +165,18 @@ impl TunIo for WindowsTun {
         if let Ok(mut w) = self.write.lock() {
             let _ = w.write_all(&winnet::clean_disconnect_marker());
             let _ = w.flush();
+        }
+    }
+
+    /// Прервать блокирующий ReadFile reader-потока (реконнект/disconnect). Сначала флаг (recv,
+    /// ещё не вошедший в ReadFile, увидит его и выйдет), затем `CancelIoEx` (прерывает уже идущий
+    /// ReadFile). Вместе закрывают гонку → reader гарантированно получает Err и отпускает `Arc`.
+    fn cancel(&self) {
+        self.cancelled.store(true, Ordering::Release);
+        // SAFETY: read_handle — валидный HANDLE пайпа, живёт пока жив self; CancelIoEx безопасен
+        // из другого потока и на handle без активного I/O (тогда просто вернёт FALSE — игнорируем).
+        unsafe {
+            let _ = CancelIoEx(self.read_handle as HANDLE, std::ptr::null());
         }
     }
 }
