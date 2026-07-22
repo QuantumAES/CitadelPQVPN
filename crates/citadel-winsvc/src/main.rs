@@ -166,7 +166,9 @@ mod windows_svc {
             name: SERVICE_NAME.into(),
             display_name: "CitadelPQVPN Service".into(),
             service_type: ServiceType::OWN_PROCESS,
-            start_type: ServiceStartType::OnDemand,
+            // AutoStart: служба всегда слушает пайп (неприв. desktop-app сам её не стартанёт — нет
+            // прав SERVICE_START). Пока туннель не поднят — только слушает пайп (адаптера/WFP нет).
+            start_type: ServiceStartType::AutoStart,
             error_control: ServiceErrorControl::Normal,
             executable_path: std::env::current_exe()?,
             launch_arguments: vec![],
