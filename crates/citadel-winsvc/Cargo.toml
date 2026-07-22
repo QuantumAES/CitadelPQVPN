@@ -1,0 +1,27 @@
+[package]
+name = "citadel-winsvc"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "CitadelPQVPN — привилегированная Windows-служба citadel-svc (модель W2): WinTUN + WFP kill-switch + маршруты/DNS, packet-pump ↔ named pipe приложения"
+
+[[bin]]
+name = "citadel-svc"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1"
+# Ядро W2 (кадры пайпа, WFP-план, маршруты) — общее с провайдером; БЕЗ движка (меньше attack surface).
+citadel-winnet = { path = "../citadel-winnet" }
+
+# Windows-only WinAPI. windows-sys 0.60 уже в Cargo.lock (транзитивно) → без новых версий.
+# Pipe-сервер (CreateNamedPipeW/ConnectNamedPipe/ReadFile/WriteFile). WinTUN-адаптер (крейт wintun),
+# WFP и SCM (windows-service) добавятся в 3b/3c — сейчас исполнители-заглушки за TODO.
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.60", features = [
+    "Win32_Foundation",
+    "Win32_System_Pipes",
+    "Win32_Storage_FileSystem",
+    "Win32_System_IO",      # OVERLAPPED — нужен для ReadFile/WriteFile/ConnectNamedPipe
+    "Win32_Security",
+] }

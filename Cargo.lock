@@ -434,6 +434,7 @@ dependencies = [
  "citadel-quic",
  "citadel-token",
  "citadel-tun",
+ "citadel-winnet",
  "hex",
  "libc",
  "qrcode",
@@ -521,6 +522,24 @@ name = "citadel-tun"
 version = "0.1.0"
 dependencies = [
  "libc",
+]
+
+[[package]]
+name = "citadel-winnet"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "ciborium",
+ "serde",
+]
+
+[[package]]
+name = "citadel-winsvc"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "citadel-winnet",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]
