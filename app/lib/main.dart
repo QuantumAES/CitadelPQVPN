@@ -2,21 +2,17 @@ import 'dart:io' show Platform;
 
 import 'package:flutter/material.dart';
 import 'package:path_provider/path_provider.dart';
-import 'package:tray_manager/tray_manager.dart';
 import 'package:window_manager/window_manager.dart';
 
 import 'package:app/app_state.dart';
 import 'package:app/home_page.dart';
+import 'package:app/windows_tray.dart';
 import 'package:app/src/rust/api/citadel.dart';
 import 'package:app/src/rust/api/diag.dart';
 import 'package:app/src/rust/frb_generated.dart';
 
 /// Desktop-платформы, где окно закрывается «красной кнопкой» (C8.2) и есть window_manager.
 bool get _isDesktop => Platform.isLinux || Platform.isWindows || Platform.isMacOS;
-
-/// #5.5: путь иконки трея (Windows — .ico, Linux/macOS — .png). tray_manager резолвит Flutter-ассеты.
-String _trayIconPath() =>
-    Platform.isWindows ? 'assets/tray_icon.ico' : 'assets/tray_icon.png';
 
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
@@ -39,9 +35,7 @@ Future<void> main() async {
       await windowManager.focus();
     });
     await windowManager.setPreventClose(true);
-    // #5.5: иконка в системном трее (меню/сворачивание в трей — в _CitadelAppState).
-    await trayManager.setIcon(_trayIconPath());
-    await trayManager.setToolTip('CitadelPQVPN');
+    // #5.5: системный трей (Windows) инициализируется в _CitadelAppState (нативный, method-channel).
   }
   // На Android cwd=`/` (песочница не writable) и нет XDG/HOME — путь хранилища должна
   // задать платформа (приватный filesDir). На десктопе путь резолвится из XDG/HOME, и
@@ -74,7 +68,7 @@ class CitadelApp extends StatefulWidget {
   State<CitadelApp> createState() => _CitadelAppState();
 }
 
-class _CitadelAppState extends State<CitadelApp> with WindowListener, TrayListener {
+class _CitadelAppState extends State<CitadelApp> with WindowListener {
   final AppState state = AppState();
   final GlobalKey<NavigatorState> _navKey = GlobalKey<NavigatorState>();
 
@@ -83,10 +77,17 @@ class _CitadelAppState extends State<CitadelApp> with WindowListener, TrayListen
     super.initState();
     if (_isDesktop) {
       windowManager.addListener(this);
-      trayManager.addListener(this);
-      // #5.5: меню трея зависит от состояния (пункт «Отключить» — только при активном туннеле).
-      state.addListener(_syncTrayMenu);
-      _syncTrayMenu();
+      // #5.5: системный трей — только Windows (нативный). Пункт «Отключить» в меню зависит от
+      // состояния → синхронизируем на смену AppState.
+      if (WindowsTray.supported) {
+        WindowsTray.init(
+          onOpen: _showFromTray,
+          onDisconnect: state.disconnect,
+          onExit: _quitApp,
+        );
+        state.addListener(_syncTray);
+        _syncTray();
+      }
     }
   }
 
@@ -94,49 +95,20 @@ class _CitadelAppState extends State<CitadelApp> with WindowListener, TrayListen
   void dispose() {
     if (_isDesktop) {
       windowManager.removeListener(this);
-      trayManager.removeListener(this);
-      state.removeListener(_syncTrayMenu);
+      if (WindowsTray.supported) state.removeListener(_syncTray);
     }
     state.dispose();
     super.dispose();
   }
 
-  // ─────────────────────────── #5.5 системный трей ───────────────────────────
+  // ─────────────────────────── #5.5 системный трей (Windows) ───────────────────────────
 
-  /// Пересобрать контекст-меню трея (по правому клику). «Отключить» — только когда туннель активен.
-  void _syncTrayMenu() {
-    if (!_isDesktop) return;
-    trayManager.setContextMenu(Menu(items: [
-      MenuItem(key: 'show', label: 'Открыть CitadelPQVPN'),
-      MenuItem.separator(),
-      if (state.isBusy) MenuItem(key: 'disconnect', label: 'Отключить туннель'),
-      MenuItem(key: 'exit', label: 'Выход'),
-    ]));
-  }
+  /// Отразить состояние туннеля в трее (пункт «Отключить» появляется только при активном).
+  void _syncTray() => WindowsTray.setConnected(state.isBusy);
 
-  /// Левый клик по иконке трея → показать окно (восстановить из фона).
-  @override
-  void onTrayIconMouseDown() => _showFromTray();
-
-  /// Правый клик → показать контекст-меню.
-  @override
-  void onTrayIconRightMouseDown() => trayManager.popUpContextMenu();
-
-  @override
-  void onTrayMenuItemClick(MenuItem menuItem) {
-    switch (menuItem.key) {
-      case 'show':
-        _showFromTray();
-      case 'disconnect':
-        state.disconnect();
-      case 'exit':
-        _quitApp();
-    }
-  }
-
-  Future<void> _showFromTray() async {
-    await windowManager.show();
-    await windowManager.focus();
+  void _showFromTray() {
+    windowManager.show();
+    windowManager.focus();
   }
 
   /// Полный выход: чистый disconnect (снятие KS) → убрать иконку трея → закрыть.
@@ -145,7 +117,7 @@ class _CitadelAppState extends State<CitadelApp> with WindowListener, TrayListen
       state.disconnect(); // vpnDisconnect → clean_shutdown ('Q'/disarm снимет kill-switch)
       await Future<void>.delayed(const Duration(milliseconds: 700));
     }
-    if (_isDesktop) await trayManager.destroy();
+    await WindowsTray.dispose();
     await windowManager.destroy();
   }
 
@@ -162,13 +134,15 @@ class _CitadelAppState extends State<CitadelApp> with WindowListener, TrayListen
       await _quitApp();
       return;
     }
+    // На Windows «в фоне» = сворачивание в системный трей; на Linux/macOS трея нет → обычный minimize.
+    final bg = WindowsTray.supported ? 'в трей' : 'свернётся';
     final choice = await showDialog<String>(
       context: ctx,
       builder: (d) => AlertDialog(
         title: const Text('Туннель активен'),
-        content: const Text(
+        content: Text(
           'VPN подключён. Что сделать при закрытии окна?\n\n'
-          '• Оставить в фоне — окно свернётся в трей, соединение продолжит работать.\n'
+          '• Оставить в фоне — окно $bg, соединение продолжит работать.\n'
           '• Отключить и выйти — разорвать туннель и закрыть приложение.',
         ),
         actions: [
@@ -180,7 +154,12 @@ class _CitadelAppState extends State<CitadelApp> with WindowListener, TrayListen
     );
     switch (choice) {
       case 'background':
-        await windowManager.hide(); // #5.5: свернуть в трей (окно скрыто, сессия жива; иконка → показать)
+        // Windows → скрыть в трей (иконка вернёт); Linux/macOS → minimize (в панель задач).
+        if (WindowsTray.supported) {
+          await windowManager.hide();
+        } else {
+          await windowManager.minimize();
+        }
       case 'quit':
         await _quitApp();
       default:

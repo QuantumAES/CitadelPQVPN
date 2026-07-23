@@ -45,9 +45,9 @@ dependencies:
   # C8.2: перехват закрытия окна на desktop (Linux) — спросить «в фоне / отключить и выйти».
   # Desktop-only по факту использования; на мобильных плагин не задействуется.
   window_manager: ^0.4.3
-  # #5.5: иконка в системном трее + сворачивание в трей («оставить в фоне») + контекст-меню.
-  # Desktop-only (Windows/Linux/macOS); на мобильных не задействуется.
-  tray_manager: ^0.2.3
+  # #5.5: системный трей реализован НАТИВНО в Windows-runner'е (Shell_NotifyIcon + method-channel
+  # citadel/tray) — без сторонних плагинов, чтобы Linux/Android НЕ тянули зависимость appindicator
+  # (её жёсткий build/runtime-реквайр ломал flutter build linux). См. lib/windows_tray.dart.
 
 dev_dependencies:
   flutter_test:
@@ -72,11 +72,6 @@ flutter:
   # included with your application, so that you can use the icons in
   # the material Icons class.
   uses-material-design: true
-
-  # #5.5: иконки системного трея (Windows — .ico, Linux/macOS — .png).
-  assets:
-    - assets/tray_icon.ico
-    - assets/tray_icon.png
 
   # To add assets to your application, add an assets section, like this:
   # assets:
