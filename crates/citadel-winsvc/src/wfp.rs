@@ -33,9 +33,19 @@ pub fn arm(filters: &[WfpFilter], tun_luid: u64) -> anyhow::Result<()> {
         unsafe { FwpmEngineClose0(old.0) };
     }
     let engine = open_dynamic_engine()?;
-    add_sublayer(engine)?;
-    for f in filters {
-        add_filter(engine, f, tun_luid)?;
+    // На ЛЮБОЙ ошибке ниже — закрыть engine. Иначе динамическая сессия (с уже добавленным sublayer'ом)
+    // утекает: повторный arm откроет новый engine и упрётся в FWP_E_ALREADY_EXISTS на том же
+    // sublayer-GUID (наблюдалось как каскад «os error 233» на второй попытке connect).
+    let build = (|| -> anyhow::Result<()> {
+        add_sublayer(engine)?;
+        for f in filters {
+            add_filter(engine, f, tun_luid)?;
+        }
+        Ok(())
+    })();
+    if let Err(e) = build {
+        unsafe { FwpmEngineClose0(engine) };
+        return Err(e);
     }
     *guard = Some(Engine(engine));
     Ok(())
@@ -140,6 +150,10 @@ fn add_filter(engine: HANDLE, f: &WfpFilter, tun_luid: u64) -> anyhow::Result<()
 
     // SAFETY: zeroed FWPM_FILTER0; поля выставлены; filterCondition указывает на conds (живёт до вызова).
     let mut filter: FWPM_FILTER0 = unsafe { std::mem::zeroed() };
+    // FWPM требует НЕПУСТОЙ displayData.name у фильтра, иначе FwpmFilterAdd0 → FWP_E_NULL_DISPLAY_NAME
+    // (0x80320023). Строка живёт до конца вызова (API копирует её внутрь объекта фильтра).
+    let mut fname: Vec<u16> = "CitadelPQVPN killswitch\0".encode_utf16().collect();
+    filter.displayData.name = PWSTR(fname.as_mut_ptr());
     filter.layerKey = FWPM_LAYER_ALE_AUTH_CONNECT_V4;
     filter.subLayerKey = CITADEL_SUBLAYER;
     filter.weight.r#type = FWP_UINT8;
@@ -159,7 +173,7 @@ fn add_filter(engine: HANDLE, f: &WfpFilter, tun_luid: u64) -> anyhow::Result<()
         anyhow::bail!("FwpmFilterAdd0 → {rc}");
     }
     // держим backing-переменные до сюда (API уже скопировал)
-    let _ = (&luid_store, &flag_store, &addrmask_store, &addr_store, &port_store);
+    let _ = (&luid_store, &flag_store, &addrmask_store, &addr_store, &port_store, &fname);
     Ok(())
 }
 
