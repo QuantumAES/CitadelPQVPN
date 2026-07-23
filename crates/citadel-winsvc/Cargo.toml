@@ -30,6 +30,7 @@ windows-sys = { version = "0.60", features = [
     "Win32_System_Console",         # SetStdHandle/STD_ERROR_HANDLE — файловый лог службы (log.rs)
     "Win32_System_SystemInformation", # GetLocalTime — таймстамп в баннере лога
     "Win32_System_Threading",       # CreateEventW/ResetEvent — overlapped-I/O пайпа (packet-pump)
+    "Win32_NetworkManagement_IpHelper", # GetBestInterface — индекс физ.интерфейса для bypass-route
 ] }
 # WFP kill-switch (FWPM) — windows-rs 0.62 (уже в lock): Result-обёртки безопаснее сырого FFI.
 windows = { version = "0.62", features = [

@@ -52,6 +52,7 @@ mod windows_svc {
     use windows_sys::Win32::Foundation::{
         CloseHandle, GetLastError, LocalFree, ERROR_IO_PENDING, HANDLE, INVALID_HANDLE_VALUE,
     };
+    use windows_sys::Win32::NetworkManagement::IpHelper::GetBestInterface;
     use windows_sys::Win32::Security::Authorization::ConvertStringSecurityDescriptorToSecurityDescriptorW;
     use windows_sys::Win32::Security::{PSECURITY_DESCRIPTOR, SECURITY_ATTRIBUTES};
     use windows_sys::Win32::Storage::FileSystem::{ReadFile, WriteFile, FILE_FLAG_OVERLAPPED};
@@ -512,10 +513,18 @@ mod windows_svc {
         // Физический шлюз ДО подмены маршрутов туннелем — для bypass (анти-петля + Q5 split).
         let gw = default_gateway();
         eprintln!("[svc] физический default-gw: {gw:?}");
-        // адрес/MTU/маршруты-в-туннель/DNS на адаптере (по имени ADAPTER_NAME)
-        apply_netsh(&plan.netsh)?;
-        // bypass: exit-IP + split-Exclude мимо туннеля через физический шлюз (host-route специфичнее /1)
+        // bypass ПЕРЕД tunnel-маршрутами: физический default ещё цел (шлюз on-link → route add к exit
+        // не падает «Сетевая папка недоступна»), а GetBestInterface даёт ФИЗИЧЕСКИЙ интерфейс, не
+        // Citadel. Ровно как Linux-helper ставит bypass ДО подмены routes. Без него трафик клиента к
+        // exit'у заворачивается в туннель (петля) → QUIC-носитель дохнет → реконнект/нет интернета.
         let bypass = apply_bypass(&plan.bypass, gw.as_deref());
+        // адрес/MTU/маршруты-в-туннель/DNS на адаптере (по имени ADAPTER_NAME). Сбой → откат bypass.
+        if let Err(e) = apply_netsh(&plan.netsh) {
+            for dest in &bypass {
+                let _ = std::process::Command::new("route").args(bypass_route_del(dest)).status();
+            }
+            return Err(e);
+        }
 
         // WFP kill-switch (fail-closed): блокируем не-туннельный трафик, кроме permit'ов плана.
         // Ошибка армирования = не поднимаем туннель без запрошенного KS (откат bypass перед выходом).
@@ -561,8 +570,29 @@ mod windows_svc {
         crate::plan::parse_default_gateway(&String::from_utf8_lossy(&out.stdout))
     }
 
-    /// Добавить bypass-маршруты (`route add <dst> mask <m> <gw>`). Возвращает УСПЕШНО добавленные
-    /// (для отката). Без gw — предупреждаем (риск петли при full-tunnel), ничего не ставим.
+    /// Индекс физического интерфейса, которым СЕЙЧАС достигается `probe` (IPv4), через IP Helper
+    /// `GetBestInterface`. Зовётся ДО подмены routes туннелем → возвращает физический интерфейс
+    /// (а не Citadel). Нужен, чтобы `route add ... IF <idx>` НЕ гадал интерфейс по шлюзу (иначе
+    /// route.exe падает «Сетевая папка недоступна» при p2p-шлюзе / после /1-маршрутов).
+    fn best_iface_index(probe: &str) -> Option<u32> {
+        let ip: std::net::Ipv4Addr = probe.parse().ok()?;
+        // GetBestInterface ждёт IPAddr в СЕТЕВОМ порядке байт (a.b.c.d в памяти) = from_le_bytes на
+        // Windows (LE): 127.0.0.1 → 0x0100007F.
+        let dw = u32::from_le_bytes(ip.octets());
+        let mut idx: u32 = 0;
+        // SAFETY: idx — валидный out-указатель; функция без побочных эффектов на память.
+        let rc = unsafe { GetBestInterface(dw, &mut idx) };
+        if rc == 0 {
+            Some(idx)
+        } else {
+            None
+        }
+    }
+
+    /// Добавить bypass-маршруты мимо туннеля через физический шлюз (`route add <dst> mask <m> <gw>
+    /// [IF <idx>]`). Возвращает добавленные (для отката). Зовётся ДО подмены routes туннелем, чтобы
+    /// физический default был цел (шлюз on-link) и `GetBestInterface` дал физический интерфейс.
+    /// Без gw — предупреждаем (риск петли при full-tunnel), ничего не ставим.
     fn apply_bypass(dests: &[String], gw: Option<&str>) -> Vec<String> {
         let Some(gw) = gw else {
             if !dests.is_empty() {
@@ -572,15 +602,34 @@ mod windows_svc {
         };
         let mut done = Vec::new();
         for dest in dests {
-            let ok = std::process::Command::new("route")
-                .args(bypass_route_add(dest, gw))
-                .status()
-                .map(|s| s.success())
-                .unwrap_or(false);
-            if ok {
-                done.push(dest.clone());
-            } else {
-                eprintln!("[svc] route add {dest} via {gw} не удался");
+            let mut args = bypass_route_add(dest, gw); // ["add", net, "mask", m, gw]
+            // явный интерфейс (индекс) — по IP назначения (host-часть CIDR), пока routes физические.
+            let probe = dest.split('/').next().unwrap_or(dest);
+            let ifidx = best_iface_index(probe);
+            if let Some(idx) = ifidx {
+                args.push("IF".into());
+                args.push(idx.to_string());
+            }
+            // .output(): route.exe возвращает 0 даже при сбое → судим по тексту (лог для диагностики).
+            let out = std::process::Command::new("route").args(&args).output();
+            match out {
+                Ok(o) => {
+                    let so = String::from_utf8_lossy(&o.stdout);
+                    let se = String::from_utf8_lossy(&o.stderr);
+                    let failed = so.contains("Сбой") || so.contains("failed") || se.contains("Сбой")
+                        || se.contains("failed") || !o.status.success();
+                    if failed {
+                        eprintln!(
+                            "[svc] route add {dest} via {gw} IF {ifidx:?} НЕ УДАЛСЯ: {} {}",
+                            so.trim(),
+                            se.trim()
+                        );
+                    } else {
+                        eprintln!("[svc] bypass ok: {dest} via {gw} IF {ifidx:?}");
+                        done.push(dest.clone());
+                    }
+                }
+                Err(e) => eprintln!("[svc] route add {dest} не запущен: {e}"),
             }
         }
         done
