@@ -619,10 +619,18 @@ fn spawn_controller(
         controller.set_token_refresher(Arc::new(move || {
             let iss = iss.clone();
             Box::pin(async move {
-                citadel_client::token_agent::fetch_tokens(&iss, &pin, &seed, 1, 3, obfs_psk)
+                // Ошибку добычи НЕ проглатываем (раньше `.ok()` терял причину → в логе лишь «токен не
+                // задан»): логируем полную цепочку — issuer недоступен? pin? obfs? заблокирован
+                // осиротевшим kill-switch'ем? Виден в лог-панели ядра (нужен диагноз auth-failed).
+                match citadel_client::token_agent::fetch_tokens(&iss, &pin, &seed, 1, 3, obfs_psk)
                     .await
-                    .ok()
-                    .and_then(|mut v| v.pop())
+                {
+                    Ok(mut v) => v.pop(),
+                    Err(e) => {
+                        eprintln!("[token] Layer-1 фетч у issuer {iss} не удался: {e:#}");
+                        None
+                    }
+                }
             }) as std::pin::Pin<Box<dyn std::future::Future<Output = Option<Vec<u8>>> + Send>>
         }));
     }

@@ -536,6 +536,12 @@ mod windows_svc {
                 return Err(anyhow::anyhow!("армировать WFP kill-switch: {e}"));
             }
             eprintln!("[svc] WFP kill-switch армирован ({} фильтров)", wfp_filters.len());
+        } else {
+            // KS выключен в ЭТОЙ сессии → снять осиротевший WFP от прошлой аварийно-разорванной
+            // KS-сессии (служба persistent/AutoStart → dynamic-фильтры живут, пока жив процесс). Иначе
+            // он молча блокировал бы не-туннельный трафик вопреки выбору «без kill-switch» И мог бы
+            // резать issuer при добыче токена. disarm идемпотентен (нет engine → no-op).
+            crate::wfp::disarm();
         }
 
         eprintln!("[svc] WinTUN '{ADAPTER_NAME}' поднят (luid={luid}); bypass={bypass:?}");
