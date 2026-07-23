@@ -2,6 +2,7 @@ import 'dart:io' show Platform;
 
 import 'package:flutter/material.dart';
 import 'package:path_provider/path_provider.dart';
+import 'package:tray_manager/tray_manager.dart';
 import 'package:window_manager/window_manager.dart';
 
 import 'package:app/app_state.dart';
@@ -12,6 +13,10 @@ import 'package:app/src/rust/frb_generated.dart';
 
 /// Desktop-платформы, где окно закрывается «красной кнопкой» (C8.2) и есть window_manager.
 bool get _isDesktop => Platform.isLinux || Platform.isWindows || Platform.isMacOS;
+
+/// #5.5: путь иконки трея (Windows — .ico, Linux/macOS — .png). tray_manager резолвит Flutter-ассеты.
+String _trayIconPath() =>
+    Platform.isWindows ? 'assets/tray_icon.ico' : 'assets/tray_icon.png';
 
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
@@ -34,6 +39,9 @@ Future<void> main() async {
       await windowManager.focus();
     });
     await windowManager.setPreventClose(true);
+    // #5.5: иконка в системном трее (меню/сворачивание в трей — в _CitadelAppState).
+    await trayManager.setIcon(_trayIconPath());
+    await trayManager.setToolTip('CitadelPQVPN');
   }
   // На Android cwd=`/` (песочница не writable) и нет XDG/HOME — путь хранилища должна
   // задать платформа (приватный filesDir). На десктопе путь резолвится из XDG/HOME, и
@@ -66,21 +74,79 @@ class CitadelApp extends StatefulWidget {
   State<CitadelApp> createState() => _CitadelAppState();
 }
 
-class _CitadelAppState extends State<CitadelApp> with WindowListener {
+class _CitadelAppState extends State<CitadelApp> with WindowListener, TrayListener {
   final AppState state = AppState();
   final GlobalKey<NavigatorState> _navKey = GlobalKey<NavigatorState>();
 
   @override
   void initState() {
     super.initState();
-    if (_isDesktop) windowManager.addListener(this);
+    if (_isDesktop) {
+      windowManager.addListener(this);
+      trayManager.addListener(this);
+      // #5.5: меню трея зависит от состояния (пункт «Отключить» — только при активном туннеле).
+      state.addListener(_syncTrayMenu);
+      _syncTrayMenu();
+    }
   }
 
   @override
   void dispose() {
-    if (_isDesktop) windowManager.removeListener(this);
+    if (_isDesktop) {
+      windowManager.removeListener(this);
+      trayManager.removeListener(this);
+      state.removeListener(_syncTrayMenu);
+    }
     state.dispose();
     super.dispose();
+  }
+
+  // ─────────────────────────── #5.5 системный трей ───────────────────────────
+
+  /// Пересобрать контекст-меню трея (по правому клику). «Отключить» — только когда туннель активен.
+  void _syncTrayMenu() {
+    if (!_isDesktop) return;
+    trayManager.setContextMenu(Menu(items: [
+      MenuItem(key: 'show', label: 'Открыть CitadelPQVPN'),
+      MenuItem.separator(),
+      if (state.isBusy) MenuItem(key: 'disconnect', label: 'Отключить туннель'),
+      MenuItem(key: 'exit', label: 'Выход'),
+    ]));
+  }
+
+  /// Левый клик по иконке трея → показать окно (восстановить из фона).
+  @override
+  void onTrayIconMouseDown() => _showFromTray();
+
+  /// Правый клик → показать контекст-меню.
+  @override
+  void onTrayIconRightMouseDown() => trayManager.popUpContextMenu();
+
+  @override
+  void onTrayMenuItemClick(MenuItem menuItem) {
+    switch (menuItem.key) {
+      case 'show':
+        _showFromTray();
+      case 'disconnect':
+        state.disconnect();
+      case 'exit':
+        _quitApp();
+    }
+  }
+
+  Future<void> _showFromTray() async {
+    await windowManager.show();
+    await windowManager.focus();
+  }
+
+  /// Полный выход: чистый disconnect (снятие KS) → убрать иконку трея → закрыть.
+  Future<void> _quitApp() async {
+    if (state.isBusy) {
+      state.disconnect(); // vpnDisconnect → clean_shutdown ('Q'/disarm снимет kill-switch)
+      await Future<void>.delayed(const Duration(milliseconds: 700));
+    }
+    if (_isDesktop) await trayManager.destroy();
+    await windowManager.destroy();
   }
 
   /// C8.2: пользователь нажал «крестик». Туннель неактивен → закрываемся сразу; активен → диалог
@@ -88,12 +154,12 @@ class _CitadelAppState extends State<CitadelApp> with WindowListener {
   @override
   void onWindowClose() async {
     if (!state.isBusy) {
-      await windowManager.destroy();
+      await _quitApp(); // туннеля нет — просто выходим (убрав иконку трея)
       return;
     }
     final ctx = _navKey.currentContext;
     if (ctx == null || !ctx.mounted) {
-      await windowManager.destroy();
+      await _quitApp();
       return;
     }
     final choice = await showDialog<String>(
@@ -102,7 +168,7 @@ class _CitadelAppState extends State<CitadelApp> with WindowListener {
         title: const Text('Туннель активен'),
         content: const Text(
           'VPN подключён. Что сделать при закрытии окна?\n\n'
-          '• Оставить в фоне — окно свернётся, соединение продолжит работать.\n'
+          '• Оставить в фоне — окно свернётся в трей, соединение продолжит работать.\n'
           '• Отключить и выйти — разорвать туннель и закрыть приложение.',
         ),
         actions: [
@@ -114,12 +180,9 @@ class _CitadelAppState extends State<CitadelApp> with WindowListener {
     );
     switch (choice) {
       case 'background':
-        await windowManager.minimize();
+        await windowManager.hide(); // #5.5: свернуть в трей (окно скрыто, сессия жива; иконка → показать)
       case 'quit':
-        state.disconnect(); // vpnDisconnect → clean_shutdown ('Q' → helper снимет kill-switch)
-        // дать движку/хелперу снять сеть до выхода процесса (иначе EOF без 'Q' оставит KS)
-        await Future<void>.delayed(const Duration(milliseconds: 700));
-        await windowManager.destroy();
+        await _quitApp();
       default:
         break; // отмена — окно остаётся открытым
     }
