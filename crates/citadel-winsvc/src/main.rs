@@ -50,13 +50,14 @@ mod windows_svc {
     use windows_service::service_control_handler::{self, ServiceControlHandlerResult};
     use windows_service::{define_windows_service, service_dispatcher};
     use windows_sys::Win32::Foundation::{
-        CloseHandle, GetLastError, LocalFree, HANDLE, INVALID_HANDLE_VALUE,
+        CloseHandle, GetLastError, LocalFree, ERROR_IO_PENDING, HANDLE, INVALID_HANDLE_VALUE,
     };
     use windows_sys::Win32::Security::Authorization::ConvertStringSecurityDescriptorToSecurityDescriptorW;
     use windows_sys::Win32::Security::{PSECURITY_DESCRIPTOR, SECURITY_ATTRIBUTES};
-    use windows_sys::Win32::Storage::FileSystem::{ReadFile, WriteFile};
+    use windows_sys::Win32::Storage::FileSystem::{ReadFile, WriteFile, FILE_FLAG_OVERLAPPED};
     use windows_sys::Win32::System::Pipes::{ConnectNamedPipe, CreateNamedPipeW, DisconnectNamedPipe};
-    use windows_sys::Win32::System::IO::CancelIoEx;
+    use windows_sys::Win32::System::Threading::{CreateEventW, ResetEvent};
+    use windows_sys::Win32::System::IO::{CancelIoEx, GetOverlappedResult, OVERLAPPED};
 
     use crate::plan::{bypass_route_add, bypass_route_del, plan_session, SessionPlan, ADAPTER_NAME};
 
@@ -67,10 +68,132 @@ mod windows_svc {
     /// Текущий хэндл пайпа (для `cancel_accept` → CancelIoEx прерывает блокирующий accept/pump).
     static CURRENT_PIPE: AtomicIsize = AtomicIsize::new(0);
 
-    /// HANDLE (`*mut c_void`) не `Send` — обёртка для передачи пайпа в поток WinTUN→пайп. Named pipe
-    /// полнодуплексный: одновременные WriteFile (этот поток) и ReadFile (поток пайп→WinTUN) корректны.
+    /// HANDLE (`*mut c_void`) не `Send` — обёртка для передачи пайпа в поток WinTUN→пайп. Пайп
+    /// OVERLAPPED-режима: одновременные WriteFile (этот поток) и ReadFile (поток пайп→WinTUN) на одном
+    /// хэндле идут независимо (каждый со своим OVERLAPPED). В СИНХРОННОМ режиме ядро сериализовало бы
+    /// их (FO_SYNCHRONOUS_IO) — блокирующий ReadFile повиснув глушил бы WriteFile → pump вставал.
     struct SendHandle(HANDLE);
     unsafe impl Send for SendHandle {}
+
+    /// Пер-поточный контекст overlapped-I/O: manual-reset событие для блокирующего завершения одной
+    /// операции. Дуплексный пайп открыт с `FILE_FLAG_OVERLAPPED`, поэтому конкурентные Read/Write НЕ
+    /// сериализуются на file-object'е (в отличие от синхронного режима). Блокируемся через
+    /// `GetOverlappedResult(wait=TRUE)`. КАЖДАЯ одновременная операция обязана иметь СВОЙ `Ov` (своё
+    /// событие+OVERLAPPED): reader-поток и writer-поток pump'а держат по одному.
+    struct Ov {
+        event: HANDLE,
+    }
+    // SAFETY: событие используется одним потоком-владельцем; HANDLE переносится в поток pump'а.
+    unsafe impl Send for Ov {}
+
+    impl Ov {
+        fn new() -> anyhow::Result<Self> {
+            // manual-reset (TRUE), начально несигнальное; без имени.
+            let event = unsafe { CreateEventW(std::ptr::null(), 1, 0, std::ptr::null()) };
+            if event.is_null() {
+                anyhow::bail!("CreateEventW: err={}", unsafe { GetLastError() });
+            }
+            Ok(Ov { event })
+        }
+
+        /// Одна overlapped Read/Write → число переданных байт. `write=false` → ReadFile.
+        fn one(&self, h: HANDLE, ptr: *mut u8, len: u32, write: bool) -> anyhow::Result<u32> {
+            // SAFETY: h — валидный overlapped-хэндл пайпа; ptr/len — валидный буфер; ov живёт до
+            // конца GetOverlappedResult (блокирует до завершения), self.event — валидное событие.
+            unsafe {
+                let mut ov: OVERLAPPED = std::mem::zeroed();
+                ov.hEvent = self.event;
+                ResetEvent(self.event);
+                let ok = if write {
+                    WriteFile(h, ptr, len, std::ptr::null_mut(), &mut ov)
+                } else {
+                    ReadFile(h, ptr, len, std::ptr::null_mut(), &mut ov)
+                };
+                if ok == 0 {
+                    let e = GetLastError();
+                    if e != ERROR_IO_PENDING {
+                        anyhow::bail!("{} err={e}", if write { "WriteFile" } else { "ReadFile" });
+                    }
+                }
+                let mut done = 0u32;
+                // bWait=TRUE: ждём на ov.hEvent; отмена через CancelIoEx завершит с ошибкой (Err).
+                if GetOverlappedResult(h, &ov, &mut done, 1) == 0 {
+                    anyhow::bail!("GetOverlappedResult err={}", GetLastError());
+                }
+                Ok(done)
+            }
+        }
+
+        fn read_exact(&self, h: HANDLE, buf: &mut [u8]) -> anyhow::Result<()> {
+            let mut off = 0;
+            while off < buf.len() {
+                let n = self.one(h, buf[off..].as_mut_ptr(), (buf.len() - off) as u32, false)?;
+                if n == 0 {
+                    anyhow::bail!("пайп закрыт (EOF) при чтении");
+                }
+                off += n as usize;
+            }
+            Ok(())
+        }
+
+        fn write_all(&self, h: HANDLE, buf: &[u8]) -> anyhow::Result<()> {
+            let mut off = 0;
+            while off < buf.len() {
+                let n =
+                    self.one(h, buf[off..].as_ptr() as *mut u8, (buf.len() - off) as u32, true)?;
+                if n == 0 {
+                    anyhow::bail!("пайп закрыт (EOF) при записи");
+                }
+                off += n as usize;
+            }
+            Ok(())
+        }
+
+        /// Прочитать один кадр пакета: `u16(len,BE) ‖ payload`. `len==0` → `Ok(None)` (чистый
+        /// disconnect); EOF/ошибка → `Err`.
+        fn read_frame(&self, h: HANDLE) -> anyhow::Result<Option<Vec<u8>>> {
+            let mut lenb = [0u8; 2];
+            self.read_exact(h, &mut lenb)?;
+            let len = u16::from_be_bytes(lenb) as usize;
+            if len == 0 {
+                return Ok(None);
+            }
+            let mut pkt = vec![0u8; len];
+            self.read_exact(h, &mut pkt)?;
+            Ok(Some(pkt))
+        }
+    }
+
+    impl Drop for Ov {
+        fn drop(&mut self) {
+            // SAFETY: event — валидный хэндл, созданный CreateEventW, больше не используется.
+            unsafe { CloseHandle(self.event) };
+        }
+    }
+
+    /// Overlapped-`ConnectNamedPipe`: дождаться подключения клиента. `true` — подключён (или уже был
+    /// до вызова, `ERROR_PIPE_CONNECTED`); `false` — ошибка/отмена (CancelIoEx на Stop → aborted).
+    fn overlapped_connect(h: HANDLE, ov: &Ov) -> bool {
+        // SAFETY: h — валидный overlapped-хэндл пайпа; o живёт до GetOverlappedResult.
+        unsafe {
+            let mut o: OVERLAPPED = std::mem::zeroed();
+            o.hEvent = ov.event;
+            ResetEvent(ov.event);
+            if ConnectNamedPipe(h, &mut o) != 0 {
+                return true; // overlapped: обычно 0; ненулевой — тоже успех
+            }
+            let e = GetLastError();
+            if e == ERROR_PIPE_CONNECTED {
+                return true; // клиент успел до ConnectNamedPipe
+            }
+            if e != ERROR_IO_PENDING {
+                eprintln!("[svc] ConnectNamedPipe err={e}");
+                return false;
+            }
+            let mut done = 0u32;
+            GetOverlappedResult(h, &o, &mut done, 1) != 0
+        }
+    }
 
     // Win32-константы CreateNamedPipeW (ABI-стабильны; локально — чтобы не гадать модуль в windows-sys).
     const PIPE_ACCESS_DUPLEX: u32 = 0x0000_0003;
@@ -217,23 +340,22 @@ mod windows_svc {
     /// через `cancel_accept` (CancelIoEx на текущем пайпе разбудит блокирующий ConnectNamedPipe/pump).
     fn serve(shutdown: &AtomicBool) -> anyhow::Result<()> {
         eprintln!("[svc] слушаю {PIPE_NAME}");
+        // Overlapped-контекст serve-потока: используется для connect + config-handshake + чтения
+        // pump'а (всё на этом потоке, последовательно). Writer-поток pump'а держит СВОЙ Ov.
+        let ov = Ov::new()?;
         while !shutdown.load(Ordering::Acquire) {
             let h = create_pipe_instance()?;
             CURRENT_PIPE.store(h as isize, Ordering::Release);
-            let ok = unsafe { ConnectNamedPipe(h, std::ptr::null_mut()) };
+            let connected = overlapped_connect(h, &ov);
             if shutdown.load(Ordering::Acquire) {
                 unsafe { CloseHandle(h) };
                 break;
             }
-            if ok == 0 {
-                let e = unsafe { GetLastError() };
-                if e != ERROR_PIPE_CONNECTED {
-                    eprintln!("[svc] ConnectNamedPipe err={e}");
-                    unsafe { CloseHandle(h) };
-                    continue;
-                }
+            if !connected {
+                unsafe { CloseHandle(h) };
+                continue;
             }
-            handle_client(h);
+            handle_client(h, &ov);
             CURRENT_PIPE.store(0, Ordering::Release);
             unsafe {
                 DisconnectNamedPipe(h);
@@ -286,7 +408,9 @@ mod windows_svc {
         let h = unsafe {
             CreateNamedPipeW(
                 name.as_ptr(),
-                PIPE_ACCESS_DUPLEX,
+                // OVERLAPPED: конкурентные Read (pipe→WinTUN) и Write (WinTUN→pipe) на одном хэндле
+                // НЕ сериализуются ядром (иначе packet-pump встаёт — блокирующий Read глушит Write).
+                PIPE_ACCESS_DUPLEX | FILE_FLAG_OVERLAPPED,
                 PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT,
                 PIPE_UNLIMITED_INSTANCES,
                 64 * 1024,
@@ -307,8 +431,8 @@ mod windows_svc {
 
     /// Обслужить одного клиента: config-handshake → оркестрация → READY → (pump). При ошибке
     /// bring_up отвечаем READY-err (приложение покажет причину).
-    fn handle_client(h: HANDLE) {
-        let setup = match read_config(h) {
+    fn handle_client(h: HANDLE, ov: &Ov) {
+        let setup = match read_config(ov, h) {
             Ok(s) => s,
             Err(e) => {
                 eprintln!("[svc] чтение config: {e:#}");
@@ -324,80 +448,33 @@ mod windows_svc {
         );
         match bring_up(&plan) {
             Ok(session) => {
-                let _ = write_all(h, &encode_ready_ok(&TunReady { adapter_luid: session.luid }));
-                let clean = pump(h, &session);
+                let _ = ov.write_all(h, &encode_ready_ok(&TunReady { adapter_luid: session.luid }));
+                let clean = pump(h, &session, ov);
                 teardown(session, clean);
             }
             Err(e) => {
                 eprintln!("[svc] bring_up: {e:#}");
-                let _ = write_all(h, &encode_ready_err(&format!("{e:#}")));
+                let _ = ov.write_all(h, &encode_ready_err(&format!("{e:#}")));
             }
         }
     }
 
     /// Прочитать config-кадр: `TAG_CONFIG ‖ u32(len,BE) ‖ cbor(TunSetup)`.
-    fn read_config(h: HANDLE) -> anyhow::Result<TunSetup> {
+    fn read_config(ov: &Ov, h: HANDLE) -> anyhow::Result<TunSetup> {
         let mut tag = [0u8; 1];
-        read_exact(h, &mut tag)?;
+        ov.read_exact(h, &mut tag)?;
         if tag[0] != TAG_CONFIG {
             anyhow::bail!("ожидался TAG_CONFIG, получен 0x{:02x}", tag[0]);
         }
         let mut lenb = [0u8; 4];
-        read_exact(h, &mut lenb)?;
+        ov.read_exact(h, &mut lenb)?;
         let len = u32::from_be_bytes(lenb) as usize;
         if len > MAX_CONFIG {
             anyhow::bail!("config-кадр слишком большой: {len} > {MAX_CONFIG}");
         }
         let mut body = vec![0u8; len];
-        read_exact(h, &mut body)?;
+        ov.read_exact(h, &mut body)?;
         decode_config(&body)
-    }
-
-    fn read_exact(h: HANDLE, buf: &mut [u8]) -> anyhow::Result<()> {
-        let mut off = 0;
-        while off < buf.len() {
-            let mut read = 0u32;
-            // SAFETY: h — валидный хэндл пайпа; буфер валиден на [off..].
-            let ok = unsafe {
-                ReadFile(
-                    h,
-                    buf[off..].as_mut_ptr(),
-                    (buf.len() - off) as u32,
-                    &mut read,
-                    std::ptr::null_mut(),
-                )
-            };
-            if ok == 0 {
-                anyhow::bail!("ReadFile err={}", unsafe { GetLastError() });
-            }
-            if read == 0 {
-                anyhow::bail!("пайп закрыт (EOF) при чтении");
-            }
-            off += read as usize;
-        }
-        Ok(())
-    }
-
-    fn write_all(h: HANDLE, buf: &[u8]) -> anyhow::Result<()> {
-        let mut off = 0;
-        while off < buf.len() {
-            let mut wrote = 0u32;
-            // SAFETY: h — валидный хэндл пайпа; буфер валиден на [off..].
-            let ok = unsafe {
-                WriteFile(
-                    h,
-                    buf[off..].as_ptr(),
-                    (buf.len() - off) as u32,
-                    &mut wrote,
-                    std::ptr::null_mut(),
-                )
-            };
-            if ok == 0 {
-                anyhow::bail!("WriteFile err={}", unsafe { GetLastError() });
-            }
-            off += wrote as usize;
-        }
-        Ok(())
     }
 
     /// Поднятая сессия: владеет WinTUN-адаптером + пакетной сессией (в `Arc` — делится между потоками
@@ -509,23 +586,33 @@ mod windows_svc {
         done
     }
 
-    /// Packet-pump: два потока поверх одного пайпа (полнодуплекс). Возвращает `true`, если получен
-    /// маркер чистого disconnect (len==0) — teardown снимет WFP; иначе (краш/реконнект) WFP держим.
-    fn pump(pipe: HANDLE, s: &Session) -> bool {
+    /// Packet-pump: два потока поверх одного OVERLAPPED-пайпа (полнодуплекс, БЕЗ сериализации).
+    /// `ov_main` (serve-поток) читает пайп→WinTUN; writer-поток держит СВОЙ `Ov` для WinTUN→пайп.
+    /// Возвращает `true`, если получен маркер чистого disconnect (len==0) — teardown снимет WFP;
+    /// иначе (краш/реконнект) WFP держим (fail-closed).
+    fn pump(pipe: HANDLE, s: &Session, ov_main: &Ov) -> bool {
         let stop = Arc::new(AtomicBool::new(false));
         let clean = Arc::new(AtomicBool::new(false));
 
-        // Поток WinTUN → пайп: блокирующее чтение из адаптера, кадрирование, запись в пайп.
+        // Поток WinTUN → пайп: блокирующее чтение из адаптера, кадрирование, overlapped-запись в пайп.
         let t1 = {
             let session = s.session.clone();
             let pipe = SendHandle(pipe);
             let stop = stop.clone();
             std::thread::spawn(move || {
                 let pipe = pipe; // move обёртки в поток
+                let ov = match Ov::new() {
+                    Ok(o) => o, // свой OVERLAPPED-контекст writer'а (не делится с reader-потоком)
+                    Err(e) => {
+                        eprintln!("[svc] pump: writer Ov не создан: {e:#}");
+                        stop.store(true, Ordering::Relaxed);
+                        return;
+                    }
+                };
                 while !stop.load(Ordering::Relaxed) {
                     match session.receive_blocking() {
                         Ok(packet) => {
-                            if write_all(pipe.0, &encode_packet(packet.bytes())).is_err() {
+                            if ov.write_all(pipe.0, &encode_packet(packet.bytes())).is_err() {
                                 break; // пайп закрыт
                             }
                         }
@@ -536,9 +623,9 @@ mod windows_svc {
             })
         };
 
-        // Поток пайп → WinTUN (текущий): читаем кадры, отправляем в адаптер.
+        // Поток пайп → WinTUN (текущий/serve): читаем кадры (overlapped), отправляем в адаптер.
         while !stop.load(Ordering::Relaxed) {
-            match read_frame(pipe) {
+            match ov_main.read_frame(pipe) {
                 Ok(Some(pkt)) => {
                     if let Ok(mut sp) = s.session.allocate_send_packet(pkt.len() as u16) {
                         sp.bytes_mut().copy_from_slice(&pkt);
@@ -549,27 +636,13 @@ mod windows_svc {
                     clean.store(true, Ordering::Relaxed); // маркер чистого disconnect (len==0)
                     break;
                 }
-                Err(_) => break, // пайп закрыт/ошибка
+                Err(_) => break, // пайп закрыт/ошибка/отмена (CancelIoEx на Stop)
             }
         }
         stop.store(true, Ordering::Relaxed);
         let _ = s.session.shutdown(); // разбудить receive_blocking в t1 (иначе висит без пакетов)
         let _ = t1.join();
         clean.load(Ordering::Relaxed)
-    }
-
-    /// Прочитать один кадр пакета из пайпа: `u16(len,BE) ‖ payload`. `len==0` → `Ok(None)` (чистый
-    /// disconnect). EOF/ошибка → `Err`.
-    fn read_frame(h: HANDLE) -> anyhow::Result<Option<Vec<u8>>> {
-        let mut lenb = [0u8; 2];
-        read_exact(h, &mut lenb)?;
-        let len = u16::from_be_bytes(lenb) as usize;
-        if len == 0 {
-            return Ok(None);
-        }
-        let mut pkt = vec![0u8; len];
-        read_exact(h, &mut pkt)?;
-        Ok(Some(pkt))
     }
 
     /// Свернуть сессию: откат bypass-маршрутов + drop адаптера (маршруты/DNS `store=active` исчезают
