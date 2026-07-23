@@ -5,11 +5,12 @@ import 'package:flutter/material.dart';
 import 'package:app/android_vpn.dart';
 import 'package:app/src/rust/api/citadel.dart';
 
-/// C8.3 split-tunneling (Android). Две независимые оси:
-///   • по приложениям  — только выбранные через туннель / только выбранные в обход;
-///   • по назначениям  — домен / IP / CIDR (в т.ч. локальная подсеть) через туннель или в обход.
+/// C8.3 split-tunneling. Две независимые оси:
+///   • по приложениям  — только выбранные через туннель / только выбранные в обход (только Android);
+///   • по назначениям  — домен / IP / CIDR (в т.ч. локальная подсеть) через туннель или в обход
+///     (Android + desktop Linux/Windows — единый winnet::split_routes + bypass helper'а/службы).
 /// Настройка глобальная (как kill-switch), применяется со СЛЕДУЮЩЕГО подключения; хранится ядром
-/// рядом с vault. Экран доступен только на Android (иначе split не применяется движком).
+/// рядом с vault.
 class SplitTunnelPage extends StatefulWidget {
   const SplitTunnelPage({super.key});
 
@@ -195,13 +196,14 @@ class _SplitTunnelPageState extends State<SplitTunnelPage> {
               ),
           ],
           const SizedBox(height: 8),
-          const Padding(
-            padding: EdgeInsets.all(16),
+          Padding(
+            padding: const EdgeInsets.all(16),
             child: Text(
               'Внимание: приложения/адреса «в обход» идут напрямую и раскрывают ваш реальный IP. '
               'Домены резолвятся при подключении; у CDN с меняющимися IP правило может «протекать» '
-              'между переподключениями. Исключение назначений требует Android 13+.',
-              style: TextStyle(fontSize: 12, color: Colors.grey),
+              'между переподключениями.'
+              '${Platform.isAndroid ? ' Исключение назначений требует Android 13+.' : ''}',
+              style: const TextStyle(fontSize: 12, color: Colors.grey),
             ),
           ),
         ],

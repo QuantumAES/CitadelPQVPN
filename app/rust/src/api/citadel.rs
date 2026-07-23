@@ -808,8 +808,17 @@ pub(crate) fn notify_active_network_changed() {
 /// Разорвать активную сессию (если есть).
 #[frb(sync)]
 pub fn vpn_disconnect() {
-    if let Some(c) = ACTIVE.lock().unwrap().take() {
+    let had = ACTIVE.lock().unwrap().take();
+    if let Some(c) = &had {
         c.disconnect();
+    }
+    // Linux-desktop: гарантированно снять kill-switch. При чистом disconnect из фазы `up` его снимет
+    // сам helper по сигналу 'Q' (clean_shutdown); но если disconnect пришёлся на фазу РЕКОНЕКТА,
+    // живого helper'а нет → правила остались бы fail-closed и интернет заблокирован после выхода.
+    // Явный disarm (идемпотентный) закрывает эту дыру. Android — KS системный; Windows держит служба.
+    #[cfg(target_os = "linux")]
+    if had.is_some() && killswitch_enabled() {
+        citadel_client::gui_tun::disarm_killswitch(citadel_client::gui_tun::HELPER_PATH);
     }
 }
 

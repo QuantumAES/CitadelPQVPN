@@ -268,8 +268,9 @@ class _HomePageState extends State<HomePage> {
                   _showAlwaysOnGuide();
                 },
               ),
-            // C8.3 split-tunnel — Android (приложения+назначения) и Linux (только назначения).
-            if (Platform.isAndroid || Platform.isLinux)
+            // C8.3 split-tunnel — Android (приложения+назначения); Linux/Windows (только назначения:
+            // единый winnet::split_routes + bypass привилегированной части — helper/служба).
+            if (Platform.isAndroid || Platform.isLinux || Platform.isWindows)
               ListTile(
                 leading: const Icon(Icons.alt_route),
                 title: const Text('Split-туннель'),

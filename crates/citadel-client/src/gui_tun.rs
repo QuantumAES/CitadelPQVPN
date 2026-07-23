@@ -102,6 +102,17 @@ impl TunProvider for GuiTunProvider {
     }
 }
 
+/// Аварийно снять kill-switch/IPv6-блок на Linux-desktop через отдельный привилегированный вызов
+/// `citadel-helper --disarm-killswitch`. Нужен, когда fail-closed правила остались висеть БЕЗ живого
+/// helper'а: пользователь нажал «Отключить» (или закрыл приложение) в фазе РЕКОНЕКТА — helper прошлой
+/// сессии уже вышел по EOF-без-'Q', оставив kill-switch (as designed), но снять его теперь некому →
+/// весь не-туннельный OUTPUT в DROP, интернета нет даже после disconnect/выхода. Идемпотентно (helper
+/// чистит несуществующие цепочки без ошибки). Fire-and-forget через `spawn` — НЕ блокируем sync-FFI
+/// `vpn_disconnect` (polkit при `auth_admin_keep` не переспрашивает пароль в пределах сессии).
+pub fn disarm_killswitch(helper_path: &str) {
+    let _ = Command::new("pkexec").args([helper_path, "--disarm-killswitch"]).spawn();
+}
+
 /// Путь управляющего сокета (в XDG_RUNTIME_DIR, иначе /tmp); уникален по PID.
 fn control_socket_path() -> String {
     let dir = std::env::var("XDG_RUNTIME_DIR").unwrap_or_else(|_| "/tmp".into());

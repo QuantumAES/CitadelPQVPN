@@ -146,6 +146,61 @@ fn default_route() -> Option<(String, String)> {
     let dev = toks.iter().position(|t| t == "dev")?;
     Some((toks.get(via + 1)?.clone(), toks.get(dev + 1)?.clone()))
 }
+
+/// Как ядро реально маршрутизирует `probe` СЕЙЧАС (до подмены routes туннелем).
+#[derive(Debug, PartialEq)]
+enum PathKind {
+    /// Назначение достижимо напрямую по подсети (on-link) через `dev` — bypass-маршрут НЕ нужен:
+    /// connected-route уже специфичнее /1-половин full-tunnel и держит назначение мимо туннеля.
+    /// Перезапись его на `via gw` СЛОМАЛА бы доставку (пакеты локальной подсети ушли бы шлюзу, а не
+    /// напрямую по L2) — это и был баг сплита «в обход» для локальной подсети при full-tunnel/KS.
+    Onlink { dev: String },
+    /// Назначение за шлюзом (`nh`) через `dev` — нужен явный bypass-маршрут /32|CIDR мимо туннеля.
+    Via { nh: String, dev: String },
+}
+
+/// Разобрать первую строку `ip route get <probe>`: `<dst> [via <nh>] dev <dev> …` (числа локаль-
+/// независимы). `via` есть → off-link через шлюз; только `dev` → on-link по подсети. Чистая функция.
+fn parse_route_get(first_line: &str) -> Option<PathKind> {
+    let t: Vec<&str> = first_line.split_whitespace().collect();
+    let dev = t.iter().position(|x| *x == "dev").and_then(|i| t.get(i + 1)).map(|s| s.to_string())?;
+    match t.iter().position(|x| *x == "via").and_then(|i| t.get(i + 1)) {
+        Some(nh) => Some(PathKind::Via { nh: nh.to_string(), dev }),
+        None => Some(PathKind::Onlink { dev }),
+    }
+}
+
+/// Спросить ядро, как достигается `probe` (до подмены routes туннелем).
+fn path_to(probe: &str) -> Option<PathKind> {
+    let out = Command::new("ip").args(["route", "get", probe]).output().ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    parse_route_get(String::from_utf8_lossy(&out.stdout).lines().next()?)
+}
+
+/// Установить bypass-маршрут для `dst` (CIDR/IP) мимо туннеля, СОХРАНИВ фактический nexthop:
+/// off-link → `via <nh> dev <dev>`; on-link (локальная подсеть) → НЕ трогаем (connected-route уже
+/// держит его мимо туннеля как более специфичный; `replace via gw` сломал бы локалку). Путь берём
+/// `ip route get` ДО подмены routes туннелем (иначе вернётся citadel0). Добавленное пишем в `added`
+/// для teardown; on-link НЕ добавляем — там нечего откатывать, а `route del` снёс бы connected-route.
+fn add_bypass(dst: &str, fallback_gw: &str, fallback_dev: &str, added: &mut Vec<String>) {
+    let probe = dst.split('/').next().unwrap_or(dst);
+    match path_to(probe) {
+        Some(PathKind::Onlink { dev }) => {
+            eprintln!("[helper] bypass {dst}: on-link (dev {dev}) — маршрут не нужен (connected-route)");
+        }
+        Some(PathKind::Via { nh, dev }) => {
+            ip(&["route", "replace", dst, "via", &nh, "dev", &dev]);
+            added.push(dst.to_string());
+        }
+        None => {
+            // путь не определён — фолбэк на default-шлюз (не регрессим удалённое назначение)
+            ip(&["route", "replace", dst, "via", fallback_gw, "dev", fallback_dev]);
+            added.push(dst.to_string());
+        }
+    }
+}
 fn iptables(args: &[&str]) {
     // stderr в null: idempotent-очистка (напр. teardown_killswitch на несуществующей цепочке при
     // первом арминге) шумит «Chain does not exist» — это ожидаемо, не ошибка.
@@ -297,18 +352,16 @@ fn main() -> Result<()> {
     if need_gw {
         match default_route() {
             Some((gw, dev)) => {
-                // exit-IP (IPv4) → host-route /32 мимо туннеля
+                // exit-IP (IPv4) → host-route /32 мимо туннеля (nexthop сохраняем per-dst)
                 for eip in args.exit_ips.split_whitespace().filter(|e| !e.contains(':')) {
-                    let cidr = format!("{eip}/32");
-                    ip(&["route", "replace", &cidr, "via", &gw, "dev", &dev]);
-                    bypass.push(cidr);
+                    add_bypass(&format!("{eip}/32"), &gw, &dev, &mut bypass);
                 }
-                // C8.3 «в обход»: CIDR назначений (IPv4) мимо туннеля через физический шлюз
+                // C8.3 «в обход»: CIDR назначений (IPv4) мимо туннеля; локальная подсеть = on-link,
+                // её connected-route держит мимо туннеля сама — add_bypass её НЕ трогает (иначе баг).
                 for b in args.bypass.split_whitespace().filter(|b| !b.contains(':')) {
-                    ip(&["route", "replace", b, "via", &gw, "dev", &dev]);
-                    bypass.push(b.to_string());
+                    add_bypass(b, &gw, &dev, &mut bypass);
                 }
-                eprintln!("[helper] bypass via {gw} dev {dev}: {:?}", bypass);
+                eprintln!("[helper] bypass (gw {gw} dev {dev}) добавлено via-маршрутов: {:?}", bypass);
             }
             None => eprintln!("[helper] WARN: нет default-route — bypass не добавлен (риск петли/утечки)"),
         }
@@ -420,6 +473,21 @@ mod tests {
         assert!(!is_ip("not-ip"));
         assert!(is_cidr("10.0.0.0/8") && is_cidr("1.1.1.1"));
         assert!(!is_cidr("1.1.1.1/40") && !is_cidr("junk"));
+    }
+
+    /// `ip route get`: on-link (только `dev`) vs off-link (`via <nh> dev`). On-link bypass-назначения
+    /// (локальная подсеть) НЕ должны получать `via gw` — иначе рвётся доставка по подсети (баг сплита).
+    #[test]
+    fn route_get_onlink_vs_via() {
+        assert_eq!(
+            parse_route_get("192.168.1.50 dev eth0 src 192.168.1.10 uid 1000"),
+            Some(PathKind::Onlink { dev: "eth0".into() })
+        );
+        assert_eq!(
+            parse_route_get("8.8.8.8 via 192.168.1.1 dev eth0 src 192.168.1.10 uid 1000"),
+            Some(PathKind::Via { nh: "192.168.1.1".into(), dev: "eth0".into() })
+        );
+        assert_eq!(parse_route_get("unreachable-garbage"), None); // нет dev → None
     }
 
     /// SCM_RIGHTS round-trip БЕЗ root/TUN: передаём read-конец pipe через socketpair и

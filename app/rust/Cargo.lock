@@ -492,6 +492,7 @@ dependencies = [
  "citadel-quic",
  "citadel-token",
  "citadel-tun",
+ "citadel-winnet",
  "hex",
  "qrcode",
  "russh",
@@ -500,6 +501,7 @@ dependencies = [
  "serde_bytes",
  "sha2 0.10.9",
  "tokio",
+ "windows-sys 0.60.2",
  "zeroize",
 ]
 
@@ -561,6 +563,15 @@ name = "citadel-tun"
 version = "0.1.0"
 dependencies = [
  "libc",
+]
+
+[[package]]
+name = "citadel-winnet"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "ciborium",
+ "serde",
 ]
 
 [[package]]
@@ -2356,6 +2367,7 @@ dependencies = [
  "jni",
  "libc",
  "tokio",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]

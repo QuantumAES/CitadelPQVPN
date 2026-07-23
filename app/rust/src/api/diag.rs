@@ -123,10 +123,11 @@ static CAPTURE_STARTED: AtomicBool = AtomicBool::new(false);
 static PERSIST: AtomicBool = AtomicBool::new(false);
 
 /// Один раз подменить stderr на pipe и начать раздачу строк в UI. Идемпотентно; зовётся из
-/// `main.dart` сразу после `RustLib.init()`. На не-unix — no-op.
+/// `main.dart` сразу после `RustLib.init()`. Unix — dup2(fd 2); Windows — SetStdHandle(STDERR).
+/// На прочих ОС — no-op.
 #[frb(sync)]
 pub fn start_log_capture() {
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     {
         if CAPTURE_STARTED.swap(true, Ordering::SeqCst) {
             return; // уже запущен
@@ -192,6 +193,67 @@ unsafe fn spawn_stderr_capture() {
                 push_line(line);
             }
             libc::close(orig);
+        });
+}
+
+/// Windows-аналог: подменить `STD_ERROR_HANDLE` на write-конец пайпа. Rust-`std` перечитывает
+/// std-handle через `GetStdHandle` на КАЖДЫЙ write, поэтому `eprintln!` движка (все `[citadel-m1:
+/// client] …`, паники) после подмены уходят в пайп. Поток-читатель раздаёт строки в шину и (если
+/// консоль есть, напр. `flutter run`) тиражирует в исходный stderr. У GUI-процесса без консоли
+/// исходный handle null → тираж пропускаем, но захват в UI работает. Пайп никто не закрывает
+/// (это process-stderr) → читатель живёт до конца процесса, как unix-версия.
+#[cfg(windows)]
+unsafe fn spawn_stderr_capture() {
+    use std::io::{BufRead, BufReader};
+    use std::os::windows::io::FromRawHandle;
+    use windows_sys::Win32::Foundation::{CloseHandle, HANDLE, INVALID_HANDLE_VALUE};
+    use windows_sys::Win32::Storage::FileSystem::WriteFile;
+    use windows_sys::Win32::System::Console::{GetStdHandle, SetStdHandle, STD_ERROR_HANDLE};
+    use windows_sys::Win32::System::Pipes::CreatePipe;
+
+    // Исходный stderr (для тиража). null/невалидный у GUI-процесса без консоли — тогда тираж no-op.
+    let orig: HANDLE = GetStdHandle(STD_ERROR_HANDLE);
+
+    let mut read: HANDLE = std::ptr::null_mut();
+    let mut write: HANDLE = std::ptr::null_mut();
+    // SAFETY: read/write — валидные out-указатели; дефолтные атрибуты, дефолтный размер буфера.
+    if CreatePipe(&mut read, &mut write, std::ptr::null(), 0) == 0 {
+        CAPTURE_STARTED.store(false, Ordering::SeqCst);
+        return;
+    }
+    // Подменить process-stderr на write-конец пайпа. С этого момента eprintln! ядра → пайп.
+    if SetStdHandle(STD_ERROR_HANDLE, write) == 0 {
+        CloseHandle(read);
+        CloseHandle(write);
+        CAPTURE_STARTED.store(false, Ordering::SeqCst);
+        return;
+    }
+
+    // HANDLE (`*mut c_void`) не `Send` → переносим в поток как isize-значения и восстанавливаем.
+    let (read_val, orig_val) = (read as isize, orig as isize);
+    let _ = std::thread::Builder::new()
+        .name("citadel-logcap".into())
+        .spawn(move || {
+            let read = read_val as HANDLE;
+            let orig = orig_val as HANDLE;
+            // Владеем read-концом как File (закроется при завершении процесса).
+            let reader = BufReader::new(std::fs::File::from_raw_handle(read as _));
+            for line in reader.lines() {
+                let Ok(line) = line else { break };
+                if !orig.is_null() && orig != INVALID_HANDLE_VALUE {
+                    // тираж в исходный stderr (консоль); CRLF как принято на Windows-консоли
+                    let with_nl = format!("{line}\r\n");
+                    let mut wrote = 0u32;
+                    let _ = WriteFile(
+                        orig,
+                        with_nl.as_ptr(),
+                        with_nl.len() as u32,
+                        &mut wrote,
+                        std::ptr::null_mut(),
+                    );
+                }
+                push_line(line);
+            }
         });
 }
 

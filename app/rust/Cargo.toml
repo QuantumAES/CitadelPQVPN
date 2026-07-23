@@ -17,6 +17,17 @@ tokio = { version = "1", features = ["rt-multi-thread", "sync"] }
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
 
+# api::diag — захват process-stderr на Windows (SetStdHandle+CreatePipe): eprintln! ядра → лог-панель.
+# windows-sys 0.60 уже в Cargo.lock (тянет citadel-winsvc) → без новых версий.
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.60", features = [
+    "Win32_Foundation",
+    "Win32_Security",               # SECURITY_ATTRIBUTES — в сигнатуре CreatePipe
+    "Win32_System_Console",         # GetStdHandle/SetStdHandle/STD_ERROR_HANDLE
+    "Win32_System_Pipes",           # CreatePipe
+    "Win32_Storage_FileSystem",     # WriteFile (тираж в исходный stderr)
+] }
+
 # Android: JNI-мост Rust→VpnService.protect() (анти-петля, C3.3).
 [target.'cfg(target_os = "android")'.dependencies]
 jni = "0.21"

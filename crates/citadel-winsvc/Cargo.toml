@@ -27,6 +27,8 @@ windows-sys = { version = "0.60", features = [
     "Win32_System_IO",              # OVERLAPPED — ReadFile/WriteFile/ConnectNamedPipe + CancelIoEx
     "Win32_Security",               # SECURITY_ATTRIBUTES/PSECURITY_DESCRIPTOR (ACL пайпа)
     "Win32_Security_Authorization", # ConvertStringSecurityDescriptorToSecurityDescriptorW (SDDL)
+    "Win32_System_Console",         # SetStdHandle/STD_ERROR_HANDLE — файловый лог службы (log.rs)
+    "Win32_System_SystemInformation", # GetLocalTime — таймстамп в баннере лога
 ] }
 # WFP kill-switch (FWPM) — windows-rs 0.62 (уже в lock): Result-обёртки безопаснее сырого FFI.
 windows = { version = "0.62", features = [

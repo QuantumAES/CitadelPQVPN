@@ -255,8 +255,8 @@ impl VpnController {
                     // старте (подключились до появления сети) — по восстановлении следующая попытка
                     // возьмёт свежий токен и поднимется. Причину показываем (Error), но не сдаёмся до
                     // disconnect (стандартное поведение VPN «connecting…»). Пользователь остановит сам.
-                    self.emit(VpnEvent::Error(e.to_string()));
-                    eprintln!("[vpn] establish не удался: {e} — ретрай через {:?}", backoff);
+                    self.emit(VpnEvent::Error(format!("{e:#}")));
+                    eprintln!("[vpn] establish не удался: {e:#} — ретрай через {:?}", backoff);
                     self.set_state(if ever_up { VpnState::Migrating } else { VpnState::Connecting });
                     if self.sleep_or_stop(backoff).await {
                         self.set_state(VpnState::Down);
@@ -315,11 +315,11 @@ impl VpnController {
                 Ok(t) => t,
                 Err(e) => {
                     if !ever_up {
-                        self.emit(VpnEvent::Error(e.to_string()));
+                        self.emit(VpnEvent::Error(format!("{e:#}")));
                         self.set_state(VpnState::Down);
                         return Err(e);
                     }
-                    eprintln!("[vpn] реконнект: configure TUN не удался: {e} — ретрай через {:?}", backoff);
+                    eprintln!("[vpn] реконнект: configure TUN не удался: {e:#} — ретрай через {:?}", backoff);
                     self.set_state(VpnState::Migrating);
                     if self.sleep_or_stop(backoff).await {
                         self.set_state(VpnState::Down);

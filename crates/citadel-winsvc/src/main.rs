@@ -11,6 +11,8 @@
 #[cfg_attr(not(windows), allow(dead_code))]
 mod plan;
 #[cfg(windows)]
+mod log;
+#[cfg(windows)]
 mod wfp;
 
 #[cfg(not(windows))]
@@ -127,6 +129,9 @@ mod windows_svc {
     }
 
     fn run_service() -> anyhow::Result<()> {
+        // Перенаправить stderr службы в файл (%ProgramData%\CitadelPQVPN\logs) — у SCM-службы нет
+        // консоли, иначе весь eprintln! bring_up/netsh/WFP теряется и туннель не диагностируется.
+        crate::log::redirect_stderr_to_file();
         // control-handler: Stop/Shutdown → флаг + прервать блокирующий accept/pump (CancelIoEx).
         let handler = move |control| -> ServiceControlHandlerResult {
             match control {
@@ -416,18 +421,24 @@ mod windows_svc {
         // get_luid() → NET_LUID_LH (union); .Value = u64-представление. SAFETY: чтение u64-поля union.
         let luid = unsafe { adapter.get_luid().Value };
 
-        // Физический шлюз ДО подмены маршрутов туннелем — для bypass (анти-петля + Q5 split).
-        let gw = default_gateway();
-        // адрес/MTU/маршруты-в-туннель/DNS на адаптере (по имени ADAPTER_NAME)
-        apply_netsh(&plan.netsh)?;
-        // bypass: exit-IP + split-Exclude мимо туннеля через физический шлюз (host-route специфичнее /1)
-        let bypass = apply_bypass(&plan.bypass, gw.as_deref());
-
+        // Стартуем сессию ДО применения IP/маршрутов: WinTUN-адаптер репортит media «connected»
+        // только с активной сессией. Если настроить адрес/маршруты, пока адаптер «disconnected»,
+        // Windows считает интерфейс неактивным и НЕ маршрутизирует через него → «туннель поднят, а
+        // интернета нет». Порядок как у wireguard-windows (сессия → конфиг).
         let session = Arc::new(
             adapter
                 .start_session(wintun::MAX_RING_CAPACITY)
                 .map_err(|e| anyhow::anyhow!("WinTUN start_session: {e}"))?,
         );
+        eprintln!("[svc] WinTUN сессия открыта (luid={luid}) — настраиваю сеть");
+
+        // Физический шлюз ДО подмены маршрутов туннелем — для bypass (анти-петля + Q5 split).
+        let gw = default_gateway();
+        eprintln!("[svc] физический default-gw: {gw:?}");
+        // адрес/MTU/маршруты-в-туннель/DNS на адаптере (по имени ADAPTER_NAME)
+        apply_netsh(&plan.netsh)?;
+        // bypass: exit-IP + split-Exclude мимо туннеля через физический шлюз (host-route специфичнее /1)
+        let bypass = apply_bypass(&plan.bypass, gw.as_deref());
 
         // WFP kill-switch (fail-closed): блокируем не-туннельный трафик, кроме permit'ов плана.
         // Ошибка армирования = не поднимаем туннель без запрошенного KS (откат bypass перед выходом).
@@ -446,15 +457,23 @@ mod windows_svc {
     }
 
     /// Применить список netsh-команд (argv без ведущего `netsh`). Ошибка любой — прерывает bring_up.
+    /// Захватываем вывод (`.output()`), т.к. дочерний netsh НЕ наследует перенаправленный в файл
+    /// stderr службы — иначе причина сбоя (напр. «Element not found») не попала бы в лог/UI.
     fn apply_netsh(cmds: &[Vec<String>]) -> anyhow::Result<()> {
         for c in cmds {
-            let status = std::process::Command::new("netsh")
+            let out = std::process::Command::new("netsh")
                 .args(c)
-                .status()
+                .output()
                 .map_err(|e| anyhow::anyhow!("запустить netsh {c:?}: {e}"))?;
-            if !status.success() {
-                anyhow::bail!("netsh {c:?} → код {:?}", status.code());
+            if !out.status.success() {
+                anyhow::bail!(
+                    "netsh {c:?} → код {:?}: {} {}",
+                    out.status.code(),
+                    String::from_utf8_lossy(&out.stdout).trim(),
+                    String::from_utf8_lossy(&out.stderr).trim()
+                );
             }
+            eprintln!("[svc] netsh ok: {}", c.join(" "));
         }
         Ok(())
     }

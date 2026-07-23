@@ -254,6 +254,12 @@ class _SubscribersPageState extends State<SubscribersPage> {
       appBar: AppBar(
         title: Text('Абоненты · ${widget.profile.name}'),
         actions: [
+          // #5.4: «Выдать доступ» — в AppBar (как «Добавить профиль» на главном), не плавающей кнопкой.
+          IconButton(
+            tooltip: 'Выдать доступ',
+            onPressed: _busy || !_sessionUp ? null : _issueDialog,
+            icon: const Icon(Icons.person_add_alt),
+          ),
           IconButton(
             tooltip: 'Обновить',
             onPressed: _busy || !_sessionUp ? null : _refresh,
@@ -261,13 +267,6 @@ class _SubscribersPageState extends State<SubscribersPage> {
           ),
         ],
       ),
-      floatingActionButton: !_sessionUp
-          ? null
-          : FloatingActionButton.extended(
-              onPressed: _busy ? null : _issueDialog,
-              icon: const Icon(Icons.person_add_alt),
-              label: const Text('Выдать доступ'),
-            ),
       body: !_sessionUp
           ? _gate(context)
           : Column(

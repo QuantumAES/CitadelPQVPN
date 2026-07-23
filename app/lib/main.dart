@@ -20,6 +20,19 @@ Future<void> main() async {
   // «оставить в фоне / отключить и выйти», а не рвать сессию молча.
   if (_isDesktop) {
     await windowManager.ensureInitialized();
+    // Портретное окно в стиле OpenVPN Connect (узкое+высокое) + брендовый заголовок окна: без него
+    // OS-заголовок/панель задач показывают "app" (имя Flutter-проекта). #5.2/#5.3.
+    const opts = WindowOptions(
+      size: Size(440, 820),
+      minimumSize: Size(380, 640),
+      center: true,
+      title: 'CitadelPQVPN',
+    );
+    await windowManager.waitUntilReadyToShow(opts, () async {
+      await windowManager.setTitle('CitadelPQVPN');
+      await windowManager.show();
+      await windowManager.focus();
+    });
     await windowManager.setPreventClose(true);
   }
   // На Android cwd=`/` (песочница не writable) и нет XDG/HOME — путь хранилища должна
