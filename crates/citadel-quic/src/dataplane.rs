@@ -73,17 +73,19 @@ impl Tunnel {
         Ok(recv.read_to_end(8192).await?)
     }
 
-    /// Сервер: принять один control-запрос, обработать `handle` и ответить.
-    pub async fn control_server<F>(&mut self, handle: F) -> Result<()>
+    /// Сервер: принять один control-запрос, обработать `handle` (→ ответ + aux) и ответить. `aux`
+    /// (напр. выделенный адрес) возвращается вызывающему — так адрес выделяется ВНУТРИ обработки, уже
+    /// ПОСЛЕ верификации токена (C6/аудит-3), а не до неё (иначе неавториз. флуд жёг бы пул адресов).
+    pub async fn control_server<F, T>(&mut self, handle: F) -> Result<T>
     where
-        F: FnOnce(&[u8]) -> Result<Vec<u8>>,
+        F: FnOnce(&[u8]) -> Result<(Vec<u8>, T)>,
     {
         let (mut send, mut recv) = self.conn.accept_bi().await?;
         let req = recv.read_to_end(8192).await?;
-        let resp = handle(&req)?;
+        let (resp, aux) = handle(&req)?;
         send.write_all(&resp).await?;
         send.finish()?;
-        Ok(())
+        Ok(aux)
     }
 }
 

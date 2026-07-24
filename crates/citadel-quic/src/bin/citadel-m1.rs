@@ -13,9 +13,8 @@
 //!           Citadel_SERVER_NAME=Citadel.exit, Citadel_ROUTES="1.1.1.1/32 ...",
 //!           Citadel_PIN=<hex> | Citadel_PIN_DIR=<dir с <host>.pin> | Citadel_PIN_FILE=<один pin>
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::process::Command;
-use std::sync::atomic::{AtomicU16, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -29,31 +28,66 @@ use citadel_quic::ratelimit::RateCfg;
 use citadel_quic::vpn::VpnController;
 use citadel_tun::Tun;
 
-// Пул адресов exit для клиентов: база/префикс из Citadel_TUN_ADDR; счётчик u16 заполняет
-// весь диапазон (для /16 — 10.7.0.2 … 10.7.255.253), чтобы адреса не кончались на реконнектах.
-static ADDR_POOL: AtomicU16 = AtomicU16::new(2);
-
 // S2.5/A5: потолок ОДНОВРЕМЕННЫХ pre-auth хендшейков TCP-fallback (анти-DoS: без него флуд
 // «молчаливыми» коннектами копит quinn-Endpoint'ы/задачи/fd). Слот держится только на хендшейк.
 const TCP_FALLBACK_MAX_INFLIGHT: usize = 256;
 // Таймаут на весь TCP-fallback хендшейк (obfs-gate + PQ-QUIC): idle/битый коннект не висит вечно.
 const TCP_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
+// C6/аудит-3: потолок ОДНОВРЕМЕННЫХ pre-auth QUIC/UDP-хендшейков (симметрично A5 на TCP). Флуд
+// хендшейками (даже с общим obfs-PSK) без cap'а копил бы задачи/память до токен-гейта. Слот держится
+// только на хендшейк (established-сессия не занимает).
+const UDP_MAX_INFLIGHT: usize = 512;
 
-/// (первые два октета сети, префикс) из Citadel_TUN_ADDR (default 10.7.0.1/24).
-fn tun_net() -> ([u8; 2], u8) {
-    let s = std::env::var("Citadel_TUN_ADDR").unwrap_or_else(|_| "10.7.0.1/24".into());
-    let mut parts = s.splitn(2, '/');
-    let ip = parts.next().unwrap_or("10.7.0.1");
-    let prefix = parts.next().and_then(|p| p.parse().ok()).unwrap_or(24u8);
-    let o: Vec<u8> = ip.split('.').filter_map(|x| x.parse().ok()).collect();
-    ([o.first().copied().unwrap_or(10), o.get(1).copied().unwrap_or(7)], prefix)
+/// C4/аудит-3: пул клиентских адресов exit. Выделяет свободный host-адрес из подсети `Citadel_TUN_ADDR`
+/// и ОСВОБОЖДАЕТ на disconnect. Заменяет монотонный `AtomicU16` (wraparound после 65534 коннектов →
+/// коллизия адресов живых клиентов = вытеснение return-маршрута/перехват + выдача сетевого/шлюзового
+/// адреса). Пропускает зарезервированные: network (host 0), gateway (host 1 = `Citadel_TUN_ADDR`),
+/// broadcast (последний). Исчерпание → `None` (клиенту отказ, а не тихая коллизия).
+struct AddrPool {
+    net: u32,   // сетевой адрес (host-order u32)
+    prefix: u8,
+    hosts: u32, // размер host-пространства = 2^(32-prefix)
+    used: HashSet<u32>,
+    next: u32, // hint (host-индекс)
 }
 
-/// Следующий клиентский адрес из пула + префикс сети.
-fn next_client_addr() -> ([u8; 4], u8) {
-    let (base, prefix) = tun_net();
-    let n = ADDR_POOL.fetch_add(1, Ordering::Relaxed);
-    ([base[0], base[1], (n >> 8) as u8, (n & 0xff) as u8], prefix)
+impl AddrPool {
+    fn from_env() -> Self {
+        let s = std::env::var("Citadel_TUN_ADDR").unwrap_or_else(|_| "10.7.0.1/24".into());
+        let (ip_s, prefix) = match s.split_once('/') {
+            Some((i, p)) => (i.to_string(), p.parse::<u8>().unwrap_or(24)),
+            None => (s, 24),
+        };
+        let prefix = prefix.min(32);
+        let ip = ip_s.parse::<std::net::Ipv4Addr>().unwrap_or(std::net::Ipv4Addr::new(10, 7, 0, 1));
+        let mask = if prefix == 0 { 0 } else { u32::MAX << (32 - prefix as u32) };
+        let net = u32::from(ip) & mask;
+        let hosts = 1u32.checked_shl(32 - prefix as u32).unwrap_or(0);
+        AddrPool { net, prefix, hosts, used: HashSet::new(), next: 2 }
+    }
+
+    /// Выделить свободный host-индекс из `[2, hosts-2]` (пропуск network=0, gateway=1, broadcast=last).
+    /// `None` — пул исчерпан.
+    fn alloc(&mut self) -> Option<[u8; 4]> {
+        if self.hosts < 4 {
+            return None; // подсеть слишком мелкая (нет хостов кроме reserved)
+        }
+        let last = self.hosts - 1; // индекс broadcast
+        for _ in 2..self.hosts {
+            let idx = self.next;
+            self.next = if self.next + 1 >= last { 2 } else { self.next + 1 };
+            if self.used.insert(idx) {
+                return Some((self.net + idx).to_be_bytes());
+            }
+        }
+        None
+    }
+
+    /// Вернуть адрес в пул (на disconnect).
+    fn free(&mut self, addr: [u8; 4]) {
+        let idx = u32::from_be_bytes(addr).wrapping_sub(self.net);
+        self.used.remove(&idx);
+    }
 }
 
 #[tokio::main]
@@ -281,11 +315,13 @@ impl IssuerAuth {
         !matches!(self, IssuerAuth::Disabled)
     }
 
-    /// Проверить токен → nonce (для учёта double-spend) или None (невалиден/чужая эпоха).
-    fn verify(&self, token: &[u8]) -> Option<[u8; 32]> {
+    /// Проверить токен → `(nonce для double-spend, epoch-бакет для prune)` или None (невалид/чужая
+    /// эпоха). Legacy → бакет `0` (не истекает, не чистится); Epoch → текущая эпоха (C5: бакеты старше
+    /// current-1 можно чистить — токен той эпохи всё равно не пройдёт verify под current±prev ключами).
+    fn verify(&self, token: &[u8]) -> Option<([u8; 32], u64)> {
         match self {
             IssuerAuth::Disabled => None,
-            IssuerAuth::Legacy(pk) => citadel_token::verify_token(pk, token),
+            IssuerAuth::Legacy(pk) => citadel_token::verify_token(pk, token).map(|n| (n, 0)),
             IssuerAuth::Epoch { dir, epoch_secs } => {
                 let e = citadel_token::current_epoch(*epoch_secs);
                 // current + prev (grace на границе эпохи / скью часов); старее — не принимаем.
@@ -295,21 +331,34 @@ impl IssuerAuth {
                         std::fs::read(format!("{dir}/{}", citadel_token::epoch_pub_name(*ep))).ok()
                     })
                     .collect();
-                citadel_token::verify_token_multi(&pubs, token)
+                citadel_token::verify_token_multi(&pubs, token).map(|n| (n, e))
             }
         }
     }
 }
 
+/// C5/аудит-3: учесть потраченный токен в epoch-бакете + prune бакетов старше `epoch-1`. Без prune
+/// `spent` рос бы со ВСЕМИ когда-либо принятыми токенами (утечка памяти на долгом exit). Legacy
+/// (эпоха 0) не чистится (не истекает). Возвращает `true`, если токен свежий (не double-spend).
+fn spend_token(spent: &Mutex<HashMap<u64, HashSet<[u8; 32]>>>, nonce: [u8; 32], epoch: u64) -> bool {
+    let mut map = spent.lock().unwrap();
+    if epoch > 1 {
+        // токен эпохи e принимается ТОЛЬКО ключами current±prev ⇒ бакеты < epoch-1 бесполезны
+        map.retain(|&e, _| e == 0 || e + 1 >= epoch);
+    }
+    map.entry(epoch).or_default().insert(nonce)
+}
+
+/// Обработать control-запрос: верифицировать токен, ВЫДЕЛИТЬ адрес (C6: только ПОСЛЕ токена),
+/// подписать привязку (M7) и вернуть выделенный `(addr, prefix)` (aux из `control_server`).
 async fn server_assign_address(
     tunnel: &mut Tunnel,
-    addr: [u8; 4],
-    prefix: u8,
+    pool: &Mutex<AddrPool>,
     issuer: &IssuerAuth,
-    spent: &Mutex<HashSet<[u8; 32]>>,
+    spent: &Mutex<HashMap<u64, HashSet<[u8; 32]>>>,
     signer: Option<&citadel_quic::pqauth::ServerSigner>,
     cert_pin: [u8; 32],
-) -> Result<()> {
+) -> Result<([u8; 4], u8)> {
     // S2.6/A3: TLS exporter серверной сессии для channel-binding ML-DSA-подписи. Считаем ДО
     // control_server (он берёт &mut tunnel) и заносим в замыкание.
     let exporter = tunnel.exporter()?;
@@ -334,9 +383,8 @@ async fn server_assign_address(
             // F-M4/C5.1: per-user auth анонимным epoch-scoped токеном (если издатель задан)
             if issuer.enabled() {
                 match issuer.verify(token) {
-                    Some(tn) => {
-                        let fresh = spent.lock().unwrap().insert(tn);
-                        if !fresh {
+                    Some((tn, epoch)) => {
+                        if !spend_token(spent, tn, epoch) {
                             return Err(anyhow!("токен уже использован (double-spend)"));
                         }
                         eprintln!("[citadel-m1:server] токен принят (nonce {}…)", hex::encode(&tn[..6]));
@@ -349,6 +397,13 @@ async fn server_assign_address(
             if t != capsule::ADDRESS_REQUEST {
                 return Err(anyhow!("ожидался ADDRESS_REQUEST, type={t}"));
             }
+
+            // C6: адрес выделяем ТОЛЬКО ПОСЛЕ верификации токена — неавториз. флуд не жжёт пул.
+            let (addr, prefix) = {
+                let mut p = pool.lock().unwrap();
+                let a = p.alloc().ok_or_else(|| anyhow!("пул адресов exit исчерпан — отказ"))?;
+                (a, p.prefix)
+            };
             let assign_bytes =
                 capsule::encode_address_assign_v4(&capsule::AssignedV4 { request_id: 1, addr, prefix });
 
@@ -364,7 +419,7 @@ async fn server_assign_address(
             resp.extend_from_slice(&citadel_masque::varint::to_vec(sig.len() as u64));
             resp.extend_from_slice(&sig);
             resp.extend_from_slice(&assign_bytes);
-            Ok(resp)
+            Ok((resp, (addr, prefix))) // aux = выделенный адрес (после токена)
         })
         .await
 }
@@ -467,7 +522,10 @@ async fn run_server(tun: Arc<Tun>) -> Result<()> {
     if issuer_auth.enabled() {
         eprintln!("[Citadel-m1:server] per-user epoch-токены включены (C5.1)");
     }
-    let spent: Arc<Mutex<HashSet<[u8; 32]>>> = Arc::new(Mutex::new(HashSet::new()));
+    // C5: spent-токены по epoch-бакетам (prune старых эпох → без утечки памяти на долгом exit).
+    let spent: Arc<Mutex<HashMap<u64, HashSet<[u8; 32]>>>> = Arc::new(Mutex::new(HashMap::new()));
+    // C4: пул адресов с освобождением на disconnect (замена монотонного AtomicU16).
+    let pool = Arc::new(Mutex::new(AddrPool::from_env()));
 
     // M7 PQ-auth: ML-DSA-65 keypair (если задан Citadel_MLDSA) + публикация pk клиенту.
     // Гибрид с Ed25519-cert+pin: сервер подписывает привязку nonce‖cert_pin, клиент проверяет.
@@ -531,6 +589,7 @@ async fn run_server(tun: Arc<Tun>) -> Result<()> {
         let spent = spent.clone();
         let signer = signer.clone();
         let router = router.clone();
+        let pool = pool.clone();
         // S2.5/A5: каждый accept'нутый TCP-стрим аллоцирует quinn-Endpoint + задачи ДО обфс/PQ-auth;
         // флуд «молчаливыми» коннектами (ничего не шлют) копил бы их безлимитно (DoS-исчерпание
         // fd/памяти). Ограничиваем число ОДНОВРЕМЕННЫХ pre-auth хендшейков семафором (нет слота →
@@ -559,13 +618,14 @@ async fn run_server(tun: Arc<Tun>) -> Result<()> {
                                 continue;
                             }
                         };
-                        let (tun, issuer_auth, spent, signer, scfg, router) = (
+                        let (tun, issuer_auth, spent, signer, scfg, router, pool) = (
                             tun.clone(),
                             issuer_auth.clone(),
                             spent.clone(),
                             signer.clone(),
                             tcp_server_cfg.clone(),
                             router.clone(),
+                            pool.clone(),
                         );
                         tokio::spawn(async move {
                             let ep = match citadel_quic::server_endpoint_obfs_tcp(stream, scfg, psk) {
@@ -597,8 +657,7 @@ async fn run_server(tun: Arc<Tun>) -> Result<()> {
                             // Хендшейк прошёл (obfs+PQ+токен впереди) → освобождаем pre-auth слот:
                             // established-сессия лимит одновременных хендшейков больше не держит.
                             drop(permit);
-                            let (addr, prefix) = next_client_addr();
-                            handle_client(Tunnel::new(conn, true), tun, addr, prefix, issuer_auth, spent, rate_limit, admin_dst, signer, pin, router).await;
+                            handle_client(Tunnel::new(conn, true), tun, issuer_auth, spent, rate_limit, admin_dst, signer, pin, router, pool).await;
                             // ep жив до конца handle_client (в scope) → соединение не рвётся
                         });
                     }
@@ -611,18 +670,37 @@ async fn run_server(tun: Arc<Tun>) -> Result<()> {
         });
     }
 
-    // QUIC accept loop (основной транспорт)
+    // QUIC accept loop (основной транспорт). C6: семафор ограничивает ОДНОВРЕМЕННЫЕ pre-auth QUIC/UDP-
+    // хендшейки (симметрично A5 на TCP) — флуд хендшейками не копит задачи/память до токен-гейта. Слот
+    // держится только на хендшейк (established-сессия не занимает). Лог отклонений throttl'им (как A5).
+    let udp_sema = Arc::new(tokio::sync::Semaphore::new(UDP_MAX_INFLIGHT));
+    let mut udp_rejected: u64 = 0;
+    let mut udp_last_log = Instant::now();
     while let Some(incoming) = ep.accept().await {
+        let permit = match udp_sema.clone().try_acquire_owned() {
+            Ok(p) => p,
+            Err(_) => {
+                incoming.ignore(); // над лимитом pre-auth → тихо отклонить (без ответа/состояния)
+                udp_rejected += 1;
+                if udp_last_log.elapsed() >= Duration::from_secs(1) {
+                    eprintln!("[citadel-m1:server] QUIC: лимит {UDP_MAX_INFLIGHT} одновременных хендшейков — отклонено {udp_rejected} за секунду (C6)");
+                    udp_rejected = 0;
+                    udp_last_log = Instant::now();
+                }
+                continue;
+            }
+        };
         let tun = tun.clone();
         let issuer_auth = issuer_auth.clone();
         let spent = spent.clone();
         let signer = signer.clone();
         let router = router.clone();
+        let pool = pool.clone();
         tokio::spawn(async move {
             match incoming.await {
                 Ok(conn) => {
-                    let (addr, prefix) = next_client_addr();
-                    handle_client(Tunnel::new(conn, false), tun, addr, prefix, issuer_auth, spent, rate_limit, admin_dst, signer, pin, router).await;
+                    drop(permit); // хендшейк прошёл → освободить pre-auth слот (established не держит)
+                    handle_client(Tunnel::new(conn, false), tun, issuer_auth, spent, rate_limit, admin_dst, signer, pin, router, pool).await;
                 }
                 Err(e) => eprintln!("[citadel-m1:server] хендшейк не удался: {e}"),
             }
@@ -631,35 +709,41 @@ async fn run_server(tun: Arc<Tun>) -> Result<()> {
     Ok(())
 }
 
-/// Обслуживание одного клиента (любой транспорт): выдать адрес (токен M4) + качать туннель.
+/// Обслуживание одного клиента (любой транспорт): выдать адрес (токен M4, адрес из пула ПОСЛЕ
+/// токена — C6) + качать туннель. Адрес освобождается в пул по завершении (C4).
 #[allow(clippy::too_many_arguments)]
 async fn handle_client(
     mut tunnel: Tunnel,
     tun: Arc<Tun>,
-    addr: [u8; 4],
-    prefix: u8,
     issuer_auth: Arc<IssuerAuth>,
-    spent: Arc<Mutex<HashSet<[u8; 32]>>>,
+    spent: Arc<Mutex<HashMap<u64, HashSet<[u8; 32]>>>>,
     rate_limit: Option<RateCfg>,
     admin_dst: Option<([u8; 4], u16)>,
     signer: Arc<Option<citadel_quic::pqauth::ServerSigner>>,
     cert_pin: [u8; 32],
     router: ExitTunRouter,
+    pool: Arc<Mutex<AddrPool>>,
 ) {
     eprintln!("[citadel-m1:server] клиент {} ({}) подключён", tunnel.peer(), tunnel.kind());
-    if let Err(e) =
-        server_assign_address(&mut tunnel, addr, prefix, &issuer_auth, &spent, (*signer).as_ref(), cert_pin).await
+    let (addr, prefix) = match server_assign_address(
+        &mut tunnel, &pool, &issuer_auth, &spent, (*signer).as_ref(), cert_pin,
+    )
+    .await
     {
-        eprintln!("[citadel-m1:server] отказ в доступе: {e}");
-        tunnel.close(1, b"auth-failed");
-        return;
-    }
+        Ok(a) => a,
+        Err(e) => {
+            eprintln!("[citadel-m1:server] отказ в доступе: {e}");
+            tunnel.close(1, b"auth-failed");
+            return;
+        }
+    };
     eprintln!("[citadel-m1:server] выдан {}.{}.{}.{}/{}", addr[0], addr[1], addr[2], addr[3], prefix);
     // Регистрируем адрес в демуксе на время сессии → return-пакеты пойдут ИМЕННО этому клиенту
-    // (не «украдёт» соседний pump). Снимаем регистрацию по завершении pump (в т.ч. при разрыве).
+    // (не «украдёт» соседний pump). Снимаем регистрацию + освобождаем пул по завершении pump.
     let return_rx = router.register(addr);
     let res = pump(tunnel, tun, Some(addr), rate_limit, admin_dst, Some(return_rx)).await;
     router.unregister(addr);
+    pool.lock().unwrap().free(addr); // C4: вернуть адрес в пул
     if let Err(e) = res {
         eprintln!("[citadel-m1:server] pump завершён: {e}");
     }
@@ -776,3 +860,72 @@ async fn run_auth_probe() -> Result<()> {
 }
 
 // `pump` (data plane TUN ⇄ транспорт) вынесен в `citadel_quic::dataplane` (C0.2).
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// AddrPool 10.7.0.0/prefix (без env) — для тестов пула.
+    fn pool(prefix: u8) -> AddrPool {
+        let net = u32::from(std::net::Ipv4Addr::new(10, 7, 0, 0)) & (u32::MAX << (32 - prefix as u32));
+        let hosts = 1u32 << (32 - prefix as u32);
+        AddrPool { net, prefix, hosts, used: HashSet::new(), next: 2 }
+    }
+
+    /// C4: пул выдаёт РАЗНЫЕ адреса, пропускает reserved (network/gateway/broadcast), исчерпание →
+    /// None (а не тихая коллизия), free возвращает адрес в пул.
+    #[test]
+    fn addr_pool_alloc_free_exhaust() {
+        let mut p = pool(29); // /29 = 8 адресов; usable host-idx [2,6] = 5 (пропуск .0/.1/.7)
+        let mut all = Vec::new();
+        for _ in 0..5 {
+            let a = p.alloc().expect("выдача");
+            assert!((2..=6).contains(&a[3]), "reserved не должен выдаваться: {a:?}");
+            all.push(a);
+        }
+        let uniq: HashSet<_> = all.iter().collect();
+        assert_eq!(uniq.len(), 5, "все выданные адреса различны");
+        assert!(p.alloc().is_none(), "пул /29 исчерпан после 5 выдач");
+        p.free(all[0]); // освободили один → снова доступен ровно один
+        assert!(p.alloc().is_some());
+        assert!(p.alloc().is_none(), "снова исчерпан");
+    }
+
+    /// C4-регрессия: адреса НЕ вылезают за /24 (старый AtomicU16 давал 10.7.1.x после 253 коннектов).
+    #[test]
+    fn addr_pool_24_stays_in_subnet() {
+        let mut p = pool(24); // 10.7.0.0/24, usable .2..254 = 253
+        for _ in 0..253 {
+            let a = p.alloc().unwrap();
+            assert_eq!([a[0], a[1], a[2]], [10, 7, 0], "адрес вне /24: {a:?}");
+            assert!((2..=254).contains(&a[3]));
+        }
+        assert!(p.alloc().is_none(), "/24 исчерпан на 253 адресах");
+    }
+
+    /// C5: double-spend ловится; prune чистит бакеты старше current-1; Legacy (эпоха 0) не чистится.
+    #[test]
+    fn spend_token_double_spend_and_prune() {
+        let spent = Mutex::new(HashMap::new());
+        let (n1, n2) = ([1u8; 32], [2u8; 32]);
+        assert!(spend_token(&spent, n1, 100));
+        assert!(!spend_token(&spent, n1, 100), "double-spend в той же эпохе");
+        assert!(spend_token(&spent, n2, 100));
+        // эпоха 101 (current) — prev-бакет 100 остаётся (grace)
+        assert!(spend_token(&spent, [3u8; 32], 101));
+        assert!(spent.lock().unwrap().contains_key(&100), "prev-эпоха цела");
+        // эпоха 103 → prune бакетов < 102 (100 и 101 удаляются)
+        assert!(spend_token(&spent, [4u8; 32], 103));
+        let m = spent.lock().unwrap();
+        assert!(!m.contains_key(&100) && !m.contains_key(&101), "старые эпохи очищены (нет утечки)");
+        assert!(m.contains_key(&103));
+        drop(m);
+
+        // Legacy (эпоха 0) — не чистится даже при больших эпохах; double-spend всё равно ловится
+        let legacy = Mutex::new(HashMap::new());
+        assert!(spend_token(&legacy, [9u8; 32], 0));
+        assert!(spend_token(&legacy, [8u8; 32], 500));
+        assert!(legacy.lock().unwrap().contains_key(&0), "Legacy-бакет цел");
+        assert!(!spend_token(&legacy, [9u8; 32], 0), "Legacy double-spend ловится");
+    }
+}
