@@ -100,6 +100,41 @@ fn pacing_from_env() -> Pacing {
     parse_pacing(&std::env::var("Citadel_PACING").unwrap_or_default())
 }
 
+/// C3/аудит-3: анти-реплей для obfs-приёма. Дубликат `nonce_pkt` (12 случайных байт, уникальных у
+/// каждого легит-пакета) = реплей — молча дропаем (анти replay-probing: цензор реплеит перехваченный
+/// пакет и смотрит, ответит ли сервер → фингерпринт). Двух-поколенное окно (~последних `[cap, 2·cap]`
+/// nonce) — O(1) амортизированно, память ≤ 2·cap. QUIC-ретрансмит несёт НОВЫЙ nonce (свежий seal на
+/// каждый пакет) → не режется; UDP-дубль сети режется (QUIC его всё равно бы отбросил).
+const REPLAY_CAP: usize = 100_000;
+
+struct ReplayGuard {
+    cur: std::collections::HashSet<[u8; 12]>,
+    prev: std::collections::HashSet<[u8; 12]>,
+    cap: usize,
+}
+
+impl ReplayGuard {
+    fn new(cap: usize) -> Self {
+        Self {
+            cur: std::collections::HashSet::new(),
+            prev: std::collections::HashSet::new(),
+            cap,
+        }
+    }
+
+    /// `true` — nonce свежий (не реплей); `false` — видели недавно (реплей → дроп).
+    fn check(&mut self, nonce: [u8; 12]) -> bool {
+        if self.cur.contains(&nonce) || self.prev.contains(&nonce) {
+            return false;
+        }
+        if self.cur.len() >= self.cap {
+            self.prev = std::mem::take(&mut self.cur); // ротация поколения (сдвиг окна)
+        }
+        self.cur.insert(nonce);
+        true
+    }
+}
+
 pub struct ObfsUdpSocket {
     /// Внутренний UDP-сокет, атомарно сменяемый при миграции пути (rebind) — lock-free на hot path.
     inner: ArcSwap<tokio::net::UdpSocket>,
@@ -107,6 +142,8 @@ pub struct ObfsUdpSocket {
     sealer: citadel_obfs::Sealer,
     /// Кешированный приёмник (под Mutex, т.к. open берёт &mut для кеша cipher по sid).
     opener: Mutex<citadel_obfs::Opener>,
+    /// C3: анти-реплей окно (по `nonce_pkt`) — дубликат = реплей, дропаем в `poll_recv`.
+    replay: Mutex<ReplayGuard>,
     send_ctr: AtomicU64,
     /// Политика паддинга исходящих пакетов (анти-fingerprint по длине, I5-размер).
     padding: citadel_obfs::Padding,
@@ -138,11 +175,13 @@ impl ObfsUdpSocket {
             inner: ArcSwap::from_pointee(inner),
             sealer: citadel_obfs::Sealer::new(&psk, &sid),
             opener: Mutex::new(citadel_obfs::Opener::new(&psk)),
+            replay: Mutex::new(ReplayGuard::new(REPLAY_CAP)), // C3: анти-реплей окно
+
             // M2-full (obfs v2): 16-байтный случайный sid — 128-битная per-session соль в k_sess
             // → per-session ключ уникален (коллизия 2^-128), body-AEAD nonce-reuse под общим PSK
             // закрыт by-construction. Старт packet_id со случайного u64 сохраняем (доп. запас).
             send_ctr: AtomicU64::new(rand::random()),
-            padding: citadel_obfs::Padding::Bucket(citadel_obfs::DEFAULT_BUCKETS),
+            padding: citadel_obfs::DEFAULT_RANDOM_PAD, // C2: случайный паддинг (анти-fingerprint длин)
             pacing,
             queue: Mutex::new(VecDeque::new()),
             last_dst: Mutex::new(None),
@@ -173,27 +212,45 @@ impl ObfsUdpSocket {
         Ok(())
     }
 
-    /// Заворачивает реальную quic-нагрузку в DATA-пакет с паддингом до бакета.
+    /// Заворачивает реальную quic-нагрузку в DATA-пакет со случайным паддингом (C2).
     fn seal(&self, quic: &[u8]) -> Vec<u8> {
         let pid = self.send_ctr.fetch_add(1, Ordering::Relaxed);
         let mut nonce = [0u8; 12];
         rand::thread_rng().fill_bytes(&mut nonce);
-        // Паддинг считается по длине quic-нагрузки и добивает пакет на проводе до бакета.
-        // Содержимое padding — нули: оно внутри AEAD, на проводе всё равно псевдослучайный шифртекст.
-        let padding = vec![0u8; citadel_obfs::pad_len_for(self.padding, quic.len())];
+        // C2: случайный добор длины (анти-fingerprint). Содержимое padding — нули: оно внутри AEAD,
+        // на проводе всё равно псевдослучайный шифртекст.
+        let padding = vec![0u8; self.pad_len(quic.len())];
         let inner = citadel_obfs::build_inner(citadel_obfs::TYPE_DATA, None, None, &padding, quic);
         self.sealer.seal(pid, &nonce, &inner)
     }
 
-    /// Chaff-пакет (`TYPE_PAD`), паддится до СЛУЧАЙНОГО бакета → распределение длин совпадает
-    /// с реальным трафиком, на проводе неотличим.
+    /// C2: длина паддинга DATA-пакета. `Random` → случайно (RNG здесь, чтобы `pad_len_random`
+    /// оставалась pure/тестируемой); прочие политики — delegate в `pad_len_for`.
+    fn pad_len(&self, quic_len: usize) -> usize {
+        match self.padding {
+            citadel_obfs::Padding::Random { floor, jitter, cap } => citadel_obfs::pad_len_random(
+                floor,
+                jitter,
+                cap,
+                quic_len,
+                rand::thread_rng().next_u32() as usize,
+            ),
+            other => citadel_obfs::pad_len_for(other, quic_len),
+        }
+    }
+
+    /// Chaff-пакет (`TYPE_PAD`): случайный размер на проводе в `[floor, cap]` (совпадает с
+    /// распределением DATA при Random-паддинге, C2) → на проводе неотличим от реального трафика.
     fn seal_chaff(&self) -> Vec<u8> {
         let pid = self.send_ctr.fetch_add(1, Ordering::Relaxed);
         let mut nonce = [0u8; 12];
         rand::thread_rng().fill_bytes(&mut nonce);
-        let buckets = citadel_obfs::DEFAULT_BUCKETS;
-        let bucket = buckets[(rand::thread_rng().next_u32() as usize) % buckets.len()];
-        let pad = bucket - citadel_obfs::FRAMING_OVERHEAD;
+        let (floor, cap) = match self.padding {
+            citadel_obfs::Padding::Random { floor, cap, .. } => (floor, cap),
+            _ => (256, 1280),
+        };
+        let wire = floor + (rand::thread_rng().next_u32() as usize) % (cap - floor + 1);
+        let pad = wire.saturating_sub(citadel_obfs::FRAMING_OVERHEAD);
         let inner = citadel_obfs::build_chaff(&vec![0u8; pad]);
         self.sealer.seal(pid, &nonce, &inner)
     }
@@ -297,7 +354,18 @@ impl AsyncUdpSocket for ObfsUdpSocket {
             let mut rb = ReadBuf::new(&mut tmp);
             match self.inner.load().poll_recv_from(cx, &mut rb) {
                 Poll::Ready(Ok(addr)) => {
-                    if let Ok(opened) = self.opener.lock().unwrap().open(rb.filled()) {
+                    let filled = rb.filled();
+                    // C3: nonce_pkt (первые 12 байт, в клере) — ключ анти-реплея.
+                    let nonce_pkt: Option<[u8; 12]> = filled.get(..12).map(|s| s.try_into().unwrap());
+                    if let Ok(opened) = self.opener.lock().unwrap().open(filled) {
+                        // C3: реплей валидного пакета (дубликат nonce) → молча дропаем (анти
+                        // replay-probing: не даём серверу «ответить» на перехваченный и переигранный
+                        // пакет). Проверяем ПОСЛЕ open — мусор/проба с чужим nonce не засоряет окно.
+                        if let Some(np) = nonce_pkt {
+                            if !self.replay.lock().unwrap().check(np) {
+                                continue;
+                            }
+                        }
                         if let Some((t, quic)) = citadel_obfs::parse_inner(&opened.inner) {
                             if t == citadel_obfs::TYPE_PAD {
                                 continue; // chaff (тайминг-шейпинг) — отбрасываем, не отдаём в QUIC
@@ -397,6 +465,25 @@ pub fn client_endpoint_obfs(psk: [u8; 32]) -> Result<quinn::Endpoint> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// C3: анти-реплей — свежий nonce проходит, повтор режется; скользящее двух-поколенное окно.
+    #[test]
+    fn replay_guard_detects_and_windows() {
+        let mut g = ReplayGuard::new(4); // маленькое окно для теста
+        let n = |i: u8| [i; 12];
+        assert!(g.check(n(1)), "свежий nonce проходит");
+        assert!(!g.check(n(1)), "повтор режется");
+        assert!(g.check(n(2)) && g.check(n(3)) && g.check(n(4)));
+        // cur заполнен (1,2,3,4) → следующий (5) ротирует: prev={1..4}, cur={5}
+        assert!(g.check(n(5)));
+        assert!(!g.check(n(1)), "1 ещё в prev — режется");
+        assert!(!g.check(n(5)), "5 в cur — режется");
+        // добиваем cur (6,7,8) и ротируем на 9 → prev={5,6,7,8}; 1..4 выпадают из окна
+        for i in 6..=9u8 {
+            assert!(g.check(n(i)));
+        }
+        assert!(g.check(n(1)), "1 давно вне окна → снова свежий (скользящее окно — ок для probing)");
+    }
 
     #[test]
     fn chaff_decision_table() {

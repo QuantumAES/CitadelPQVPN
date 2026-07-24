@@ -124,10 +124,19 @@ pub enum Padding {
     None,
     /// Добить итоговый размер на проводе до ближайшего бакета ≥ настоящего.
     Bucket(&'static [usize]),
+    /// C2/аудит-3: СЛУЧАЙНЫЙ добор до размера в `[max(wire,floor), cap]` — непрерывное распределение
+    /// длин на проводе (нет дискретной сигнатуры «ровно 256/512/1024/1280», по которой цензор
+    /// фингерпринтил протокол), при этом мелкие пакеты скрыты полом `floor`, а `cap` держит MTU.
+    /// Требует RNG у вызывающего → длина считается [`pad_len_random`] (pad_len_for(Random)=0).
+    Random { floor: usize, jitter: usize, cap: usize },
 }
 
+/// C2: дефолтная политика случайного паддинга (анти-fingerprint по длине). Параметры — компромисс
+/// анти-DPI vs overhead; tunable. floor 256 (скрыть мелкие), jitter 512 (спред), cap 1280 (MTU-safe).
+pub const DEFAULT_RANDOM_PAD: Padding = Padding::Random { floor: 256, jitter: 512, cap: 1280 };
+
 /// Сколько байт padding добавить в DATA-пакет с `quic_len` полезной нагрузки,
-/// чтобы итоговый размер на проводе попал на бакет.
+/// чтобы итоговый размер на проводе попал на бакет. `Random` считается [`pad_len_random`] (нужен RNG).
 pub fn pad_len_for(policy: Padding, quic_len: usize) -> usize {
     match policy {
         Padding::None => 0,
@@ -140,7 +149,20 @@ pub fn pad_len_for(policy: Padding, quic_len: usize) -> usize {
             }
             0 // больше наибольшего бакета (в пределах MTU не случается) — не паддим
         }
+        Padding::Random { .. } => 0, // считается через pad_len_random (RNG у вызывающего)
     }
+}
+
+/// C2: длина случайного паддинга. `rand_val` — случайное число от вызывающего (RNG в obfs-сокете) →
+/// функция pure/тестируема. Провод = `max(wire, floor) + rand_val % (jitter+1)`, капнут `cap`.
+pub fn pad_len_random(floor: usize, jitter: usize, cap: usize, quic_len: usize, rand_val: usize) -> usize {
+    let wire = FRAMING_OVERHEAD + quic_len;
+    if wire >= cap {
+        return 0; // уже у cap (MTU) — паддить некуда
+    }
+    let base = wire.max(floor);
+    let target = (base + rand_val % (jitter + 1)).min(cap);
+    target.saturating_sub(wire)
 }
 
 /// Обратный разбор inner_plaintext → (type, quic_payload), пропуская ts/echo/padding.
@@ -457,6 +479,27 @@ mod tests {
         let p = Padding::Bucket(DEFAULT_BUCKETS);
         let over = *DEFAULT_BUCKETS.last().unwrap() - FRAMING_OVERHEAD + 1;
         assert_eq!(pad_len_for(p, over), 0);
+    }
+
+    /// C2: случайный паддинг — провод в `[max(wire,floor), cap]`, НЕПРЕРЫВНЫЙ (а не 4 дискретных
+    /// бакета-сигнатуры); мелкие скрыты полом; крупные у cap не паддятся (MTU).
+    #[test]
+    fn pad_random_bounds_cap_and_continuity() {
+        let (floor, jitter, cap) = (256, 512, 1280);
+        // мелкий пакет (q=5, wire=60): провод всегда в [floor, cap]
+        for r in [0usize, 1, 100, 511, 512, 513, 99_999] {
+            let wire = FRAMING_OVERHEAD + 5 + pad_len_random(floor, jitter, cap, 5, r);
+            assert!((floor..=cap).contains(&wire), "r={r}: wire={wire} вне [{floor},{cap}]");
+        }
+        // rand=0 → ровно floor (нижняя граница)
+        assert_eq!(FRAMING_OVERHEAD + 5 + pad_len_random(floor, jitter, cap, 5, 0), floor);
+        // крупный пакет (wire >= cap) → паддинга нет
+        assert_eq!(pad_len_random(floor, jitter, cap, cap, 999), 0);
+        // непрерывность: разные rand → много разных размеров (не дискретные бакеты)
+        let sizes: std::collections::HashSet<usize> = (0..300)
+            .map(|r| FRAMING_OVERHEAD + 5 + pad_len_random(floor, jitter, cap, 5, r))
+            .collect();
+        assert!(sizes.len() > 50, "распределение непрерывно, не дискретно ({} значений)", sizes.len());
     }
 
     /// Сквозной тест: политика → build_inner → seal даёт длину ровно в бакет,
