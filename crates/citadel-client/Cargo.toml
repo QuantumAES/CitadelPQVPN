@@ -20,7 +20,8 @@ ciborium = "0.2"            # CBOR (чистый Rust, serde) — формат �
 base64 = "0.22"             # URL_SAFE_NO_PAD для citadel://-ссылки
 hex = "0.4"                 # C7.3: client_id ↔ hex для admin-плоскости
 sha2 = "0.10"               # SHA-256 обязательства к публичным ключам (§9.3)
-aws-lc-rs = "1.17"          # vault: PBKDF2-HMAC-SHA256 + AES-256-GCM (то же ядро крипты, что в движке)
+aws-lc-rs = "1.17"          # vault: AES-256-GCM + legacy PBKDF2 (чтение старых v1-файлов)
+argon2 = "0.5"              # C1/аудит-3: memory-hard KDF мастер-пароля vault (анти-GPU/ASIC-перебор)
 zeroize = "1"               # S1.3/M7: затирание секретов (vault-ключ, plaintext профилей, PSK, seed)
 qrcode = { version = "0.14", default-features = false, features = ["svg"] }  # генерация QR (без image-crate)
 citadel-tun = { path = "../citadel-tun" }   # GuiTunProvider: Tun::from_raw_fd (Linux-desktop)
