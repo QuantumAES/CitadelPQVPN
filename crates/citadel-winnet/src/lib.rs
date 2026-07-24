@@ -72,9 +72,65 @@ pub fn encode_config(setup: &TunSetup) -> Vec<u8> {
     out
 }
 
-/// Разобрать управляющий кадр конфига (без ведущего тега — тег читает транспорт-цикл).
+/// Разобрать управляющий кадр конфига (без ведущего тега — тег читает транспорт-цикл). W2 (аудит-3):
+/// CBOR приходит от НЕпривилегированного app по пайпу (ACL даёт IU), а поля уходят в `netsh`/`route`/
+/// WFP привилегированной службы (LocalSystem) — валидируем ЗДЕСЬ, на границе привилегий, паритет с
+/// Linux-helper (S1.2). Хоть std::process и не расщепляет argv (нет shell), битое значение сорвало бы
+/// bring_up, а `0.0.0.0/0` в `bypass` дал бы WFP-permit «весь трафик» (дыра в KS) — отсекаем заранее.
 pub fn decode_config(body: &[u8]) -> anyhow::Result<TunSetup> {
-    Ok(ciborium::from_reader(body)?)
+    let setup: TunSetup = ciborium::from_reader(body)?;
+    setup.validate()?;
+    Ok(setup)
+}
+
+/// `s` — валидный IPv4-адрес. Отсекает перевод строки/мусор (как `citadel-helper::is_ip`).
+fn is_ipv4(s: &str) -> bool {
+    s.parse::<std::net::Ipv4Addr>().is_ok()
+}
+
+/// `s` — валидный IPv4 `a.b.c.d/p` (0..=32) или голый IPv4 (=host /32). Как `citadel-helper::is_cidr`.
+fn is_cidr_v4(s: &str) -> bool {
+    match s.split_once('/') {
+        Some((a, p)) => is_ipv4(a) && p.parse::<u8>().map(|n| n <= 32).unwrap_or(false),
+        None => is_ipv4(s),
+    }
+}
+
+impl TunSetup {
+    /// W2: валидация всех строковых полей ДО построения netsh/route/WFP-плана (граница привилегий).
+    /// Туннель IPv4-only ⇒ адреса/маршруты/DNS — только IPv4. Числовые (`mtu`/`addr`/`prefix`) уже
+    /// типизированы (u32/[u8;4]/u8) — инъекция невозможна by-construction; `prefix` клампится в `mask`.
+    pub fn validate(&self) -> anyhow::Result<()> {
+        if self.prefix > 32 {
+            anyhow::bail!("TunSetup: prefix {} вне 0..=32", self.prefix);
+        }
+        for r in &self.routes {
+            if !is_cidr_v4(r) {
+                anyhow::bail!("TunSetup: невалидный маршрут {r:?} (ожидался IPv4-CIDR)");
+            }
+        }
+        if let Some(dns) = &self.dns {
+            if !is_ipv4(dns) {
+                anyhow::bail!("TunSetup: dns {dns:?} не IPv4-адрес (анти-инъекция)");
+            }
+        }
+        for e in &self.exit_ips {
+            if !is_ipv4(e) {
+                anyhow::bail!("TunSetup: exit_ip {e:?} не IPv4-адрес");
+            }
+        }
+        for b in &self.bypass {
+            if !is_cidr_v4(b) {
+                anyhow::bail!("TunSetup: bypass {b:?} не IPv4-CIDR");
+            }
+            // W2: bypass с префиксом /0 (0.0.0.0/0) стал бы WFP-permit «весь трафик» = дыра в
+            // kill-switch (permit RemoteHost 0.0.0.0/0 перебил бы fail-closed Block). Запрещаем.
+            if b.split_once('/').is_some_and(|(_, p)| p == "0") {
+                anyhow::bail!("TunSetup: bypass {b:?} с префиксом /0 запрещён (обнулил бы kill-switch)");
+            }
+        }
+        Ok(())
+    }
 }
 
 /// Верхняя граница тела READY-ответа (анти-DoS при чтении из пайпа).
@@ -312,6 +368,34 @@ mod tests {
         assert_eq!(len, frame.len() - 5);
         let back = decode_config(&frame[5..]).unwrap();
         assert_eq!(back, s);
+    }
+
+    /// W2: decode_config валидирует недоверенный CBOR (граница привилегий app→служба). Валидный
+    /// конфиг проходит; инъекция/мусор в полях, уходящих в netsh/route/WFP, — отклонены.
+    #[test]
+    fn decode_config_validates_untrusted_fields() {
+        let enc = |s: &TunSetup| {
+            let mut b = Vec::new();
+            ciborium::into_writer(s, &mut b).unwrap();
+            b
+        };
+        let base = sample_setup();
+        assert!(decode_config(&enc(&base)).is_ok(), "валидный конфиг проходит");
+
+        let bad = |mut mut_fn: Box<dyn FnMut(&mut TunSetup)>| {
+            let mut s = base.clone();
+            mut_fn(&mut s);
+            decode_config(&enc(&s))
+        };
+        // инъекция перевода строки в dns (иначе ушла бы в netsh set dnsservers)
+        assert!(bad(Box::new(|s| s.dns = Some("1.1.1.1\nnameserver 6.6.6.6".into()))).is_err());
+        assert!(bad(Box::new(|s| s.routes = vec!["not-a-cidr".into()])).is_err()); // мусорный маршрут
+        assert!(bad(Box::new(|s| s.bypass = vec!["junk/33".into()])).is_err()); // битый CIDR
+        assert!(bad(Box::new(|s| s.bypass = vec!["0.0.0.0/0".into()])).is_err()); // /0 = дыра в KS
+        assert!(bad(Box::new(|s| s.exit_ips = vec!["evil".into()])).is_err()); // exit_ip не IP
+        assert!(bad(Box::new(|s| s.prefix = 33)).is_err()); // prefix вне диапазона
+        // 0.0.0.0/0 в routes (full-tunnel) — ЛЕГИТИМНО, проходит
+        assert!(bad(Box::new(|s| s.routes = vec!["0.0.0.0/0".into()])).is_ok());
     }
 
     /// Кадрирование пакетов: несколько полных кадров разбираются, частичный хвост остаётся.
