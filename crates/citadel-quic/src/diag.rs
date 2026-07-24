@@ -98,8 +98,9 @@ pub async fn run_diagnostics(cfg: &ClientConfig, mut emit: impl FnMut(DiagStep))
         }
     }
 
-    // ── 5. полный establish (PQ-handshake + токен → назначенный адрес) ──
-    let session = match establish_session(cfg).await {
+    // ── 5. полный establish (PQ-handshake + токен → назначенный адрес). Диагностика тестирует
+    // основной QUIC/UDP-путь (force_tcp=false); реальный connect при провале эскалирует на obfs-TCP. ──
+    let session = match establish_session(cfg, false).await {
         Ok(s) => {
             emit(DiagStep::ok(
                 "Сессия (establish)",

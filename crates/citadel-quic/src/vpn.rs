@@ -241,14 +241,28 @@ impl VpnController {
             // Недоступен issuer → None → establish покажет отказ token-required exit, цикл ретраит
             // (само-лечится по восстановлении сети). token-less/без Layer-1 → refresher не задан.
             let refresher = self.token_refresh.lock().unwrap().clone();
-            if let Some(f) = refresher {
+            if let Some(f) = &refresher {
                 if let Some(t) = f().await {
                     cfg.token = t;
                 }
             }
 
-            // ── establish ──
-            let session = match establish_session(&cfg).await {
+            // ── establish: сперва QUIC/UDP ──
+            let mut established = establish_session(&cfg, false).await;
+            // Эскалация на obfs-TCP: QUIC мог подняться (хендшейк), но крупный control-обмен не прошёл —
+            // мобильный/NAT64-путь не несёт большой ML-DSA-ответ через QUIC (MTU: хендшейк ок, ответ
+            // чёрнодырится → establish виснет). TCP решает через сегментацию/MSS. Токен свежий (прошлый
+            // спенчен сервером на QUIC-попытке → double-spend иначе). Только при наличии obfs-канала.
+            if established.is_err() && cfg.obfs_psk.is_some() {
+                eprintln!("[vpn] establish/QUIC не удался — эскалация на obfs-TCP (мобильный MTU/NAT64?)");
+                if let Some(f) = &refresher {
+                    if let Some(t) = f().await {
+                        cfg.token = t;
+                    }
+                }
+                established = establish_session(&cfg, true).await;
+            }
+            let session = match established {
                 Ok(s) => s,
                 Err(e) => {
                     // Ретраим ВСЕГДА, в т.ч. ПЕРВЫЙ коннект: сеть/issuer могли быть недоступны на

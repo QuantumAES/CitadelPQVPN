@@ -136,8 +136,11 @@ fn require_pin_or_insecure(mode: &PinMode, allow_insecure_no_pin: bool) -> Resul
 }
 
 /// Поднять сессию: failover по списку exit'ов (M5) + control-обмен (токен→адрес, PQ-auth M7).
-/// **Без TUN и без сетевой настройки** — только транспорт и назначенный адрес.
-pub async fn establish_session(cfg: &ClientConfig) -> Result<Session> {
+/// **Без TUN и без сетевой настройки** — только транспорт и назначенный адрес. `force_tcp` — идти
+/// сразу obfs-TCP (минуя QUIC/UDP): эскалация VpnController'а, когда QUIC-хендшейк проходит, но
+/// мобильный/NAT64-путь не несёт крупные пакеты через QUIC (MTU: хендшейк ок, но большой ML-DSA-ответ
+/// сервера чёрнодырится) — TCP решает сегментацией/MSS.
+pub async fn establish_session(cfg: &ClientConfig, force_tcp: bool) -> Result<Session> {
     eprintln!("[citadel-m1:client] exit-серверы (перемешаны): {}", cfg.servers.join(", "));
     // S1.1/M4: не-PQ suite (classical/all) не гарантирует анти-HNDL — предупреждаем явно.
     if !crate::kx_is_pq(&cfg.kx_suite) {
@@ -154,7 +157,7 @@ pub async fn establish_session(cfg: &ClientConfig) -> Result<Session> {
     let mut chosen = String::new();
     let mut reasons: Vec<String> = Vec::new();
     for server in &cfg.servers {
-        match connect_server(server, cfg).await {
+        match connect_server(server, cfg, force_tcp).await {
             Ok(Some(t)) => {
                 eprintln!("[citadel-m1:client] ВЫБРАН exit {server} (транспорт {})", t.kind());
                 tunnel = Some(t);
@@ -228,26 +231,33 @@ pub async fn run_data_plane(session: Session, tun: Arc<dyn TunIo>) -> Result<()>
 }
 
 /// Подключиться к ОДНОМУ exit'у: основной путь PQ-QUIC, при недоступности — obfs-over-TCP
-/// fallback (M4, порт `cfg.tcp_port`, по умолчанию 443). `None` — exit недоступен → вызывающий
-/// пробует следующий из списка (M5 failover).
-async fn connect_server(server: &str, cfg: &ClientConfig) -> Result<Option<Tunnel>> {
+/// fallback (M4, порт `cfg.tcp_port`, по умолчанию 443). `force_tcp` — пропустить QUIC/UDP и идти
+/// сразу obfs-TCP (MTU-эскалация: QUIC-хендшейк проходит, но мобильный/NAT64-путь не несёт крупные
+/// QUIC-пакеты). `None` — exit недоступен → вызывающий пробует следующий из списка (M5 failover).
+async fn connect_server(server: &str, cfg: &ClientConfig, force_tcp: bool) -> Result<Option<Tunnel>> {
     let host = host_of(server);
     let addr = match tokio::net::lookup_host(server).await.map(|mut it| it.next()) {
         Ok(Some(a)) => a,
         _ => return Ok(None),
     };
     // failover/fallback хотят быстрый QUIC-timeout; один сервер без fallback — ждём дольше.
-    let multi = cfg.servers.len() > 1;
-    let attempts = if multi || cfg.obfs_psk.is_some() { 5 } else { 60 };
-    if let Some(conn) = try_quic_connect(server, addr, cfg, attempts, host).await? {
-        eprintln!("[citadel-m1:client] PQ-туннель (QUIC/UDP) к {server} ✔");
-        return Ok(Some(Tunnel::new(conn, false)));
+    if !force_tcp {
+        let multi = cfg.servers.len() > 1;
+        let attempts = if multi || cfg.obfs_psk.is_some() { 5 } else { 60 };
+        if let Some(conn) = try_quic_connect(server, addr, cfg, attempts, host).await? {
+            eprintln!("[citadel-m1:client] PQ-туннель (QUIC/UDP) к {server} ✔");
+            return Ok(Some(Tunnel::new(conn, false)));
+        }
     }
-    // S0.3/H1: fallback — PQ-QUIC ПОВЕРХ obfs-TCP (не «голый» PSK). Та же TLS/pin/KX/токены.
+    // S0.3/H1: fallback (или форсированный force_tcp) — PQ-QUIC ПОВЕРХ obfs-TCP (не «голый» PSK).
+    // Та же TLS/pin/KX/токены; TCP-транспорт снимает QUIC-MTU-проблему на мобильном/NAT64-пути (MSS).
     if let Some(psk) = cfg.obfs_psk {
         let tcp_target = format!("{host}:{}", cfg.tcp_port);
         if let Ok(Some(taddr)) = tokio::net::lookup_host(&tcp_target).await.map(|mut it| it.next()) {
-            eprintln!("[citadel-m1:client] QUIC/UDP к {server} недоступен → PQ-QUIC поверх obfs-TCP к {tcp_target}");
+            eprintln!(
+                "[citadel-m1:client] {} → PQ-QUIC поверх obfs-TCP к {tcp_target}",
+                if force_tcp { format!("MTU-эскалация {server}") } else { format!("QUIC/UDP к {server} недоступен") }
+            );
             // таймаут: мёртвый host иначе висит на connect (~минуты) и ломает failover. 8с — запас
             // под высокий RTT мобильных сетей (частый Android-путь при заблокированном UDP).
             match tokio::time::timeout(Duration::from_secs(8), quic_over_tcp_connect(taddr, psk, cfg, host)).await {
