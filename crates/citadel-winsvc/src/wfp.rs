@@ -10,7 +10,7 @@
 
 use std::sync::Mutex;
 
-use citadel_winnet::{WfpAction, WfpFilter, WfpMatch};
+use citadel_winnet::{WfpAction, WfpFamily, WfpFilter, WfpMatch};
 use windows::core::{GUID, PWSTR};
 use windows::Win32::Foundation::{ERROR_SUCCESS, HANDLE};
 use windows::Win32::NetworkManagement::WindowsFilteringPlatform::*;
@@ -154,7 +154,13 @@ fn add_filter(engine: HANDLE, f: &WfpFilter, tun_luid: u64) -> anyhow::Result<()
     // (0x80320023). Строка живёт до конца вызова (API копирует её внутрь объекта фильтра).
     let mut fname: Vec<u16> = "CitadelPQVPN killswitch\0".encode_utf16().collect();
     filter.displayData.name = PWSTR(fname.as_mut_ptr());
-    filter.layerKey = FWPM_LAYER_ALE_AUTH_CONNECT_V4;
+    // W1: слой по семейству. V4 = kill-switch (весь стек); V6 = fail-closed блок утечки нативного
+    // IPv6 (туннель IPv4-only). ALE_AUTH_CONNECT_V6 гейтит установление IPv6-соединений (TCP-connect/
+    // первый UDP, включая IPv6-DNS); ICMPv6 ND идёт мимо этого слоя ⇒ локальный IPv6-стек не ломается.
+    filter.layerKey = match f.family {
+        WfpFamily::V4 => FWPM_LAYER_ALE_AUTH_CONNECT_V4,
+        WfpFamily::V6 => FWPM_LAYER_ALE_AUTH_CONNECT_V6,
+    };
     filter.subLayerKey = CITADEL_SUBLAYER;
     filter.weight.r#type = FWP_UINT8;
     filter.weight.Anonymous.uint8 = f.weight;

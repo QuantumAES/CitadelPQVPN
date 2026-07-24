@@ -215,13 +215,24 @@ pub enum WfpMatch {
     Dhcp,
 }
 
+/// Семейство адресов фильтра → слой WFP, на который его ставит служба. Туннель IPv4-only, поэтому
+/// `V6`-фильтры служат ТОЛЬКО для fail-closed блока утечки нативного IPv6 (аналог `CITADEL_KS6` на
+/// Linux, S2.2/A2): permit loopback, block-any на `FWPM_LAYER_ALE_AUTH_CONNECT_V6`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WfpFamily {
+    V4,
+    V6,
+}
+
 /// Один WFP-фильтр плана. `weight` — приоритет: чем выше, тем раньше матчится (permit'ы обязаны
 /// стоять ВЫШЕ финального Block, иначе трафик был бы заблокирован — как «DROP после всех RETURN»).
+/// `family` выбирает слой (V4 kill-switch vs V6-блок утечки) — веса сравниваются В ПРЕДЕЛАХ слоя.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WfpFilter {
     pub action: WfpAction,
     pub match_: WfpMatch,
     pub weight: u8,
+    pub family: WfpFamily,
 }
 
 /// Вес финального Block (самый низкий): любой permit его перебивает.
@@ -239,21 +250,39 @@ pub const WFP_WEIGHT_PERMIT_HI: u8 = 12;
 /// работал» при включённом kill-switch. Здесь они получают отдельный `RemoteHost`-permit, fail-closed
 /// для всего прочего сохранён (Block — самый низкий вес, catch-all).
 pub fn wfp_killswitch_plan(exit_ips: &[String], bypass: &[String]) -> Vec<WfpFilter> {
+    let v4 = |action, match_, weight| WfpFilter { action, match_, weight, family: WfpFamily::V4 };
     let mut f = vec![
-        WfpFilter { action: WfpAction::Permit, match_: WfpMatch::Loopback, weight: WFP_WEIGHT_PERMIT_HI },
-        WfpFilter { action: WfpAction::Permit, match_: WfpMatch::TunnelInterface, weight: WFP_WEIGHT_PERMIT_HI },
+        v4(WfpAction::Permit, WfpMatch::Loopback, WFP_WEIGHT_PERMIT_HI),
+        v4(WfpAction::Permit, WfpMatch::TunnelInterface, WFP_WEIGHT_PERMIT_HI),
     ];
     for eip in exit_ips {
-        f.push(WfpFilter { action: WfpAction::Permit, match_: WfpMatch::RemoteHost(eip.clone()), weight: WFP_WEIGHT_PERMIT });
+        f.push(v4(WfpAction::Permit, WfpMatch::RemoteHost(eip.clone()), WFP_WEIGHT_PERMIT));
     }
     // C8.1/Q5: split-обход — permit ТОЛЬКО к выбранным назначениям (иначе fail-closed их режет).
     for b in bypass {
-        f.push(WfpFilter { action: WfpAction::Permit, match_: WfpMatch::RemoteHost(b.clone()), weight: WFP_WEIGHT_PERMIT });
+        f.push(v4(WfpAction::Permit, WfpMatch::RemoteHost(b.clone()), WFP_WEIGHT_PERMIT));
     }
-    f.push(WfpFilter { action: WfpAction::Permit, match_: WfpMatch::Dhcp, weight: WFP_WEIGHT_PERMIT });
+    f.push(v4(WfpAction::Permit, WfpMatch::Dhcp, WFP_WEIGHT_PERMIT));
     // fail-closed catch-all — самый низкий вес: любой permit выше него.
-    f.push(WfpFilter { action: WfpAction::Block, match_: WfpMatch::Any, weight: WFP_WEIGHT_BLOCK });
+    f.push(v4(WfpAction::Block, WfpMatch::Any, WFP_WEIGHT_BLOCK));
     f
+}
+
+/// W1 (аудит-3) / A2-паритет для Windows: fail-closed блок исходящего IPv6. Туннель IPv4-only ⇒
+/// нативный IPv6 (данные + IPv6-DNS) уходит физическим адаптером МИМО туннеля И мимо IPv4-kill-switch
+/// → деанонимизация на dual-stack (ровно A2, закрытый на Linux `ip6tables`/Android blackhole, но не
+/// на Windows). Ставится службой на `FWPM_LAYER_ALE_AUTH_CONNECT_V6`, который гейтит УСТАНОВЛЕНИЕ
+/// исходящих IPv6-соединений (TCP-connect / первый UDP, включая IPv6-DNS). ICMPv6 ND (RS/RA/NS/NA)
+/// идёт МИМО ALE_AUTH_CONNECT ⇒ локальный IPv6-стек не ломается без спец-permit (в отличие от Linux
+/// OUTPUT, где ND пришлось разрешать явно). Permit только loopback (::1). Триггерится при
+/// `killswitch || full-tunnel` (см. [`plan_session`]), как `block_ipv6` на Linux.
+pub fn wfp_ipv6_block_plan() -> Vec<WfpFilter> {
+    let v6 = |action, match_, weight| WfpFilter { action, match_, weight, family: WfpFamily::V6 };
+    vec![
+        v6(WfpAction::Permit, WfpMatch::Loopback, WFP_WEIGHT_PERMIT_HI),
+        // fail-closed: весь прочий исходящий IPv6 — Block (самый низкий вес, catch-all).
+        v6(WfpAction::Block, WfpMatch::Any, WFP_WEIGHT_BLOCK),
+    ]
 }
 
 #[cfg(test)]
@@ -383,5 +412,29 @@ mod tests {
         // fail-closed: Block — строго ниже любого permit по весу
         let min_permit = plan.iter().filter(|f| f.action == WfpAction::Permit).map(|f| f.weight).min().unwrap();
         assert!(blocks[0].weight < min_permit, "Block-вес должен быть ниже всех permit (fail-closed)");
+
+        // W1: kill-switch — целиком IPv4-слой (V6-утечку закрывает отдельный wfp_ipv6_block_plan).
+        assert!(plan.iter().all(|f| f.family == WfpFamily::V4), "KS-фильтры — семейство V4");
+    }
+
+    /// W1 (A2-паритет Windows): IPv6-блок — fail-closed на V6-слое. permit только loopback, ровно
+    /// один Block-Any, Block ниже permit по весу, ВСЕ фильтры — семейство V6 (иначе встали бы на
+    /// V4-слой и не закрыли бы утечку нативного IPv6 мимо IPv4-only туннеля).
+    #[test]
+    fn wfp_ipv6_block_failclosed_v6_family() {
+        let plan = wfp_ipv6_block_plan();
+        assert!(plan.iter().all(|f| f.family == WfpFamily::V6), "IPv6-блок — семейство V6");
+
+        let blocks: Vec<_> = plan.iter().filter(|f| f.action == WfpAction::Block).collect();
+        assert_eq!(blocks.len(), 1, "ровно один финальный Block");
+        assert_eq!(blocks[0].match_, WfpMatch::Any, "Block — catch-all (весь IPv6)");
+
+        // loopback (::1) разрешён — не рвём локальные IPv6-сокеты
+        assert!(plan.iter().any(|f| f.action == WfpAction::Permit && f.match_ == WfpMatch::Loopback));
+
+        // fail-closed: Block строго ниже любого permit по весу (иначе IPv6 утёк бы)
+        let min_permit =
+            plan.iter().filter(|f| f.action == WfpAction::Permit).map(|f| f.weight).min().unwrap();
+        assert!(blocks[0].weight < min_permit, "Block ниже всех permit (fail-closed IPv6)");
     }
 }

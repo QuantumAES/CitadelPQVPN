@@ -2,7 +2,10 @@
 //! (netsh-команды IP/маршрутов/DNS + bypass-маршруты + WFP-план). WinAPI-исполнители (`main.rs`,
 //! cfg(windows)) их применяют. Тестируется на ЛЮБОЙ ОС — как rule-генераторы `citadel-helper`.
 
-use citadel_winnet::{tunnel_route_entries, wfp_killswitch_plan, TunSetup, WfpFilter};
+use citadel_winnet::{
+    is_full_tunnel, tunnel_route_entries, wfp_ipv6_block_plan, wfp_killswitch_plan, TunSetup,
+    WfpFilter,
+};
 
 /// Имя WinTUN-адаптера (служба создаёт его под этим именем; netsh-команды ссылаются на него).
 pub const ADAPTER_NAME: &str = "Citadel";
@@ -54,7 +57,19 @@ pub fn plan_session(s: &TunSetup, adapter: &str) -> SessionPlan {
     bypass.extend(s.exit_ips.iter().cloned());
     bypass.extend(s.bypass.iter().cloned());
 
-    let wfp = if s.killswitch { Some(wfp_killswitch_plan(&s.exit_ips, &s.bypass)) } else { None };
+    // WFP: IPv4 kill-switch (при killswitch) + IPv6-блок утечки (при killswitch ИЛИ full-tunnel).
+    // W1/аудит-3: туннель IPv4-only ⇒ нативный IPv6 (данные + IPv6-DNS) иначе течёт мимо туннеля И
+    // мимо IPv4-kill-switch (деанон на dual-stack). Триггер `killswitch || full_tunnel` = как
+    // `block_ipv6` на Linux-helper (S2.2/A2). Оба слоя (V4 KS + V6 block) — в ОДНОЙ dynamic
+    // WFP-сессии, армятся/снимаются вместе. Full-tunnel без KS → только V6-блок (IPv4 не режем).
+    let mut wfp_filters: Vec<WfpFilter> = Vec::new();
+    if s.killswitch {
+        wfp_filters.extend(wfp_killswitch_plan(&s.exit_ips, &s.bypass));
+    }
+    if s.killswitch || is_full_tunnel(&s.routes) {
+        wfp_filters.extend(wfp_ipv6_block_plan());
+    }
+    let wfp = (!wfp_filters.is_empty()).then_some(wfp_filters);
 
     SessionPlan { netsh, bypass, wfp }
 }
@@ -106,6 +121,24 @@ pub fn bypass_route_del(dest: &str) -> Vec<String> {
     vec!["delete".into(), net]
 }
 
+/// W3 (аудит-3): лежит ли `file` НЕПОСРЕДСТВЕННО в каталоге `dir` (совпадение родителя). Используется
+/// службой для аутентификации клиента пайпа: подключившийся процесс обязан быть образом из install-dir
+/// службы (Program Files, куда пишет только админ ⇒ медиум-малварь туда бинарь не положит), иначе
+/// любой процесс юзера (ACL даёт IU) гонял бы привилегированную реконфигурацию сети. Регистро- и
+/// сепаратор-независимо (Windows-FS). Чистая функция (юнит-тест на любой ОС).
+pub fn same_dir(file: &std::path::Path, dir: &std::path::Path) -> bool {
+    // Своё разбиение по '/' (а не Path::parent) — чтобы Windows-пути с '\' корректно сравнивались и
+    // при тесте на Linux (Path::parent там не парсит '\' как сепаратор). Нормализуем оба: '\'→'/',
+    // lower-case (Windows-FS регистронезависима), с dir снимаем хвостовой '/'.
+    let norm = |p: &std::path::Path| p.as_os_str().to_string_lossy().replace('\\', "/").to_lowercase();
+    let dir_n = norm(dir);
+    let dir_n = dir_n.trim_end_matches('/');
+    match norm(file).rsplit_once('/') {
+        Some((parent, _name)) => parent == dir_n,
+        None => false,
+    }
+}
+
 /// Префикс-длина → маска IPv4 в точечной нотации (`16` → `255.255.0.0`).
 fn mask(prefix: u8) -> String {
     let p = prefix.min(32) as u32;
@@ -138,7 +171,8 @@ mod tests {
         assert_eq!(mask(0), "0.0.0.0");
     }
 
-    /// full-tunnel раскрывается в две /1-маршрута на адаптере; адрес/DNS присутствуют.
+    /// full-tunnel раскрывается в две /1-маршрута на адаптере; адрес/DNS присутствуют. W1: даже БЕЗ
+    /// kill-switch full-tunnel ставит IPv6-блок (V6-only), т.к. IPv4-only туннель иначе течёт по IPv6.
     #[test]
     fn full_tunnel_plan() {
         let p = plan_session(&setup(false, &["0.0.0.0/0"]), "Citadel");
@@ -146,7 +180,30 @@ mod tests {
         assert!(flat.contains(&"10.7.0.5".to_string()) && flat.contains(&"255.255.0.0".to_string()));
         assert!(flat.contains(&"0.0.0.0/1".to_string()) && flat.contains(&"128.0.0.0/1".to_string()));
         assert!(flat.contains(&"1.1.1.1".to_string())); // DNS
-        assert!(p.wfp.is_none()); // killswitch off
+        // W1: full-tunnel без KS → WFP = ТОЛЬКО IPv6-блок (V4-трафик не режем; V6-утечку закрываем).
+        let wfp = p.wfp.expect("full-tunnel → IPv6-блок даже без kill-switch");
+        assert!(wfp.iter().all(|f| f.family == citadel_winnet::WfpFamily::V6), "только V6-фильтры");
+        assert!(
+            wfp.iter().any(|f| f.action == citadel_winnet::WfpAction::Block
+                && f.match_ == citadel_winnet::WfpMatch::Any),
+            "fail-closed Block IPv6"
+        );
+    }
+
+    /// W1: матрица WFP по режиму. split-tunnel без KS → WFP не нужен; full-tunnel без KS → только
+    /// V6-блок; kill-switch → оба слоя (V4 KS + V6-блок) в одном плане (одна dynamic WFP-сессия).
+    #[test]
+    fn wfp_families_by_mode() {
+        use citadel_winnet::WfpFamily;
+        // split-tunnel (не full), KS off → WFP не нужен вовсе
+        assert!(plan_session(&setup(false, &["10.0.0.0/8"]), "Citadel").wfp.is_none());
+        // full-tunnel, KS off → только V6
+        let ft = plan_session(&setup(false, &["0.0.0.0/0"]), "Citadel").wfp.unwrap();
+        assert!(ft.iter().all(|f| f.family == WfpFamily::V6));
+        // KS on → есть и V4, и V6
+        let ks = plan_session(&setup(true, &["0.0.0.0/0"]), "Citadel").wfp.unwrap();
+        assert!(ks.iter().any(|f| f.family == WfpFamily::V4));
+        assert!(ks.iter().any(|f| f.family == WfpFamily::V6));
     }
 
     /// killswitch → WFP-план присутствует; bypass = exit-IP + split-Exclude (в обход физ.шлюзом).
@@ -184,5 +241,19 @@ Network Destination        Netmask          Gateway       Interface  Metric
             vec!["add", "203.0.113.9", "mask", "255.255.255.255", "10.0.0.1"]
         );
         assert_eq!(bypass_route_del("192.168.1.0/24"), vec!["delete", "192.168.1.0"]);
+    }
+
+    /// W3: клиент пайпа аутентифицируется по «образ в том же каталоге, что служба». app.exe и
+    /// citadel-svc.exe Inno ставит в один `{app}` (=%ProgramFiles%\CitadelPQVPN) → same_dir=true;
+    /// малварь из Temp / подкаталога / другого места → false (Program Files пишет только админ).
+    #[test]
+    fn client_image_same_dir_as_service() {
+        use std::path::Path;
+        let dir = Path::new(r"C:\Program Files\CitadelPQVPN");
+        assert!(same_dir(Path::new(r"C:\Program Files\CitadelPQVPN\app.exe"), dir));
+        assert!(same_dir(Path::new(r"c:\program files\citadelpqvpn\App.exe"), dir), "регистронезависимо");
+        assert!(!same_dir(Path::new(r"C:\Users\bob\AppData\Local\Temp\evil.exe"), dir), "чужой каталог");
+        assert!(!same_dir(Path::new(r"C:\Program Files\CitadelPQVPN\sub\app.exe"), dir), "подкаталог ≠ каталог");
+        assert!(!same_dir(Path::new("app.exe"), dir), "без родителя");
     }
 }

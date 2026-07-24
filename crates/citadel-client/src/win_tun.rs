@@ -161,6 +161,52 @@ fn open_overlapped_pipe(path: &str) -> io::Result<PipeHandle> {
     Ok(PipeHandle(h as isize))
 }
 
+/// W4 (аудит-3): анти-сквоттинг named pipe. Клиент ОБЯЗАН убедиться, что серверный конец пайпа создан
+/// привилегированным процессом (владелец объекта = SYSTEM или Administrators), а не подставным
+/// процессом под тем же юзером. Иначе сквоттер, успевший создать `\\.\pipe\citadel-svc` в окне гонки
+/// (или до старта службы), выдал бы себя за службу → получил бы РАСШИФРОВАННЫЙ входящий туннельный
+/// трафик и инъектировал бы пакеты в аутентифицированный туннель жертвы. Медиум-юзер НЕ может создать
+/// объект во владении SYSTEM/Administrators (deny-only Administrators SID в токене) ⇒ owner-SID —
+/// надёжный дискриминатор. Dev-обход: env `Citadel_INSECURE_PIPE` (служба под юзером в console-режиме).
+fn verify_pipe_server_privileged(pipe: isize) -> Result<()> {
+    use windows_sys::Win32::Foundation::LocalFree;
+    use windows_sys::Win32::Security::Authorization::{GetSecurityInfo, SE_KERNEL_OBJECT};
+    use windows_sys::Win32::Security::{
+        IsWellKnownSid, WinBuiltinAdministratorsSid, WinLocalSystemSid, OWNER_SECURITY_INFORMATION,
+        PSECURITY_DESCRIPTOR, PSID,
+    };
+    if std::env::var_os("Citadel_INSECURE_PIPE").is_some() {
+        eprintln!("[win_tun] ⚠ Citadel_INSECURE_PIPE — проверка владельца пайпа отключена (dev)");
+        return Ok(());
+    }
+    // SAFETY: pipe — валидный хэндл с READ_CONTROL (GENERIC_READ его включает). owner указывает ВНУТРЬ
+    // sd (LocalAlloc'нут GetSecurityInfo) → валиден до LocalFree(sd); ppsidgroup/ppdacl/ppsacl = null.
+    unsafe {
+        let mut owner: PSID = std::ptr::null_mut();
+        let mut sd: PSECURITY_DESCRIPTOR = std::ptr::null_mut();
+        let rc = GetSecurityInfo(
+            pipe as HANDLE,
+            SE_KERNEL_OBJECT,
+            OWNER_SECURITY_INFORMATION,
+            &mut owner,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            &mut sd,
+        );
+        if rc != 0 {
+            bail!("не прочитать владельца пайпа службы (GetSecurityInfo err={rc}) — не доверяю каналу (W4)");
+        }
+        let privileged = IsWellKnownSid(owner, WinLocalSystemSid) != 0
+            || IsWellKnownSid(owner, WinBuiltinAdministratorsSid) != 0;
+        LocalFree(sd);
+        if !privileged {
+            bail!("сервер пайпа citadel-svc НЕ привилегирован (владелец ≠ SYSTEM/Administrators) — возможен сквоттинг, отказ (W4)");
+        }
+    }
+    Ok(())
+}
+
 /// `TunProvider` для Windows-desktop: привилегии — в службе `citadel-svc`, связь по named pipe.
 pub struct WindowsTunProvider {
     /// Путь named pipe службы (по умолчанию [`PIPE_PATH`]; переопределяемо для dev/тестов).
@@ -194,6 +240,10 @@ impl TunProvider for WindowsTunProvider {
         let pipe = open_overlapped_pipe(&self.pipe_path).with_context(|| {
             format!("служба citadel-svc недоступна ({}) — установлена и запущена?", self.pipe_path)
         })?;
+        // W4: сервер пайпа обязан быть привилегированным (SYSTEM/Admins), а не сквоттером под юзером —
+        // проверяем ДО отправки конфига/доверия каналу (анти-impersonation туннельного data-path).
+        verify_pipe_server_privileged(pipe.0)
+            .context("проверка подлинности службы citadel-svc (W4)")?;
         // Раздельные overlapped-контексты recv/send (общий хэндл, независимые OVERLAPPED).
         let read_io = OvIo::new().context("создать read-событие пайпа")?;
         let write_io = OvIo::new().context("создать write-событие пайпа")?;

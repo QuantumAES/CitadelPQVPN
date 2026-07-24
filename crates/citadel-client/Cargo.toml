@@ -42,7 +42,8 @@ sendfd = "0.4"
 # reader'а на реконнекте. Win32_Security — тип SECURITY_ATTRIBUTES в сигнатуре CreateFileW.
 windows-sys = { version = "0.60", features = [
     "Win32_Foundation",
-    "Win32_Security",
+    "Win32_Security",               # W4: IsWellKnownSid + well-known SID-типы (владелец пайпа службы)
+    "Win32_Security_Authorization", # W4: GetSecurityInfo — прочитать владельца серверного пайпа
     "Win32_Storage_FileSystem",
     "Win32_System_IO",
     "Win32_System_Threading",

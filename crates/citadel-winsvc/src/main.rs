@@ -41,7 +41,7 @@ mod windows_svc {
 
     use citadel_winnet::{
         decode_config, encode_packet, encode_ready_err, encode_ready_ok, TunReady, TunSetup,
-        TAG_CONFIG,
+        WfpFamily, TAG_CONFIG,
     };
     use windows_service::service::{
         ServiceControl, ServiceControlAccept, ServiceExitCode, ServiceState, ServiceStatus,
@@ -56,7 +56,9 @@ mod windows_svc {
     use windows_sys::Win32::Security::Authorization::ConvertStringSecurityDescriptorToSecurityDescriptorW;
     use windows_sys::Win32::Security::{PSECURITY_DESCRIPTOR, SECURITY_ATTRIBUTES};
     use windows_sys::Win32::Storage::FileSystem::{ReadFile, WriteFile, FILE_FLAG_OVERLAPPED};
-    use windows_sys::Win32::System::Pipes::{ConnectNamedPipe, CreateNamedPipeW, DisconnectNamedPipe};
+    use windows_sys::Win32::System::Pipes::{
+        ConnectNamedPipe, CreateNamedPipeW, DisconnectNamedPipe, GetNamedPipeClientProcessId,
+    };
     use windows_sys::Win32::System::Threading::{CreateEventW, ResetEvent};
     use windows_sys::Win32::System::IO::{CancelIoEx, GetOverlappedResult, OVERLAPPED};
 
@@ -206,8 +208,11 @@ mod windows_svc {
     const PIPE_NAME: &str = r"\\.\pipe\citadel-svc";
     /// ACL пайпа (SDDL): SYSTEM/Builtin-Admins — полный доступ (GA); интерактивные пользователи (IU) —
     /// read+write (desktop-app коннектится под юзером). Сеть/аноним/сервисы — нет доступа. `P` —
-    /// protected DACL (без наследования). Закрывает: любой локальный процесс поднимал бы туннель.
-    const PIPE_SDDL: &str = "D:P(A;;GA;;;SY)(A;;GA;;;BA)(A;;GRGW;;;IU)";
+    /// protected DACL (без наследования). W3 (аудит-3): SACL с mandatory-label `(ML;;NW;;;ME)` —
+    /// no-write-up ниже Medium ⇒ low-integrity/AppContainer-процессы (типовой sandbox малвари) НЕ
+    /// могут писать в пайп, даже будучи IU. Легитимный app (Medium) не затронут. Дополняется
+    /// per-connection проверкой образа клиента (`verify_client_is_installed_app`, W3).
+    const PIPE_SDDL: &str = "D:P(A;;GA;;;SY)(A;;GA;;;BA)(A;;GRGW;;;IU)S:(ML;;NW;;;ME)";
     /// Верхняя граница config-кадра (анти-DoS при чтении из пайпа).
     const MAX_CONFIG: usize = 64 * 1024;
     /// `ERROR_PIPE_CONNECTED` — клиент успел подключиться до `ConnectNamedPipe` (не ошибка).
@@ -228,7 +233,7 @@ mod windows_svc {
     /// Консольный dev-режим: тот же serve-цикл без SCM (работает до kill / Ctrl-C).
     pub fn run_console() -> anyhow::Result<()> {
         eprintln!("[svc] citadel-svc: dev-console режим");
-        serve(&SHUTDOWN)
+        serve(&SHUTDOWN, false) // dev: служба под юзером, клиент из build-дерева → client-auth выкл
     }
 
     // SCM-boilerplate: ffi_service_main парсит аргументы и зовёт service_main на фоновом потоке.
@@ -273,7 +278,7 @@ mod windows_svc {
             ServiceState::Running,
             ServiceControlAccept::STOP | ServiceControlAccept::SHUTDOWN,
         ))?;
-        let _ = serve(&SHUTDOWN);
+        let _ = serve(&SHUTDOWN, true); // SCM/LocalSystem → W3 client-auth enforce
         status_handle
             .set_service_status(status(ServiceState::Stopped, ServiceControlAccept::empty()))?;
         Ok(())
@@ -339,8 +344,8 @@ mod windows_svc {
 
     /// serve-цикл: принимать клиентов по одному, пока не выставлен `shutdown`. Прерывается на Stop
     /// через `cancel_accept` (CancelIoEx на текущем пайпе разбудит блокирующий ConnectNamedPipe/pump).
-    fn serve(shutdown: &AtomicBool) -> anyhow::Result<()> {
-        eprintln!("[svc] слушаю {PIPE_NAME}");
+    fn serve(shutdown: &AtomicBool, enforce_client_auth: bool) -> anyhow::Result<()> {
+        eprintln!("[svc] слушаю {PIPE_NAME} (client-auth W3: {})", if enforce_client_auth { "вкл" } else { "выкл (dev-console)" });
         // Overlapped-контекст serve-потока: используется для connect + config-handshake + чтения
         // pump'а (всё на этом потоке, последовательно). Writer-поток pump'а держит СВОЙ Ov.
         let ov = Ov::new()?;
@@ -356,6 +361,20 @@ mod windows_svc {
                 unsafe { CloseHandle(h) };
                 continue;
             }
+            // W3: аутентифицировать клиента ДО чтения config (это недоверенный ввод, управляющий
+            // привилегированной реконфигурацией сети). SCM-режим (LocalSystem) → enforce; dev-console
+            // (служба под юзером, клиент из build-дерева) → пропускаем.
+            if enforce_client_auth {
+                if let Err(e) = verify_client_is_installed_app(h) {
+                    eprintln!("[svc] отклонён клиент пайпа (W3): {e:#}");
+                    CURRENT_PIPE.store(0, Ordering::Release);
+                    unsafe {
+                        DisconnectNamedPipe(h);
+                        CloseHandle(h);
+                    }
+                    continue;
+                }
+            }
             handle_client(h, &ov);
             CURRENT_PIPE.store(0, Ordering::Release);
             unsafe {
@@ -365,6 +384,57 @@ mod windows_svc {
         }
         eprintln!("[svc] serve остановлен");
         Ok(())
+    }
+
+    /// W3 (аудит-3): аутентификация клиента пайпа. ACL даёт доступ любому интерактивному юзеру (IU),
+    /// но служба (LocalSystem) выполняет привилегированную реконфигурацию сети — доверять ЛЮБОМУ
+    /// процессу нельзя. Проверяем, что подключившийся процесс — установленное приложение Citadel: его
+    /// образ в ТОМ ЖЕ каталоге, что и служба (Inno ставит app.exe и citadel-svc.exe в один
+    /// `%ProgramFiles%\CitadelPQVPN`; Program Files пишет только админ ⇒ медиум-малварь туда бинарь
+    /// не положит). SYSTEM открывает клиента (≤ integrity) — OpenProcess надёжен. Дополняет
+    /// mandatory-label в SDDL (блок low-integrity). Err → клиент не из install-dir (отклонить).
+    fn verify_client_is_installed_app(pipe: HANDLE) -> anyhow::Result<()> {
+        let install_dir = std::env::current_exe()
+            .ok()
+            .and_then(|p| p.parent().map(|d| d.to_path_buf()))
+            .ok_or_else(|| anyhow::anyhow!("не определить install-dir службы (current_exe)"))?;
+        let mut pid: u32 = 0;
+        // SAFETY: pipe — валидный серверный хэндл подключённого клиента; pid — out-указатель.
+        if unsafe { GetNamedPipeClientProcessId(pipe, &mut pid) } == 0 {
+            anyhow::bail!("GetNamedPipeClientProcessId err={}", unsafe { GetLastError() });
+        }
+        let image = client_image_path(pid)?;
+        if !crate::plan::same_dir(&image, &install_dir) {
+            anyhow::bail!(
+                "образ клиента {image:?} не в install-dir службы {install_dir:?} — не приложение Citadel"
+            );
+        }
+        eprintln!("[svc] W3: клиент пайпа аутентифицирован (образ из install-dir, pid={pid})");
+        Ok(())
+    }
+
+    /// Полный путь образа процесса `pid` (QueryFullProcessImageNameW). SYSTEM открывает любой процесс
+    /// правом PROCESS_QUERY_LIMITED_INFORMATION (кросс-integrity вниз всегда разрешён).
+    fn client_image_path(pid: u32) -> anyhow::Result<std::path::PathBuf> {
+        use windows_sys::Win32::System::Threading::{
+            OpenProcess, QueryFullProcessImageNameW, PROCESS_QUERY_LIMITED_INFORMATION,
+        };
+        // SAFETY: OpenProcess лимитированным правом; хэндл закрываем; буфер фикс. под MAX_PATH,
+        // len — in/out (ёмкость буфера → фактическая длина, символы UTF-16).
+        unsafe {
+            let h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
+            if h.is_null() {
+                anyhow::bail!("OpenProcess(pid={pid}) err={}", GetLastError());
+            }
+            let mut buf = [0u16; 260]; // MAX_PATH
+            let mut len = buf.len() as u32;
+            let ok = QueryFullProcessImageNameW(h, 0, buf.as_mut_ptr(), &mut len);
+            CloseHandle(h);
+            if ok == 0 {
+                anyhow::bail!("QueryFullProcessImageNameW(pid={pid}) err={}", GetLastError());
+            }
+            Ok(std::path::PathBuf::from(String::from_utf16_lossy(&buf[..len as usize])))
+        }
     }
 
     /// Прервать блокирующий ConnectNamedPipe/ReadFile на текущем пайпе (control-handler на Stop).
@@ -442,10 +512,10 @@ mod windows_svc {
         };
         let plan = plan_session(&setup, ADAPTER_NAME);
         eprintln!(
-            "[svc] сессия: {} netsh-команд, bypass={:?}, killswitch={}",
+            "[svc] сессия: {} netsh-команд, bypass={:?}, wfp-фильтров={} (KS и/или IPv6-блок)",
             plan.netsh.len(),
             plan.bypass,
-            plan.wfp.is_some()
+            plan.wfp.as_ref().map_or(0, |w| w.len())
         );
         match bring_up(&plan) {
             Ok(session) => {
@@ -486,6 +556,10 @@ mod windows_svc {
         luid: u64,
         /// Успешно добавленные bypass-назначения (`route add …`) — откатываются в teardown.
         bypass: Vec<String>,
+        /// W1: армирован ли РЕАЛЬНЫЙ kill-switch (V4-фильтры), а не только IPv6-блок утечки. От этого
+        /// зависит fail-closed-удержание WFP при аварийном разрыве (teardown): KS держим, чистый
+        /// IPv6-блок (full-tunnel без KS) — снимаем (пользователь fail-closed не выбирал).
+        killswitch: bool,
     }
 
     /// Поднять туннель: WinTUN-адаптер → bypass-маршруты (мимо туннеля) → адрес/MTU/маршруты/DNS.
@@ -526,16 +600,23 @@ mod windows_svc {
             return Err(e);
         }
 
-        // WFP kill-switch (fail-closed): блокируем не-туннельный трафик, кроме permit'ов плана.
-        // Ошибка армирования = не поднимаем туннель без запрошенного KS (откат bypass перед выходом).
+        // WFP fail-closed: IPv4 kill-switch (permit'ы плана) и/или IPv6-блок утечки (W1). Оба слоя —
+        // в одной dynamic-сессии. `killswitch_armed` = есть ли РЕАЛЬНЫЙ KS (V4-фильтры) → от него
+        // зависит удержание WFP при аварийном разрыве (teardown). Ошибка армирования = не поднимаем
+        // туннель без запрошенной защиты (откат bypass перед выходом).
+        let mut killswitch_armed = false;
         if let Some(wfp_filters) = &plan.wfp {
             if let Err(e) = crate::wfp::arm(wfp_filters, luid) {
                 for dest in &bypass {
                     let _ = std::process::Command::new("route").args(bypass_route_del(dest)).status();
                 }
-                return Err(anyhow::anyhow!("армировать WFP kill-switch: {e}"));
+                return Err(anyhow::anyhow!("армировать WFP: {e}"));
             }
-            eprintln!("[svc] WFP kill-switch армирован ({} фильтров)", wfp_filters.len());
+            killswitch_armed = wfp_filters.iter().any(|f| f.family == WfpFamily::V4);
+            eprintln!(
+                "[svc] WFP армирован: {} фильтров (IPv4 kill-switch и/или IPv6-блок утечки, W1)",
+                wfp_filters.len()
+            );
         } else {
             // KS выключен в ЭТОЙ сессии → снять осиротевший WFP от прошлой аварийно-разорванной
             // KS-сессии (служба persistent/AutoStart → dynamic-фильтры живут, пока жив процесс). Иначе
@@ -545,7 +626,7 @@ mod windows_svc {
         }
 
         eprintln!("[svc] WinTUN '{ADAPTER_NAME}' поднят (luid={luid}); bypass={bypass:?}");
-        Ok(Session { session, _adapter: adapter, luid, bypass })
+        Ok(Session { session, _adapter: adapter, luid, bypass, killswitch: killswitch_armed })
     }
 
     /// Применить список netsh-команд (argv без ведущего `netsh`). Ошибка любой — прерывает bring_up.
@@ -701,16 +782,22 @@ mod windows_svc {
     }
 
     /// Свернуть сессию: откат bypass-маршрутов + drop адаптера (маршруты/DNS `store=active` исчезают
-    /// с ним). WFP kill-switch снимаем ТОЛЬКО при чистом disconnect (`clean`); при аварийном разрыве
-    /// держим (fail-closed) — следующий `arm`/перезапуск службы его переармирует/снимет.
+    /// с ним). WFP при чистом disconnect снимаем ВСЕГДА. При аварийном разрыве держим fail-closed
+    /// ТОЛЬКО если был РЕАЛЬНЫЙ kill-switch (`s.killswitch`); если WFP был лишь IPv6-блоком утечки
+    /// (full-tunnel без KS — пользователь fail-closed не выбирал), снимаем, чтобы после падения
+    /// движка IPv6-связность восстановилась (как Linux-helper снимает CITADEL_KS6 без killswitch, W1).
     fn teardown(s: Session, clean: bool) {
         for dest in &s.bypass {
             let _ = std::process::Command::new("route").args(bypass_route_del(dest)).status();
         }
         if clean {
             crate::wfp::disarm();
-        } else {
+        } else if s.killswitch {
             eprintln!("[svc] аварийный разрыв — WFP kill-switch ОСТАВЛЕН (fail-closed)");
+        } else {
+            // WFP был только IPv6-блоком (full-tunnel без KS) → снимаем: IPv6 восстановится, как IPv4.
+            crate::wfp::disarm();
+            eprintln!("[svc] аварийный разрыв — IPv6-блок снят (kill-switch не запрашивался)");
         }
         // drop(s) закрывает WinTUN-сессию и адаптер.
     }
