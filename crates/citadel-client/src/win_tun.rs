@@ -140,25 +140,41 @@ impl Drop for OvIo {
     }
 }
 
-/// Открыть named pipe службы в overlapped-режиме.
+/// Открыть named pipe службы в overlapped-режиме. При `ERROR_PIPE_BUSY` (все инстансы заняты, os 231)
+/// ждём освобождения (`WaitNamedPipe`) и ретраим до дедлайна. Служба держит ОДИН инстанс и блокируется
+/// в pump на всю сессию, а `disconnect()` при смене профиля — fire-and-forget: старая сессия отпускает
+/// пайп и служба пересоздаёт инстанс НЕ мгновенно (teardown route/WFP). Без ожидания новый connect
+/// падал бы «Все копии канала заняты». Несуществующий пайп (служба не запущена) → не BUSY → сразу Err.
 fn open_overlapped_pipe(path: &str) -> io::Result<PipeHandle> {
+    use windows_sys::Win32::Foundation::{GetLastError, ERROR_PIPE_BUSY};
+    use windows_sys::Win32::System::Pipes::WaitNamedPipeW;
     let name = wide(path);
-    // SAFETY: name — валидная UTF-16 строка; прочие аргументы — константы/null.
-    let h = unsafe {
-        CreateFileW(
-            name.as_ptr(),
-            GENERIC_READ | GENERIC_WRITE,
-            0,
-            std::ptr::null(),
-            OPEN_EXISTING,
-            FILE_FLAG_OVERLAPPED,
-            std::ptr::null_mut(),
-        )
-    };
-    if h == INVALID_HANDLE_VALUE {
-        return Err(io::Error::last_os_error());
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        // SAFETY: name — валидная UTF-16 строка; прочие аргументы — константы/null.
+        let h = unsafe {
+            CreateFileW(
+                name.as_ptr(),
+                GENERIC_READ | GENERIC_WRITE,
+                0,
+                std::ptr::null(),
+                OPEN_EXISTING,
+                FILE_FLAG_OVERLAPPED,
+                std::ptr::null_mut(),
+            )
+        };
+        if h != INVALID_HANDLE_VALUE {
+            return Ok(PipeHandle(h as isize));
+        }
+        // SAFETY: читаем код сразу после неудачного CreateFileW.
+        let err = unsafe { GetLastError() };
+        if err != ERROR_PIPE_BUSY || std::time::Instant::now() >= deadline {
+            return Err(io::Error::from_raw_os_error(err as i32));
+        }
+        // Все инстансы заняты → ждём до 500мс освобождения, затем ретрай CreateFileW (дедлайн ~5с).
+        // SAFETY: name валиден; таймаут в мс.
+        unsafe { WaitNamedPipeW(name.as_ptr(), 500) };
     }
-    Ok(PipeHandle(h as isize))
 }
 
 /// W4 (аудит-3): анти-сквоттинг named pipe. Клиент ОБЯЗАН убедиться, что серверный конец пайпа создан

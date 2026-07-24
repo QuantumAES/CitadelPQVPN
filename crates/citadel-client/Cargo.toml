@@ -46,6 +46,7 @@ windows-sys = { version = "0.60", features = [
     "Win32_Security_Authorization", # W4: GetSecurityInfo — прочитать владельца серверного пайпа
     "Win32_Storage_FileSystem",
     "Win32_System_IO",
+    "Win32_System_Pipes",           # WaitNamedPipeW — ждать свободный инстанс при ERROR_PIPE_BUSY
     "Win32_System_Threading",
 ] }
 
