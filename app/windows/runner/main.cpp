@@ -27,8 +27,8 @@ int APIENTRY wWinMain(_In_ HINSTANCE instance, _In_opt_ HINSTANCE prev,
   FlutterWindow window(project);
   Win32Window::Point origin(10, 10);
   // Портретное окно в стиле OpenVPN Connect (узкое+высокое). window_manager в main.dart затем
-  // выставит min-size и центрирует; здесь задаём стартовый размер, чтобы не мелькнул 1280x720.
-  Win32Window::Size size(440, 820);
+  // фиксирует размер (440x600) и отключает ресайз; здесь стартовый размер, чтобы не мелькнул 1280x720.
+  Win32Window::Size size(440, 600);
   if (!window.Create(L"CitadelPQVPN", origin, size)) {
     return EXIT_FAILURE;
   }

@@ -69,13 +69,22 @@ if [[ "$WITH_APP" -eq 1 ]]; then
     log "Установка app-бандла → $APP_DIR…"
     $SUDO rm -rf "$APP_DIR"
     $SUDO cp -r "$BUNDLE" "$APP_DIR"
+    # П.5: брендовая иконка (hicolor) из app_icons/Linux — все размеры как citadelpqvpn.png.
+    ICONSRC="$REPO/app_icons/Linux"
+    if [[ -d "$ICONSRC" ]]; then
+      for sz in 16 24 32 48 64 128 256 512; do
+        src="$ICONSRC/${sz}x${sz}/apps/app.png"
+        [[ -f "$src" ]] && $SUDO install -Dm644 "$src" "/usr/share/icons/hicolor/${sz}x${sz}/apps/citadelpqvpn.png"
+      done
+      $SUDO gtk-update-icon-cache -q /usr/share/icons/hicolor 2>/dev/null || true
+    fi
     $SUDO tee /usr/share/applications/citadel-pqvpn.desktop >/dev/null <<EOF
 [Desktop Entry]
 Type=Application
 Name=CitadelPQVPN
 Comment=Постквантовый VPN
 Exec=$APP_DIR/app
-Icon=network-vpn
+Icon=citadelpqvpn
 Categories=Network;
 Terminal=false
 EOF

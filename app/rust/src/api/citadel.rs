@@ -177,8 +177,9 @@ pub fn killswitch_enabled() -> bool {
 }
 
 /// Режим отладки (журнал ядра + диагностика в UI). Персистится в файл рядом с vault (как kill-switch),
-/// иначе тумблер сбрасывался бы в дефолт при каждом рестарте. Дефолт (файла нет) — включён (предрелиз).
-static DEBUG_ENABLED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+/// иначе тумблер сбрасывался бы в дефолт при каждом рестарте. Дефолт (файла нет) — ВЫКЛЮЧЕН (на всех
+/// клиентах: журнал ядра пишется только при явном включении пользователем — приватность/no-logs).
+static DEBUG_ENABLED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 static DEBUG_LOADED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 fn debug_flag_file() -> PathBuf {
@@ -199,7 +200,7 @@ pub fn set_debug_enabled(on: bool) {
 }
 
 /// Сохранённое состояние режима отладки (инициализация тумблера). Ленивая подгрузка при первом
-/// обращении; файла нет → дефолт (включён). Имя `*_persisted` — чтобы Dart-обёртка не конфликтовала
+/// обращении; файла нет → дефолт ВЫКЛЮЧЕН. Имя `*_persisted` — чтобы Dart-обёртка не конфликтовала
 /// с полем `AppState.debugEnabled`.
 #[frb(sync)]
 pub fn debug_enabled_persisted() -> bool {

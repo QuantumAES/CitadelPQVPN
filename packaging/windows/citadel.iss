@@ -16,7 +16,8 @@
 #define AppName "CitadelPQVPN"
 #define Publisher "CitadelPQVPN"
 #define SvcExe "citadel-svc.exe"
-#define AppExe "app.exe"          ; Flutter BINARY_NAME (app/windows/CMakeLists: set(BINARY_NAME "app"))
+#define FlutterExe "app.exe"      ; Flutter BINARY_NAME (app/windows/CMakeLists: set(BINARY_NAME "app"))
+#define AppExe "CitadelPQVPN.exe" ; п.1: инсталлятор переименовывает app.exe → CitadelPQVPN.exe
 #define SvcName "CitadelPQVPN"    ; = SERVICE_NAME в citadel-svc
 
 [Setup]
@@ -47,8 +48,12 @@ Name: "en"; MessagesFile: "compiler:Default.isl"
 Name: "desktopicon"; Description: "{cm:CreateDesktopIcon}"; GroupDescription: "{cm:AdditionalIcons}"
 
 [Files]
-; Flutter-бандл целиком (app.exe + flutter_windows.dll + citadel_client.dll + data\ + прочие DLL).
-Source: "payload\app\*"; DestDir: "{app}"; Flags: recursesubdirs ignoreversion
+; Flutter-бандл целиком (flutter_windows.dll + citadel_client.dll + data\ + прочие DLL), КРОМЕ
+; главного exe — его ставим следующей строкой под брендовым именем (п.1).
+Source: "payload\app\*"; DestDir: "{app}"; Excludes: "{#FlutterExe}"; Flags: recursesubdirs ignoreversion
+; Главный exe приложения: app.exe → CitadelPQVPN.exe (п.1). Flutter грузит data\/DLL относительно
+; своего КАТАЛОГА, не имени — переименование безопасно (и W3 сверяет каталог клиента, не имя).
+Source: "payload\app\{#FlutterExe}"; DestDir: "{app}"; DestName: "{#AppExe}"; Flags: ignoreversion
 ; Привилегированная служба + WinTUN (грузится службой рантаймом из своей папки).
 Source: "payload\{#SvcExe}"; DestDir: "{app}"; Flags: ignoreversion
 Source: "payload\wintun.dll"; DestDir: "{app}"; Flags: ignoreversion

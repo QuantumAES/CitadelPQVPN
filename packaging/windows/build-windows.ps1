@@ -38,6 +38,7 @@ function Sign([string]$file) {
 
 Write-Host "== [1/5] Rust: service citadel-svc ($target) ==" -ForegroundColor Cyan
 Push-Location $root
+$env:CITADEL_VERSION = $Version   # -> build.rs VERSIONINFO (Details tab of citadel-svc.exe properties)
 cargo build --release --target $target -p citadel-winsvc
 Pop-Location
 $svc = Join-Path $root "target\$target\release\citadel-svc.exe"

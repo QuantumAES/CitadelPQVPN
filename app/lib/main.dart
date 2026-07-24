@@ -23,14 +23,19 @@ Future<void> main() async {
     await windowManager.ensureInitialized();
     // Портретное окно в стиле OpenVPN Connect (узкое+высокое) + брендовый заголовок окна: без него
     // OS-заголовок/панель задач показывают "app" (имя Flutter-проекта). #5.2/#5.3.
+    // #п2: фикс-размер окна (не ресайзится) — узкое+высокое портретное как OpenVPN Connect. Высота
+    // 600 (−220 от прежних 820). min==max==size + setResizable(false) → рамку тянуть нельзя.
+    const winSize = Size(440, 600);
     const opts = WindowOptions(
-      size: Size(440, 820),
-      minimumSize: Size(380, 640),
+      size: winSize,
+      minimumSize: winSize,
+      maximumSize: winSize,
       center: true,
       title: 'CitadelPQVPN',
     );
     await windowManager.waitUntilReadyToShow(opts, () async {
       await windowManager.setTitle('CitadelPQVPN');
+      await windowManager.setResizable(false); // #п2: фиксированное окно
       await windowManager.show();
       await windowManager.focus();
     });

@@ -200,8 +200,9 @@ class _HomePageState extends State<HomePage> {
     showModalBottomSheet(
       context: context,
       showDragHandle: true,
+      isScrollControlled: true, // #п3: снять дефолтный лимит высоты (9/16 экрана) → все пункты видны
       builder: (sheetCtx) => SafeArea(
-        child: SingleChildScrollView( // #6: скролл — в компактном окне все пункты влезают
+        child: SingleChildScrollView( // fallback: скролл только если пунктов больше, чем влезает
           child: Column(
           mainAxisSize: MainAxisSize.min,
           children: [

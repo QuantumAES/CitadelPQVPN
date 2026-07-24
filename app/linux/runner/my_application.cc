@@ -59,8 +59,12 @@ static void my_application_activate(GApplication* application) {
     gtk_window_set_title(window, "CitadelPQVPN");
   }
 
-  // Компактное оконное окно (как openvpn connect), не во весь экран.
-  gtk_window_set_default_size(window, 440, 760);
+  // Компактное фикс-окно (как OpenVPN Connect), не во весь экран. Высота 600 (−220); window_manager
+  // в main.dart затем фиксирует размер и отключает ресайз, здесь дублируем нерастягиваемость нативно.
+  gtk_window_set_default_size(window, 440, 600);
+  gtk_window_set_resizable(window, FALSE);
+  // П.5: брендовая иконка окна (таскбар/титул) — тема hicolor, ставится install-скриптами.
+  gtk_window_set_icon_name(window, "citadelpqvpn");
 
   g_autoptr(FlDartProject) project = fl_dart_project_new();
   fl_dart_project_set_dart_entrypoint_arguments(

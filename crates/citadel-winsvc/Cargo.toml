@@ -14,6 +14,11 @@ anyhow = "1"
 # Ядро W2 (кадры пайпа, WFP-план, маршруты) — общее с провайдером; БЕЗ движка (меньше attack surface).
 citadel-winnet = { path = "../citadel-winnet" }
 
+# П.1: version-ресурс (VERSIONINFO) citadel-svc.exe — свойства/Подробно как у app.exe. Плейн
+# build-dep (компилится на любом хосте); build.rs использует только при target_os=windows.
+[build-dependencies]
+winresource = "0.1"
+
 # Windows-only WinAPI. windows-sys 0.60 уже в Cargo.lock (транзитивно) → без новых версий.
 # Pipe-сервер (CreateNamedPipeW/ConnectNamedPipe/ReadFile/WriteFile). WinTUN-адаптер (крейт wintun),
 # WFP и SCM (windows-service) добавятся в 3b/3c — сейчас исполнители-заглушки за TODO.

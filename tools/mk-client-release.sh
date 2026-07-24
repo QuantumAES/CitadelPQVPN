@@ -69,6 +69,13 @@ mkdir -p "$STAGE"
 cp -r "$BUNDLE" "$STAGE/bundle"
 cp "$REPO_ROOT/target/release/citadel-helper" "$STAGE/citadel-helper"
 cp "$REPO_ROOT/packaging/dev.citadelpqvpn.helper.policy" "$STAGE/dev.citadelpqvpn.helper.policy"
+# П.5: брендовые иконки (hicolor) в тарбол — install.sh поставит их в /usr/share/icons/hicolor.
+if [[ -d "$REPO_ROOT/app_icons/Linux" ]]; then
+  for sz in 16 24 32 48 64 128 256 512; do
+    isrc="$REPO_ROOT/app_icons/Linux/${sz}x${sz}/apps/app.png"
+    [[ -f "$isrc" ]] && install -Dm644 "$isrc" "$STAGE/icons/hicolor/${sz}x${sz}/apps/citadelpqvpn.png"
+  done
+fi
 
 # самодостаточный установщик внутри тарбола
 cat > "$STAGE/install.sh" <<'INSTALL'
@@ -102,13 +109,18 @@ $SUDO install -m 644 -o root -g root "$HERE/dev.citadelpqvpn.helper.policy" "$PO
 log "App-бандл → $APP_DIR…"
 $SUDO rm -rf "$APP_DIR"
 $SUDO cp -r "$HERE/bundle" "$APP_DIR"
+# П.5: брендовые иконки (hicolor) из тарбола → системная тема.
+if [[ -d "$HERE/icons/hicolor" ]]; then
+  $SUDO cp -r "$HERE/icons/hicolor/." /usr/share/icons/hicolor/
+  $SUDO gtk-update-icon-cache -q /usr/share/icons/hicolor 2>/dev/null || true
+fi
 $SUDO tee /usr/share/applications/citadel-pqvpn.desktop >/dev/null <<DESKTOP
 [Desktop Entry]
 Type=Application
 Name=CitadelPQVPN
 Comment=Постквантовый VPN
 Exec=$APP_DIR/app
-Icon=network-vpn
+Icon=citadelpqvpn
 Categories=Network;
 Terminal=false
 DESKTOP
