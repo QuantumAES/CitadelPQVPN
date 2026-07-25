@@ -1,0 +1,56 @@
+# Стенд для e2e-проверки консольного Linux-клиента (трек L): настоящие issuer + exit
+# из демо-стека и клиент, собранный по новой модели (citadel-vpnd + citadel-engine + citadel-cli).
+name: citadel-pq-cli
+
+services:
+  issuer:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: citadel-pq:latest
+    container_name: citadel-cli-issuer
+    entrypoint: ["/usr/local/bin/entrypoint-issuer.sh"]
+    volumes: ["clishare:/shared"]
+    networks: ["clinet"]
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "test -f /shared/issuer.pub"]
+      interval: 2s
+      timeout: 2s
+      retries: 30
+      start_period: 5s
+
+  exit:
+    image: citadel-pq:latest
+    container_name: citadel-cli-exit
+    depends_on:
+      issuer: { condition: service_healthy }
+    entrypoint: ["/usr/local/bin/entrypoint-exit.sh"]
+    cap_add: ["NET_ADMIN"]
+    devices: ["/dev/net/tun:/dev/net/tun"]
+    sysctls: ["net.ipv4.ip_forward=1"]
+    volumes: ["clishare:/shared"]
+    networks: ["clinet"]
+
+  # Клиент новой модели: внутри контейнера поднимается citadel-vpnd (как systemd-юнит),
+  # он запускает citadel-engine под отдельным uid, а citadel-cli играет роль человека.
+  client-cli:
+    build:
+      context: .
+      dockerfile: Dockerfile.cli
+    image: citadel-pq-cli:latest
+    container_name: citadel-cli-client
+    depends_on:
+      issuer: { condition: service_healthy }
+    entrypoint: ["/usr/local/bin/entrypoint-client-cli.sh"]
+    cap_add: ["NET_ADMIN"]
+    devices: ["/dev/net/tun:/dev/net/tun"]
+    volumes: ["clishare:/shared"]
+    networks: ["clinet"]
+
+volumes:
+  clishare:
+
+networks:
+  clinet:
+    driver: bridge

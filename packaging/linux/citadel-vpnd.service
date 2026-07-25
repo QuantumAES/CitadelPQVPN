@@ -1,0 +1,67 @@
+[Unit]
+Description=CitadelPQVPN — демон постквантового VPN-клиента
+Documentation=https://github.com/QuantumAES/CitadelPQVPN
+# Сеть нужна не самому демону (он лишь ждёт команд), а движку, который он запускает;
+# ранний старт безвреден, но так журнал читается логичнее.
+After=network-online.target
+Wants=network-online.target
+# Бесконечный рестарт-луп при неустранимой ошибке — это шторм к issuer/exit и заметный
+# для DPI паттерн; после 5 падений за минуту юнит останавливается (L15).
+StartLimitIntervalSec=60
+StartLimitBurst=5
+
+[Service]
+Type=exec
+ExecStart=/usr/lib/citadel-pqvpn/citadel-vpnd
+Restart=on-failure
+RestartSec=2s
+
+# Каталог управляющего сокета: systemd создаёт и чистит его сам.
+# Владельца группы демон выставляет сам (root:citadel-vpn, 0750) — сюда её не пишем,
+# чтобы юнит не ломался на машине, где группу ещё не создали.
+RuntimeDirectory=citadel-vpn
+RuntimeDirectoryMode=0750
+
+# ── песочница (L13) ───────────────────────────────────────────────────────────
+# Демон работает от root, но ему нужен строго ограниченный набор возможностей:
+#   NET_ADMIN/NET_RAW — TUN, маршруты, iptables;  SETUID/SETGID — сброс привилегий движка;
+#   CHOWN — владелец сокета;  KILL — добить зависший движок (он под другим uid).
+NoNewPrivileges=yes
+CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_RAW CAP_SETUID CAP_SETGID CAP_CHOWN CAP_KILL
+AmbientCapabilities=
+
+# /usr и /boot — только чтение; /etc остаётся записываемым: туда пишется resolv.conf (F6).
+ProtectSystem=full
+# Демон НИКОГДА не читает домашние каталоги: хранилище профилей — дело citadel-cli,
+# демон получает готовую ссылку по сокету. Запрет делает это свойство проверяемым.
+ProtectHome=yes
+PrivateTmp=yes
+ProtectProc=invisible
+ProcSubset=pid
+ProtectKernelTunables=yes
+ProtectKernelLogs=yes
+ProtectClock=yes
+ProtectHostname=yes
+ProtectControlGroups=yes
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+RestrictAddressFamilies=AF_UNIX AF_NETLINK AF_INET AF_INET6
+# Нужен /dev/net/tun, поэтому PrivateDevices=yes включить нельзя — вместо него точечный allow.
+PrivateDevices=no
+DevicePolicy=closed
+DeviceAllow=/dev/net/tun rw
+# NB: ProtectKernelModules=yes НЕ ставим — iptables подгружает ip_tables/xt_owner при первом
+# применении правил, и на свежезагруженной системе kill-switch иначе не встанет.
+
+# L6: секреты сессии не должны утечь через core dump (systemd-coredump кладёт их на диск).
+LimitCORE=0
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target

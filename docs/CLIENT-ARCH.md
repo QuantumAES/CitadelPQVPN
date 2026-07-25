@@ -296,6 +296,7 @@ CitadelPQVPN/
 | **C6** ✅ (частично) | **Упаковка/секреты**: kill-switch (Linux firewall + Android always-on) ✅; vault (AES-256-GCM) ✅; APK ✅; `SecretStore` keychain / msix/dmg / нотаризация macOS — остаток | C2–C5 |
 | **C7** ✅ | **Admin-plane v2** — управление абонентами по туннелю: PQ-TLS admin-канал к issuer из-под туннеля, роли ссылок (мастер/клиент), GUI «Абоненты», CLI `citadel-token admin`. Заменил SSH-путь C5.5 (§8/§10). *Единая нумерация с `SECURITY-ROADMAP` §C7* | C5 |
 | **C8** | **Сетевой контроль/приватность User-mode** *(бывш. «C7» здесь)*. C8.3 split-tunnel: Android (прил.+назнач.) ✅, Linux (назнач.) ✅; C8.2 window-close prompt (Linux) ✅; C8.5 запрет скриншотов (Android FLAG_SECURE, дефолт ВКЛ) ✅; C8.1 отменён; C8.0 + Linux per-app — план. См. §14.1 | C3 |
+| **L** | **Консольный клиент Linux** (сервер/VPS/SSH-сценарий): `citadel-vpnd` (root, systemd) + `citadel-engine` (uid `citadel-vpn`, без caps) + `citadel-cli` (TUI/подкоманды, vault общий с GUI). Модель процессов, границы доверия и угрозы L1–L20 — в **`LINUX-CLI.md`** | C0, C1, C6 |
 
 ---
 

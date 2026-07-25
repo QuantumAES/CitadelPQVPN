@@ -1,0 +1,19 @@
+[package]
+name = "citadel-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "CitadelPQVPN — консольный клиент Linux: TUI-настройка, vault с мастер-паролем, управление сессией через citadel-vpnd"
+
+[[bin]]
+name = "citadel-cli"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1"
+libc = "0.2"                                      # ввод пароля без эха (termios), права файлов
+citadel-client = { path = "../citadel-client" }   # vault (Argon2id) + разбор citadel://-ссылок
+citadel-vpnd = { path = "../citadel-vpnd" }       # общий контракт IPC + санитизация вывода
+ratatui = "0.29"                                  # полноэкранный TUI (без сети/ФС — только отрисовка)
+crossterm = "0.28"                                # терминальный бэкенд ratatui
+zeroize = "1"                                     # затирание пароля/ссылки в памяти TUI

@@ -16,6 +16,11 @@ __pycache__/
 docker/citadel-m1
 docker/citadel-token
 docker/citadel-m0
+# бинари клиента трека L, копируются в docker/ прогоном run-cli-tests.sh
+docker/citadel-vpnd
+docker/citadel-engine
+docker/citadel-cli
+docker/citadel-linkgen
 docker/veil-*
 docker/.env
 

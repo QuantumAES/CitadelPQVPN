@@ -1,0 +1,32 @@
+[Unit]
+Description=CitadelPQVPN — блокировка сети до подъёма туннеля (режим «без утечек при загрузке»)
+Documentation=https://github.com/QuantumAES/CitadelPQVPN
+# ВНИМАНИЕ. Юнит по умолчанию ВЫКЛЮЧЕН и включается осознанно:
+#   systemctl enable --now citadel-lockdown.service
+#
+# Что он делает: армирует fail-closed правила ДО того, как поднимется сеть. Пока туннель не
+# установлен, наружу не уходит ничего — ни телеметрия, ни NTP, ни DNS-запрос с именем вашего
+# VPN-сервера. Это закрывает окно утечки между загрузкой машины и подключением (L10).
+#
+# Чем платите:
+#   1. до подключения интернета на машине нет вообще (это и есть смысл режима);
+#   2. резолвер тоже закрыт, поэтому в ссылке профиля должен быть АДРЕС exit'а и issuer'а, а не
+#      имя — резолвить его будет негде;
+#   3. если что-то пойдёт не так: `sudo citadel-cli killswitch --disarm` или
+#      `sudo systemctl stop citadel-lockdown`.
+DefaultDependencies=no
+After=local-fs.target
+Before=network-pre.target
+Wants=network-pre.target
+Conflicts=shutdown.target
+Before=shutdown.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/lib/citadel-pqvpn/citadel-vpnd --lockdown
+# Остановка юнита = осознанное снятие защиты.
+ExecStop=/usr/lib/citadel-pqvpn/citadel-vpnd --disarm
+
+[Install]
+WantedBy=multi-user.target

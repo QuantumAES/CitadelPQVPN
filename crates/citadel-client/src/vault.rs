@@ -325,13 +325,52 @@ impl Vault {
 
         if let Some(dir) = self.path.parent() {
             std::fs::create_dir_all(dir).with_context(|| format!("создать {}", dir.display()))?;
+            restrict_dir(dir);
         }
         let tmp = self.path.with_extension("tmp");
-        std::fs::write(&tmp, &out).with_context(|| format!("писать {}", tmp.display()))?;
+        write_private(&tmp, &out).with_context(|| format!("писать {}", tmp.display()))?;
         std::fs::rename(&tmp, &self.path).context("атомарно заменить vault")?;
         Ok(())
     }
 }
+
+/// Записать файл хранилища так, чтобы его не мог прочитать никто, кроме владельца.
+///
+/// L7 (аудит Linux-клиента): `std::fs::write` создаёт файл с `0666 & ~umask` — на типичной
+/// многопользовательской машине это `0644`, то есть **шифртекст vault'а читает любой локальный
+/// пользователь** и может унести его на офлайн-перебор мастер-пароля. Argon2id делает перебор
+/// дорогим, но давать его бесплатно незачем: файл создаётся сразу с `0600`. На не-unix (Windows,
+/// где доступ разграничивает ACL профиля, и Android с приватным каталогом приложения) — обычная запись.
+#[cfg(unix)]
+fn write_private(path: &Path, data: &[u8]) -> Result<()> {
+    use std::io::Write as _;
+    use std::os::unix::fs::OpenOptionsExt;
+    let mut f = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(path)?;
+    f.write_all(data)?;
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn write_private(path: &Path, data: &[u8]) -> Result<()> {
+    std::fs::write(path, data)?;
+    Ok(())
+}
+
+/// Каталог хранилища — только владельцу (0700). Best-effort: на не-unix и при отсутствии прав
+/// (каталог создан платформой) молча пропускаем.
+#[cfg(unix)]
+fn restrict_dir(dir: &Path) {
+    use std::os::unix::fs::PermissionsExt;
+    let _ = std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700));
+}
+
+#[cfg(not(unix))]
+fn restrict_dir(_dir: &Path) {}
 
 /// C1: Argon2id(passphrase, salt, m_kib/t/p) → ключ AES-256-GCM. Memory-hard → перебор мастер-пароля
 /// (при утечке файла vault) на порядки дороже, чем PBKDF2, особенно на GPU/ASIC (память-bound).
@@ -575,6 +614,22 @@ mod tests {
         assert_eq!(v.list_issued().len(), 1);
         v.remove_issued("nope").unwrap(); // no-op
         assert_eq!(v.list_issued().len(), 1);
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// L7: файл хранилища не должен быть читаем другими пользователями машины — иначе шифртекст
+    /// уносят на офлайн-перебор мастер-пароля. Проверяем И после создания, И после изменения.
+    #[cfg(unix)]
+    #[test]
+    fn vault_file_is_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+        let path = tmp_path("perms");
+        let mut v = Vault::create(&path, "permspass1").unwrap();
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "после create ожидается 0600, получено {mode:o}");
+        v.add("p", &sample_uri()).unwrap();
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "после записи профиля ожидается 0600, получено {mode:o}");
         std::fs::remove_file(&path).ok();
     }
 
