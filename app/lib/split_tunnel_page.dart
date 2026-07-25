@@ -75,10 +75,14 @@ class _SplitTunnelPageState extends State<SplitTunnelPage> {
   }
 
   /// Определить локальные подсети устройства (/24 из каждого не-loopback IPv4) и предложить добавить.
+  /// Интерфейс САМОГО туннеля пропускаем: его подсеть — это шлюз exit'а (ADMIN_VIP, admin-канал),
+  /// она обязана оставаться в туннеле, и «обход» по ней всё равно не применяется (VpnService
+  /// вернёт её в маршруты). Кнопка нажимается при поднятом VPN, поэтому tun тут виден.
   Future<void> _addLocalSubnet() async {
     final subnets = <String>{};
     try {
       for (final ni in await NetworkInterface.list(type: InternetAddressType.IPv4)) {
+        if (ni.name.startsWith('tun') || ni.name.startsWith('citadel')) continue;
         for (final a in ni.addresses) {
           if (a.isLoopback) continue;
           final p = a.address.split('.');

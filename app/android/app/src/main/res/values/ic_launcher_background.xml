@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Фон adaptive-иконки: средний цвет рамки арта (тёмный сине-зелёный) — кромка маски сливается
+     с картинкой вместо белого кольца legacy-обработки. -->
+<resources>
+    <color name="ic_launcher_background">#002729</color>
+</resources>

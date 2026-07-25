@@ -16,7 +16,8 @@ void setLogFile({required String path}) =>
     RustLib.instance.api.crateApiDiagSetLogFile(path: path);
 
 /// Один раз подменить stderr на pipe и начать раздачу строк в UI. Идемпотентно; зовётся из
-/// `main.dart` сразу после `RustLib.init()`. На не-unix — no-op.
+/// `main.dart` сразу после `RustLib.init()`. Unix — dup2(fd 2); Windows — SetStdHandle(STDERR).
+/// На прочих ОС — no-op.
 void startLogCapture() => RustLib.instance.api.crateApiDiagStartLogCapture();
 
 /// Живой хвост логов: подписка на новые строки (после `start_log_capture`). Отдаётся Dart'у

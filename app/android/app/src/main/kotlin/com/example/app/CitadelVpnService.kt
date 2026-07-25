@@ -83,19 +83,50 @@ class CitadelVpnService : VpnService() {
         val linkRoutes = routes.split(" ").filter { it.isNotEmpty() }
         val appList = apps.split(" ").filter { it.isNotEmpty() }
         val destList = destRoutes.split(" ").filter { it.isNotEmpty() }
+        // Подсеть туннеля (назначенный addr/prefix). В ней живёт шлюз exit'а = ADMIN_VIP (C7.2),
+        // т.е. admin-канал «Абоненты». На Linux/Windows маршрут в неё появляется САМ (адрес на
+        // интерфейсе → on-link), а у VPN-сети Android маршрутов ровно столько, сколько добавлено
+        // здесь. Поэтому подсеть туннеля добавляем ЯВНО и ВСЕГДА — иначе split (dest-include без
+        // неё, dest-exclude поверх неё, app-фильтр без нас самих) уносит её мимо VPN, и connect()
+        // к 10.7.0.1 падает в EHOSTUNREACH «No route to host» (для UID под VPN Android ставит
+        // fallthrough-правило unreachable). prefix 0 не трогаем — это и есть 0.0.0.0/0.
+        val tunNet = if (prefix in 1..32) networkOf(addr, prefix) else null
         // C8.3 назначения: include → только они в туннель (остальное, вкл. IPv6, напрямую);
         //                  exclude → full-tunnel минус они (excludeRoute, Android 13+/API33).
+        // Из exclude-списка вырезаем всё, что накрывает подсеть туннеля (инвариант выше).
         val destInclude = destMode == "include" && destList.isNotEmpty()
-        val destExclude = destMode == "exclude" && destList.isNotEmpty()
+        val excludeList = if (destMode == "exclude") destList.filter { d ->
+            val s = splitCidr(d)
+            val clash = tunNet != null && prefixesOverlap(s.first, s.second, tunNet, prefix)
+            if (clash) {
+                android.util.Log.w("CitadelVpn", "C8.3 split-dest: $d накрывает подсеть туннеля $tunNet/$prefix — НЕ исключаю (иначе теряется admin-канал)")
+            }
+            !clash
+        } else emptyList()
+        val destExclude = excludeList.isNotEmpty()
         val tunnelRoutes = if (destInclude) destList else linkRoutes
         // full-tunnel (→ IPv6-blackhole применим) только когда НЕ селективный include и маршруты полны
         val fullTunnel = !destInclude && (tunnelRoutes.isEmpty() || tunnelRoutes.any { it == "0.0.0.0/0" })
 
         // C8.3 приложения: include → только выбранные пакеты в туннель; exclude → все, кроме них.
+        // Фильтр активен, только если список непуст (режим без списка = «не ограничивать», как
+        // SplitTunnel::is_active в ядре) — иначе include с пустым списком запер бы в туннель всё.
         // addAllowed/DisallowedApplication взаимоисключающи; несуществующий пакет бросает — ловим
         // пер-пакет, чтобы один удалённый пакет не завалил establish целиком.
         fun applyAppFilter(b: Builder) {
+            if (appList.isEmpty()) return
+            // САМИ мы всегда в туннеле: admin-канал идёт к ADMIN_VIP (адрес внутри туннеля) из
+            // этого же процесса, а сокеты движка к exit'у и так исключены protect() (C3.3).
+            // include → добавляем себя в разрешённые; exclude → никогда не исключаем себя.
+            if (appMode == "include") {
+                try {
+                    b.addAllowedApplication(packageName)
+                } catch (e: Exception) {
+                    android.util.Log.w("CitadelVpn", "C8.3 split-app: не добавил себя ($packageName): ${e.message}")
+                }
+            }
             for (pkg in appList) {
+                if (pkg == packageName) continue // см. выше: себя не исключаем и не дублируем
                 try {
                     when (appMode) {
                         "include" -> b.addAllowedApplication(pkg)
@@ -123,10 +154,13 @@ class CitadelVpnService : VpnService() {
             }
             for (d in dns.split(" ").filter { it.isNotEmpty() }) b.addDnsServer(d)
             if (tunnelRoutes.isEmpty()) b.addRoute("0.0.0.0", 0) // нет split-маршрутов → full-tunnel
+            // Инвариант: подсеть туннеля (шлюз = ADMIN_VIP, admin-канал) всегда через туннель —
+            // при любом split-конфиге. Дубль с 0.0.0.0/0 безвреден (более специфичный префикс).
+            if (tunNet != null) b.addRoute(tunNet, prefix)
             // C8.3 exclude: вырезать выбранные назначения из full-tunnel (Android 13+/API33)
             if (destExclude) {
                 if (Build.VERSION.SDK_INT >= 33) {
-                    for (d in destList) {
+                    for (d in excludeList) {
                         val s = splitCidr(d)
                         b.excludeRoute(android.net.IpPrefix(java.net.InetAddress.getByName(s.first), s.second))
                     }
@@ -230,6 +264,42 @@ class CitadelVpnService : VpnService() {
     private fun splitCidr(cidr: String): Pair<String, Int> {
         val i = cidr.indexOf('/')
         return if (i < 0) Pair(cidr, 32) else Pair(cidr.substring(0, i), cidr.substring(i + 1).toInt())
+    }
+
+    // ── IPv4-хелперы для маршрутной арифметики split'а (Kotlin-Int знаковый → считаем в Long) ──
+
+    /** "a.b.c.d" → беззнаковый u32 в Long; `-1` — не IPv4-литерал. */
+    private fun ipv4ToLong(ip: String): Long {
+        val parts = ip.split(".")
+        if (parts.size != 4) return -1L
+        var v = 0L
+        for (p in parts) {
+            val n = p.toIntOrNull() ?: return -1L
+            if (n !in 0..255) return -1L
+            v = (v shl 8) or n.toLong()
+        }
+        return v
+    }
+
+    /** Маска префикса как u32-в-Long (`/0` → 0). */
+    private fun maskOf(prefix: Int): Long =
+        if (prefix <= 0) 0L else (0xFFFFFFFFL shl (32 - prefix.coerceAtMost(32))) and 0xFFFFFFFFL
+
+    /** Сетевой адрес `ip/prefix` строкой (кривой ip → сам ip: маршрут добавится как есть). */
+    private fun networkOf(ip: String, prefix: Int): String {
+        val v = ipv4ToLong(ip)
+        if (v < 0) return ip
+        val n = v and maskOf(prefix)
+        return "${(n shr 24) and 0xff}.${(n shr 16) and 0xff}.${(n shr 8) and 0xff}.${n and 0xff}"
+    }
+
+    /** Пересекаются ли префиксы (один содержит другой) — сравнение по более короткому. */
+    private fun prefixesOverlap(a: String, ap: Int, b: String, bp: Int): Boolean {
+        val av = ipv4ToLong(a)
+        val bv = ipv4ToLong(b)
+        if (av < 0 || bv < 0) return false
+        val m = maskOf(minOf(ap, bp))
+        return (av and m) == (bv and m)
     }
 
     private fun startForegroundNotif() {

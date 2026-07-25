@@ -116,12 +116,16 @@ class _CitadelAppState extends State<CitadelApp> with WindowListener {
     windowManager.focus();
   }
 
-  /// Полный выход: чистый disconnect (снятие KS) → убрать иконку трея → закрыть.
+  /// Полный выход: чистый disconnect (снятие KS) → остановить службу → убрать трей → закрыть.
   Future<void> _quitApp() async {
     if (state.isBusy) {
       state.disconnect(); // vpnDisconnect → clean_shutdown ('Q'/disarm снимет kill-switch)
       await Future<void>.delayed(const Duration(milliseconds: 700));
     }
+    // п.2 (Windows): погасить привилегированную citadel-svc.exe — она не должна висеть в задачах
+    // без приложения. ПОСЛЕ disconnect: пока идёт сессия, служба занята pump'ом и запрос не примет.
+    // На следующем подключении провайдер поднимет её обратно через SCM. На Linux/macOS — no-op.
+    desktopServiceQuit();
     await WindowsTray.dispose();
     await windowManager.destroy();
   }

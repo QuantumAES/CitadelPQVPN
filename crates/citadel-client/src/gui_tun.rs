@@ -58,7 +58,7 @@ impl TunProvider for GuiTunProvider {
         //   Exclude → маршруты ссылки как есть + выбранные CIDR в обход (через физический шлюз);
         //   Off     → как раньше (маршруты ссылки).
         // C8.3 split → (маршруты_в_туннель, CIDR_в_обход): единый источник winnet (Linux+Windows).
-        let (routes_vec, bypass_vec) = winnet::split_routes(p.dest_mode, &p.routes, &p.dest_routes);
+        let (routes_vec, bypass_vec) = winnet::split_routes(p.dest_mode, &p.routes, &p.dest_routes, (p.addr, p.prefix));
         let (routes_str, bypass_str) = (routes_vec.join(" "), bypass_vec.join(" "));
         let mut cmd = Command::new("pkexec");
         cmd.arg(&self.helper_path).args([

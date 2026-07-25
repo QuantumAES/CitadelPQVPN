@@ -28,7 +28,7 @@ void setDebugEnabled({required bool on_}) =>
     RustLib.instance.api.crateApiCitadelSetDebugEnabled(on_: on_);
 
 /// Сохранённое состояние режима отладки (инициализация тумблера). Ленивая подгрузка при первом
-/// обращении; файла нет → дефолт (включён). Имя `*_persisted` — чтобы Dart-обёртка не конфликтовала
+/// обращении; файла нет → дефолт ВЫКЛЮЧЕН. Имя `*_persisted` — чтобы Dart-обёртка не конфликтовала
 /// с полем `AppState.debugEnabled`.
 bool debugEnabledPersisted() =>
     RustLib.instance.api.crateApiCitadelDebugEnabledPersisted();
@@ -135,6 +135,14 @@ void androidStopSession() =>
 
 /// Разорвать активную сессию (если есть).
 void vpnDisconnect() => RustLib.instance.api.crateApiCitadelVpnDisconnect();
+
+/// Windows: погасить привилегированную службу `citadel-svc` при ВЫХОДЕ из приложения (п.2) —
+/// elevated-процесс не должен висеть в задачах, когда клиента нет. Зовётся из Dart последним шагом
+/// выхода (после [`vpn_disconnect`], иначе служба занята pump'ом активной сессии и не ответит).
+/// На следующем подключении провайдер поднимет службу обратно через SCM. Best-effort: на прочих
+/// платформах и при недоступной службе — тихий no-op (выход из приложения не блокируем).
+void desktopServiceQuit() =>
+    RustLib.instance.api.crateApiCitadelDesktopServiceQuit();
 
 /// Прогнать тест-кейсы подключения к exit'у профиля/ссылки, стримя результат по шагам
 /// (DNS → QUIC/UDP → TCP → establish → egress). Диагностика идёт тем же путём, что реальный

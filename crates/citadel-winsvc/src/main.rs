@@ -41,7 +41,7 @@ mod windows_svc {
 
     use citadel_winnet::{
         decode_config, encode_packet, encode_ready_err, encode_ready_ok, TunReady, TunSetup,
-        WfpFamily, TAG_CONFIG,
+        WfpFamily, TAG_CONFIG, TAG_QUIT,
     };
     use windows_service::service::{
         ServiceControl, ServiceControlAccept, ServiceExitCode, ServiceState, ServiceStatus,
@@ -310,7 +310,21 @@ mod windows_svc {
             account_name: None, // LocalSystem
             account_password: None,
         };
-        let service = manager.create_service(&info, ServiceAccess::CHANGE_CONFIG)?;
+        // Идемпотентность: при АПГРЕЙДЕ служба уже есть (инсталлятор зовёт `install` всегда) —
+        // create_service вернёт ERROR_SERVICE_EXISTS. Тогда открываем существующую и обновляем
+        // конфиг (путь к exe мог смениться), иначе новые настройки (SDDL/recovery) не доехали бы
+        // до тех, кто обновляется, а не ставит с нуля.
+        let service = match manager.create_service(&info, ServiceAccess::CHANGE_CONFIG) {
+            Ok(s) => s,
+            Err(e) => {
+                let s = manager
+                    .open_service(SERVICE_NAME, ServiceAccess::CHANGE_CONFIG)
+                    .map_err(|e2| anyhow::anyhow!("служба не создана ({e}) и не открыта ({e2})"))?;
+                s.change_config(&info)?;
+                eprintln!("[svc] служба '{SERVICE_NAME}' уже была — конфиг обновлён");
+                s
+            }
+        };
         service.set_description(
             "CitadelPQVPN — постквантовый VPN: WinTUN + WFP kill-switch (модель W2)",
         )?;
@@ -326,8 +340,46 @@ mod windows_svc {
             command: None,
             actions: Some(vec![restart(5), restart(5), restart(30)]),
         })?;
+        grant_start_to_interactive_users();
         eprintln!("[svc] служба '{SERVICE_NAME}' установлена (авто-рестарт при краше)");
         Ok(())
+    }
+
+    /// Дать интерактивному пользователю право ЗАПУСКА службы (`RP` = SERVICE_START) + чтения статуса.
+    ///
+    /// Нужно, потому что приложение при выходе гасит службу (`TAG_QUIT`, п.2 — не держать
+    /// elevated-процесс без клиента), а поднять её обратно на следующем запуске неприв. процесс без
+    /// этого права не может (дефолтный дескриптор службы даёт IU только чтение).
+    ///
+    /// Умышленно НЕ даём `WP` (SERVICE_STOP): остановка идёт ТОЛЬКО через аутентифицированный пайп
+    /// (W3) и только когда сессии нет — иначе любой локальный пользователь мог бы снять службу с
+    /// активным туннелем, а вместе с ней и WFP-kill-switch (fail-open = деанон). Старт же поднимает
+    /// лишь слушателя пайпа, который сам аутентифицирует клиента ⇒ прироста поверхности почти нет.
+    ///
+    /// Через `sc.exe sdset` (абсолютный путь из %SystemRoot%, аргументы — константы, без ввода
+    /// снаружи): SetServiceObjectSecurity потребовал бы ручной сборки SD в unsafe-коде внутри
+    /// привилегированного бинаря. Ошибка не фатальна — служба остаётся AutoStart и переживёт
+    /// перезагрузку, просто «оживёт» не сразу (пользователю подскажет текст ошибки в приложении).
+    fn grant_start_to_interactive_users() {
+        // SY — LocalSystem (полный набор служебных прав), BA — администраторы (полный + смена ACL),
+        // IU — интерактивные: CC/LC/SW/LO/RC (чтение конфига/статуса) + RP (SERVICE_START),
+        // SU — служебные аккаунты (чтение), как в дефолтном дескрипторе служб.
+        const SDDL: &str = "D:(A;;CCLCSWRPWPDTLOCRRC;;;SY)(A;;CCDCLCSWRPWPDTLOCRSDRCWDWO;;;BA)\
+                            (A;;CCLCSWRPLORC;;;IU)(A;;CCLCSWLOCRRC;;;SU)";
+        let sc = std::path::Path::new(&std::env::var("SystemRoot").unwrap_or_else(|_| "C:\\Windows".into()))
+            .join("System32")
+            .join("sc.exe");
+        match std::process::Command::new(&sc).args(["sdset", SERVICE_NAME, SDDL]).output() {
+            Ok(o) if o.status.success() => {
+                eprintln!("[svc] SDDL службы: интерактивному пользователю разрешён SERVICE_START")
+            }
+            Ok(o) => eprintln!(
+                "[svc] sc sdset не удался ({}) — служба останется AutoStart: {}",
+                o.status,
+                String::from_utf8_lossy(&o.stdout).trim()
+            ),
+            Err(e) => eprintln!("[svc] sc sdset не запущен ({e}) — служба останется AutoStart"),
+        }
     }
 
     /// Удалить службу из SCM (нужна elevation).
@@ -375,11 +427,16 @@ mod windows_svc {
                     continue;
                 }
             }
-            handle_client(h, &ov);
+            let quit = handle_client(h, &ov);
             CURRENT_PIPE.store(0, Ordering::Release);
             unsafe {
                 DisconnectNamedPipe(h);
                 CloseHandle(h);
+            }
+            if quit {
+                // TAG_QUIT: приложение закрылось → служба больше не нужна. Флаг завершает цикл
+                // (в SCM-режиме run_service выставит Stopped и процесс уйдёт из списка задач).
+                shutdown.store(true, Ordering::Release);
             }
         }
         eprintln!("[svc] serve остановлен");
@@ -500,14 +557,29 @@ mod windows_svc {
         Ok(h)
     }
 
+    /// Что запросил клиент в фазе конфигурации.
+    enum Request {
+        /// Поднять туннель по этому конфигу (`TAG_CONFIG`).
+        Config(Box<TunSetup>),
+        /// Остановить службу (`TAG_QUIT`) — приложение выходит.
+        Quit,
+    }
+
     /// Обслужить одного клиента: config-handshake → оркестрация → READY → (pump). При ошибке
     /// bring_up отвечаем READY-err (приложение покажет причину).
-    fn handle_client(h: HANDLE, ov: &Ov) {
-        let setup = match read_config(ov, h) {
-            Ok(s) => s,
+    /// `true` — клиент попросил остановить службу (serve-цикл выходит, процесс завершается).
+    fn handle_client(h: HANDLE, ov: &Ov) -> bool {
+        let setup = match read_request(ov, h) {
+            Ok(Request::Quit) => {
+                // Сессии сейчас нет (serve обслуживает по одному клиенту) ⇒ ни адаптера, ни WFP
+                // снимать не нужно: выходим сразу, teardown уже отработал на прошлом клиенте.
+                eprintln!("[svc] клиент запросил остановку службы (выход приложения) — завершаюсь");
+                return true;
+            }
+            Ok(Request::Config(s)) => *s,
             Err(e) => {
                 eprintln!("[svc] чтение config: {e:#}");
-                return;
+                return false;
             }
         };
         let plan = plan_session(&setup, ADAPTER_NAME);
@@ -528,24 +600,29 @@ mod windows_svc {
                 let _ = ov.write_all(h, &encode_ready_err(&format!("{e:#}")));
             }
         }
+        false
     }
 
-    /// Прочитать config-кадр: `TAG_CONFIG ‖ u32(len,BE) ‖ cbor(TunSetup)`.
-    fn read_config(ov: &Ov, h: HANDLE) -> anyhow::Result<TunSetup> {
+    /// Прочитать управляющий кадр фазы конфигурации: `TAG_CONFIG ‖ u32(len,BE) ‖ cbor(TunSetup)`
+    /// либо `TAG_QUIT` (без тела).
+    fn read_request(ov: &Ov, h: HANDLE) -> anyhow::Result<Request> {
         let mut tag = [0u8; 1];
         ov.read_exact(h, &mut tag)?;
-        if tag[0] != TAG_CONFIG {
-            anyhow::bail!("ожидался TAG_CONFIG, получен 0x{:02x}", tag[0]);
+        match tag[0] {
+            TAG_QUIT => Ok(Request::Quit),
+            TAG_CONFIG => {
+                let mut lenb = [0u8; 4];
+                ov.read_exact(h, &mut lenb)?;
+                let len = u32::from_be_bytes(lenb) as usize;
+                if len > MAX_CONFIG {
+                    anyhow::bail!("config-кадр слишком большой: {len} > {MAX_CONFIG}");
+                }
+                let mut body = vec![0u8; len];
+                ov.read_exact(h, &mut body)?;
+                Ok(Request::Config(Box::new(decode_config(&body)?)))
+            }
+            other => anyhow::bail!("ожидался TAG_CONFIG/TAG_QUIT, получен 0x{other:02x}"),
         }
-        let mut lenb = [0u8; 4];
-        ov.read_exact(h, &mut lenb)?;
-        let len = u32::from_be_bytes(lenb) as usize;
-        if len > MAX_CONFIG {
-            anyhow::bail!("config-кадр слишком большой: {len} > {MAX_CONFIG}");
-        }
-        let mut body = vec![0u8; len];
-        ov.read_exact(h, &mut body)?;
-        decode_config(&body)
     }
 
     /// Поднятая сессия: владеет WinTUN-адаптером + пакетной сессией (в `Arc` — делится между потоками

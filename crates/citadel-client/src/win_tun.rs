@@ -239,7 +239,7 @@ impl TunProvider for WindowsTunProvider {
     fn configure(&self, p: &TunParams) -> Result<Arc<dyn TunIo>> {
         // C8.3 split → (маршруты_в_туннель, CIDR_в_обход): та же winnet::split_routes, что на Linux
         // (единая split-семантика, включая Q5 kill-switch⇄split).
-        let (routes, bypass) = winnet::split_routes(p.dest_mode, &p.routes, &p.dest_routes);
+        let (routes, bypass) = winnet::split_routes(p.dest_mode, &p.routes, &p.dest_routes, (p.addr, p.prefix));
         let setup = TunSetup {
             addr: p.addr,
             prefix: p.prefix,
@@ -251,6 +251,12 @@ impl TunProvider for WindowsTunProvider {
             killswitch: p.killswitch,
         };
 
+        // Приложение гасит службу при выходе (см. [`service_request_quit`]) → к моменту коннекта её
+        // может не быть в памяти. Поднимаем через SCM (право SERVICE_START выдано инсталлятором
+        // интерактивному пользователю). Best-effort: если не вышло — ниже понятная ошибка пайпа.
+        if let Err(e) = service_ensure_running() {
+            eprintln!("[win] служба citadel-svc не запущена и не стартанула: {e:#}");
+        }
         // Подключиться к службе (overlapped-хэндл). Отсутствие пайпа = служба не установлена/не
         // запущена (понятная ошибка вместо «file not found»).
         let pipe = open_overlapped_pipe(&self.pipe_path).with_context(|| {
@@ -278,6 +284,122 @@ impl TunProvider for WindowsTunProvider {
             cancelled: AtomicBool::new(false),
         }))
     }
+}
+
+// ─────────────────────────── жизненный цикл службы (п.2: не висеть без приложения) ───────────────────────────
+
+/// Имя службы в SCM (= `SERVICE_NAME` в `citadel-svc`).
+const SERVICE_NAME: &str = "CitadelPQVPN";
+
+/// Выполнить `f` над открытой в SCM службой (хэндлы закрываются в любом случае).
+/// `access` — требуемые права (`SERVICE_QUERY_STATUS`, `SERVICE_START`, …).
+fn with_service<T>(access: u32, f: impl FnOnce(*mut std::ffi::c_void) -> Result<T>) -> Result<T> {
+    use windows_sys::Win32::System::Services::{
+        CloseServiceHandle, OpenSCManagerW, OpenServiceW, SC_MANAGER_CONNECT,
+    };
+    let name = wide(SERVICE_NAME);
+    // SAFETY: name — валидная UTF-16 строка; оба SC-хэндла закрываются ровно один раз на всех путях.
+    unsafe {
+        let scm = OpenSCManagerW(std::ptr::null(), std::ptr::null(), SC_MANAGER_CONNECT);
+        if scm.is_null() {
+            bail!("OpenSCManager: {}", io::Error::last_os_error());
+        }
+        let svc = OpenServiceW(scm, name.as_ptr(), access);
+        if svc.is_null() {
+            let e = io::Error::last_os_error();
+            CloseServiceHandle(scm);
+            bail!("OpenService({SERVICE_NAME}): {e} — служба установлена?");
+        }
+        let out = f(svc);
+        CloseServiceHandle(svc);
+        CloseServiceHandle(scm);
+        out
+    }
+}
+
+/// Текущее состояние службы (`SERVICE_RUNNING`/`SERVICE_STOPPED`/…) или ошибка (не установлена/нет прав).
+fn service_state(svc: *mut std::ffi::c_void) -> Result<u32> {
+    use windows_sys::Win32::System::Services::{QueryServiceStatus, SERVICE_STATUS};
+    // SAFETY: svc — валидный хэндл с правом SERVICE_QUERY_STATUS; st — out-структура.
+    unsafe {
+        let mut st: SERVICE_STATUS = std::mem::zeroed();
+        if QueryServiceStatus(svc, &mut st) == 0 {
+            bail!("QueryServiceStatus: {}", io::Error::last_os_error());
+        }
+        Ok(st.dwCurrentState)
+    }
+}
+
+/// Убедиться, что служба `citadel-svc` запущена; если нет — стартовать через SCM и подождать
+/// перехода в Running (до ~5 с). Право `SERVICE_START` интерактивному пользователю выдаёт
+/// инсталлятор (`citadel-svc install` → `sc sdset`), UAC не требуется.
+pub fn service_ensure_running() -> Result<()> {
+    use windows_sys::Win32::System::Services::{
+        StartServiceW, SERVICE_QUERY_STATUS, SERVICE_RUNNING, SERVICE_START, SERVICE_START_PENDING,
+    };
+    with_service(SERVICE_QUERY_STATUS | SERVICE_START, |svc| {
+        let state = service_state(svc)?;
+        if state == SERVICE_RUNNING {
+            return Ok(());
+        }
+        // SAFETY: svc — валидный хэндл с правом SERVICE_START; аргументов у службы нет.
+        if state != SERVICE_START_PENDING && unsafe { StartServiceW(svc, 0, std::ptr::null()) } == 0
+        {
+            // SAFETY: код ошибки читаем сразу после неудачного вызова.
+            let e = unsafe { windows_sys::Win32::Foundation::GetLastError() };
+            // 1056 = ERROR_SERVICE_ALREADY_RUNNING (гонка с другим стартом) — это успех.
+            if e != 1056 {
+                bail!(
+                    "StartService({SERVICE_NAME}): {} (нет права SERVICE_START? переустановите приложение)",
+                    io::Error::from_raw_os_error(e as i32)
+                );
+            }
+        }
+        // Дождаться Running: сразу после StartService пайпа ещё нет (иначе первый connect падает).
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while std::time::Instant::now() < deadline {
+            if service_state(svc)? == SERVICE_RUNNING {
+                return Ok(());
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+        bail!("служба {SERVICE_NAME} не перешла в Running за 5 с")
+    })
+}
+
+/// Попросить службу завершиться (`TAG_QUIT` по пайпу) — зовётся при ВЫХОДЕ из приложения, чтобы
+/// привилегированный `citadel-svc.exe` не оставался в процессах без клиента. Best-effort: службы
+/// может уже не быть, а если идёт чужая сессия — serve-цикл занят и коннект не пройдёт (и не должен:
+/// активный туннель этим не рвём). Ошибку зовущий вправе игнорировать — выход не блокируем.
+pub fn service_request_quit() -> Result<()> {
+    use windows_sys::Win32::System::Services::{SERVICE_QUERY_STATUS, SERVICE_RUNNING};
+    // Гасить нечего (не установлена / уже остановлена) → мгновенный выход БЕЗ ретраев ниже:
+    // иначе каждый выход из приложения стоил бы пользователю лишних секунд ожидания.
+    if with_service(SERVICE_QUERY_STATUS, service_state)? != SERVICE_RUNNING {
+        return Ok(());
+    }
+    // Сразу после disconnect служба ещё в teardown (снятие WFP/маршрутов, netsh) — слушающего
+    // инстанса пайпа в этот момент НЕТ, и CreateFileW падает не в ERROR_PIPE_BUSY, а в
+    // ERROR_FILE_NOT_FOUND. Поэтому коротко ретраим открытие (~2.5 с), пока serve-цикл вернётся
+    // к accept; дольше не ждём — выход из приложения важнее, чем гарантия остановки службы.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(2500);
+    let pipe = loop {
+        match open_overlapped_pipe(PIPE_PATH) {
+            Ok(p) => break p,
+            Err(_) if std::time::Instant::now() < deadline => {
+                std::thread::sleep(std::time::Duration::from_millis(150));
+            }
+            Err(e) => {
+                return Err(anyhow::Error::new(e))
+                    .with_context(|| format!("служба citadel-svc недоступна ({PIPE_PATH})"))
+            }
+        }
+    };
+    // W4-проверку владельца намеренно не делаем: кадр из одного байта без секретов, максимум
+    // сквоттер его «съест» (служба тогда просто продолжит работать — не деградация безопасности).
+    let io = OvIo::new().context("создать write-событие пайпа")?;
+    io.write_all(pipe.0, &[winnet::TAG_QUIT]).context("отправить TAG_QUIT службе")?;
+    Ok(())
 }
 
 /// Прочитать управляющий кадр READY от службы: `TAG_READY ‖ status ‖ u32(len) ‖ body`.

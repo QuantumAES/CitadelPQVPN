@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  Adaptive-иконка (Android 8+/API26). Без неё система применяет к легаси-PNG «legacy treatment»:
+  ужимает картинку и подкладывает БЕЛЫЙ круг — то самое «мелкая квадратная иконка в белом круге»
+  на Android 13.
+
+  Слои — 108dp; видимая область маски — центральные 72dp, поэтому арт нарисован ровно в них
+  (ic_launcher_foreground.png): картинка видна ЦЕЛИКОМ, а скругление/форму даёт маска ОС (круг,
+  squircle, капля — по лаунчеру). Фон — цвет рамки самого арта (#002729), чтобы кромка маски
+  сливалась с ним, а не светилась белым.
+-->
+<adaptive-icon xmlns:android="http://schemas.android.com/apk/res/android">
+    <background android:drawable="@color/ic_launcher_background"/>
+    <foreground android:drawable="@mipmap/ic_launcher_foreground"/>
+</adaptive-icon>
