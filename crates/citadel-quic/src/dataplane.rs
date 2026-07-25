@@ -131,7 +131,8 @@ impl Inbound {
                     // клиенту (легитимный стек ОС ставит src = адрес TUN). Иначе exit форвардил
                     // бы пакет со спуфнутым источником (DoS-reflection / подмена другого клиента).
                     if v.src != expected_src {
-                        eprintln!(
+                        // no-logs: адреса пользователя — только под Citadel_DEBUG_LOG (см. lib::debug_logs)
+                        crate::dlog!(
                             "[exit] S0.2: дроп спуфинг inner-src {}.{}.{}.{} (ожидался {}.{}.{}.{})",
                             v.src[0], v.src[1], v.src[2], v.src[3],
                             expected_src[0], expected_src[1], expected_src[2], expected_src[3]
@@ -147,7 +148,8 @@ impl Inbound {
                     });
                     // F2: не форвардить во внутренние/служебные сети (metadata/RFC1918/loopback/…)
                     if !is_admin && ip::is_blocked_dst(v.dst) {
-                        eprintln!(
+                        // no-logs: назначение пользователя — самое чувствительное, что тут есть.
+                        crate::dlog!(
                             "[exit] F2: заблокирован inner-dst {}.{}.{}.{}",
                             v.dst[0], v.dst[1], v.dst[2], v.dst[3]
                         );
@@ -157,7 +159,9 @@ impl Inbound {
                 None => {
                     // S0.2/H3: не-IPv4 (IPv6/мусор) is_blocked_dst не покрывает → default-deny
                     // (не fail-open). Туннель назначает только IPv4; v6 внутри пока не поддержан.
-                    eprintln!("[exit] S0.2: дроп не-IPv4 inner-пакета (default-deny)");
+                    // Клиент такие пакеты дропает у себя (см. pump), сюда они приходят от старых
+                    // клиентов/мусора — молча, без строки на пакет (лог-амплификация).
+                    crate::dlog!("[exit] S0.2: дроп не-IPv4 inner-пакета (default-deny)");
                     return false;
                 }
             }
@@ -167,7 +171,7 @@ impl Inbound {
                 self.dropped += 1;
                 self.dropped_bytes += pkt.len() as u64;
                 if self.dropped == 1 || self.dropped.is_multiple_of(50) {
-                    eprintln!(
+                    crate::dlog!(
                         "[exit] F7: rate-limit — дропнуто {} пакетов / {} б (клиент превысил лимит)",
                         self.dropped, self.dropped_bytes
                     );
@@ -185,11 +189,20 @@ impl Inbound {
 const WATCHDOG_INTERVAL: std::time::Duration = std::time::Duration::from_secs(8);
 const WATCHDOG_TX_MIN: u64 = 12;
 
-/// Решение watchdog по дельте счётчиков датаграмм за окно: путь считаем мёртвым, если за окно
-/// отправлено ≥ порога, а принято 0 (шлём под нагрузкой, но обратно НИЧЕГО — MTU-чёрная-дыра или
-/// NAT-rebind после смены сети; quinn idle-timeout это НЕ ловит, т.к. keep-alive проходит).
-fn watchdog_trips(sent: u64, recvd: u64) -> bool {
-    sent >= WATCHDOG_TX_MIN && recvd == 0
+/// Решение watchdog по дельтам за окно. Путь считаем мёртвым, только если ОДНОВРЕМЕННО:
+///   * отправлено ≥ порога датаграмм (мы реально под нагрузкой, а не в простое);
+///   * принято 0 датаграмм (обратного туннельного трафика нет);
+///   * `transport_rx == 0` — на транспорте не принято НИ ОДНОГО QUIC-пакета.
+///
+/// Третье условие критично (без него — ложные разрывы и реконнект-шторм): пока с той стороны идут
+/// ACK'и/ответы на keep-alive, путь ЖИВ, а «0 датаграмм» означает, что наши inner-пакеты дропает
+/// сам exit (egress-фильтр F2, анти-спуфинг, недостижимое назначение) либо ответа не даёт хост
+/// назначения. Рвать в этом случае транспорт бессмысленно: новая сессия упрётся в то же самое, а
+/// пользователь получит бесконечное «переподключение». Настоящая чёрная дыра пути (MTU/NAT-rebind
+/// после смены сети) даёт `transport_rx == 0` — её мы по-прежнему ловим, и quinn idle-timeout тут
+/// не помощник (при keep-alive он молчит до 15с, а мы рвём за 8с).
+fn watchdog_trips(sent: u64, recvd: u64, transport_rx: u64) -> bool {
+    sent >= WATCHDOG_TX_MIN && recvd == 0 && transport_rx == 0
 }
 
 /// Двунаправленная перекачка TUN ⇄ транспорт (QUIC DATAGRAM либо obfs-TCP record).
@@ -276,17 +289,41 @@ pub async fn pump(
 
     // S0.3/H1: единый транспорт — всегда quinn::Connection (поверх UDP или obfs-TCP). Раньше
     // здесь была вторая ветка «голого» obfs-TCP datagram-протокола; теперь TCP несёт тот же QUIC.
+    // Роль: на exit'е (`egress = Some`) диагностический вывод про трафик клиента подчиняется
+    // no-logs (`Citadel_DEBUG_LOG`), на клиенте — печатается всегда (это устройство пользователя,
+    // лог нужен ему самому и панели диагностики).
+    let is_exit = egress.is_some();
+    macro_rules! pump_log {
+        ($($t:tt)*) => {
+            if !is_exit || crate::debug_logs() {
+                eprintln!($($t)*);
+            }
+        };
+    }
+
     let Tunnel { conn, .. } = tunnel;
     let send_conn = conn.clone();
     let send_tx = tx_count.clone();
+    // Сколько inner-пакетов не-IPv4 мы отбросили локально (см. ниже) — для диагностики окна.
+    let non_v4 = Arc::new(AtomicU64::new(0));
+    let send_non_v4 = non_v4.clone();
     let sender = tokio::spawn(async move {
         while let Some(pkt) = tun_to_net_rx.recv().await {
+            // S2.2/A2: туннель IPv4-only (адрес назначается v4, exit по default-deny дропает
+            // не-IPv4). На Android в TUN намеренно заведён blackhole-маршрут `::/0` (анти-leak),
+            // поэтому весь IPv6 приложений сыплется сюда. Гнать его на exit бессмысленно (там он
+            // всё равно умрёт), зато он ломает диагностику живости: «шлём много, не принимаем
+            // ничего» = ложное срабатывание watchdog → реконнект-шторм. Дропаем на месте и считаем.
+            if ip::parse_ipv4(&pkt).is_none() {
+                send_non_v4.fetch_add(1, Ordering::Relaxed);
+                continue;
+            }
             let dg = datagram::encode(datagram::CTX_RAW_IP, &pkt);
             match send_conn.send_datagram(bytes::Bytes::from(dg)) {
                 Ok(()) => {
                     send_tx.fetch_add(1, Ordering::Relaxed);
                 }
-                Err(e) => eprintln!("[pump] датаграмма отброшена ({} б): {e}", pkt.len()),
+                Err(e) => pump_log!("[pump] датаграмма отброшена ({} б): {e}", pkt.len()),
             }
         }
     });
@@ -307,7 +344,7 @@ pub async fn pump(
                     }
                 }
                 Err(e) => {
-                    eprintln!("[pump] соединение закрыто: {e}");
+                    pump_log!("[pump] соединение закрыто: {e}");
                     break;
                 }
             }
@@ -327,24 +364,59 @@ pub async fn pump(
     let wd_tx = tx_count.clone();
     let wd_rx = rx_count.clone();
     let wd_stop = stop.clone();
+    let wd_non_v4 = non_v4.clone();
+    // Диагностику окна печатает только КЛИЕНТ (`egress == None`): на exit'е это был бы лог о
+    // трафике пользователя — против no-logs (см. handle_client).
+    let wd_client = egress.is_none();
     let watchdog = tokio::spawn(async move {
-        let (mut seen_tx, mut seen_rx) = (0u64, 0u64);
+        let (mut seen_tx, mut seen_rx, mut seen_v6, mut seen_urx) = (0u64, 0u64, 0u64, 0u64);
         loop {
             tokio::time::sleep(WATCHDOG_INTERVAL).await;
             if wd_stop.load(Ordering::Acquire) {
                 break;
             }
-            let (tx, rx) = (wd_tx.load(Ordering::Relaxed), wd_rx.load(Ordering::Relaxed));
-            let (sent, recvd) = (tx.wrapping_sub(seen_tx), rx.wrapping_sub(seen_rx));
-            seen_tx = tx;
-            seen_rx = rx;
-            if watchdog_trips(sent, recvd) {
+            let st = wd_conn.stats();
+            let (tx, rx, v6, urx) = (
+                wd_tx.load(Ordering::Relaxed),
+                wd_rx.load(Ordering::Relaxed),
+                wd_non_v4.load(Ordering::Relaxed),
+                st.udp_rx.datagrams,
+            );
+            let (sent, recvd, dropped_v6, transport_rx) = (
+                tx.wrapping_sub(seen_tx),
+                rx.wrapping_sub(seen_rx),
+                v6.wrapping_sub(seen_v6),
+                urx.wrapping_sub(seen_urx),
+            );
+            (seen_tx, seen_rx, seen_v6, seen_urx) = (tx, rx, v6, urx);
+            if watchdog_trips(sent, recvd, transport_rx) {
                 eprintln!(
-                    "[pump] watchdog: {sent} датаграмм отправлено, 0 принято за {}с — путь мёртв, рву транспорт",
+                    "[pump] watchdog: {sent} датаграмм отправлено, 0 принято и НИ ОДНОГО QUIC-пакета от exit за {}с — путь мёртв, рву транспорт",
                     WATCHDOG_INTERVAL.as_secs()
                 );
                 wd_conn.close(0u32.into(), b"citadel: data-path watchdog");
                 break;
+            }
+            // Путь жив (QUIC-пакеты идут), но туннельного ответа нет — раньше здесь был разрыв,
+            // теперь только сигнал: проблема выше транспорта (дроп на exit / молчит назначение).
+            if wd_client && sent >= WATCHDOG_TX_MIN && recvd == 0 {
+                eprintln!(
+                    "[pump] обратных датаграмм нет {}с: отправлено {sent}, принято 0, но транспорт ЖИВ \
+                     (QUIC-пакетов от exit: {transport_rx}, RTT {} мс, MTU пути {}) — рвать сессию не буду; \
+                     похоже, пакеты дропает exit или молчит назначение",
+                    WATCHDOG_INTERVAL.as_secs(),
+                    st.path.rtt.as_millis(),
+                    st.path.current_mtu,
+                );
+            }
+            // Отдельный сигнал про IPv6: он уходит в blackhole по дизайну (туннель IPv4-only) —
+            // без этой строки «интернет не работает» на v6-only ресурсах выглядит как загадка.
+            if wd_client && dropped_v6 > 0 {
+                eprintln!(
+                    "[pump] IPv6 в туннель не идёт (IPv4-only): отброшено {dropped_v6} пакетов за {}с — \
+                     это анти-leak blackhole (S2.2/A2), приложения должны ходить по IPv4",
+                    WATCHDOG_INTERVAL.as_secs()
+                );
             }
         }
     });
@@ -593,14 +665,19 @@ mod tests {
         assert!(!plain.accept(&tcp(assigned, vip, 7001)), "нет admin-исключения → F2 дропает");
     }
 
-    /// pump-watchdog: рвём путь только если под нагрузкой (tx ≥ порога) обратно 0 датаграмм.
-    /// Хоть один принятый — путь жив; мало отправленных — это простой, не трогаем.
+    /// pump-watchdog: рвём путь только когда под нагрузкой (tx ≥ порога) нет НИ обратных датаграмм,
+    /// НИ вообще QUIC-пакетов от пира. Хоть один принятый пакет любого уровня — путь жив (дроп на
+    /// exit'е ≠ мёртвый путь: рвать сессию нельзя, иначе реконнект-шторм). Мало отправили — простой.
     #[test]
     fn watchdog_trips_only_on_dead_path_under_load() {
-        assert!(watchdog_trips(WATCHDOG_TX_MIN, 0), "ровно порог tx, 0 принято — путь мёртв");
-        assert!(watchdog_trips(WATCHDOG_TX_MIN + 500, 0), "много шлём, 0 принято — путь мёртв");
-        assert!(!watchdog_trips(WATCHDOG_TX_MIN, 1), "хоть 1 принят — путь жив");
-        assert!(!watchdog_trips(WATCHDOG_TX_MIN - 1, 0), "мало отправили (простой) — не трогаем");
-        assert!(!watchdog_trips(0, 0), "полный простой — не трогаем");
+        assert!(watchdog_trips(WATCHDOG_TX_MIN, 0, 0), "порог tx, ничего не принято — путь мёртв");
+        assert!(watchdog_trips(WATCHDOG_TX_MIN + 500, 0, 0), "много шлём, тишина — путь мёртв");
+        assert!(!watchdog_trips(WATCHDOG_TX_MIN, 1, 0), "хоть 1 датаграмма — путь жив");
+        assert!(!watchdog_trips(WATCHDOG_TX_MIN - 1, 0, 0), "мало отправили (простой) — не трогаем");
+        assert!(!watchdog_trips(0, 0, 0), "полный простой — не трогаем");
+        // КЛЮЧЕВОЕ (баг реконнект-шторма): датаграмм назад нет, но ACK'и/keep-alive пира идут —
+        // это дроп на стороне exit, а не мёртвый путь. Транспорт не рвём.
+        assert!(!watchdog_trips(WATCHDOG_TX_MIN + 100, 0, 1), "QUIC-пакеты идут — путь жив");
+        assert!(!watchdog_trips(WATCHDOG_TX_MIN, 0, 40), "поток ACK'ов — путь жив");
     }
 }

@@ -23,9 +23,9 @@ Future<void> main() async {
     await windowManager.ensureInitialized();
     // Портретное окно в стиле OpenVPN Connect (узкое+высокое) + брендовый заголовок окна: без него
     // OS-заголовок/панель задач показывают "app" (имя Flutter-проекта). #5.2/#5.3.
-    // #п2: фикс-размер окна (не ресайзится) — узкое+высокое портретное как OpenVPN Connect. Высота
-    // 600 (−220 от прежних 820). min==max==size + setResizable(false) → рамку тянуть нельзя.
-    const winSize = Size(440, 600);
+    // #п2: фикс-размер окна (не ресайзится) — узкое+высокое портретное как OpenVPN Connect.
+    // min==max==size + setResizable(false) → рамку тянуть нельзя.
+    const winSize = Size(400, 680);
     const opts = WindowOptions(
       size: winSize,
       minimumSize: winSize,
@@ -108,8 +108,17 @@ class _CitadelAppState extends State<CitadelApp> with WindowListener {
 
   // ─────────────────────────── #5.5 системный трей (Windows) ───────────────────────────
 
-  /// Отразить состояние туннеля в трее (пункт «Отключить» появляется только при активном).
-  void _syncTray() => WindowsTray.setConnected(state.isBusy);
+  /// Отразить состояние туннеля в трее: цвет точки-бейджа на значке + tooltip + видимость пункта
+  /// «Отключить». Так состояние читается у свёрнутого приложения, без его открытия.
+  void _syncTray() {
+    final (phase, tip) = switch (state.phase) {
+      VpnPhase.up => ('up', 'CitadelPQVPN — туннель активен${state.exit.isEmpty ? '' : ' (${state.exit})'}'),
+      VpnPhase.connecting => ('connecting', 'CitadelPQVPN — подключение…'),
+      VpnPhase.error => ('error', 'CitadelPQVPN — ошибка: ${state.errorMsg}'),
+      VpnPhase.off => ('off', 'CitadelPQVPN — туннель выключен'),
+    };
+    WindowsTray.setPhase(phase, tooltip: tip);
+  }
 
   void _showFromTray() {
     windowManager.show();

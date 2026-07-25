@@ -229,6 +229,9 @@ impl VpnController {
         self.set_state(VpnState::Connecting);
         let mut backoff = RECONNECT_BACKOFF_START;
         let mut ever_up = false;
+        // Предъявлялся ли текущий `cfg.token` exit'у: потраченный токен повторно слать нельзя
+        // (exit ловит double-spend → «auth-failed»), нужен свежий от issuer.
+        let mut token_spent = false;
 
         loop {
             if self.stopped.load(Ordering::SeqCst) {
@@ -242,25 +245,52 @@ impl VpnController {
             // (само-лечится по восстановлении сети). token-less/без Layer-1 → refresher не задан.
             let refresher = self.token_refresh.lock().unwrap().clone();
             if let Some(f) = &refresher {
-                if let Some(t) = f().await {
-                    cfg.token = t;
+                match f().await {
+                    Some(t) => cfg.token = t, // свежий токен — этой попытке есть что предъявить
+                    // Свежего токена нет (issuer недоступен ЛИБО держит single-session-аренду 4/B
+                    // после предыдущей сессии). Если прошлый токен уже предъявлялся — он потрачен,
+                    // и повтор гарантированно даст «auth-failed» от exit: получился бы шторм
+                    // бессмысленных попыток с ложной причиной в UI. Ждём и пробуем снова.
+                    None if token_spent => {
+                        let why = "нет свежего Layer-1 токена (issuer недоступен или ещё держит \
+                                   аренду прошлой сессии) — жду и пробую снова";
+                        self.emit(VpnEvent::Error(why.into()));
+                        eprintln!("[vpn] {why} (через {backoff:?})");
+                        self.set_state(if ever_up { VpnState::Migrating } else { VpnState::Connecting });
+                        if self.sleep_or_stop(backoff).await {
+                            self.set_state(VpnState::Down);
+                            return Ok(());
+                        }
+                        backoff = next_backoff(backoff);
+                        continue;
+                    }
+                    None => {} // первый заход: токен из ссылки/vault ещё не предъявлялся — пробуем им
                 }
             }
+            token_spent = true; // ниже токен уходит exit'у; повторно его предъявлять нельзя
 
             // ── establish: сперва QUIC/UDP ──
             let mut established = establish_session(&cfg, false).await;
             // Эскалация на obfs-TCP: QUIC мог подняться (хендшейк), но крупный control-обмен не прошёл —
             // мобильный/NAT64-путь не несёт большой ML-DSA-ответ через QUIC (MTU: хендшейк ок, ответ
-            // чёрнодырится → establish виснет). TCP решает через сегментацию/MSS. Токен свежий (прошлый
-            // спенчен сервером на QUIC-попытке → double-spend иначе). Только при наличии obfs-канала.
-            if established.is_err() && cfg.obfs_psk.is_some() {
-                eprintln!("[vpn] establish/QUIC не удался — эскалация на obfs-TCP (мобильный MTU/NAT64?)");
-                if let Some(f) = &refresher {
-                    if let Some(t) = f().await {
-                        cfg.token = t;
+            // чёрнодырится → establish виснет). TCP решает это сегментацией/MSS. Токен берём свежий
+            // (прошлый спенчен сервером на QUIC-попытке → иначе double-spend). Только при наличии
+            // obfs-канала И только если отказ вообще лечится сменой транспорта (см. should_escalate_to_tcp:
+            // иначе жжём второй токен и подменяем настоящую причину бесполезным «auth-failed»).
+            if let Err(e) = &established {
+                let first = format!("{e:#}");
+                if cfg.obfs_psk.is_some() && should_escalate_to_tcp(&first) {
+                    eprintln!("[vpn] establish/QUIC не удался ({first}) — эскалация на obfs-TCP (мобильный MTU/NAT64?)");
+                    if let Some(f) = &refresher {
+                        if let Some(t) = f().await {
+                            cfg.token = t;
+                        }
                     }
+                    // Причину QUIC-попытки тащим в итоговую ошибку: без неё в UI оставалась бы только
+                    // вторая (часто менее информативная), и диагноз уходил в сторону.
+                    established = establish_session(&cfg, true).await
+                        .map_err(|e2| anyhow::anyhow!("{e2:#}; ранее по QUIC/UDP: {first}"));
                 }
-                established = establish_session(&cfg, true).await;
             }
             let session = match established {
                 Ok(s) => s,
@@ -432,6 +462,28 @@ fn next_backoff(cur: Duration) -> Duration {
     (cur * 2).min(RECONNECT_BACKOFF_MAX)
 }
 
+/// Стоит ли после неудачи QUIC-establish эскалировать на obfs-TCP. Эскалация лечит РОВНО один класс
+/// отказов: транспорт поднялся, а крупный control-обмен (ML-DSA pub+sig, ~5 КБ) не прошёл — на
+/// мобильном/NAT64-пути его чёрнодырит по MTU, и TCP решает это сегментацией.
+///
+/// Отказ «по существу» так не лечится, а цена ошибки высокая: вторая попытка ПРЕДЪЯВЛЯЕТ ЕЩЁ ОДИН
+/// токен (issuer выдаёт их под single-session-аренду 4/B — запас не бесконечен), а в UI/лог уезжает
+/// последняя, бесполезная причина («auth-failed») вместо настоящей. Поэтому не эскалируем, если exit
+/// отказал осознанно (токен/double-spend/пул), не сошлась PQ-auth, не настроен pin или exit вовсе
+/// недоступен (в этом случае `connect_server` уже пробовал obfs-TCP сам — второй заход бессмыслен).
+fn should_escalate_to_tcp(err: &str) -> bool {
+    let e = err.to_lowercase();
+    const HARD_REFUSALS: &[&str] = &[
+        "auth-failed",      // exit закрыл сессию: токен отвергнут / пул адресов исчерпан
+        "double-spend",
+        "токен",            // «невалидный токен», «токен уже использован», «токен не задан»
+        "pq-auth",          // подпись ML-DSA / commitment не сошлись
+        "pin",              // fail-closed по серт-pin (S0.1/H2)
+        "недоступен",       // «ни один exit недоступен» — TCP-fallback уже пробовался внутри
+    ];
+    !HARD_REFUSALS.iter().any(|m| e.contains(m))
+}
+
 /// Ужать `cfg_mtu` под бюджет QUIC-датаграммы (`budget` от [`crate::client::Session::quic_datagram_mtu`]):
 /// если сконфигурированный MTU больше бюджета — вернуть бюджет (иначе полноразмерные пакеты
 /// дропаются в pump «datagram too large»). `None` (obfs-TCP) или MTU ≤ бюджета — оставить как есть.
@@ -464,6 +516,30 @@ mod tests {
         ])
         .await;
         assert_eq!(got, vec!["192.168.0.0/16".to_string(), "10.0.0.5/32".to_string()]);
+    }
+
+    /// Эскалация QUIC→obfs-TCP только там, где она лечит: «повисший»/оборванный крупный
+    /// control-обмен (MTU/NAT64). На осознанном отказе exit'а (токен, PQ-auth, pin, недоступность)
+    /// повтор лишь сожжёт второй токен и подменит причину в UI на «auth-failed» — не эскалируем.
+    #[test]
+    fn escalate_to_tcp_only_on_transport_style_failures() {
+        // лечится TCP: соединение оборвалось/повисло на большом ответе
+        assert!(should_escalate_to_tcp("read error: connection lost: timed out"));
+        assert!(should_escalate_to_tcp("обрезанная PQ-подпись"));
+        assert!(should_escalate_to_tcp("timed out"));
+        // отказ по существу — эскалация только навредит
+        assert!(!should_escalate_to_tcp(
+            "read error: connection lost: closed by peer: auth-failed (code 1)"
+        ));
+        assert!(!should_escalate_to_tcp("токен уже использован (double-spend)"));
+        assert!(!should_escalate_to_tcp("невалидный токен — отказ в доступе"));
+        assert!(!should_escalate_to_tcp("PQ-auth: ML-DSA подпись сервера НЕ прошла — возможен MITM"));
+        assert!(!should_escalate_to_tcp(
+            "серт-pin не настроен — отказ (fail-closed, S0.1/H2)"
+        ));
+        assert!(!should_escalate_to_tcp(
+            "ни один exit недоступен:\n1.2.3.4:4433: QUIC/UDP:4433 и obfs-TCP:443 недоступны"
+        ));
     }
 
     #[tokio::test]

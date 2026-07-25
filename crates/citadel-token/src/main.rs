@@ -349,7 +349,7 @@ fn run_issuer() -> Result<()> {
                             let r = citadel_token::pqtls::accept_tls(tcp, scfg, obfs_psk)
                                 .and_then(|tls| srv.serve_conn(tls));
                             if let Err(e) = r {
-                                eprintln!("[issuer] admin-соединение завершено: {e}");
+                                citadel_token::dlog!("[issuer] admin-соединение завершено: {e}");
                             }
                         });
                     }
@@ -424,7 +424,7 @@ fn run_issuer() -> Result<()> {
                         stream, scfg, &state, &dir, &quota, max_per_epoch, &lease, lease_secs,
                         obfs_psk,
                     ) {
-                        eprintln!("[issuer] соединение завершено: {e}");
+                        citadel_token::dlog!("[issuer] соединение завершено: {e}");
                     }
                 });
             }
@@ -498,19 +498,20 @@ fn serve_client(
     }
     let (pk, sig) = (&auth[..32], &auth[32..]);
     if !citadel_token::ed25519_verify(pk, &challenge, sig) {
-        anyhow::bail!("Layer-1: подпись челленджа неверна (client {peer:?})");
+        anyhow::bail!("Layer-1: подпись челленджа неверна");
     }
     if !registry_allows(dir, pk, now_unix()) {
-        anyhow::bail!("Layer-1: client_id не активен/истёк/отозван — отказ (client {peer:?})");
+        anyhow::bail!("Layer-1: client_id не активен/истёк/отозван — отказ");
     }
     let client_id: [u8; 32] = pk.try_into().expect("pk = auth[..32], ровно 32 байта");
-    eprintln!("[issuer] Layer-1 ✔ абонент {}… авторизован", &hex::encode(pk)[..12]);
+    // no-logs: связка client_id↔время — только при явном Citadel_DEBUG_LOG (см. citadel_token::debug_logs)
+    citadel_token::dlog!("[issuer] Layer-1 ✔ абонент {}… авторизован", &hex::encode(pk)[..12]);
     // Задача 4/B (мягкий single-session): аренда client_id ещё активна → отклоняем новую выдачу
     // (второе устройство с той же ссылки / слишком частый реконнект). Клиент получит 0 токенов →
     // establish без токена → exit откажет → клиент подождёт истечения аренды и переподключится.
     // Закрываем соединение ДО отправки epoch-pub (ничего лишнего не раскрываем).
     if !lease_grant(&mut lease.lock().unwrap(), client_id, now_unix(), lease_secs) {
-        eprintln!(
+        citadel_token::dlog!(
             "[issuer] single-session (4/B): {}… держит активную аренду — новая сессия отклонена",
             &hex::encode(client_id)[..12]
         );
@@ -530,7 +531,7 @@ fn serve_client(
         // квота epoch-bounded. Достигнут потолок → прекращаем выдачу этому клиенту в эту эпоху.
         let cur_epoch = state.lock().unwrap().0;
         if !quota_grant(&mut quota.lock().unwrap(), client_id, cur_epoch, max_per_epoch) {
-            eprintln!(
+            citadel_token::dlog!(
                 "[issuer] квота исчерпана: {}… уже получил {max_per_epoch} токен(ов) в эпоху {cur_epoch} — стоп",
                 &hex::encode(client_id)[..12]
             );
@@ -542,7 +543,7 @@ fn serve_client(
         write_frame(&mut conn, &blind_sig)?;
         n += 1;
     }
-    eprintln!("[issuer] клиент {peer:?}: подписано вслепую {n} токен(ов)");
+    citadel_token::dlog!("[issuer] клиент {peer:?}: подписано вслепую {n} токен(ов)");
     Ok(())
 }
 

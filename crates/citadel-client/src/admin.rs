@@ -83,6 +83,16 @@ fn admin_addr(master_uri: &str) -> Result<String> {
     Ok(format!("{ADMIN_VIP}:{port}"))
 }
 
+/// Цель диагностической admin-пробы: `(ADMIN_VIP, admin_port)` для МАСТЕР-ссылки. `None` —
+/// ссылка клиентская (admin-полей нет) или не парсится, тогда шаг диагностики просто пропускается.
+/// Проба (см. `citadel_quic::diag`) шлёт TCP-SYN на этот адрес прямо в туннель, мимо ОС-роутинга.
+pub fn admin_probe_dst(master_uri: &str) -> Option<([u8; 4], u16)> {
+    let link = CredentialLink::from_uri(master_uri).ok()?;
+    link.admin_seed?; // не мастер (нет admin-seed) — admin-канала нет
+    let vip: std::net::Ipv4Addr = ADMIN_VIP.parse().ok()?;
+    Some((vip.octets(), link.admin_port().parse().ok()?))
+}
+
 /// Разобрать client_id (64 hex) в 32 байта.
 pub fn parse_client_id(hexstr: &str) -> Result<[u8; 32]> {
     hex::decode(hexstr.trim())

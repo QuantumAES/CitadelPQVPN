@@ -30,7 +30,16 @@ impl DiagStep {
 
 /// Прогнать все пробы против `cfg`, стримя результат через `emit`. Никогда не паникует;
 /// каждый провал — просто шаг с `ok=false`. Резолвер egress-пробы — Cloudflare 1.1.1.1.
-pub async fn run_diagnostics(cfg: &ClientConfig, mut emit: impl FnMut(DiagStep)) {
+///
+/// `admin` — `Some((ADMIN_VIP, порт))` для мастер-профиля: добавляет пробу admin-канала (C7.2)
+/// сырым TCP-SYN по туннелю. Это единственная проба, отвечающая на жалобу «не открывается список
+/// абонентов»: она проверяет путь до issuer'а МИМО ОС-роутинга, отделяя поломку на exit'е от
+/// поломки маршрута/split-tunnel на устройстве. `None` (клиентская ссылка) — шаг пропускается.
+pub async fn run_diagnostics(
+    cfg: &ClientConfig,
+    admin: Option<([u8; 4], u16)>,
+    mut emit: impl FnMut(DiagStep),
+) {
     // ── 1. конфигурация ──
     emit(DiagStep::ok(
         "Конфигурация",
@@ -78,7 +87,7 @@ pub async fn run_diagnostics(cfg: &ClientConfig, mut emit: impl FnMut(DiagStep))
                 format!("QUIC/UDP · {server}"),
                 "UDP:4433 недоступен или блокируется (порт закрыт/firewall/NAT)",
             )),
-            Err(e) => emit(DiagStep::fail(format!("QUIC/UDP · {server}"), format!("ошибка: {e}"))),
+            Err(e) => emit(DiagStep::fail(format!("QUIC/UDP · {server}"), format!("ошибка: {e:#}"))),
         }
 
         // 4. TCP-проба к obfs-fallback порту
@@ -93,7 +102,7 @@ pub async fn run_diagnostics(cfg: &ClientConfig, mut emit: impl FnMut(DiagStep))
                 format!("TCP · {tcp_target}"),
                 "порт принимает соединения (obfs-fallback доступен)",
             )),
-            Ok(Err(e)) => emit(DiagStep::fail(format!("TCP · {tcp_target}"), format!("connect: {e}"))),
+            Ok(Err(e)) => emit(DiagStep::fail(format!("TCP · {tcp_target}"), format!("connect: {e:#}"))),
             Err(_) => emit(DiagStep::fail(format!("TCP · {tcp_target}"), "таймаут connect (3с)")),
         }
     }
@@ -122,7 +131,10 @@ pub async fn run_diagnostics(cfg: &ClientConfig, mut emit: impl FnMut(DiagStep))
             s
         }
         Err(e) => {
-            emit(DiagStep::fail("Сессия (establish)", format!("{e}")));
+            // `{e:#}` (не `{e}`): у quinn причина лежит в `source` — без альтернативной формы
+            // видно лишь бесполезное «read error: connection lost», а не сам разрыв
+            // («timed out» / «closed by peer: code 1» = отказ exit'а по токену/пулу адресов).
+            emit(DiagStep::fail("Сессия (establish)", format!("{e:#}")));
             return; // без сессии egress не проверить
         }
     };
@@ -149,11 +161,33 @@ pub async fn run_diagnostics(cfg: &ClientConfig, mut emit: impl FnMut(DiagStep))
         )),
         Err(e) => emit(DiagStep::fail(
             "Egress через туннель",
-            format!("{e} — сессия поднялась, но трафик наружу не проходит"),
+            format!("{e:#} — сессия поднялась, но трафик наружу не проходит"),
         )),
     }
 
-    // ── 7. teardown ──
+    // ── 7. admin-канал (C7.2): TCP-SYN на ADMIN_VIP:порт сырым пакетом по туннелю ──
+    // Проба идёт МИМО ОС-роутинга, поэтому чётко делит диагноз «список абонентов не открывается»:
+    // ✔ — путь до issuer'а по туннелю жив (ищи причину в маршруте ОС/split-tunnel или в TLS/авторизации);
+    // ✗ — до issuer'а не доходит сам туннельный путь (C7.2-исключение/DNAT/issuer).
+    if let Some((vip, port)) = admin {
+        let vip_s = format!("{}.{}.{}.{}:{port}", vip[0], vip[1], vip[2], vip[3]);
+        match session.admin_syn_probe(vip, port, Duration::from_secs(6)).await {
+            Ok(true) => emit(DiagStep::ok(
+                format!("Admin-канал · {vip_s}"),
+                "SYN-ACK по туннелю — плоскость управления достижима",
+            )),
+            Ok(false) => emit(DiagStep::fail(
+                format!("Admin-канал · {vip_s}"),
+                "RST — порт закрыт (issuer не слушает / DNAT указывает в никуда)",
+            )),
+            Err(e) => emit(DiagStep::fail(
+                format!("Admin-канал · {vip_s}"),
+                format!("{e:#} — exit не пропускает/не DNAT'ит admin-трафик (C7.2)"),
+            )),
+        }
+    }
+
+    // ── 8. teardown ──
     drop(session);
     emit(DiagStep::ok("Готово", "сессия закрыта"));
 }

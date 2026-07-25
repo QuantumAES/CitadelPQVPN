@@ -855,13 +855,14 @@ pub struct DiagLineDto {
 
 /// Разобрать креды сохранённого профиля (по id) или сырой `citadel://`-ссылки в [`CredentialLink`]
 /// (нужны issuer+client_seed для добычи Layer-1 токена в диагностике, не только `ClientConfig`).
-fn link_from(profile_id: Option<String>, link: Option<String>) -> Result<CredentialLink> {
+fn link_from(profile_id: Option<String>, link: Option<String>) -> Result<(String, CredentialLink)> {
     let uri = match (profile_id, link) {
         (Some(id), _) => profile_uri(&id)?,
         (None, Some(l)) => l,
         (None, None) => return Err(anyhow!("нужен profile_id или link")),
     };
-    CredentialLink::from_uri(&uri)
+    let parsed = CredentialLink::from_uri(&uri)?;
+    Ok((uri, parsed))
 }
 
 /// Прогнать тест-кейсы подключения к exit'у профиля/ссылки, стримя результат по шагам
@@ -872,8 +873,11 @@ pub fn run_diagnostics(
     link: Option<String>,
     sink: StreamSink<DiagLineDto>,
 ) -> Result<()> {
-    let dlink = link_from(profile_id, link)?;
+    let (uri, dlink) = link_from(profile_id, link)?;
     let cfg = dlink.to_client_config();
+    // Мастер-профиль → добавляем пробу admin-канала (C7.2) по туннелю: именно она отвечает на
+    // жалобу «не открывается список абонентов» — проверяет путь до issuer'а мимо ОС-роутинга.
+    let admin = citadel_client::admin_probe_dst(&uri);
     let issuer = dlink.issuer.clone();
     let issuer_pin = dlink.issuer_pin; // S2.1/A1: pin PQ-TLS канала к издателю
     let client_seed = dlink.client_seed;
@@ -910,7 +914,7 @@ pub fn run_diagnostics(
         } else {
             cfg
         };
-        citadel_client::run_diagnostics(&cfg, |s| {
+        citadel_client::run_diagnostics(&cfg, admin, |s| {
             let _ = sink.add(DiagLineDto { step: s.name, ok: s.ok, detail: s.detail });
         })
         .await;

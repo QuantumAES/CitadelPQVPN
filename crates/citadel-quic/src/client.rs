@@ -110,6 +110,65 @@ impl Session {
             }
         }
     }
+
+    /// Диагностическая **admin-проба** (C7.2): TCP-SYN на `vip:port` сырым пакетом прямо в туннель
+    /// (минуя ОС-роутинг и TUN) и ожидание ответа. Отделяет два разных диагноза одной жалобы
+    /// «не открывается список абонентов»:
+    ///   * нет ответа → admin-плоскость на стороне exit'а не доходит до issuer (egress-исключение
+    ///     C7.2 не настроено / DNAT не стоит / issuer не слушает);
+    ///   * `Ok(true)` (SYN-ACK) → канал по туннелю ЖИВ, значит проблема в маршрутизации ОС клиента
+    ///     до `vip` (split-tunnel/route/EHOSTUNREACH) либо выше — в TLS/аутентификации admin-канала.
+    ///
+    /// `Ok(false)` — пришёл RST: пакет дошёл до стека, но порт закрыт (issuer не поднят/DNAT в никуда).
+    /// Полуоткрытое соединение на issuer'е закрываем RST'ом (не оставляем висеть до таймаута).
+    pub async fn admin_syn_probe(
+        &self,
+        vip: [u8; 4],
+        port: u16,
+        timeout: Duration,
+    ) -> Result<bool> {
+        let conn = self.tunnel.conn();
+        let sport: u16 = 40000 + (rand::random::<u16>() % 20000);
+        let seq: u32 = rand::random();
+        let syn = ip::build_tcp4(self.addr, sport, vip, port, seq, 0, ip::TCP_SYN, 64240);
+        conn.send_datagram(bytes::Bytes::from(datagram::encode(datagram::CTX_RAW_IP, &syn)))
+            .map_err(|e| anyhow!("admin-проба: не отправить датаграмму: {e}"))?;
+
+        let deadline = tokio::time::Instant::now() + timeout;
+        loop {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if remaining.is_zero() {
+                return Err(anyhow!(
+                    "admin-проба: нет ответа от {}.{}.{}.{}:{port} за {}с",
+                    vip[0], vip[1], vip[2], vip[3], timeout.as_secs()
+                ));
+            }
+            let dg = match tokio::time::timeout(remaining, conn.read_datagram()).await {
+                Ok(Ok(dg)) => dg,
+                Ok(Err(e)) => return Err(anyhow!("admin-проба: транспорт закрыт: {e}")),
+                Err(_) => continue, // истечёт на следующей проверке deadline
+            };
+            let Some((datagram::CTX_RAW_IP, inner)) = datagram::decode(&dg) else { continue };
+            let Some(t) = ip::parse_tcp4(inner) else { continue };
+            if t.src != vip || t.sport != port || t.dport != sport {
+                continue; // не наш ответ
+            }
+            if t.flags & ip::TCP_RST != 0 {
+                return Ok(false); // порт закрыт (issuer не слушает / DNAT в никуда)
+            }
+            if t.flags & (ip::TCP_SYN | ip::TCP_ACK) == (ip::TCP_SYN | ip::TCP_ACK) {
+                // закрываем полуоткрытое соединение на issuer'е (иначе висит до его таймаута)
+                let rst = ip::build_tcp4(
+                    self.addr, sport, vip, port,
+                    seq.wrapping_add(1), t.seq.wrapping_add(1),
+                    ip::TCP_RST | ip::TCP_ACK, 0,
+                );
+                let _ = conn
+                    .send_datagram(bytes::Bytes::from(datagram::encode(datagram::CTX_RAW_IP, &rst)));
+                return Ok(true);
+            }
+        }
+    }
 }
 
 /// Хост-часть `host:port` (для pin-файла и TCP-fallback цели).

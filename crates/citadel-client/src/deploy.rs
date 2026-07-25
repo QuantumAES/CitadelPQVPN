@@ -395,7 +395,11 @@ impl DeployConfig {
             udp_port: 4433,
             tcp_port: 443,
             tun_addr: "10.7.0.1/16".into(),
-            mtu: 1100,
+            // MTU туннеля exit'а = бюджет QUIC-датаграммы (citadel_quic::INNER_MTU). Ниже — крупные
+            // UDP-пакеты клиента (QUIC/HTTP3!) не влезали бы в TUN exit'а и молча терялись; выше —
+            // не влезали бы в датаграмму. Клиент клампит свой TUN под тот же бюджет ⇒ обе стороны
+            // симметричны.
+            mtu: citadel_quic::INNER_MTU as u32,
             obfs_psk: psk,
         })
     }
@@ -451,6 +455,8 @@ export Citadel_PIN_FILE=/shared/exit.pin
 export Citadel_OBFS_PSK="${Citadel_OBFS_PSK:-}"
 export Citadel_TCP_LISTEN=0.0.0.0:443
 export Citadel_KX=all
+# No-logs: Citadel_DEBUG_LOG НЕ задаём — exit молчит о клиентах (IP/выданный адрес/назначения).
+# Для разбора инцидента оператор поднимает контейнер с Citadel_DEBUG_LOG=1 осознанно и временно.
 rm -f /shared/exit.pin
 echo "[citadel-exit] token-less; listen 4433/udp + 443/tcp"
 exec citadel-m1

@@ -44,7 +44,8 @@ pub use citadel_quic::vpn::{
 pub use citadel_tun::TunIo;
 pub use creds::{CredentialBundle, CredentialLink, BUNDLE_VERSION, DEFAULT_ADMIN_PORT};
 pub use admin::{
-    admin_issue, admin_list, admin_revoke, build_subscriber_link, IssuedLink, SubscriberEntry,
+    admin_issue, admin_list, admin_probe_dst, admin_revoke, build_subscriber_link, IssuedLink,
+    SubscriberEntry,
 };
 pub use vault::{IssuedRecord, Profile, Vault};
 #[cfg(any(target_os = "linux", target_os = "android"))]

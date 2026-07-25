@@ -7,7 +7,7 @@ export Citadel_SERVERS="exit:4433 exit2:4433"   # M5 multi-server: клиент 
 export Citadel_CONNECT=exit:4433                # single-target для probe/auth-probe (ТЕСТ 4/8)
 export Citadel_SERVER_NAME=Citadel.exit
 export Citadel_TUN=Citadel0
-export Citadel_MTU=1100
+export Citadel_MTU=1161   # = citadel_quic::INNER_MTU: ровно то, что влезает в одну QUIC-датаграмму (выше — тихий дроп, ниже — дроп крупных UDP от клиента)
 export Citadel_ROUTES="1.1.1.1/32 1.0.0.1/32 10.99.0.1/32"
 export Citadel_PIN_DIR=/shared                  # M5: pin per-host — /shared/<host>.pin
 export Citadel_OBFS_PSK=$(cat /shared/obfs.psk)   # общий PSK от издателя (генерируется, не хардкод)

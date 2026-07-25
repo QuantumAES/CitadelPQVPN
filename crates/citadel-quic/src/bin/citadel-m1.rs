@@ -167,8 +167,14 @@ fn detect_egress() -> String {
     "eth0".to_string()
 }
 
+/// MTU туннельного интерфейса exit'а. Дефолт — [`citadel_quic::INNER_MTU`], т.е. ровно то, что
+/// влезает в одну QUIC-датаграмму. Выше ставить нельзя: ядро отдало бы в `pump` пакет из интернета
+/// размером до MTU, а датаграмма его не унесла бы → тихий дроп (для TCP это маскирует MSS-clamp,
+/// но крупный UDP — QUIC/HTTP3, видео, игры — просто пропадал бы). Заодно MSS-clamp и ICMP
+/// «fragmentation needed» от ядра теперь считаются от честного значения — PMTUD у отправителей
+/// в интернете работает вместо чёрной дыры.
 fn mtu() -> String {
-    std::env::var("Citadel_MTU").unwrap_or_else(|_| "1280".into())
+    std::env::var("Citadel_MTU").unwrap_or_else(|_| citadel_quic::INNER_MTU.to_string())
 }
 
 /// C7.2: admin-VIP:порт для точечного пропуска в data-plane (`Citadel_ADMIN_VIP` = IPv4 шлюза
@@ -387,7 +393,8 @@ async fn server_assign_address(
                         if !spend_token(spent, tn, epoch) {
                             return Err(anyhow!("токен уже использован (double-spend)"));
                         }
-                        eprintln!("[citadel-m1:server] токен принят (nonce {}…)", hex::encode(&tn[..6]));
+                        // no-logs: nonce токена — псевдоним сессии; в лог только при Citadel_DEBUG_LOG
+                        citadel_quic::dlog!("[citadel-m1:server] токен принят (nonce {}…)", hex::encode(&tn[..6]));
                     }
                     None => return Err(anyhow!("невалидный токен — отказ в доступе")),
                 }
@@ -724,7 +731,8 @@ async fn handle_client(
     router: ExitTunRouter,
     pool: Arc<Mutex<AddrPool>>,
 ) {
-    eprintln!("[citadel-m1:server] клиент {} ({}) подключён", tunnel.peer(), tunnel.kind());
+    // no-logs: IP клиента + время подключения = деанонимизирующая пара; см. citadel_quic::debug_logs
+    citadel_quic::dlog!("[citadel-m1:server] клиент {} ({}) подключён", tunnel.peer(), tunnel.kind());
     let (addr, prefix) = match server_assign_address(
         &mut tunnel, &pool, &issuer_auth, &spent, (*signer).as_ref(), cert_pin,
     )
@@ -732,12 +740,12 @@ async fn handle_client(
     {
         Ok(a) => a,
         Err(e) => {
-            eprintln!("[citadel-m1:server] отказ в доступе: {e}");
+            citadel_quic::dlog!("[citadel-m1:server] отказ в доступе: {e}");
             tunnel.close(1, b"auth-failed");
             return;
         }
     };
-    eprintln!("[citadel-m1:server] выдан {}.{}.{}.{}/{}", addr[0], addr[1], addr[2], addr[3], prefix);
+    citadel_quic::dlog!("[citadel-m1:server] выдан {}.{}.{}.{}/{}", addr[0], addr[1], addr[2], addr[3], prefix);
     // Регистрируем адрес в демуксе на время сессии → return-пакеты пойдут ИМЕННО этому клиенту
     // (не «украдёт» соседний pump). Снимаем регистрацию + освобождаем пул по завершении pump.
     let return_rx = router.register(addr);
@@ -745,7 +753,7 @@ async fn handle_client(
     router.unregister(addr);
     pool.lock().unwrap().free(addr); // C4: вернуть адрес в пул
     if let Err(e) = res {
-        eprintln!("[citadel-m1:server] pump завершён: {e}");
+        citadel_quic::dlog!("[citadel-m1:server] pump завершён: {e}");
     }
 }
 

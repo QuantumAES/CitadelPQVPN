@@ -9,7 +9,7 @@
 
 use anyhow::{anyhow, Result};
 
-use citadel_client::{run_diagnostics, CredentialLink};
+use citadel_client::{admin_probe_dst, run_diagnostics, CredentialLink};
 
 #[tokio::main(flavor = "multi_thread")]
 async fn main() -> Result<()> {
@@ -21,8 +21,11 @@ async fn main() -> Result<()> {
     let cfg = CredentialLink::from_uri(&link)?.to_client_config();
     eprintln!("[citadel-diag] старт диагностики ({} exit'ов)…\n", cfg.servers.len());
 
+    // мастер-ссылка → дополнительно проверяем admin-канал (C7.2) по туннелю
+    let admin = admin_probe_dst(&link);
+
     let mut fails = 0u32;
-    run_diagnostics(&cfg, |s| {
+    run_diagnostics(&cfg, admin, |s| {
         if !s.ok {
             fails += 1;
         }

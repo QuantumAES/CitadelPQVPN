@@ -247,7 +247,7 @@ impl ObfsUdpSocket {
         rand::thread_rng().fill_bytes(&mut nonce);
         let (floor, cap) = match self.padding {
             citadel_obfs::Padding::Random { floor, cap, .. } => (floor, cap),
-            _ => (256, 1280),
+            _ => (256, citadel_obfs::WIRE_CAP), // не выше того, что мог бы отправить сам QUIC (MTU)
         };
         let wire = floor + (rand::thread_rng().next_u32() as usize) % (cap - floor + 1);
         let pad = wire.saturating_sub(citadel_obfs::FRAMING_OVERHEAD);

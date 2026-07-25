@@ -37,17 +37,30 @@ class FlutterWindow : public Win32Window {
 
   // ── #5.5 системный трей (Windows-native, Shell_NotifyIcon) ──
   // Method-channel `citadel/tray` для связи с Dart (lib/windows_tray.dart):
-  // Dart → C++: init / setConnected / dispose; C++ → Dart: onOpen / onDisconnect / onExit.
+  // Dart → C++: init / setPhase / dispose; C++ → Dart: onOpen / onDisconnect / onExit.
+  //
+  // Состояние туннеля видно ПО ЗНАЧКУ (свёрнутое приложение): базовая иконка + цветная точка-бейдж
+  // в правом нижнем углу, а в состоянии «выключено» база ещё и обесцвечивается. Точка рисуется в
+  // рантайме поверх IDI_APP_ICON — отдельные .ico-ресурсы на каждое состояние не нужны.
+  enum class TrayPhase { Off, Connecting, Up, Error };
+
   void SetupTrayChannel();
   void AddTrayIcon();
   void RemoveTrayIcon();
   void ShowTrayMenu();
   void InvokeTray(const std::string& method);
+  // Иконка «база + бейдж состояния» нужного системного размера; nullptr — не удалось (fallback).
+  HICON MakeTrayIcon(TrayPhase phase);
+  // Применить фазу к уже добавленной иконке (иконка + tooltip); no-op, если трей не добавлен.
+  void ApplyTrayPhase();
 
   std::unique_ptr<flutter::MethodChannel<flutter::EncodableValue>> tray_channel_;
   NOTIFYICONDATAW tray_nid_{};
   bool tray_added_ = false;
   bool tray_connected_ = false;
+  TrayPhase tray_phase_ = TrayPhase::Off;
+  // Текущая нарисованная иконка — уничтожается при замене/удалении (иначе утечка GDI-хэндлов).
+  HICON tray_icon_ = nullptr;
   // Подписи меню приходят из Dart (UTF-8 → wide) — без кириллических литералов в .cpp.
   std::wstring tray_tip_ = L"CitadelPQVPN";
   std::wstring label_open_;

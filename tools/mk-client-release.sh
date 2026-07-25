@@ -1,15 +1,18 @@
 #!/usr/bin/env bash
 # ─────────────────────────────────────────────────────────────────────────────
-# Сборка и упаковка КЛИЕНТОВ CitadelPQVPN (Android APK + Linux desktop-бандл) в релиз.
+# Сборка и упаковка КЛИЕНТОВ CitadelPQVPN (Android APK + Linux desktop + Linux CLI) в релиз.
 #
 # Дополняет tools/mk-release.sh (серверные бинари) клиентскими артефактами того же релиза:
 #   - CitadelPQVPN-<version>.apk            — Android (fat APK, все ABI; debug-подпись, см. NB);
-#   - citadel-desktop-linux-<arch>.tar.zst  — Linux: flutter-бандл + citadel-helper + polkit
-#     .policy + самодостаточный install.sh (ставит helper/polkit/app одной командой).
+#   - citadel-desktop-linux-<arch>.tar.zst  — Linux GUI: flutter-бандл + citadel-helper + polkit
+#     .policy + самодостаточный install.sh (ставит helper/polkit/app одной командой);
+#   - citadel-cli-linux-<arch>.tar.zst      — Linux консольный клиент (трек L): citadel-vpnd +
+#     citadel-engine + citadel-cli + systemd-юниты + install.sh (аналог tools/install-cli.sh,
+#     но ставит из бандла, без cargo и без исходников на целевой машине).
 # Складывает в dist/<version>/, пере-генерит sha256sums по ВСЕМ артефактам (сервер+клиент) и
 # подписывает релизным minisign-ключом (как mk-release.sh). Публикация — tools/publish-release.sh.
 #
-#   tools/mk-client-release.sh [version] [--no-sign]
+#   tools/mk-client-release.sh [version] [--no-sign] [--no-apk] [--no-cli]
 #
 # Env: FLUTTER=/path/to/flutter/bin/flutter (по умолч. ~/flutter/bin/flutter),
 #      CITADEL_RELEASE_KEY_DIR (секрет minisign), CITADEL_RELEASE_PUB (self-verify).
@@ -25,11 +28,13 @@ cd "$REPO_ROOT"
 
 NO_SIGN=0
 NO_APK=0
+NO_CLI=0
 ARGS=()
 for a in "$@"; do
   case "$a" in
     --no-sign) NO_SIGN=1 ;;
     --no-apk)  NO_APK=1 ;;   # только Linux-бандл (машина без Android SDK / экономия памяти)
+    --no-cli)  NO_CLI=1 ;;   # без консольного клиента (трек L)
     *) ARGS+=("$a") ;;
   esac
 done
@@ -136,7 +141,119 @@ tar -C "$STAGE_ROOT" -cf - "citadel-desktop-linux-$SUFFIX" \
 rm -rf "$STAGE_ROOT"
 printf '  %-34s %s\n' "citadel-desktop-linux-$SUFFIX.tar.zst" "$(du -h "$OUT/citadel-desktop-linux-$SUFFIX.tar.zst" | cut -f1)"
 
-# ── 3. Android APK (fat, все ABI) ──
+# ── 3. Linux консольный клиент (трек L): vpnd + engine + cli + юниты ──
+# Тарбол самодостаточен: на целевой машине не нужны ни cargo, ни исходники — install.sh лишь
+# раскладывает бинари по правам (root / uid citadel-vpn / пользователь) и включает юнит.
+if [[ "$NO_CLI" -eq 1 ]]; then
+  echo "[mk-client] --no-cli: консольный клиент пропущен."
+else
+  echo "[mk-client] сборка citadel-vpnd + citadel-engine + citadel-cli (release)…"
+  cargo build --release -p citadel-vpnd -p citadel-engine -p citadel-cli
+
+  CLI_ROOT="$(mktemp -d)"
+  CLI_STAGE="$CLI_ROOT/citadel-cli-linux-$SUFFIX"
+  mkdir -p "$CLI_STAGE"
+  for b in citadel-vpnd citadel-engine citadel-cli; do
+    [[ -x "$REPO_ROOT/target/release/$b" ]] || die "нет бинаря: target/release/$b"
+    cp "$REPO_ROOT/target/release/$b" "$CLI_STAGE/$b"
+  done
+  cp "$REPO_ROOT/packaging/linux/citadel-vpnd.service"     "$CLI_STAGE/citadel-vpnd.service"
+  cp "$REPO_ROOT/packaging/linux/citadel-lockdown.service" "$CLI_STAGE/citadel-lockdown.service"
+
+  cat > "$CLI_STAGE/install.sh" <<'CLIINSTALL'
+#!/usr/bin/env bash
+# Установка КОНСОЛЬНОГО клиента CitadelPQVPN (трек L) из этого бандла.
+#
+# Три компонента с разными правами — в этом вся модель безопасности (docs/LINUX-CLI.md):
+#   /usr/lib/citadel-pqvpn/citadel-vpnd    root, systemd-юнит  — плумбер: TUN/маршруты/kill-switch
+#   /usr/lib/citadel-pqvpn/citadel-engine  uid citadel-vpn     — движок: весь недоверенный ввод
+#   /usr/bin/citadel-cli                   обычный юзер        — TUI, хранилище профилей
+#
+# Создаёт системного пользователя и группу citadel-vpn, но В ГРУППУ НИКОГО НЕ ДОБАВЛЯЕТ: её член
+# управляет маршрутизацией всей машины (L3) — это решение администратора, а не побочный эффект
+# установки.  Запуск:  ./install.sh [--user ИМЯ]
+set -euo pipefail
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+LIB_DIR=/usr/lib/citadel-pqvpn
+BIN_DIR=/usr/bin
+UNIT_DIR=/etc/systemd/system
+SVC_USER=citadel-vpn
+SVC_GROUP=citadel-vpn
+
+ADD_USER=""
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --user) ADD_USER="${2:-}"; shift ;;
+    *) echo "неизвестный аргумент: $1" >&2; exit 1 ;;
+  esac
+  shift
+done
+
+SUDO=""; [[ "${EUID}" -eq 0 ]] || SUDO="sudo"
+log() { printf '\033[1;34m==>\033[0m %s\n' "$*"; }
+
+log "Runtime-зависимости (iproute2, iptables)…"
+if command -v apt-get >/dev/null; then
+  $SUDO apt-get update -qq
+  $SUDO apt-get install -y -qq iproute2 iptables
+else
+  echo "  apt-get не найден — поставь вручную: iproute2 iptables" >&2
+fi
+
+if ! getent group "$SVC_GROUP" >/dev/null; then
+  log "Создаю группу $SVC_GROUP…"
+  $SUDO groupadd --system "$SVC_GROUP"
+fi
+if ! getent passwd "$SVC_USER" >/dev/null; then
+  log "Создаю системного пользователя $SVC_USER (без домашнего каталога и без шелла)…"
+  $SUDO useradd --system --gid "$SVC_GROUP" --no-create-home \
+                --home-dir /nonexistent --shell /usr/sbin/nologin "$SVC_USER"
+fi
+
+log "Установка бинарей (root:root, без setuid — привилегии даёт systemd, а не бит на файле)…"
+$SUDO install -d -m 755 "$LIB_DIR"
+$SUDO install -m 755 -o root -g root "$HERE/citadel-vpnd"   "$LIB_DIR/citadel-vpnd"
+$SUDO install -m 755 -o root -g root "$HERE/citadel-engine" "$LIB_DIR/citadel-engine"
+$SUDO install -m 755 -o root -g root "$HERE/citadel-cli"    "$BIN_DIR/citadel-cli"
+
+log "Установка systemd-юнитов…"
+$SUDO install -m 644 -o root -g root "$HERE/citadel-vpnd.service"     "$UNIT_DIR/citadel-vpnd.service"
+$SUDO install -m 644 -o root -g root "$HERE/citadel-lockdown.service" "$UNIT_DIR/citadel-lockdown.service"
+$SUDO systemctl daemon-reload
+$SUDO systemctl enable --now citadel-vpnd.service
+
+if [[ -n "$ADD_USER" ]]; then
+  log "Добавляю $ADD_USER в группу $SVC_GROUP…"
+  $SUDO usermod -aG "$SVC_GROUP" "$ADD_USER"
+  echo "    Членство вступит в силу после перелогина (или: newgrp $SVC_GROUP)."
+fi
+
+cat <<EOF
+
+Готово. Демон: systemctl status citadel-vpnd
+
+Дальше:
+  1. дайте себе право управлять туннелем:
+       sudo usermod -aG $SVC_GROUP \$USER   # затем перелогиньтесь
+     ВНИМАНИЕ: член этой группы управляет маршрутизацией всей машины — добавляйте
+     только тех, кому доверяете как администратору сети (docs/LINUX-CLI.md, L3).
+  2. запустите настройку:      citadel-cli
+  3. журнал демона:            journalctl -u citadel-vpnd -f
+
+Режим «без утечек при загрузке» (по умолчанию выключен, читайте ограничения в юните):
+     sudo systemctl enable --now citadel-lockdown.service
+EOF
+CLIINSTALL
+  chmod +x "$CLI_STAGE/install.sh"
+
+  echo "[mk-client] упаковка консольного клиента → citadel-cli-linux-$SUFFIX.tar.zst…"
+  tar -C "$CLI_ROOT" -cf - "citadel-cli-linux-$SUFFIX" \
+    | zstd -q -19 -f -o "$OUT/citadel-cli-linux-$SUFFIX.tar.zst"
+  rm -rf "$CLI_ROOT"
+  printf '  %-34s %s\n' "citadel-cli-linux-$SUFFIX.tar.zst" "$(du -h "$OUT/citadel-cli-linux-$SUFFIX.tar.zst" | cut -f1)"
+fi
+
+# ── 4. Android APK (fat, все ABI) ──
 if [[ "$NO_APK" -eq 1 ]]; then
   echo "[mk-client] --no-apk: сборка APK пропущена (Linux-бандл собран)."
 else
@@ -148,7 +265,7 @@ else
   printf '  %-34s %s\n' "CitadelPQVPN-$VERSION.apk" "$(du -h "$OUT/CitadelPQVPN-$VERSION.apk" | cut -f1)"
 fi
 
-# ── 4. sha256sums по ВСЕМ артефактам релиза (сервер .zst + клиент .tar.zst/.apk) + подпись ──
+# ── 5. sha256sums по ВСЕМ артефактам релиза (сервер .zst + клиент .tar.zst/.apk) + подпись ──
 cd "$OUT"
 shopt -s nullglob
 sha256sum ./*.zst ./*.apk 2>/dev/null | sed 's#\./##' > sha256sums
@@ -171,6 +288,7 @@ fi
 cat <<EOF
 
 === ГОТОВО: клиенты в $OUT ===
-  CitadelPQVPN-$VERSION.apk, citadel-desktop-linux-$SUFFIX.tar.zst
+  CitadelPQVPN-$VERSION.apk, citadel-desktop-linux-$SUFFIX.tar.zst,
+  citadel-cli-linux-$SUFFIX.tar.zst
 Публикация в GitHub Release: tools/publish-release.sh $VERSION
 EOF

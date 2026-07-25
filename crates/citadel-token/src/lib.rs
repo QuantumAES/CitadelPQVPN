@@ -19,6 +19,28 @@ use rand::RngCore;
 use std::io::{self, Read, Write};
 use std::net::TcpStream;
 
+/// **No-logs (приватность серверных ролей).** Издатель и admin-канал по умолчанию НЕ пишут в лог
+/// ничего, что связывает абонента, его адрес и время: ни `client_id`, ни IP пира, ни факт выдачи.
+/// Иначе docker-лог/journald превращается в форензик-журнал «кто и когда подключался» — ровно то,
+/// от чего защищает вся анонимная схема (blind RSA, unlinkability, C5.x). Диагностика включается
+/// оператором явно и осознанно: `Citadel_DEBUG_LOG=1`.
+pub fn debug_logs() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        matches!(std::env::var("Citadel_DEBUG_LOG").as_deref(), Ok(v) if v != "0" && !v.is_empty())
+    })
+}
+
+/// `eprintln!`, который молчит без [`debug_logs`] — для строк с идентифицирующими данными.
+#[macro_export]
+macro_rules! dlog {
+    ($($t:tt)*) => {
+        if $crate::debug_logs() {
+            eprintln!($($t)*);
+        }
+    };
+}
+
 pub mod admin; // C7.1: admin-плоскость (реестр по PQ-TLS: domain-sep Ed25519 + EKM channel binding)
 pub mod pqtls; // S2.1/A1: PQ-TLS + pin канал к издателю (анти-MITM, анти-деанон client_id)
 pub mod obfs_stream; // S2.1/A1 (остаток): синхронная obfs-обёртка issuer-канала (probe-resistance, анти-DPI)

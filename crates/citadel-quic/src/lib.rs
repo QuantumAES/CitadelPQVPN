@@ -30,6 +30,39 @@ pub use protect::{clear_socket_protector, set_socket_protector, SocketProtector}
 
 pub const ALPN: &[u8] = b"Citadel-pq";
 
+/// **No-logs (приватность exit'а).** Exit по умолчанию НЕ пишет в лог ничего о клиентах и их
+/// трафике: ни IP пира, ни выданный туннельный адрес, ни назначения/размеры пакетов. Такой лог —
+/// готовый форензик-журнал «кто, когда и куда ходил», т.е. ровно то, что вся схема (анонимные
+/// токены, unlinkability) старается не создавать; docker-лог при этом ещё и переживает контейнер.
+/// Оператор включает диагностику явно: `Citadel_DEBUG_LOG=1`. Клиентская сторона движка своими
+/// логами распоряжается сама (это устройство пользователя, там лог нужен для поддержки).
+pub fn debug_logs() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        matches!(std::env::var("Citadel_DEBUG_LOG").as_deref(), Ok(v) if v != "0" && !v.is_empty())
+    })
+}
+
+/// `eprintln!`, который на серверной стороне молчит без [`debug_logs`].
+#[macro_export]
+macro_rules! dlog {
+    ($($t:tt)*) => {
+        if $crate::debug_logs() {
+            eprintln!($($t)*);
+        }
+    };
+}
+
+/// Максимальный inner-IP-пакет, который ГАРАНТИРОВАННО влезает в одну QUIC-датаграмму при
+/// фиксированном MTU транспорта (`citadel_obfs::MAX_QUIC_PACKET`): пакет минус QUIC/AEAD-оверхед
+/// минус 1 байт context-varint MASQUE. Клиент клампит свой TUN под фактический
+/// `Session::quic_datagram_mtu()`, но exit конфигурирует общий TUN ДО появления соединений, поэтому
+/// ему нужна константа. Держать TUN exit'а выше этого значения нельзя: пакеты из интернета размером
+/// 1162..MTU молча дропались бы в `pump` («datagram too large») — TCP спасал бы MSS-clamp, а крупные
+/// UDP (QUIC/HTTP3, игры, видео) просто пропадали бы. Синхронность с quinn проверяет тест
+/// `inner_mtu_fits_real_datagram_budget` (живое соединение на loopback).
+pub const INNER_MTU: u16 = 1161;
+
 pub fn pq_groups() -> Vec<&'static dyn SupportedKxGroup> {
     vec![aws_lc_rs::kx_group::X25519MLKEM768]
 }
@@ -98,7 +131,10 @@ fn transport() -> Arc<quinn::TransportConfig> {
     // даёт 15с без передеплоя сервера. Keepalive 5с ⇒ 2 пропущенных ⇒ close.
     tc.max_idle_timeout(Some(Duration::from_secs(15).try_into().unwrap()));
     // Фиксируем MTU: запас под obfs-оверхед L1 (M3), без агрессивного discovery до 1500.
-    tc.initial_mtu(1200);
+    // Значение синхронизировано с `citadel_obfs::MAX_QUIC_PACKET` (потолок провода L1) — см.
+    // тест `obfs_wire_cap_matches_quic_mtu`: иначе паддинг L1 раздувает пакет выше того, что
+    // QUIC считает своим MTU, и полноразмерные пакеты чёрнодырятся на «узких» путях (мобильные/NAT64).
+    tc.initial_mtu(citadel_obfs::MAX_QUIC_PACKET as u16);
     tc.mtu_discovery_config(None);
     Arc::new(tc)
 }
@@ -286,6 +322,56 @@ mod tests {
         // S1.1/M4: только pq/пусто гарантируют PQ; classical/all — нет.
         assert!(kx_is_pq("pq") && kx_is_pq(""));
         assert!(!kx_is_pq("classical") && !kx_is_pq("all"));
+    }
+
+    /// MTU-инвариант L0/L1: потолок obfs-провода = ровно тот пакет, который может отдать QUIC
+    /// (`initial_mtu`), плюс фрейминг. Если разъедутся — паддинг L1 начнёт раздувать полноразмерные
+    /// пакеты выше MTU пути, и на «узких» путях (мобильные сети/NAT64/CLAT) данные уйдут в чёрную
+    /// дыру при живом хендшейке. Тест держит обе константы в синхроне.
+    #[test]
+    fn obfs_wire_cap_matches_quic_mtu() {
+        assert_eq!(
+            citadel_obfs::WIRE_CAP,
+            citadel_obfs::MAX_QUIC_PACKET + citadel_obfs::FRAMING_OVERHEAD
+        );
+        // потолок провода + UDP(8) + IPv4(20) обязан влезать в 1300 б — запас под мобильные пути
+        const { assert!(citadel_obfs::WIRE_CAP + 28 <= 1300, "obfs-пакет не влезает в узкий путь") };
+        match citadel_obfs::DEFAULT_RANDOM_PAD {
+            citadel_obfs::Padding::Random { cap, .. } => assert_eq!(cap, citadel_obfs::WIRE_CAP),
+            _ => panic!("дефолтная политика паддинга должна быть Random"),
+        }
+    }
+
+    /// `INNER_MTU` обязан помещаться в реальный бюджет QUIC-датаграммы (+1 байт context-varint).
+    /// Живое соединение на loopback (поверх obfs-TCP — без биндинга UDP-портов в CI) даёт настоящий
+    /// `max_datagram_size` от quinn: если апстрим сменит оверхед, тест поймает это здесь, а не
+    /// «тихими дропами» полноразмерных пакетов на exit'е.
+    #[tokio::test]
+    async fn inner_mtu_fits_real_datagram_budget() {
+        let psk = [0x33u8; 32];
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let srv = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let scfg = server_config(kx_groups_for("pq")).unwrap();
+            let ep = server_endpoint_obfs_tcp(stream, scfg, psk).unwrap();
+            let conn = ep.accept().await.unwrap().await.unwrap();
+            let budget = conn.max_datagram_size().unwrap();
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            budget
+        });
+        let stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let ep = client_endpoint_obfs_tcp(stream, psk).unwrap();
+        let ccfg = client_config(kx_groups_for("pq")).unwrap();
+        let conn = ep.connect_with(ccfg, addr, "Citadel.exit").unwrap().await.unwrap();
+        let client_budget = conn.max_datagram_size().unwrap();
+        let server_budget = srv.await.unwrap();
+        for b in [client_budget, server_budget] {
+            assert!(
+                b > INNER_MTU as usize,
+                "бюджет датаграммы {b} < INNER_MTU {INNER_MTU} + 1 байт контекста"
+            );
+        }
     }
 
     /// A7: `server_config_with_cert` даёт pin = BLAKE3(cert DER) — стабильный для одной идентичности

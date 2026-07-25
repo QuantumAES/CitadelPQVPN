@@ -299,8 +299,9 @@ impl AdminServer {
                     bail!("valid_until в прошлом — запись была бы мёртвой");
                 }
                 atomic_write(&path, &registry_apply_add(&cur, &client_id, vu))?;
-                // stderr = audit-trail admin-мутаций (docker logs issuer)
-                eprintln!("[admin] add {}… active до {vu}", &hex::encode(client_id)[..12]);
+                // Мутация уже записана в сам реестр (он и есть audit-trail). В stderr дублируем
+                // только под Citadel_DEBUG_LOG: иначе docker-лог накапливал бы «кто и когда выдан».
+                crate::dlog!("[admin] add {}… active до {vu}", &hex::encode(client_id)[..12]);
                 Ok(AdminResponse::Ok)
             }
             AdminRequest::Revoke { client_id } => {
@@ -308,7 +309,7 @@ impl AdminServer {
                     bail!("отзыв client_id админа запрещён (self-lockout, R6) — break-glass на сервере");
                 }
                 atomic_write(&path, &registry_apply_revoke(&cur, &client_id)?)?;
-                eprintln!("[admin] revoke {}… (действует ≤ длины эпохи)", &hex::encode(client_id)[..12]);
+                crate::dlog!("[admin] revoke {}… (действует ≤ длины эпохи)", &hex::encode(client_id)[..12]);
                 Ok(AdminResponse::Ok)
             }
         }

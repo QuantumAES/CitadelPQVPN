@@ -16,6 +16,9 @@ echo "[issuer] общий obfs-PSK → /shared/obfs.psk"
 # issuer-порт молчит на не-obfs пробу и на проводе неотличим от туннеля). Клиент берёт PSK из ссылки.
 export Citadel_OBFS_PSK=$(cat /shared/obfs.psk)
 export Citadel_TOKEN_ROLE=issuer
+# ДЕМО/E2E-стенд: включаем диагностический вывод. В проде (env от AdminDeployer) его НЕТ —
+# серверные роли по умолчанию молчат о клиентах и их трафике (no-logs, citadel_quic::debug_logs).
+export Citadel_DEBUG_LOG=1
 export Citadel_TOKEN_DIR=/shared
 export Citadel_TOKEN_LISTEN=0.0.0.0:7000
 export Citadel_EPOCH_SECS=3600   # C5.1: длина эпохи (ДОЛЖНА совпадать с exit) — токены epoch-scoped

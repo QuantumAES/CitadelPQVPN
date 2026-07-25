@@ -116,8 +116,24 @@ pub fn build_chaff(padding: &[u8]) -> Vec<u8> {
 /// nonce_pkt(12) + enc_header(24) + type(1) + pad_len(2) + tag(16) = 55 (v2; было 47 в v1).
 pub const FRAMING_OVERHEAD: usize = 12 + HDR_PT_LEN + 1 + 2 + 16;
 
+/// Максимальный QUIC-пакет, который может прийти на упаковку: `initial_mtu` транспорта в
+/// `citadel_quic::transport()` (MTU-discovery выключен ⇒ размер фиксирован). Держится в синхроне
+/// тестом `obfs_wire_cap_matches_quic_mtu` в citadel-quic.
+pub const MAX_QUIC_PACKET: usize = 1200;
+
+/// **Потолок размера пакета НА ПРОВОДЕ.** Ключевой MTU-инвариант L1: obfs добавляет к QUIC-пакету
+/// `FRAMING_OVERHEAD` + паддинг, но QUIC об этом не знает — он считает, что укладывается в свой
+/// `initial_mtu`. Если паддинг раздувает провод выше `MAX_QUIC_PACKET + FRAMING_OVERHEAD`, то
+/// полноразмерные пакеты (и только они!) начинают не влезать в путь, где MTU впритык — мобильные
+/// сети/NAT64/CLAT/GTP. Диагноз при этом коварный: хендшейк и мелкие пакеты идут, а данные —
+/// чёрная дыра. Поэтому потолок = ровно то, что мог бы отправить сам QUIC: паддинг добивает
+/// МЕЛКИЕ пакеты и никогда не увеличивает крупные (для них он и так бесполезен — они у потолка).
+/// На проводе это 1255 б UDP-payload ⇒ ≤1283 б IPv4-пакет.
+pub const WIRE_CAP: usize = FRAMING_OVERHEAD + MAX_QUIC_PACKET;
+
 /// Бакеты размеров пакета НА ПРОВОДЕ по умолчанию (анти-fingerprint по длине, I5).
-pub const DEFAULT_BUCKETS: &[usize] = &[256, 512, 1024, 1280];
+/// Верхний бакет = [`WIRE_CAP`] (см. MTU-инвариант выше), а не «круглые» 1280.
+pub const DEFAULT_BUCKETS: &[usize] = &[256, 512, 1024, WIRE_CAP];
 
 #[derive(Clone, Copy, Debug)]
 pub enum Padding {
@@ -132,8 +148,9 @@ pub enum Padding {
 }
 
 /// C2: дефолтная политика случайного паддинга (анти-fingerprint по длине). Параметры — компромисс
-/// анти-DPI vs overhead; tunable. floor 256 (скрыть мелкие), jitter 512 (спред), cap 1280 (MTU-safe).
-pub const DEFAULT_RANDOM_PAD: Padding = Padding::Random { floor: 256, jitter: 512, cap: 1280 };
+/// анти-DPI vs overhead; tunable. floor 256 (скрыть мелкие), jitter 512 (спред), cap — [`WIRE_CAP`]
+/// (MTU-инвариант: паддинг не делает пакет больше, чем мог бы отправить сам QUIC).
+pub const DEFAULT_RANDOM_PAD: Padding = Padding::Random { floor: 256, jitter: 512, cap: WIRE_CAP };
 
 /// Сколько байт padding добавить в DATA-пакет с `quic_len` полезной нагрузки,
 /// чтобы итоговый размер на проводе попал на бакет. `Random` считается [`pad_len_random`] (нужен RNG).
@@ -485,7 +502,7 @@ mod tests {
     /// бакета-сигнатуры); мелкие скрыты полом; крупные у cap не паддятся (MTU).
     #[test]
     fn pad_random_bounds_cap_and_continuity() {
-        let (floor, jitter, cap) = (256, 512, 1280);
+        let (floor, jitter, cap) = (256, 512, WIRE_CAP);
         // мелкий пакет (q=5, wire=60): провод всегда в [floor, cap]
         for r in [0usize, 1, 100, 511, 512, 513, 99_999] {
             let wire = FRAMING_OVERHEAD + 5 + pad_len_random(floor, jitter, cap, 5, r);
@@ -502,13 +519,31 @@ mod tests {
         assert!(sizes.len() > 50, "распределение непрерывно, не дискретно ({} значений)", sizes.len());
     }
 
+    /// MTU-инвариант: при дефолтной политике паддинг НИКОГДА не делает провод больше, чем
+    /// `MAX_QUIC_PACKET + FRAMING_OVERHEAD`. Это и есть баг «на мобильной сети хендшейк проходит,
+    /// а данные не идут»: раздутый паддингом полноразмерный пакет не влезал в узкий путь.
+    #[test]
+    fn default_padding_never_exceeds_quic_mtu_on_wire() {
+        let Padding::Random { floor, jitter, cap } = DEFAULT_RANDOM_PAD else {
+            panic!("дефолт — Random");
+        };
+        for q in [0usize, 40, 500, 1100, MAX_QUIC_PACKET - 1, MAX_QUIC_PACKET] {
+            for r in [0usize, 7, 511, 512, 4096, 65_535] {
+                let wire = FRAMING_OVERHEAD + q + pad_len_random(floor, jitter, cap, q, r);
+                assert!(wire <= WIRE_CAP, "q={q}, r={r}: провод {wire} > потолка {WIRE_CAP}");
+            }
+        }
+        // полноразмерный QUIC-пакет паддингом не раздувается вовсе
+        assert_eq!(pad_len_random(floor, jitter, cap, MAX_QUIC_PACKET, 12_345), 0);
+    }
+
     /// Сквозной тест: политика → build_inner → seal даёт длину ровно в бакет,
     /// а приёмная сторона (open → parse_inner) срезает padding и возвращает исходный quic.
     #[test]
     fn pad_then_seal_lands_on_bucket_and_strips_clean() {
         let p = Padding::Bucket(DEFAULT_BUCKETS);
-        // верхняя граница = максимальный бакет − FRAMING_OVERHEAD (1280−55=1225 в v2)
-        for q in [0usize, 3, 50, 209, 210, 600, 977, 1225] {
+        // верхняя граница = максимальный бакет (WIRE_CAP) − FRAMING_OVERHEAD = MAX_QUIC_PACKET
+        for q in [0usize, 3, 50, 209, 210, 600, 977, MAX_QUIC_PACKET] {
             let quic: Vec<u8> = (0..q).map(|i| i as u8).collect();
             let padding = vec![0u8; pad_len_for(p, q)];
             let inner = build_inner(TYPE_DATA, None, None, &padding, &quic);

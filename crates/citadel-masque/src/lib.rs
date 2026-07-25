@@ -388,6 +388,93 @@ pub mod ip {
         })
     }
 
+    // ---- минимальный TCP (для admin-пробы по туннелю) ----
+    pub const TCP_FIN: u8 = 0x01;
+    pub const TCP_SYN: u8 = 0x02;
+    pub const TCP_RST: u8 = 0x04;
+    pub const TCP_ACK: u8 = 0x10;
+
+    /// Контрольная сумма TCP — тот же алгоритм, что у UDP, но `proto=6` в псевдозаголовке
+    /// и длина = длина сегмента (у TCP нет собственного поля длины).
+    fn tcp_checksum(src: [u8; 4], dst: [u8; 4], seg: &[u8]) -> u16 {
+        let mut sum: u32 = 0;
+        for chunk in [&src[..], &dst[..]] {
+            sum += u16::from_be_bytes([chunk[0], chunk[1]]) as u32;
+            sum += u16::from_be_bytes([chunk[2], chunk[3]]) as u32;
+        }
+        sum += 6; // zero || protocol (TCP)
+        sum += seg.len() as u32;
+        let mut i = 0;
+        while i + 1 < seg.len() {
+            sum += u16::from_be_bytes([seg[i], seg[i + 1]]) as u32;
+            i += 2;
+        }
+        if i < seg.len() {
+            sum += (seg[i] as u32) << 8;
+        }
+        while sum >> 16 != 0 {
+            sum = (sum & 0xffff) + (sum >> 16);
+        }
+        !(sum as u16)
+    }
+
+    /// Минимальный TCP-сегмент без опций и без данных (data offset = 5) в IPv4-пакете.
+    /// Нужен диагностической admin-пробе: SYN к `ADMIN_VIP:порт` прямо в туннель (мимо ОС-роутинга)
+    /// и RST для закрытия полуоткрытого соединения на issuer'е.
+    #[allow(clippy::too_many_arguments)] // ровно поля TCP-заголовка: группировать не во что
+    pub fn build_tcp4(
+        src: [u8; 4],
+        sport: u16,
+        dst: [u8; 4],
+        dport: u16,
+        seq: u32,
+        ack: u32,
+        flags: u8,
+        window: u16,
+    ) -> Vec<u8> {
+        let mut seg = Vec::with_capacity(20);
+        seg.extend_from_slice(&sport.to_be_bytes());
+        seg.extend_from_slice(&dport.to_be_bytes());
+        seg.extend_from_slice(&seq.to_be_bytes());
+        seg.extend_from_slice(&ack.to_be_bytes());
+        seg.push(5 << 4); // data offset = 5 слов (20 б), reserved = 0
+        seg.push(flags);
+        seg.extend_from_slice(&window.to_be_bytes());
+        seg.extend_from_slice(&[0, 0]); // checksum (placeholder)
+        seg.extend_from_slice(&[0, 0]); // urgent pointer
+        let c = tcp_checksum(src, dst, &seg);
+        seg[16..18].copy_from_slice(&c.to_be_bytes());
+        build_ipv4(6, src, dst, &seg)
+    }
+
+    pub struct Tcp4 {
+        pub src: [u8; 4],
+        pub dst: [u8; 4],
+        pub sport: u16,
+        pub dport: u16,
+        pub seq: u32,
+        pub ack: u32,
+        pub flags: u8,
+    }
+
+    /// Разбор TCP-заголовка внутри IPv4-пакета (`None` — не TCP/обрезан).
+    pub fn parse_tcp4(pkt: &[u8]) -> Option<Tcp4> {
+        let v = parse_ipv4(pkt)?;
+        if v.proto != 6 || v.payload.len() < 20 {
+            return None;
+        }
+        let p = v.payload;
+        Some(Tcp4 {
+            src: v.src,
+            dst: v.dst,
+            sport: u16::from_be_bytes([p[0], p[1]]),
+            dport: u16::from_be_bytes([p[2], p[3]]),
+            seq: u32::from_be_bytes([p[4], p[5], p[6], p[7]]),
+            ack: u32::from_be_bytes([p[8], p[9], p[10], p[11]]),
+            flags: p[13],
+        })
+    }
+
     // ---- минимальный DNS ----
     pub fn build_dns_query(id: u16, qname: &str, qtype: u16) -> Vec<u8> {
         let mut m = Vec::new();
@@ -487,6 +574,26 @@ pub mod ip {
             assert_eq!(inet_checksum(&pkt[..20]), 0); // IP ок
         }
 
+        /// TCP-хелпер admin-пробы: собранный SYN парсится обратно, контрольные суммы IP и TCP
+        /// сходятся (полная сумма сегмента с псевдозаголовком == 0), флаги/порты на месте.
+        #[test]
+        fn tcp_syn_roundtrip_and_checksum() {
+            let src = [10, 7, 0, 9];
+            let dst = [10, 7, 0, 1];
+            let pkt = build_tcp4(src, 41000, dst, 7001, 0xdead_beef, 0, TCP_SYN, 64240);
+            assert_eq!(inet_checksum(&pkt[..20]), 0); // IP-заголовок валиден
+            let t = parse_tcp4(&pkt).unwrap();
+            assert_eq!((t.sport, t.dport), (41000, 7001));
+            assert_eq!((t.src, t.dst), (src, dst));
+            assert_eq!(t.seq, 0xdead_beef);
+            assert_eq!(t.flags, TCP_SYN);
+            // TCP-сумма: пересчёт по полученному сегменту (вместе с записанной суммой) даёт 0
+            let v = parse_ipv4(&pkt).unwrap();
+            assert_eq!(tcp_checksum(src, dst, v.payload), 0);
+            // не-TCP (UDP) через tcp-парсер — None (default-deny, не паника)
+            assert!(parse_tcp4(&build_udp4(src, 1, dst, 2, b"x")).is_none());
+        }
+
         #[test]
         fn dns_query_format_and_response_parse() {
             let q = build_dns_query(0xabcd, "example.com", 1);
@@ -569,6 +676,7 @@ mod fuzz {
             let _ = ip::icmp_echo_kind(&b);
             let _ = ip::build_icmp_echo_reply(&b);
             let _ = ip::parse_udp4(&b);
+            let _ = ip::parse_tcp4(&b);
             let _ = ip::parse_dns_response(&b);
         }
     }
