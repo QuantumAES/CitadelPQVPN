@@ -335,6 +335,7 @@ impl Daemon {
         let mut st = sh.status.clone();
         st.killswitch_armed = sh.net.killswitch_armed(&self.tools);
         st.version = env!("CARGO_PKG_VERSION").to_string();
+        st.daemon_started_unix = started_unix();
         st
     }
 
@@ -580,8 +581,23 @@ fn idle_status() -> StatusInfo {
     StatusInfo {
         state: "idle".into(),
         version: env!("CARGO_PKG_VERSION").to_string(),
+        daemon_started_unix: started_unix(),
         ..Default::default()
     }
+}
+
+/// Момент старта демона (unix-секунды), зафиксированный при первом обращении — то есть на
+/// старте процесса. См. [`StatusInfo::daemon_started_unix`]: по нему CLI отличает «работает
+/// свежеустановленный демон» от «на диске новый, а в памяти старый».
+fn started_unix() -> u64 {
+    use std::sync::OnceLock;
+    static T: OnceLock<u64> = OnceLock::new();
+    *T.get_or_init(|| {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0)
+    })
 }
 
 // ───────────────────────────── системное окружение ─────────────────────────────

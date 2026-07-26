@@ -38,7 +38,16 @@ Future<void> main() async {
       await windowManager.setResizable(false); // #п2: фиксированное окно
       // Окно фиксированного размера разворачивать некуда: кнопка «развернуть» либо не работала
       // бы, либо растянула бы портретный макет. Убираем её из системной рамки.
-      await windowManager.setMaximizable(false);
+      //
+      // Но НЕ на Linux: там `setMaximizable(false)` в window_manager сделан через
+      // `gtk_window_set_type_hint(GDK_WINDOW_TYPE_HINT_DIALOG)`, то есть окно объявляется
+      // диалогом — а диалогу WM (GNOME/KWin/Xfwm) рисует только «закрыть», без «свернуть».
+      // Так и пропала минимизация. Убрать одну кнопку, не задев другую, этим API нельзя:
+      // `setMinimizable` дёргает ровно тот же type hint. На Linux «развернуть» и без того
+      // недоступно — `setResizable(false)` уже запрещает менять размер.
+      if (!Platform.isLinux) {
+        await windowManager.setMaximizable(false);
+      }
       await windowManager.show();
       await windowManager.focus();
     });

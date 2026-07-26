@@ -86,6 +86,17 @@ fn print_help() {
 
 // ───────────────────────────── состояние и сессия ─────────────────────────────
 
+/// Сказать вслух, если демон работает из устаревшего бинаря (см. [`ipc::stale_daemon_hint`]).
+/// Молча пропускаем всё, что не удалось выяснить: подсказка обязана быть либо точной, либо
+/// отсутствовать — ложная тревога тут хуже молчания.
+fn warn_if_stale_daemon(c: &Client) {
+    if let Ok(s) = c.status() {
+        if let Some(h) = ipc::stale_daemon_hint(&s) {
+            eprintln!("ВНИМАНИЕ: {h}");
+        }
+    }
+}
+
 fn cmd_status() -> Result<()> {
     let c = Client::default();
     let s = c.status()?;
@@ -114,6 +125,9 @@ fn cmd_status() -> Result<()> {
         }
         println!("              подробности: journalctl -u citadel-vpnd -n 50");
     }
+    if let Some(h) = ipc::stale_daemon_hint(&s) {
+        println!("\nВНИМАНИЕ: {h}");
+    }
     Ok(())
 }
 
@@ -136,6 +150,9 @@ fn cmd_connect(name: Option<String>) -> Result<()> {
 
     let st = Settings::load();
     let c = Client::default();
+    // До подключения: если сессия не поднимется из-за давно исправленного бага в старом
+    // демоне, человек должен узнать причину сразу, а не из журнала.
+    warn_if_stale_daemon(&c);
     println!("Подключение к профилю «{}»…", sanitize_text(&label, 64));
     c.connect_session(ConnectReq {
         link: uri,
@@ -193,6 +210,7 @@ fn cmd_version() -> Result<()> {
         Ok(v) => println!("citadel-vpnd  {v} ({})", c.socket_path()),
         Err(e) => println!("citadel-vpnd  недоступен ({e})"),
     }
+    warn_if_stale_daemon(&c);
     Ok(())
 }
 

@@ -79,6 +79,18 @@ struct App {
     split_sel: usize,
     /// Прокрутка экрана справки (в маленьком терминале она не влезает целиком).
     help_scroll: u16,
+    /// Прокрутка журнала сессии, в строках **от начала**. Отсчёт от начала, а не от конца,
+    /// выбран намеренно: пока человек читает старую запись, приходящие снизу новые не должны
+    /// уводить у него текст из-под глаз.
+    log_scroll: usize,
+    /// Автопрокрутка к последнему сообщению. По умолчанию включена — в норме от журнала ждут
+    /// «хвоста», как от `journalctl -f`; выключается сама, как только пролистали вверх.
+    log_follow: bool,
+    /// Геометрия журнала с последней отрисовки: сколько строк видно и сколько их всего после
+    /// переноса. Считает это только рендер (перенос зависит от ширины окна), а нужны они
+    /// обработчику клавиш — иначе PageUp не знает, на сколько листать и где предел.
+    log_visible: usize,
+    log_total: usize,
     quit: bool,
 }
 
@@ -101,6 +113,10 @@ impl App {
             client: Client::default(),
             split_sel: 0,
             help_scroll: 0,
+            log_scroll: 0,
+            log_follow: true,
+            log_visible: 0,
+            log_total: 0,
             quit: false,
         }
     }
@@ -363,6 +379,22 @@ fn key_main(app: &mut App, key: KeyEvent) {
             app.lock();
             app.note("Хранилище заблокировано");
         }
+        // Журнал листается отдельно от списка профилей: ↑↓ заняты выбором профиля, поэтому
+        // для журнала — PageUp/PageDown, Shift+↑↓ построчно и Home/End к краям.
+        KeyCode::PageUp => log_scroll_by(app, -(app.log_visible.max(1) as isize)),
+        KeyCode::PageDown => log_scroll_by(app, app.log_visible.max(1) as isize),
+        KeyCode::Up if key.modifiers.contains(KeyModifiers::SHIFT) => log_scroll_by(app, -1),
+        KeyCode::Down if key.modifiers.contains(KeyModifiers::SHIFT) => log_scroll_by(app, 1),
+        KeyCode::Home => log_scroll_to(app, 0),
+        KeyCode::End => log_scroll_to(app, usize::MAX),
+        KeyCode::Char('f') => {
+            app.log_follow = !app.log_follow;
+            app.note(if app.log_follow {
+                "Автопрокрутка журнала включена"
+            } else {
+                "Автопрокрутка журнала выключена (f — включить, End — к последней записи)"
+            });
+        }
         KeyCode::Down | KeyCode::Char('j') => move_sel(app, 1),
         KeyCode::Up | KeyCode::Char('k') => move_sel(app, -1),
         KeyCode::Enter => do_connect(app),
@@ -404,6 +436,36 @@ fn key_main(app: &mut App, key: KeyEvent) {
         KeyCode::Char('?') | KeyCode::Char('h') => open_help(app),
         _ => {}
     }
+}
+
+/// Максимальная прокрутка журнала: дальше начнётся пустота под последней строкой.
+fn log_max_scroll(app: &App) -> usize {
+    app.log_total.saturating_sub(app.log_visible)
+}
+
+/// Сдвинуть журнал на `delta` строк.
+///
+/// Автопрокрутка выводится из позиции, а не хранится отдельным «режимом»: пролистали вверх —
+/// слежение выключилось само, вернулись к последней строке — включилось. Так поведение
+/// совпадает с `journalctl -f`/`less +F`, где не нужно помнить, в каком ты режиме.
+fn log_scroll_by(app: &mut App, delta: isize) {
+    let max = log_max_scroll(app);
+    app.log_scroll = clamp_scroll(app.log_scroll, delta, max);
+    app.log_follow = app.log_scroll >= max;
+}
+
+/// Сдвиг позиции с зажимом в `0..=max`. Отдельной функцией — чтобы проверять тестом без
+/// терминала: именно здесь легко получить прокрутку в пустоту или залипание у края.
+fn clamp_scroll(cur: usize, delta: isize, max: usize) -> usize {
+    let cur = cur.min(max) as isize;
+    (cur + delta).clamp(0, max as isize) as usize
+}
+
+/// Перейти к строке `to` (`usize::MAX` — к самой последней записи).
+fn log_scroll_to(app: &mut App, to: usize) {
+    let max = log_max_scroll(app);
+    app.log_scroll = to.min(max);
+    app.log_follow = app.log_scroll >= max;
 }
 
 fn move_sel(app: &mut App, delta: i32) {
@@ -649,6 +711,14 @@ fn draw_status_bar(f: &mut Frame, area: Rect, app: &App) {
             Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
         ));
     }
+    // Обновлённый на диске демон, который так и не перезапустили, ведёт себя как старый — и
+    // человек ищет причину в чём угодно, кроме этого. Говорим прямо в шапке.
+    if ipc::stale_daemon_hint(s).is_some() {
+        spans.push(Span::styled(
+            "│ демон УСТАРЕЛ: sudo systemctl restart citadel-vpnd ",
+            Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+        ));
+    }
     f.render_widget(
         Paragraph::new(Line::from(spans))
             .block(Block::default().borders(Borders::ALL).title(" CitadelPQVPN ")),
@@ -732,13 +802,89 @@ fn draw_main(f: &mut Frame, area: Rect, app: &mut App) {
         right[0],
     );
 
-    let log: Vec<Line> = app.log.iter().rev().take(50).rev().map(|l| Line::raw(format!(" {l}"))).collect();
+    draw_log(f, right[1], app);
+}
+
+/// Журнал сессии с прокруткой.
+///
+/// Переносим строки САМИ, вместо `Wrap`: прокрутке нужно знать, сколько строк получилось после
+/// переноса (где предел листания и куда прыгать по End), а `Paragraph` этого не сообщает.
+/// Заодно исчезает рассогласование «считали по записям, показали по строкам» — из-за него
+/// журнал прокручивался бы мимо на длинных сообщениях об ошибках.
+fn draw_log(f: &mut Frame, area: Rect, app: &mut App) {
+    // Внутренняя ширина: минус рамка (2) и минус ведущий пробел отступа.
+    let width = area.width.saturating_sub(3) as usize;
+    let rows: Vec<String> = app.log.iter().flat_map(|l| wrap_text(l, width)).collect();
+
+    let visible = area.height.saturating_sub(2) as usize;
+    app.log_visible = visible;
+    app.log_total = rows.len();
+    let max = log_max_scroll(app);
+    // Слежение за хвостом пересчитывается каждый кадр: и новая запись, и изменение размера
+    // терминала должны оставлять нас внизу, раз автопрокрутка включена.
+    if app.log_follow {
+        app.log_scroll = max;
+    }
+    let scroll = app.log_scroll.min(max);
+
+    // Заголовок честно говорит, что видно и следим ли за хвостом — иначе «журнал замер»
+    // выглядит как зависший клиент.
+    let title = if app.log_follow {
+        " Журнал сессии ".to_string()
+    } else {
+        format!(" Журнал сессии — {}/{} строк, автопрокрутка выкл (f) ", (scroll + visible).min(rows.len()), rows.len())
+    };
+    let lines: Vec<Line> = rows.into_iter().map(|s| Line::raw(format!(" {s}"))).collect();
     f.render_widget(
-        Paragraph::new(log)
-            .wrap(Wrap { trim: true })
-            .block(Block::default().borders(Borders::ALL).title(" Журнал сессии ")),
-        right[1],
+        Paragraph::new(lines)
+            .scroll((scroll.min(u16::MAX as usize) as u16, 0))
+            .block(Block::default().borders(Borders::ALL).title(title)),
+        area,
     );
+}
+
+/// Разложить строку по ширине окна, по возможности не разрывая слова. Слово длиннее строки
+/// (URL, hex-пин) режется жёстко — иначе оно вытолкнуло бы разметку за край.
+///
+/// Ширина считается в символах: журнал состоит из ASCII и кириллицы, где символ занимает ровно
+/// одну колонку, а управляющие последовательности отсюда уже вычищены (`sanitize_text`, L16).
+fn wrap_text(s: &str, width: usize) -> Vec<String> {
+    if width == 0 {
+        return vec![String::new()];
+    }
+    if s.chars().count() <= width {
+        return vec![s.to_string()];
+    }
+    let mut out = Vec::new();
+    let mut cur = String::new();
+    let mut cur_len = 0usize;
+    for word in s.split(' ') {
+        let wl = word.chars().count();
+        if cur_len > 0 && cur_len + 1 + wl > width {
+            out.push(std::mem::take(&mut cur));
+            cur_len = 0;
+        }
+        if wl > width {
+            // Длинное слово: добиваем текущую строку и рубим остаток по ширине.
+            for ch in word.chars() {
+                if cur_len == width {
+                    out.push(std::mem::take(&mut cur));
+                    cur_len = 0;
+                }
+                cur.push(ch);
+                cur_len += 1;
+            }
+            continue;
+        }
+        if cur_len > 0 {
+            cur.push(' ');
+            cur_len += 1;
+        }
+        cur.push_str(word);
+        cur_len += wl;
+    }
+    out.push(cur);
+    out
 }
 
 fn draw_split(f: &mut Frame, area: Rect, app: &App) {
@@ -779,6 +925,13 @@ fn draw_help(f: &mut Frame, area: Rect, app: &App) {
         key("D", "снять залипшие fail-closed правила (нет сети после краха)"),
         key("l", "закрыть хранилище (профили уйдут из памяти)"),
         key("q / Esc", "выйти из интерфейса"),
+        Line::raw(""),
+        head("Журнал сессии  (правая нижняя панель)"),
+        key("PgUp / PgDn", "листать журнал на страницу"),
+        key("Shift+↑ ↓", "листать журнал построчно"),
+        key("Home / End", "к первой / к последней записи"),
+        key("f", "автопрокрутка вкл/выкл (по умолчанию включена)"),
+        Line::raw("   Прокрутка вверх выключает слежение за хвостом, возврат вниз — включает."),
         Line::raw(""),
         head("Split-tunnel  (экран «s»)"),
         key("m", "режим: off → exclude → include"),
@@ -836,7 +989,7 @@ fn draw_input(f: &mut Frame, area: Rect, app: &App, title: &str, hint: &str) {
 
 fn draw_footer(f: &mut Frame, area: Rect, app: &App) {
     let keys = match app.screen {
-        Screen::Main => " Enter подключить │ d отключить │ a добавить │ x удалить │ K kill-switch │ D снять защиту │ s split │ l закрыть хранилище │ ? справка │ q выход",
+        Screen::Main => " Enter подключить │ d отключить │ a добавить │ x удалить │ K kill-switch │ D снять защиту │ s split │ PgUp/PgDn журнал │ f автопрокрутка │ ? справка │ q выход",
         Screen::Unlock { .. } => " Enter подтвердить │ F1 справка │ Esc выход",
         Screen::AddLink => " Enter добавить │ Tab показать/скрыть │ F1 справка │ Esc отмена",
         Screen::ConfirmRemove { .. } => " y удалить │ любая другая — отмена",
@@ -853,4 +1006,44 @@ fn draw_footer(f: &mut Frame, area: Rect, app: &App) {
         Paragraph::new(Line::styled(msg, style)).block(Block::default().borders(Borders::ALL)),
         area,
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Короткая строка не режется, длинная — рвётся по пробелам и НЕ теряет ни символа.
+    #[test]
+    fn wrap_keeps_words_and_content() {
+        assert_eq!(wrap_text("коротко", 20), vec!["коротко"]);
+        let rows = wrap_text("демон отказал в конфигурации туннеля", 12);
+        assert!(rows.iter().all(|r| r.chars().count() <= 12), "строка шире окна: {rows:?}");
+        assert_eq!(rows.join(" "), "демон отказал в конфигурации туннеля");
+    }
+
+    /// Слово длиннее окна режется жёстко — иначе оно вылезло бы за рамку.
+    #[test]
+    fn wrap_splits_overlong_word() {
+        let rows = wrap_text("4bd28b925381c481289149c2bc58f20f", 10);
+        assert!(rows.iter().all(|r| r.chars().count() <= 10), "{rows:?}");
+        assert_eq!(rows.concat(), "4bd28b925381c481289149c2bc58f20f");
+    }
+
+    /// Нулевая ширина (окно схлопнуто) не должна ни паниковать, ни зациклиться.
+    #[test]
+    fn wrap_zero_width_is_safe() {
+        assert_eq!(wrap_text("что-нибудь", 0), vec![String::new()]);
+    }
+
+    /// Прокрутка не уходит в пустоту за последней строкой и не проваливается выше первой.
+    #[test]
+    fn scroll_clamped_to_bounds() {
+        assert_eq!(clamp_scroll(0, -5, 10), 0);
+        assert_eq!(clamp_scroll(3, 100, 10), 10);
+        assert_eq!(clamp_scroll(4, -2, 10), 2);
+        // Журнал короче окна — листать некуда.
+        assert_eq!(clamp_scroll(0, 7, 0), 0);
+        // Окно выросло (max упал) — позиция подтягивается к новому пределу, а не остаётся за ним.
+        assert_eq!(clamp_scroll(50, 0, 10), 10);
+    }
 }

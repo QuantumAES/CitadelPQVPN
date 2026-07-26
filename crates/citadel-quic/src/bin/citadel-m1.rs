@@ -7,7 +7,7 @@
 //!     (drop приватных/служебных назначений, анти-пивот во внутреннюю сеть).
 //!
 //! env: Citadel_ROLE=server|client, Citadel_TUN=Citadel0, Citadel_MTU=1280
-//!   server: Citadel_LISTEN=0.0.0.0:4433, Citadel_TUN_ADDR=10.7.0.1/24, Citadel_NAT_SRC=10.7.0.0/24,
+//!   server: Citadel_LISTEN=0.0.0.0:4433, Citadel_TUN_ADDR=10.7.0.1/16, Citadel_NAT_SRC=10.7.0.0/16,
 //!           Citadel_PIN_FILE=/shared/exit.pin (куда записать pin)
 //!   client: Citadel_SERVERS="h1:p h2:p" (M5 multi-server; или один Citadel_CONNECT=host:port),
 //!           Citadel_SERVER_NAME=Citadel.exit, Citadel_ROUTES="1.1.1.1/32 ...",
@@ -47,35 +47,62 @@ struct AddrPool {
     net: u32,   // сетевой адрес (host-order u32)
     prefix: u8,
     hosts: u32, // размер host-пространства = 2^(32-prefix)
+    /// Host-индекс шлюза — адреса самого exit'а из `Citadel_TUN_ADDR` (он же ADMIN_VIP, C7.2).
+    ///
+    /// Именно индекс, а не «единица»: при `10.7.0.1/16` шлюз действительно идёт первым в сети,
+    /// но стоит расширить подсеть до `10.7.0.1/12` — сеть становится `10.0.0.0/12`, а шлюз
+    /// оказывается в её глубине (host-индекс 458753). Пул, считающий шлюзом «сеть+1», выдал бы
+    /// `10.7.0.1` очередному клиенту: коллизия с самим exit'ом и с admin-каналом «Абоненты».
+    gw: u32,
     used: HashSet<u32>,
     next: u32, // hint (host-индекс)
 }
 
 impl AddrPool {
     fn from_env() -> Self {
-        let s = std::env::var("Citadel_TUN_ADDR").unwrap_or_else(|_| "10.7.0.1/24".into());
+        const DEFAULT_PREFIX: u8 = 16;
+        let s = std::env::var("Citadel_TUN_ADDR").unwrap_or_else(|_| "10.7.0.1/16".into());
         let (ip_s, prefix) = match s.split_once('/') {
-            Some((i, p)) => (i.to_string(), p.parse::<u8>().unwrap_or(24)),
-            None => (s, 24),
+            Some((i, p)) => (i.to_string(), p.parse::<u8>().unwrap_or(DEFAULT_PREFIX)),
+            None => (s, DEFAULT_PREFIX),
         };
         let prefix = prefix.min(32);
         let ip = ip_s.parse::<std::net::Ipv4Addr>().unwrap_or(std::net::Ipv4Addr::new(10, 7, 0, 1));
         let mask = if prefix == 0 { 0 } else { u32::MAX << (32 - prefix as u32) };
         let net = u32::from(ip) & mask;
         let hosts = 1u32.checked_shl(32 - prefix as u32).unwrap_or(0);
-        AddrPool { net, prefix, hosts, used: HashSet::new(), next: 2 }
+        AddrPool { net, prefix, hosts, gw: u32::from(ip) - net, used: HashSet::new(), next: 1 }
     }
 
-    /// Выделить свободный host-индекс из `[2, hosts-2]` (пропуск network=0, gateway=1, broadcast=last).
-    /// `None` — пул исчерпан.
-    fn alloc(&mut self) -> Option<[u8; 4]> {
+    /// Число адресов, которые пул вообще может выдать: всё host-пространство минус network,
+    /// broadcast и шлюз.
+    fn capacity(&self) -> usize {
         if self.hosts < 4 {
-            return None; // подсеть слишком мелкая (нет хостов кроме reserved)
+            return 0;
         }
         let last = self.hosts - 1; // индекс broadcast
-        for _ in 2..self.hosts {
+        let candidates = (last - 1) as usize; // индексы 1..=last-1
+        candidates - usize::from((1..last).contains(&self.gw))
+    }
+
+    /// Выделить свободный host-индекс из `[1, hosts-2]`, пропустив шлюз. `None` — пул исчерпан.
+    fn alloc(&mut self) -> Option<[u8; 4]> {
+        // Проверка «пул полон» ДО сканирования — иначе на исчерпанной подсети каждый запрос
+        // прочёсывал бы всё host-пространство под общим мьютексом. Для /24 это незаметно, для
+        // /12 (миллион адресов) — готовая точка отказа: заняв пул, его можно было бы держать
+        // заклиненным дешёвыми повторными коннектами.
+        if self.used.len() >= self.capacity() {
+            return None;
+        }
+        let last = self.hosts - 1;
+        // Цикл покрывает весь диапазон кандидатов ровно один раз: `next` идёт по кругу
+        // 1..=last-1, а свободный индекс гарантированно есть — его наличие проверено выше.
+        for _ in 1..last {
             let idx = self.next;
-            self.next = if self.next + 1 >= last { 2 } else { self.next + 1 };
+            self.next = if self.next + 1 >= last { 1 } else { self.next + 1 };
+            if idx == self.gw {
+                continue; // адрес самого exit'а (ADMIN_VIP) клиенту не выдаём
+            }
             if self.used.insert(idx) {
                 return Some((self.net + idx).to_be_bytes());
             }
@@ -195,7 +222,7 @@ fn server_setup_net(ifname: &str) {
     }
     run("ip", &["link", "set", ifname, "mtu", &mtu(), "up"]);
     let _ = std::fs::write("/proc/sys/net/ipv4/ip_forward", b"1");
-    let nat = std::env::var("Citadel_NAT_SRC").unwrap_or_else(|_| "10.7.0.0/24".into());
+    let nat = std::env::var("Citadel_NAT_SRC").unwrap_or_else(|_| "10.7.0.0/16".into());
     let eg = detect_egress();
     run("iptables", &["-t", "nat", "-A", "POSTROUTING", "-s", &nat, "-o", &eg, "-j", "MASQUERADE"]);
     // S0.2/H3: форвардим ТОЛЬКО из пула клиентских адресов; прочий inner-src (спуфинг) — DROP.
@@ -873,11 +900,17 @@ async fn run_auth_probe() -> Result<()> {
 mod tests {
     use super::*;
 
-    /// AddrPool 10.7.0.0/prefix (без env) — для тестов пула.
-    fn pool(prefix: u8) -> AddrPool {
-        let net = u32::from(std::net::Ipv4Addr::new(10, 7, 0, 0)) & (u32::MAX << (32 - prefix as u32));
+    /// AddrPool из адреса шлюза с префиксом (без env) — для тестов пула.
+    fn pool_gw(gw: [u8; 4], prefix: u8) -> AddrPool {
+        let ip = u32::from(std::net::Ipv4Addr::new(gw[0], gw[1], gw[2], gw[3]));
+        let net = ip & (u32::MAX << (32 - prefix as u32));
         let hosts = 1u32 << (32 - prefix as u32);
-        AddrPool { net, prefix, hosts, used: HashSet::new(), next: 2 }
+        AddrPool { net, prefix, hosts, gw: ip - net, used: HashSet::new(), next: 1 }
+    }
+
+    /// Штатная раскладка: шлюз — первый адрес подсети (10.7.0.1/prefix).
+    fn pool(prefix: u8) -> AddrPool {
+        pool_gw([10, 7, 0, 1], prefix)
     }
 
     /// C4: пул выдаёт РАЗНЫЕ адреса, пропускает reserved (network/gateway/broadcast), исчерпание →
@@ -909,6 +942,50 @@ mod tests {
             assert!((2..=254).contains(&a[3]));
         }
         assert!(p.alloc().is_none(), "/24 исчерпан на 253 адресах");
+    }
+
+    /// Штатная сеть /16: пул остаётся внутри подсети и не выдаёт адрес шлюза.
+    #[test]
+    fn addr_pool_16_is_default_shape() {
+        let mut p = pool(16);
+        assert_eq!(p.capacity(), 65533, "/16: 65536 минус network, broadcast и шлюз");
+        for _ in 0..1000 {
+            let a = p.alloc().unwrap();
+            assert_eq!([a[0], a[1]], [10, 7], "адрес вне /16: {a:?}");
+            assert_ne!(a, [10, 7, 0, 1], "выдан адрес шлюза");
+        }
+    }
+
+    /// Запас на расширение до /12. Здесь ломался бы прежний пул: сеть становится 10.0.0.0/12,
+    /// шлюз 10.7.0.1 лежит НЕ первым адресом, и «пропускаем сеть+1» его больше не защищает —
+    /// он достался бы клиенту (коллизия с exit'ом и с admin-каналом ADMIN_VIP).
+    #[test]
+    fn addr_pool_12_never_hands_out_gateway() {
+        let mut p = pool_gw([10, 7, 0, 1], 12);
+        assert_eq!(p.capacity(), (1 << 20) - 3);
+        // Гоним пул через окрестность шлюза: индекс 458753 должен быть пропущен.
+        let gw_idx = 0x0007_0001u32;
+        p.next = gw_idx - 2;
+        let got: Vec<[u8; 4]> = (0..5).map(|_| p.alloc().unwrap()).collect();
+        assert!(!got.contains(&[10, 7, 0, 1]), "выдан адрес шлюза: {got:?}");
+        assert!(got.contains(&[10, 7, 0, 0]) && got.contains(&[10, 7, 0, 2]), "соседи выданы: {got:?}");
+        for a in &got {
+            assert!(a[0] == 10 && a[1] < 16, "адрес вне 10.0.0.0/12: {a:?}");
+        }
+    }
+
+    /// Исчерпанный пул отвечает `None` сразу, не прочёсывая host-пространство (анти-DoS: на /12
+    /// такой скан — миллион итераций под общим мьютексом на каждый коннект).
+    #[test]
+    fn addr_pool_exhausted_is_cheap() {
+        let mut p = pool(29); // 8 адресов → capacity 5
+        assert_eq!(p.capacity(), 5);
+        for _ in 0..5 {
+            p.alloc().unwrap();
+        }
+        let before = p.next;
+        assert!(p.alloc().is_none());
+        assert_eq!(p.next, before, "исчерпанный пул не должен даже двигать курсор");
     }
 
     /// C5: double-spend ловится; prune чистит бакеты старше current-1; Legacy (эпоха 0) не чистится.

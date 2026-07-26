@@ -55,26 +55,60 @@ INSTALLER_SHA="$(sha256sum "$INSTALLER" | cut -d' ' -f1)"
 assets=("${zst[@]}" "${apk[@]}" "$DIST/sha256sums" "$DIST/sha256sums.minisig" "$INSTALLER")
 
 # ── клиентские артефакты (если собраны mk-client-release.sh) — для notes ──
-APK_NAME=""; LINUX_NAME=""
+#
+# Сами файлы уходят в релиз и так (glob *.zst / *.apk выше). Здесь — человекочитаемая часть:
+# артефакт, не описанный в notes, на странице релиза выглядит как безымянный архив, и им никто
+# не пользуется. Ровно так до этого выпадал консольный клиент (трек L): тарбол выкладывался,
+# но в notes его не было.
+APK_NAME=""; GUI_NAME=""; CLI_NAME=""
 for f in "${apk[@]}"; do APK_NAME="$(basename "$f")"; done
 shopt -s nullglob
-for f in "$DIST"/citadel-desktop-linux-*.tar.zst; do LINUX_NAME="$(basename "$f")"; done
+for f in "$DIST"/citadel-desktop-linux-*.tar.zst; do GUI_NAME="$(basename "$f")"; done
+for f in "$DIST"/citadel-cli-linux-*.tar.zst;     do CLI_NAME="$(basename "$f")"; done
 shopt -u nullglob
-CLIENTS_BLOCK=""
-if [[ -n "$APK_NAME" || -n "$LINUX_NAME" ]]; then
-  CLIENTS_BLOCK="$(cat <<EOF
 
-Клиенты:
-${APK_NAME:+    Android: $APK_NAME (fat APK; разреши установку из неизвестных источников).}
-${LINUX_NAME:+    Linux:   $LINUX_NAME — распакуй и поставь:}
-${LINUX_NAME:+        tar --zstd -xf $LINUX_NAME && cd citadel-desktop-linux-* && ./install.sh}
-EOF
-)"
+# Пропущенный клиент — почти всегда забытый флаг сборки (--no-apk/--no-cli), а не замысел.
+[[ -n "$CLI_NAME" ]] || echo "[publish] NB: в $DIST нет citadel-cli-linux-*.tar.zst (собран с --no-cli?)"
+[[ -n "$GUI_NAME" ]] || echo "[publish] NB: в $DIST нет citadel-desktop-linux-*.tar.zst"
+[[ -n "$APK_NAME" ]] || echo "[publish] NB: в $DIST нет APK (собран с --no-apk?)"
+
+CLIENTS_BLOCK=""
+add() { CLIENTS_BLOCK+="$1"$'\n'; }
+if [[ -n "$APK_NAME" || -n "$GUI_NAME" || -n "$CLI_NAME" ]]; then
+  add ""
+  add "Клиенты:"
+  if [[ -n "$APK_NAME" ]]; then
+    add ""
+    add "  Android — $APK_NAME (fat APK, все ABI; разреши установку из неизвестных источников)."
+  fi
+  if [[ -n "$GUI_NAME" ]]; then
+    add ""
+    add "  Linux, графический — $GUI_NAME:"
+    add ""
+    add "      tar --zstd -xf $GUI_NAME && cd citadel-desktop-linux-* && ./install.sh"
+  fi
+  if [[ -n "$CLI_NAME" ]]; then
+    add ""
+    add "  Linux, консольный — $CLI_NAME (citadel-cli + демон citadel-vpnd,"
+    add "  разделение привилегий: плумбер под root, движок под отдельным uid, TUI под юзером):"
+    add ""
+    add "      tar --zstd -xf $CLI_NAME && cd citadel-cli-linux-* && sudo ./install.sh"
+    add "      sudo usermod -aG citadel-vpn \$USER      # затем ПЕРЕЛОГИНЬТЕСЬ"
+    add "      citadel-cli"
+    add ""
+    add "  Право управлять туннелем даёт членство в группе citadel-vpn, и установщик НИКОГО в неё"
+    add "  не добавляет сам: её член управляет маршрутизацией всей машины (docs/LINUX-CLI.md, L3)."
+    add "  Без членства citadel-cli скажет «нет доступа к сокету» — это не поломка."
+    add "  Установка поверх прежней версии сама перезапускает демон: без этого в памяти оставался"
+    add "  бы старый процесс, и обновление не вступило бы в силу. Активная сессия при этом рвётся"
+    add "  чисто — kill-switch снимается."
+  fi
 fi
 
 # ── notes (без backtick'ов: код-блоки 4 пробелами; heredoc раскрывает $… ) ──
 notes="$(cat <<EOF
-CitadelPQVPN $TAG — подписанные бинари exit-сервера + клиенты (Android/Linux).
+CitadelPQVPN $TAG — подписанные бинари exit-сервера + клиенты
+(Android, Linux графический, Linux консольный).
 $CLIENTS_BLOCK
 
 Развёртывание СЕРВЕРА (root):
@@ -110,8 +144,12 @@ fi
 
 # ── создать или обновить релиз (идемпотентно) ──
 if gh release view "$TAG" >/dev/null 2>&1; then
-  echo "[publish] релиз $TAG уже существует → обновляю ассеты (--clobber)"
+  echo "[publish] релиз $TAG уже существует → обновляю ассеты (--clobber) и notes"
   gh release upload "$TAG" "${assets[@]}" --clobber
+  # Notes обновляем тоже: раньше их писал только `create`, и добавленный в существующий релиз
+  # артефакт (как консольный клиент) навсегда оставался неописанным — файл есть, инструкции нет.
+  # Плюс sha256sums в notes обязаны совпадать с выложенными, иначе ручная проверка не сойдётся.
+  gh release edit "$TAG" --notes "$notes" >/dev/null
 else
   echo "[publish] создаю релиз $TAG"
   gh release create "$TAG" "${assets[@]}" \

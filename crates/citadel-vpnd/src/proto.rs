@@ -103,6 +103,13 @@ pub struct StatusInfo {
     pub owner_uid: u32,
     /// Версия демона.
     pub version: String,
+    /// Когда стартовал САМ демон (unix-секунды). Нужно, чтобы поймать «на диске лежит новый
+    /// бинарь, а работает старый процесс»: `systemctl enable --now` не перезапускает активный
+    /// юнит, и после апгрейда исправленный демон может так и не начать работать — снаружи это
+    /// выглядит как «фикс не помог». `serde(default)` обязателен: демон прошлой версии этого
+    /// поля не пришлёт, и новый CLI обязан спокойно прочитать его ответ (0 = «не знаю»).
+    #[serde(default)]
+    pub daemon_started_unix: u64,
 }
 
 /// Событие движка, ретранслируемое подписчикам.
@@ -241,6 +248,50 @@ mod tests {
             }
             other => panic!("не тот вариант: {other:?}"),
         }
+    }
+
+    /// Совместимость версий в обе стороны на управляющем канале.
+    ///
+    /// CLI и демон обновляются одним установщиком, но между установкой файлов и перезапуском
+    /// юнита они РАЗНЫХ версий — именно в этом окне и живёт диагностика «демон устарел». Если
+    /// разбор кадра в этот момент падает, `citadel-cli status` вместо понятной подсказки выдаёт
+    /// ошибку протокола, и человек остаётся без объяснения.
+    ///
+    /// Проверяем оба направления на примере поля `daemon_started_unix`:
+    ///   * новый клиент читает ответ СТАРОГО демона (поля нет) → `serde(default)` даёт 0;
+    ///   * старый клиент читает ответ НОВОГО демона (поле лишнее) → неизвестные поля игнорируются.
+    #[test]
+    fn status_info_is_version_compatible_both_ways() {
+        /// Снимок `StatusInfo` до появления `daemon_started_unix` (демон прошлой версии).
+        #[derive(Serialize, Deserialize, Default)]
+        struct OldStatusInfo {
+            state: String,
+            exit: String,
+            transport: String,
+            cidr: String,
+            since_unix: u64,
+            label: String,
+            killswitch_armed: bool,
+            last_error: String,
+            owner_uid: u32,
+            version: String,
+        }
+
+        // старый демон → новый клиент
+        let old = OldStatusInfo { state: "up".into(), version: "0.1.0".into(), ..Default::default() };
+        let mut buf = Vec::new();
+        write_frame(&mut buf, &old).unwrap();
+        let got: StatusInfo = read_frame(&mut &buf[..]).unwrap().unwrap();
+        assert_eq!(got.state, "up");
+        assert_eq!(got.version, "0.1.0");
+        assert_eq!(got.daemon_started_unix, 0, "поля не было — должен быть default");
+
+        // новый демон → старый клиент
+        let new = StatusInfo { state: "up".into(), daemon_started_unix: 1_700_000_000, ..Default::default() };
+        let mut buf = Vec::new();
+        write_frame(&mut buf, &new).unwrap();
+        let back: OldStatusInfo = read_frame(&mut &buf[..]).unwrap().unwrap();
+        assert_eq!(back.state, "up", "лишнее поле не должно ломать разбор");
     }
 
     /// EOF на границе кадра — это не ошибка, а нормальное закрытие канала.

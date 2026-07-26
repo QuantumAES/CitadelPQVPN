@@ -235,7 +235,16 @@ log "Установка systemd-юнитов…"
 $SUDO install -m 644 -o root -g root "$HERE/citadel-vpnd.service"     "$UNIT_DIR/citadel-vpnd.service"
 $SUDO install -m 644 -o root -g root "$HERE/citadel-lockdown.service" "$UNIT_DIR/citadel-lockdown.service"
 $SUDO systemctl daemon-reload
-$SUDO systemctl enable --now citadel-vpnd.service
+$SUDO systemctl enable citadel-vpnd.service
+# ВАЖНО, апгрейд: `enable --now` на УЖЕ запущенном юните — no-op (`start` активный юнит не
+# трогает), а `daemon-reload` не перечитывает песочницу работающего процесса. Без restart
+# после обновления в системе продолжает жить СТАРЫЙ демон: старый бинарь и старый
+# `ProtectSystem` без `ReadWritePaths=/etc` — то есть «уже исправленные» баги возвращаются.
+# Активную сессию restart рвёт, но чисто: по SIGTERM демон снимает kill-switch.
+if $SUDO systemctl is-active --quiet citadel-vpnd.service; then
+  log "Демон уже работает — перезапускаю на новую версию (активная сессия будет разорвана)…"
+fi
+$SUDO systemctl restart citadel-vpnd.service
 
 if [[ -n "$ADD_USER" ]]; then
   log "Добавляю $ADD_USER в группу $SVC_GROUP…"

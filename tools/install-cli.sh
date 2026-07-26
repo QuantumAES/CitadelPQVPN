@@ -80,7 +80,17 @@ log "Установка systemd-юнитов…"
 $SUDO install -m 644 -o root -g root "$REPO/packaging/linux/citadel-vpnd.service"     "$UNIT_DIR/citadel-vpnd.service"
 $SUDO install -m 644 -o root -g root "$REPO/packaging/linux/citadel-lockdown.service" "$UNIT_DIR/citadel-lockdown.service"
 $SUDO systemctl daemon-reload
-$SUDO systemctl enable --now citadel-vpnd.service
+$SUDO systemctl enable citadel-vpnd.service
+# ВАЖНО, апгрейд: `enable --now` на УЖЕ запущенном юните — no-op (`start` активный юнит не
+# трогает), а `daemon-reload` не перечитывает песочницу работающего процесса. То есть после
+# обновления в системе продолжал жить СТАРЫЙ демон: старый бинарь и старый `ProtectSystem`
+# без `ReadWritePaths=/etc`. Ровно так «уже исправленный» EROFS на /etc/resolv.conf валил
+# сессию у пользователя, у которого фикс давно стоял на диске. Поэтому — безусловный restart.
+# Активную сессию он рвёт, но чисто: по SIGTERM демон снимает kill-switch (teardown clean).
+if $SUDO systemctl is-active --quiet citadel-vpnd.service; then
+  log "Демон уже работает — перезапускаю на новую версию (активная сессия будет разорвана)…"
+fi
+$SUDO systemctl restart citadel-vpnd.service
 
 # 6. доступ пользователю (только по явной просьбе)
 if [[ -n "$ADD_USER" ]]; then
