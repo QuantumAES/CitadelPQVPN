@@ -56,6 +56,8 @@ enum Screen {
     ConfirmRemove { id: String, name: String },
     /// Настройка split-tunnel.
     Split { adding: bool },
+    /// Справка по клавишам (`?` или F1). Помнит, откуда её открыли, чтобы вернуть обратно.
+    Help { from_split: bool },
 }
 
 struct App {
@@ -75,6 +77,8 @@ struct App {
     last_key: Instant,
     client: Client,
     split_sel: usize,
+    /// Прокрутка экрана справки (в маленьком терминале она не влезает целиком).
+    help_scroll: u16,
     quit: bool,
 }
 
@@ -96,6 +100,7 @@ impl App {
             last_key: Instant::now(),
             client: Client::default(),
             split_sel: 0,
+            help_scroll: 0,
             quit: false,
         }
     }
@@ -248,12 +253,41 @@ fn handle_key(app: &mut App, key: KeyEvent) {
         app.quit = true;
         return;
     }
+    // F1 работает всюду, включая экраны ввода: там символ «?» — часть пароля/ссылки, перехватить
+    // его нельзя. На экранах без ввода справку открывает и «?».
+    if key.code == KeyCode::F(1) && !matches!(app.screen, Screen::Help { .. }) {
+        open_help(app);
+        return;
+    }
     match &app.screen {
         Screen::Unlock { .. } => key_unlock(app, key),
         Screen::Main => key_main(app, key),
         Screen::AddLink => key_add(app, key),
         Screen::ConfirmRemove { .. } => key_confirm(app, key),
         Screen::Split { .. } => key_split(app, key),
+        Screen::Help { .. } => key_help(app, key),
+    }
+}
+
+/// Открыть справку, запомнив экран возврата.
+fn open_help(app: &mut App) {
+    let from_split = matches!(app.screen, Screen::Split { .. });
+    app.help_scroll = 0;
+    app.screen = Screen::Help { from_split };
+    app.note("Справка: ↑↓ прокрутка, Esc — назад");
+}
+
+fn key_help(app: &mut App, key: KeyEvent) {
+    let from_split = matches!(app.screen, Screen::Help { from_split: true });
+    match key.code {
+        KeyCode::Down | KeyCode::Char('j') => app.help_scroll = app.help_scroll.saturating_add(1),
+        KeyCode::Up | KeyCode::Char('k') => app.help_scroll = app.help_scroll.saturating_sub(1),
+        // Любая другая клавиша закрывает справку — так её не приходится «искать, чем выйти».
+        _ => {
+            app.screen = if from_split { Screen::Split { adding: false } } else { Screen::Main };
+            app.message.clear();
+            app.error = false;
+        }
     }
 }
 
@@ -367,6 +401,7 @@ fn key_main(app: &mut App, key: KeyEvent) {
             app.split_sel = 0;
             app.screen = Screen::Split { adding: false };
         }
+        KeyCode::Char('?') | KeyCode::Char('h') => open_help(app),
         _ => {}
     }
 }
@@ -507,6 +542,7 @@ fn key_split(app: &mut App, key: KeyEvent) {
     }
     match key.code {
         KeyCode::Esc | KeyCode::Char('q') => app.screen = Screen::Main,
+        KeyCode::Char('?') | KeyCode::Char('h') => open_help(app),
         KeyCode::Char('m') => {
             app.settings.dest_mode = match app.settings.dest_mode.as_str() {
                 "off" => "exclude".into(),
@@ -579,6 +615,7 @@ fn draw(f: &mut Frame, app: &mut App) {
                 draw_split(f, rows[1], app);
             }
         }
+        Screen::Help { .. } => draw_help(f, rows[1], app),
     }
     draw_footer(f, rows[2], app);
 }
@@ -637,7 +674,7 @@ fn draw_unlock(f: &mut Frame, area: Rect, app: &App, create: bool, second: bool)
         Line::raw(format!("  {masked}▏")),
         Line::raw(""),
         Line::raw(format!("  Хранилище: {}", settings::vault_path().display())),
-        Line::raw("  Enter — подтвердить, Esc — выход"),
+        Line::raw("  Enter — подтвердить, F1 — справка, Esc — выход"),
     ];
     f.render_widget(
         Paragraph::new(body).block(Block::default().borders(Borders::ALL).title(title)),
@@ -673,10 +710,19 @@ fn draw_main(f: &mut Frame, area: Rect, app: &mut App) {
         Line::raw(format!(" Split:        {} {}", st.dest_mode, st.dests.join(" "))),
         Line::raw(format!(" Хранилище:    {}", settings::vault_path().display())),
     ];
+    // Человеку — что случилось и с чем, а не текст ошибки движка: технические подробности всё
+    // равно есть рядом, в журнале сессии (и в `journalctl -u citadel-vpnd`).
     if !app.status.last_error.is_empty() {
+        let label = sanitize_text(&app.status.label, 48);
+        let what = if label.is_empty() {
+            " Сервер недоступен".to_string()
+        } else {
+            format!(" Сервер недоступен — профиль «{label}»")
+        };
+        info.push(Line::styled(what, Style::default().fg(Color::Red)));
         info.push(Line::styled(
-            format!(" Ошибка: {}", sanitize_text(&app.status.last_error, 200)),
-            Style::default().fg(Color::Red),
+            " Подробности — в журнале сессии справа",
+            Style::default().fg(Color::DarkGray),
         ));
     }
     f.render_widget(
@@ -716,6 +762,58 @@ fn draw_split(f: &mut Frame, area: Rect, app: &App) {
     );
 }
 
+/// Справка по клавишам (`?`/F1). Отвечает на два вопроса, которые в TUI не видны сами: какая
+/// клавиша что делает на КАЖДОМ экране и что происходит с сессией при выходе из интерфейса.
+fn draw_help(f: &mut Frame, area: Rect, app: &App) {
+    let head = |s: &str| Line::styled(format!(" {s}"), Style::default().add_modifier(Modifier::BOLD));
+    let key = |k: &str, what: &str| Line::raw(format!("   {k:<14}{what}"));
+    let lines = vec![
+        head("Список профилей"),
+        key("↑ ↓ / k j", "выбрать профиль"),
+        key("Enter", "подключиться к выбранному профилю"),
+        key("d", "отключиться (чистый разрыв — kill-switch снимается)"),
+        key("a", "добавить профиль из citadel://-ссылки"),
+        key("x", "удалить выбранный профиль (спросит подтверждение)"),
+        key("s", "split-tunnel: какие назначения идут через туннель"),
+        key("K", "kill-switch вкл/выкл (действует со следующего подключения)"),
+        key("D", "снять залипшие fail-closed правила (нет сети после краха)"),
+        key("l", "закрыть хранилище (профили уйдут из памяти)"),
+        key("q / Esc", "выйти из интерфейса"),
+        Line::raw(""),
+        head("Split-tunnel  (экран «s»)"),
+        key("m", "режим: off → exclude → include"),
+        key("a / x", "добавить / удалить назначение (IP, CIDR или домен)"),
+        key("↑ ↓", "выбрать назначение в списке"),
+        key("Esc / q", "назад к профилям"),
+        Line::raw("   exclude — перечисленное идёт МИМО туннеля; include — только оно В туннель"),
+        Line::raw(""),
+        head("Ввод (пароль, ссылка, назначение)"),
+        key("Enter", "подтвердить"),
+        key("Tab", "показать/скрыть введённое (ссылка — это креды, по умолчанию скрыта)"),
+        key("Esc", "отмена (на экране пароля — выход)"),
+        Line::raw(""),
+        head("Всегда"),
+        key("? / h / F1", "эта справка (в поле ввода — только F1)"),
+        key("Ctrl-C", "выйти из интерфейса"),
+        Line::raw(""),
+        head("Что важно понимать"),
+        Line::raw("   Выход из интерфейса НЕ разрывает туннель: соединение держит системный"),
+        Line::raw("   демон citadel-vpnd. Отключает только «d» (или citadel-cli disconnect)."),
+        Line::raw("   Хранилище закрывается само после 10 минут без нажатий."),
+        Line::raw("   Подробности ошибок — в журнале сессии справа и в `journalctl -u citadel-vpnd`."),
+    ];
+    let total = lines.len() as u16;
+    // Не даём прокрутить в пустоту: максимум — когда последняя строка у нижней рамки.
+    let visible = area.height.saturating_sub(2);
+    let scroll = app.help_scroll.min(total.saturating_sub(visible));
+    f.render_widget(
+        Paragraph::new(lines)
+            .scroll((scroll, 0))
+            .block(Block::default().borders(Borders::ALL).title(" Справка по клавишам ")),
+        area,
+    );
+}
+
 fn draw_input(f: &mut Frame, area: Rect, app: &App, title: &str, hint: &str) {
     let shown = if app.masked {
         "•".repeat(app.input.chars().count())
@@ -738,11 +836,12 @@ fn draw_input(f: &mut Frame, area: Rect, app: &App, title: &str, hint: &str) {
 
 fn draw_footer(f: &mut Frame, area: Rect, app: &App) {
     let keys = match app.screen {
-        Screen::Main => " Enter подключить │ d отключить │ a добавить │ x удалить │ K kill-switch │ D снять защиту │ s split │ l закрыть хранилище │ q выход",
-        Screen::Unlock { .. } => " Enter подтвердить │ Esc выход",
-        Screen::AddLink => " Enter добавить │ Tab показать/скрыть │ Esc отмена",
+        Screen::Main => " Enter подключить │ d отключить │ a добавить │ x удалить │ K kill-switch │ D снять защиту │ s split │ l закрыть хранилище │ ? справка │ q выход",
+        Screen::Unlock { .. } => " Enter подтвердить │ F1 справка │ Esc выход",
+        Screen::AddLink => " Enter добавить │ Tab показать/скрыть │ F1 справка │ Esc отмена",
         Screen::ConfirmRemove { .. } => " y удалить │ любая другая — отмена",
-        Screen::Split { .. } => " m режим │ a добавить │ x удалить │ Esc назад",
+        Screen::Split { .. } => " m режим │ a добавить │ x удалить │ ? справка │ Esc назад",
+        Screen::Help { .. } => " ↑↓ прокрутка │ любая клавиша — назад",
     };
     let style = if app.error {
         Style::default().fg(Color::Red)

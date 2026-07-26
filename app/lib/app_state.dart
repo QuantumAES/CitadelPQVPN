@@ -58,10 +58,43 @@ class AppState extends ChangeNotifier {
   String exit = '';
   String transport = '';
   String cidr = '';
+
+  /// Технический текст ошибки от ядра. В интерфейсе НЕ показывается: он про причины внутри
+  /// (цепочка `{e:#}`), а человеку нужен итог. Полностью дублируется в журнал отладки.
   String errorMsg = '';
+
+  /// Заголовок отказа для человека («Сервер недоступен») и подсказка, что делать/куда смотреть.
+  /// Разделены, потому что отказы бывают разные: недоступный сервер — это лог, а отсутствие
+  /// разрешения на VPN — действие пользователя, и путать их нельзя.
+  String errorTitle = '';
+  String errorHint = '';
+
+  void _setError(String title, String hint, String detail) {
+    phase = VpnPhase.error;
+    errorTitle = title;
+    errorHint = hint;
+    errorMsg = detail;
+    since = null;
+  }
+
+  void _clearError() {
+    errorTitle = errorHint = errorMsg = '';
+  }
 
   /// Момент перехода в `up` — для счётчика времени сессии.
   DateTime? since;
+
+  /// Имя профиля текущей (или последней) попытки подключения. Нужно для человекочитаемых
+  /// сообщений: «Сервер недоступен» само по себе не говорит, к ЧЕМУ не удалось подключиться.
+  /// Пусто для пробного коннекта по сырой ссылке (профиля ещё нет).
+  String get activeProfileName {
+    final id = activeProfileId;
+    if (id == null) return '';
+    for (final p in profiles) {
+      if (p.id == id) return p.name;
+    }
+    return '';
+  }
 
   StreamSubscription<VpnEventDto>? _sub;
 
@@ -172,13 +205,15 @@ class AppState extends ChangeNotifier {
     // «Подключаемся» уже на время консента/старта сервиса (может всплыть системный диалог).
     phase = VpnPhase.connecting;
     activeProfileId = profileId;
-    exit = transport = cidr = errorMsg = '';
+    exit = transport = cidr = '';
+    _clearError();
     since = null;
     notifyListeners();
 
     if (!await AndroidVpn.prepare()) {
-      phase = VpnPhase.error;
-      errorMsg = 'Нет разрешения на VPN';
+      // Не «сервер недоступен»: пользователь не дал разрешение на VPN — это его действие.
+      _setError('Нет разрешения на VPN', 'разрешите подключение в системном диалоге',
+          'VpnService.prepare отклонён пользователем');
       notifyListeners();
       return;
     }
@@ -196,7 +231,8 @@ class AppState extends ChangeNotifier {
     _sub?.cancel();
     phase = VpnPhase.connecting;
     activeProfileId = profileId;
-    exit = transport = cidr = errorMsg = '';
+    exit = transport = cidr = '';
+    _clearError();
     since = null;
     notifyListeners();
     _sub = stream.listen(_handleEvent, onError: _onStreamError);
@@ -212,17 +248,13 @@ class AppState extends ChangeNotifier {
         transport = ev.transport;
         cidr = ev.cidr;
       case 'error':
-        phase = VpnPhase.error;
-        errorMsg = ev.error;
-        since = null;
+        _setError('Сервер недоступен', 'подробности в журнале отладки', ev.error);
     }
     notifyListeners();
   }
 
   void _onStreamError(Object e) {
-    phase = VpnPhase.error;
-    errorMsg = '$e';
-    since = null;
+    _setError('Сервер недоступен', 'подробности в журнале отладки', '$e');
     notifyListeners();
   }
 
@@ -255,6 +287,7 @@ class AppState extends ChangeNotifier {
     phase = VpnPhase.off;
     activeProfileId = null;
     exit = transport = cidr = '';
+    _clearError(); // отключились сами — прошлый отказ больше не про текущее состояние
     since = null;
     notifyListeners();
   }

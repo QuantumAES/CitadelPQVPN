@@ -83,6 +83,7 @@ class CitadelVpnService : VpnService() {
         val linkRoutes = routes.split(" ").filter { it.isNotEmpty() }
         val appList = apps.split(" ").filter { it.isNotEmpty() }
         val destList = destRoutes.split(" ").filter { it.isNotEmpty() }
+        val dnsList = dns.split(" ").filter { it.isNotEmpty() }
         // Подсеть туннеля (назначенный addr/prefix). В ней живёт шлюз exit'а = ADMIN_VIP (C7.2),
         // т.е. admin-канал «Абоненты». На Linux/Windows маршрут в неё появляется САМ (адрес на
         // интерфейсе → on-link), а у VPN-сети Android маршрутов ровно столько, сколько добавлено
@@ -152,8 +153,21 @@ class CitadelVpnService : VpnService() {
                 val s = splitCidr(r)
                 b.addRoute(s.first, s.second)
             }
-            for (d in dns.split(" ").filter { it.isNotEmpty() }) b.addDnsServer(d)
+            for (d in dnsList) b.addDnsServer(d)
             if (tunnelRoutes.isEmpty()) b.addRoute("0.0.0.0", 0) // нет split-маршрутов → full-tunnel
+            // Инвариант «резолвер туннеля ходит ЧЕРЕЗ туннель» — то же, что host-route на DNS в
+            // citadel-vpnd (plan::tunnel_route_cmds). Без него при dest-include (в туннель только
+            // выбранные адреса) или при exclude, накрывающем резолвер, DNS-сервер оказывается вне
+            // туннеля: приложения под VPN не резолвят ничего вовсе. /32 специфичнее любого
+            // exclude-префикса, поэтому исключения его не отменяют.
+            for (d in dnsList) {
+                if (d.contains(':')) continue // туннель IPv4-only, v6-резолвер не маршрутизируем
+                try {
+                    b.addRoute(d, 32)
+                } catch (e: Exception) {
+                    android.util.Log.w("CitadelVpn", "маршрут к резолверу $d не добавлен: ${e.message}")
+                }
+            }
             // Инвариант: подсеть туннеля (шлюз = ADMIN_VIP, admin-канал) всегда через туннель —
             // при любом split-конфиге. Дубль с 0.0.0.0/0 безвреден (более специфичный префикс).
             if (tunNet != null) b.addRoute(tunNet, prefix)

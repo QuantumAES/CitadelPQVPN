@@ -74,6 +74,7 @@ mkdir -p "$STAGE"
 cp -r "$BUNDLE" "$STAGE/bundle"
 cp "$REPO_ROOT/target/release/citadel-helper" "$STAGE/citadel-helper"
 cp "$REPO_ROOT/packaging/dev.citadelpqvpn.helper.policy" "$STAGE/dev.citadelpqvpn.helper.policy"
+cp "$REPO_ROOT/packaging/49-citadel-pqvpn.rules" "$STAGE/49-citadel-pqvpn.rules"
 # П.5: брендовые иконки (hicolor) в тарбол — install.sh поставит их в /usr/share/icons/hicolor.
 if [[ -d "$REPO_ROOT/app_icons/Linux" ]]; then
   for sz in 16 24 32 48 64 128 256 512; do
@@ -91,6 +92,8 @@ set -euo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 HELPER_DIR=/usr/lib/citadel-pqvpn
 POLICY=/usr/share/polkit-1/actions/dev.citadelpqvpn.helper.policy
+RULES=/etc/polkit-1/rules.d/49-citadel-pqvpn.rules
+CTL_GROUP=citadel-vpn
 APP_DIR=/opt/citadel-pqvpn
 SUDO=""; [[ "${EUID}" -eq 0 ]] || SUDO="sudo"
 log() { printf '\033[1;34m==>\033[0m %s\n' "$*"; }
@@ -110,6 +113,14 @@ $SUDO install -m 755 -o root -g root "$HERE/citadel-helper" "$HELPER_DIR/citadel
 
 log "polkit-политика → $POLICY…"
 $SUDO install -m 644 -o root -g root "$HERE/dev.citadelpqvpn.helper.policy" "$POLICY"
+
+# Правило «без пароля для группы citadel-vpn»: иначе polkit просит пароль на каждое поднятие
+# туннеля, включая автоматические реконнекты. Право управлять VPN даёт членство в группе —
+# та же модель, что у консольного клиента. В группу установщик НИКОГО не добавляет.
+log "polkit-правило → $RULES (без пароля для группы $CTL_GROUP)…"
+getent group "$CTL_GROUP" >/dev/null || $SUDO groupadd --system "$CTL_GROUP"
+$SUDO install -d -m 755 "$(dirname "$RULES")"
+$SUDO install -m 644 -o root -g root "$HERE/49-citadel-pqvpn.rules" "$RULES"
 
 log "App-бандл → $APP_DIR…"
 $SUDO rm -rf "$APP_DIR"
@@ -131,7 +142,11 @@ Terminal=false
 DESKTOP
 
 echo
-log "Готово. Запуск: $APP_DIR/app (или меню «CitadelPQVPN»). polkit спросит пароль один раз."
+echo
+log "Готово. Запуск: $APP_DIR/app (или меню «CitadelPQVPN»)."
+echo "Чтобы туннель поднимался без запроса пароля, добавьте себя в группу и ПЕРЕЛОГИНЬТЕСЬ:"
+echo "    sudo usermod -aG $CTL_GROUP \$USER"
+echo "Без группы всё работает, но polkit будет спрашивать пароль администратора."
 INSTALL
 chmod +x "$STAGE/install.sh"
 

@@ -127,6 +127,16 @@ nnp=$(grep NoNewPrivs /proc/$(pgrep -n citadel-engine)/status 2>/dev/null | awk 
 head1 "L-ТЕСТ 8 — интерфейс, маршруты и kill-switch применены"
 ip -brief addr show citadel0 2>/dev/null && ok "интерфейс citadel0 поднят" || bad "нет интерфейса citadel0"
 ip route | grep -q "1.1.1.1.*citadel0" && ok "маршрут 1.1.1.1 → citadel0" || bad "нет маршрута в туннель"
+# Резолвер настроен ХОТЬ КАКИМ-ТО способом из лестницы (файл / systemd-resolved / resolvconf /
+# принудительный заворот :53). В контейнере /etc/resolv.conf — bind-mount, поэтому проверяем и
+# запасной путь: раньше невозможность записать файл валила всю сессию.
+if grep -q "nameserver 1.1.1.1" /etc/resolv.conf 2>/dev/null; then
+    ok "resolv.conf указывает на резолвер туннеля"
+elif iptables -t nat -S CITADEL_DNS >/dev/null 2>&1; then
+    ok "резолвер настроен заворотом :53 в туннель (запасной способ лестницы)"
+else
+    bad "DNS туннеля не настроен ни одним способом"
+fi
 if iptables -S CITADEL_KS >/dev/null 2>&1; then
     ok "цепочка CITADEL_KS создана"
     iptables -S CITADEL_KS | sed 's/^/      /'
@@ -180,6 +190,13 @@ sleep 2
 iptables -S CITADEL_KS >/dev/null 2>&1 && bad "kill-switch не снят после чистого disconnect" || ok "kill-switch снят"
 ip link show citadel0 >/dev/null 2>&1 && bad "интерфейс citadel0 остался" || ok "интерфейс убран"
 grep -q "nameserver 1.1.1.1" /etc/resolv.conf 2>/dev/null && bad "resolv.conf не восстановлен" || ok "resolv.conf восстановлен"
+# Сессия выше переживала реконнект (L-ТЕСТ 11): правила F6 не должны копиться и обязаны сняться
+# ВСЕ. Иначе после отключения в OUTPUT остаётся DROP на :53 к мёртвому интерфейсу — DNS не
+# работает вовсе, а причина неочевидна.
+n53=$(iptables -S OUTPUT 2>/dev/null | grep -c "dport 53" || true)
+[ "${n53:-0}" = "0" ] && ok "правила F6 (:53) сняты полностью" \
+    || bad "в OUTPUT осталось правил :53: $n53 (копились на реконнектах)"
+iptables -t nat -S CITADEL_DNS >/dev/null 2>&1 && bad "цепочка заворота DNS не снята" || ok "заворот DNS снят"
 ping -c 2 -W 3 1.1.1.1 >/dev/null 2>&1 && ok "обычная сеть работает" || bad "сеть не восстановилась"
 
 head1 "L-ТЕСТ 13 — аварийное снятие защиты (citadel-cli killswitch --disarm)"

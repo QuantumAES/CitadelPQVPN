@@ -6,10 +6,15 @@
 #   - runtime-зависимости (iproute2, iptables, polkit);
 #   - привилегированный citadel-helper → /usr/lib/citadel-pqvpn/ (root:root 755);
 #   - polkit-политику (кастомный action, exec.path → helper, auth_admin_keep);
+#   - polkit-правило «без пароля для группы citadel-vpn» (отключается --ask-password);
 #   - опционально (--with-app) app-бандл → /opt/citadel-pqvpn/ + .desktop launcher.
 #
 # Запуск: от обычного пользователя (apt/install через sudo) ИЛИ от root.
-#   ./tools/install-desktop.sh [--with-app]
+#   ./tools/install-desktop.sh [--with-app] [--user ИМЯ] [--ask-password]
+#
+#   --user ИМЯ       добавить пользователя в группу citadel-vpn (нужен перелогин)
+#   --ask-password   НЕ ставить правило «без пароля»: polkit будет спрашивать пароль
+#                    администратора на каждое поднятие туннеля, включая реконнекты
 #
 # citadel-helper берётся из target/release (если собран) — иначе собирается `cargo`
 # (нужен Rust-тулчейн). Для clean-VM без Rust: собери на dev-хосте
@@ -21,11 +26,23 @@ set -euo pipefail
 HELPER_DIR=/usr/lib/citadel-pqvpn
 HELPER="$HELPER_DIR/citadel-helper"
 POLICY=/usr/share/polkit-1/actions/dev.citadelpqvpn.helper.policy
+RULES=/etc/polkit-1/rules.d/49-citadel-pqvpn.rules
+CTL_GROUP=citadel-vpn
 APP_DIR=/opt/citadel-pqvpn
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
 WITH_APP=0
-for a in "$@"; do [[ "$a" == "--with-app" ]] && WITH_APP=1; done
+PASSWORDLESS=1
+ADD_USER=""
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --with-app)     WITH_APP=1 ;;
+    --ask-password) PASSWORDLESS=0 ;;
+    --user)         ADD_USER="${2:-}"; shift ;;
+    *)              echo "неизвестный аргумент: $1" >&2; exit 2 ;;
+  esac
+  shift
+done
 
 SUDO=""
 [[ "${EUID}" -eq 0 ]] || SUDO="sudo"
@@ -60,6 +77,33 @@ $SUDO install -m 755 -o root -g root "$BIN" "$HELPER"
 # 3. polkit-политика
 log "Установка polkit-политики → $POLICY…"
 $SUDO install -m 644 -o root -g root "$REPO/packaging/dev.citadelpqvpn.helper.policy" "$POLICY"
+
+# 3b. правило «без пароля для группы citadel-vpn».
+# Без него polkit спрашивает пароль на КАЖДОЕ поднятие туннеля, в том числе на автоматических
+# реконнектах — для VPN-клиента это нерабочий сценарий. Право управлять туннелем при этом не
+# «раздаётся всем»: его даёт членство в группе, ровно как у консольного клиента (сокет демона).
+if [[ "$PASSWORDLESS" -eq 1 ]]; then
+  if ! getent group "$CTL_GROUP" >/dev/null; then
+    log "Создание группы $CTL_GROUP…"
+    $SUDO groupadd --system "$CTL_GROUP"
+  fi
+  log "Установка polkit-правила → $RULES (без пароля для группы $CTL_GROUP)…"
+  $SUDO install -d -m 755 "$(dirname "$RULES")"
+  $SUDO install -m 644 -o root -g root "$REPO/packaging/49-citadel-pqvpn.rules" "$RULES"
+else
+  log "Правило «без пароля» НЕ ставится (--ask-password): polkit будет спрашивать пароль."
+  $SUDO rm -f "$RULES"
+fi
+
+if [[ -n "$ADD_USER" ]]; then
+  if id "$ADD_USER" >/dev/null 2>&1; then
+    log "Добавляю $ADD_USER в группу $CTL_GROUP…"
+    $SUDO usermod -aG "$CTL_GROUP" "$ADD_USER"
+    echo "    ВАЖНО: членство в группе появится после ПЕРЕЛОГИНА пользователя $ADD_USER."
+  else
+    echo "  пользователя $ADD_USER нет — пропускаю добавление в группу" >&2
+  fi
+fi
 
 # 4. опционально app-бандл + .desktop
 if [[ "$WITH_APP" -eq 1 ]]; then
@@ -98,4 +142,12 @@ echo
 log "Готово."
 echo "    helper : $HELPER"
 echo "    policy : $POLICY  (action dev.citadelpqvpn.helper)"
-echo "GUI поднимет туннель через pkexec — polkit спросит пароль один раз (auth_admin_keep)."
+if [[ "$PASSWORDLESS" -eq 1 ]]; then
+  echo "    rules  : $RULES  (без пароля для группы $CTL_GROUP)"
+  echo
+  echo "Чтобы GUI не спрашивал пароль, добавьте себя в группу и ПЕРЕЛОГИНЬТЕСЬ:"
+  echo "    sudo usermod -aG $CTL_GROUP \$USER"
+  echo "Кто не в группе — поднимет туннель по паролю администратора, как раньше."
+else
+  echo "GUI поднимет туннель через pkexec — polkit будет спрашивать пароль администратора."
+fi

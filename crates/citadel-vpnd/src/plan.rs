@@ -100,22 +100,82 @@ pub fn ipv6_block_teardown() -> Vec<Vec<String>> {
 
 /// F6 (DNS fail-closed): резолвер достижим только через туннель, прочий `:53` дропается.
 /// Возвращает аргументы `iptables` для **установки**; снятие — [`dns_rules_teardown`].
-pub fn dns_rules(ifn: &str) -> Vec<Vec<String>> {
-    vec![
-        a(&["-A", "OUTPUT", "-p", "udp", "--dport", "53", "!", "-o", ifn, "-j", "DROP"]),
-        a(&["-A", "OUTPUT", "-p", "tcp", "--dport", "53", "!", "-o", ifn, "-j", "DROP"]),
-    ]
+///
+/// `allow_loopback` — пускать `:53` на `lo`. Нужно, когда резолвером системы остаётся локальный
+/// stub (systemd-resolved на 127.0.0.53) или когда весь `:53` заворачивается NAT'ом: сам запрос к
+/// stub'у машину не покидает, а его апстрим уже идёт по нашим правилам — то есть через туннель.
+/// Когда мы переписали `resolv.conf` сами, stub не задействован и loopback остаётся закрытым.
+pub fn dns_rules(ifn: &str, allow_loopback: bool) -> Vec<Vec<String>> {
+    let mut r = Vec::new();
+    if allow_loopback {
+        // ACCEPT идёт ПЕРЕД DROP: правила добавляются в OUTPUT по порядку.
+        r.push(a(&["-A", "OUTPUT", "-p", "udp", "--dport", "53", "-o", "lo", "-j", "ACCEPT"]));
+        r.push(a(&["-A", "OUTPUT", "-p", "tcp", "--dport", "53", "-o", "lo", "-j", "ACCEPT"]));
+    }
+    r.push(a(&["-A", "OUTPUT", "-p", "udp", "--dport", "53", "!", "-o", ifn, "-j", "DROP"]));
+    r.push(a(&["-A", "OUTPUT", "-p", "tcp", "--dport", "53", "!", "-o", ifn, "-j", "DROP"]));
+    r
 }
 
 /// Снятие F6-правил (те же правила с `-D`).
+///
+/// Снимаем ОБА варианта (с loopback-исключением и без) независимо от того, какой применялся:
+/// удаление отсутствующего правила — не ошибка, зато снятие идемпотентно и переживает смену
+/// способа настройки резолвера между реконнектами. Это же делает установку безопасной для
+/// повторов: перед каждым `-A` вызывающий сначала снимает старое, иначе на каждом реконнекте
+/// в OUTPUT копился бы ещё один DROP — и после disconnect резолвер остался бы заблокирован.
 pub fn dns_rules_teardown(ifn: &str) -> Vec<Vec<String>> {
-    dns_rules(ifn)
+    dns_rules(ifn, true)
         .into_iter()
         .map(|mut v| {
             v[0] = "-D".into();
             v
         })
         .collect()
+}
+
+/// Цепочка принудительного заворота DNS в туннель (таблица `nat`).
+pub const DNS_NAT_CHAIN: &str = "CITADEL_DNS";
+
+/// Последний рубеж настройки DNS: весь исходящий `:53` переписывается на резолвер туннеля.
+///
+/// Применяется, когда системный резолвер настроить нечем — `/etc` только для чтения, а ни
+/// systemd-resolved, ни resolvconf на машине нет. Содержимое `resolv.conf` тогда вообще
+/// перестаёт иметь значение: куда бы приложение ни спросило, запрос уедет в туннель.
+///
+/// Исключения (RETURN до DNAT): сам резолвер туннеля (иначе NAT зациклился бы на себе) и `lo` —
+/// переписывать адрес у петлевого пакета нельзя (после реврайта ядру пришлось бы менять и
+/// источник 127.0.0.1, пакет улетел бы «марсианином»). Локальный stub при этом продолжает
+/// работать: его собственный апстрим-запрос — уже не петлевой и заворачивается этими правилами.
+pub fn dns_redirect_rules(dns: Ipv4Addr) -> Vec<Vec<String>> {
+    let to = format!("{dns}:53");
+    let self_dst = format!("{dns}/32");
+    let mut r = vec![
+        a(&["-t", "nat", "-N", DNS_NAT_CHAIN]),
+        a(&["-t", "nat", "-A", DNS_NAT_CHAIN, "-d", &self_dst, "-j", "RETURN"]),
+        a(&["-t", "nat", "-A", DNS_NAT_CHAIN, "-o", "lo", "-j", "RETURN"]),
+    ];
+    for proto in ["udp", "tcp"] {
+        r.push(a(&[
+            "-t", "nat", "-A", DNS_NAT_CHAIN, "-p", proto, "--dport", "53", "-j", "DNAT",
+            "--to-destination", &to,
+        ]));
+    }
+    for proto in ["udp", "tcp"] {
+        r.push(a(&["-t", "nat", "-I", "OUTPUT", "1", "-p", proto, "--dport", "53", "-j", DNS_NAT_CHAIN]));
+    }
+    r
+}
+
+/// Снятие заворота DNS (идемпотентно).
+pub fn dns_redirect_teardown() -> Vec<Vec<String>> {
+    let mut r = Vec::new();
+    for proto in ["udp", "tcp"] {
+        r.push(a(&["-t", "nat", "-D", "OUTPUT", "-p", proto, "--dport", "53", "-j", DNS_NAT_CHAIN]));
+    }
+    r.push(a(&["-t", "nat", "-F", DNS_NAT_CHAIN]));
+    r.push(a(&["-t", "nat", "-X", DNS_NAT_CHAIN]));
+    r
 }
 
 /// Маршруты туннеля (аргументы `ip`). `0.0.0.0/0` раскрывается в две половинки `/1`: они
@@ -265,7 +325,7 @@ mod tests {
 
     #[test]
     fn dns_teardown_mirrors_setup() {
-        let up = dns_rules("citadel0");
+        let up = dns_rules("citadel0", true);
         let down = dns_rules_teardown("citadel0");
         assert_eq!(up.len(), down.len());
         for (u, d) in up.iter().zip(down.iter()) {
@@ -273,6 +333,55 @@ mod tests {
             assert_eq!(d[0], "-D");
             assert_eq!(u[1..], d[1..], "снятие должно точно зеркалить установку");
         }
+        // Снятие обязано покрывать и строгий вариант (без loopback-исключения) — иначе смена
+        // способа настройки резолвера между реконнектами оставила бы висеть чужой DROP.
+        for rule in dns_rules("citadel0", false) {
+            let as_del: Vec<String> =
+                std::iter::once("-D".to_string()).chain(rule[1..].iter().cloned()).collect();
+            assert!(down.contains(&as_del), "снятие не покрывает правило {rule:?}");
+        }
+    }
+
+    /// Разрешение `:53` на `lo` обязано идти ДО общего DROP — иначе локальный stub-резолвер
+    /// (systemd-resolved) отрезан и DNS не работает вовсе.
+    #[test]
+    fn dns_loopback_accept_precedes_drop() {
+        let r = dns_rules("citadel0", true);
+        let accept = r.iter().rposition(|x| x.last().map(String::as_str) == Some("ACCEPT")).unwrap();
+        let drop = r.iter().position(|x| x.last().map(String::as_str) == Some("DROP")).unwrap();
+        assert!(accept < drop, "ACCEPT для lo должен идти раньше DROP");
+        // строгий режим: никаких исключений, весь не-туннельный :53 в DROP
+        assert!(dns_rules("citadel0", false).iter().all(|x| x.last().map(String::as_str) == Some("DROP")));
+    }
+
+    /// Заворот DNS: исключения (сам резолвер и `lo`) обязаны стоять до DNAT, иначе NAT зациклит
+    /// себя на себе, а петлевой пакет уйдёт с чужим адресом источника.
+    #[test]
+    fn dns_redirect_shape() {
+        let dns = Ipv4Addr::new(10, 7, 0, 1);
+        let r = dns_redirect_rules(dns);
+        assert_eq!(s(r.first().unwrap()), vec!["-t", "nat", "-N", DNS_NAT_CHAIN]);
+        let first_dnat =
+            r.iter().position(|x| x.contains(&"DNAT".to_string())).expect("правило DNAT");
+        let last_return =
+            r.iter().rposition(|x| x.last().map(String::as_str) == Some("RETURN")).unwrap();
+        assert!(last_return < first_dnat, "исключения должны идти до DNAT");
+        assert!(r.iter().any(|x| x.contains(&"10.7.0.1/32".to_string())), "резолвер сам себя не NAT'ит");
+        assert!(r.iter().any(|x| x.contains(&"lo".to_string())), "петлевой :53 не переписываем");
+        // цель DNAT — именно резолвер туннеля
+        assert!(r.iter().filter(|x| x.contains(&"DNAT".to_string())).all(|x| x.contains(&"10.7.0.1:53".to_string())));
+        // хук в OUTPUT ставится последним, обе транспортные ветки
+        assert_eq!(r.iter().filter(|x| x.contains(&"OUTPUT".to_string())).count(), 2);
+        // всё уходит в таблицу nat, а не в filter (иначе снесли бы фильтрующие правила)
+        assert!(r.iter().all(|x| x[0] == "-t" && x[1] == "nat"));
+    }
+
+    #[test]
+    fn dns_redirect_teardown_removes_hook_and_chain() {
+        let down = dns_redirect_teardown();
+        assert!(down.iter().all(|x| x[0] == "-t" && x[1] == "nat"));
+        assert_eq!(down.iter().filter(|x| x.contains(&"-D".to_string())).count(), 2, "хук из OUTPUT");
+        assert_eq!(s(down.last().unwrap()), vec!["-t", "nat", "-X", DNS_NAT_CHAIN]);
     }
 
     #[test]

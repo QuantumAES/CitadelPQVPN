@@ -73,6 +73,11 @@ flutter:
   # the material Icons class.
   uses-material-design: true
 
+  # Брендовый логотип (тот же рисунок, что у иконки приложения — app_icons/Windows/icon-256.png):
+  # показывается на экране ввода мастер-пароля, чтобы окно опознавалось как CitadelPQVPN.
+  assets:
+    - assets/logo.png
+
   # To add assets to your application, add an assets section, like this:
   # assets:
   #   - images/a_dot_burr.jpeg

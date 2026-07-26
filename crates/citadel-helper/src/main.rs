@@ -101,6 +101,13 @@ fn parse_args() -> Result<Args> {
         if !is_cidr(b) {
             bail!("--bypass: невалидный CIDR {b:?}");
         }
+        // Охват, а не только форма: «в обход» шире /8 — это уже не исключение, а тихое
+        // отключение kill-switch при включённом индикаторе защиты. Тот же порог, что в
+        // citadel-vpnd (`valid::MIN_BYPASS_PREFIX`), чтобы у GUI и CLI была одна граница.
+        let prefix = b.split_once('/').map(|(_, p)| p).unwrap_or("32");
+        if prefix.parse::<u8>().unwrap_or(32) < 8 {
+            bail!("--bypass слишком широкий ({b:?}): минимум /8 — иначе это гасит kill-switch");
+        }
     }
     Ok(Args {
         sock: get("--sock").context("нужен --sock <path>")?,

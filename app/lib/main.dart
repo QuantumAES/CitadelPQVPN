@@ -36,6 +36,9 @@ Future<void> main() async {
     await windowManager.waitUntilReadyToShow(opts, () async {
       await windowManager.setTitle('CitadelPQVPN');
       await windowManager.setResizable(false); // #п2: фиксированное окно
+      // Окно фиксированного размера разворачивать некуда: кнопка «развернуть» либо не работала
+      // бы, либо растянула бы портретный макет. Убираем её из системной рамки.
+      await windowManager.setMaximizable(false);
       await windowManager.show();
       await windowManager.focus();
     });
@@ -114,7 +117,13 @@ class _CitadelAppState extends State<CitadelApp> with WindowListener {
     final (phase, tip) = switch (state.phase) {
       VpnPhase.up => ('up', 'CitadelPQVPN — туннель активен${state.exit.isEmpty ? '' : ' (${state.exit})'}'),
       VpnPhase.connecting => ('connecting', 'CitadelPQVPN — подключение…'),
-      VpnPhase.error => ('error', 'CitadelPQVPN — ошибка: ${state.errorMsg}'),
+      VpnPhase.error => (
+          'error',
+          [
+            'CitadelPQVPN — ${state.errorTitle.isEmpty ? 'сервер недоступен' : state.errorTitle.toLowerCase()}',
+            if (state.activeProfileName.isNotEmpty) '(${state.activeProfileName})',
+          ].join(' ')
+        ),
       VpnPhase.off => ('off', 'CitadelPQVPN — туннель выключен'),
     };
     WindowsTray.setPhase(phase, tooltip: tip);
@@ -139,12 +148,22 @@ class _CitadelAppState extends State<CitadelApp> with WindowListener {
     await windowManager.destroy();
   }
 
-  /// C8.2: пользователь нажал «крестик». Туннель неактивен → закрываемся сразу; активен → диалог
-  /// «Оставить в фоне» (свернуть, сессия жива) / «Отключить и выйти» (чистый disconnect → снятие KS).
+  /// C8.2: пользователь нажал «крестик». Туннель неактивен → закрываемся сразу; активен →
+  /// уходим в фон, не разрывая сессию.
+  ///
+  /// Где есть трей (Windows), диалога НЕТ: закрытие окна при активном туннеле — это «убрать с
+  /// глаз», а не «отключить». Приложение сворачивается в трей, соединение продолжает работать;
+  /// выйти по-настоящему — пункт «Выход» в меню трея (он делает чистый disconnect со снятием
+  /// kill-switch). Где трея нет (Linux/macOS), скрытое окно вернуть было бы нечем, поэтому там
+  /// по-прежнему спрашиваем.
   @override
   void onWindowClose() async {
     if (!state.isBusy) {
       await _quitApp(); // туннеля нет — просто выходим (убрав иконку трея)
+      return;
+    }
+    if (WindowsTray.supported) {
+      await windowManager.hide();
       return;
     }
     final ctx = _navKey.currentContext;
@@ -152,15 +171,14 @@ class _CitadelAppState extends State<CitadelApp> with WindowListener {
       await _quitApp();
       return;
     }
-    // На Windows «в фоне» = сворачивание в системный трей; на Linux/macOS трея нет → обычный minimize.
-    final bg = WindowsTray.supported ? 'в трей' : 'свернётся';
+    // Сюда попадают только платформы без трея (Linux/macOS): «в фоне» = свернуть в панель задач.
     final choice = await showDialog<String>(
       context: ctx,
       builder: (d) => AlertDialog(
         title: const Text('Туннель активен'),
-        content: Text(
+        content: const Text(
           'VPN подключён. Что сделать при закрытии окна?\n\n'
-          '• Оставить в фоне — окно $bg, соединение продолжит работать.\n'
+          '• Оставить в фоне — окно свернётся, соединение продолжит работать.\n'
           '• Отключить и выйти — разорвать туннель и закрыть приложение.',
         ),
         actions: [
@@ -172,12 +190,7 @@ class _CitadelAppState extends State<CitadelApp> with WindowListener {
     );
     switch (choice) {
       case 'background':
-        // Windows → скрыть в трей (иконка вернёт); Linux/macOS → minimize (в панель задач).
-        if (WindowsTray.supported) {
-          await windowManager.hide();
-        } else {
-          await windowManager.minimize();
-        }
+        await windowManager.minimize();
       case 'quit':
         await _quitApp();
       default:
@@ -256,7 +269,10 @@ class _UnlockScreenState extends State<UnlockScreen> {
               mainAxisSize: MainAxisSize.min,
               crossAxisAlignment: CrossAxisAlignment.stretch,
               children: [
-                Icon(Icons.shield_moon_outlined, size: 64, color: cs.primary),
+                // Фирменный логотип (тот же, что иконка приложения) — экран пароля должен
+                // опознаваться как CitadelPQVPN, а не как безымянный запрос пароля.
+                Image.asset('assets/logo.png',
+                    width: 96, height: 96, filterQuality: FilterQuality.medium),
                 const SizedBox(height: 16),
                 Text('CitadelPQVPN',
                     textAlign: TextAlign.center,

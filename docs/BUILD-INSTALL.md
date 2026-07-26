@@ -23,9 +23,35 @@ flutter build linux --release                 # → build/linux/x64/release/bund
 Установка (на машине **с TUN**, нужен root/pkexec):
 
 ```sh
-sudo tools/install-desktop.sh --with-app       # helper + polkit-политика + app → /opt/citadel-pqvpn
+sudo tools/install-desktop.sh --with-app       # helper + polkit (политика + правило) + app → /opt/citadel-pqvpn
+sudo usermod -aG citadel-vpn $USER              # чтобы GUI не спрашивал пароль (затем ПЕРЕЛОГИН)
 /opt/citadel-pqvpn/app                          # запуск GUI
 ```
+
+**Про запрос пароля.** GUI поднимает туннель через `pkexec citadel-helper`, и polkit по умолчанию
+просит пароль администратора — причём не только на первое подключение: каждый автоматический
+реконнект (смена Wi-Fi/LTE, восстановление связи) запускает хелпер заново, то есть спрашивает
+снова. Установщик поэтому ставит правило `/etc/polkit-1/rules.d/49-citadel-pqvpn.rules`: членам
+группы `citadel-vpn` (та же группа, что даёт право управлять туннелем консольному клиенту)
+подтверждение не требуется. Кто не в группе — работает как раньше, по паролю.
+Не нужно такого поведения — `sudo tools/install-desktop.sh --with-app --ask-password`.
+Добавлять в группу стоит только тех, кому доверяете администрирование сети машины (член группы
+может завернуть весь её трафик в свой exit) — поэтому установщик никого не добавляет сам,
+`--user ИМЯ` делает это по явной просьбе.
+
+### Чистка кешей сборки
+
+Дерево сборки растёт до десятков гигабайт (`target/` + `app/build` + per-ABI Rust под Android):
+
+```sh
+bash tools/clean-caches.sh -n            # показать, что и сколько удалится
+bash tools/clean-caches.sh               # безопасно: incremental-кеши + мусор docker
+bash tools/clean-caches.sh --deep        # + cargo clean, flutter clean, gradle-трансформы
+```
+
+`--deep` означает полную пересборку в следующий раз (cargo ~10–15 мин из-за aws-lc-rs, APK ~6–8 мин
+из-за четырёх ABI). Скрипт не трогает исходники, `dist/` с релизами, `~/.cargo/registry`,
+`~/.pub-cache`, хранилища профилей и ключи; удаляет только то, что пересоздаётся сборкой.
 
 ## Клиент — Android (APK)
 

@@ -626,7 +626,9 @@ class _StatusCard extends StatelessWidget {
         bg = cs.errorContainer;
         fg = cs.onErrorContainer;
         icon = Icons.gpp_bad_outlined;
-        label = 'Ошибка';
+        // Человеку — что произошло, а не текст ошибки движка: подробности (полная цепочка
+        // причин) остаются в журнале отладки, кому надо — посмотрит там.
+        label = state.errorTitle.isEmpty ? 'Сервер недоступен' : state.errorTitle;
       case VpnPhase.off:
         bg = cs.surfaceContainerHighest;
         fg = cs.onSurfaceVariant;
@@ -638,6 +640,14 @@ class _StatusCard extends StatelessWidget {
       if (state.exit.isNotEmpty) state.exit,
       if (state.transport.isNotEmpty) state.transport,
       if (state.cidr.isNotEmpty) state.cidr,
+    ].join('  ·  ');
+
+    // В отказе показываем ПРОФИЛЬ, к которому пытались подключиться, и подсказку по этому виду
+    // отказа — сам текст ошибки ядра здесь не показываем (он в журнале отладки).
+    final name = state.activeProfileName;
+    final failure = <String>[
+      if (name.isNotEmpty) 'профиль «$name»',
+      if (state.errorHint.isNotEmpty) state.errorHint,
     ].join('  ·  ');
 
     return Container(
@@ -671,12 +681,12 @@ class _StatusCard extends StatelessWidget {
                     ])),
             ],
           ),
-          if (details.isNotEmpty || state.errorMsg.isNotEmpty) ...[
+          if (details.isNotEmpty || state.phase == VpnPhase.error) ...[
             const SizedBox(height: 6),
             Align(
               alignment: Alignment.centerLeft,
               child: Text(
-                state.phase == VpnPhase.error ? state.errorMsg : details,
+                state.phase == VpnPhase.error ? failure : details,
                 style: Theme.of(context)
                     .textTheme
                     .bodyMedium

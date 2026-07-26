@@ -30,8 +30,14 @@ NoNewPrivileges=yes
 CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_RAW CAP_SETUID CAP_SETGID CAP_CHOWN CAP_KILL
 AmbientCapabilities=
 
-# /usr и /boot — только чтение; /etc остаётся записываемым: туда пишется resolv.conf (F6).
+# /usr, /boot И /etc — только чтение (это и означает `full`).
 ProtectSystem=full
+# …кроме /etc: туда пишется resolv.conf (F6). БЕЗ этой строки демон получает EROFS на
+# /etc/resolv.conf и сессия не поднимается вовсе — ловили вживую.
+# Точечный `ReadWritePaths=/etc/resolv.conf` НЕ годится: systemd делает bind-mount самого файла,
+# после чего его нельзя ни заменить через rename (EBUSY), ни удалить, а запись «по ссылке»
+# испортила бы stub systemd-resolved. Поэтому в запись возвращается каталог целиком.
+ReadWritePaths=/etc
 # Демон НИКОГДА не читает домашние каталоги: хранилище профилей — дело citadel-cli,
 # демон получает готовую ссылку по сокету. Запрет делает это свойство проверяемым.
 ProtectHome=yes

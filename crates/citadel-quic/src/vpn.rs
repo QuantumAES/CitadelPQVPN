@@ -210,6 +210,9 @@ impl VpnController {
     /// UI вышел из спиннера, а не завис. Используется, когда до [`connect`] дело не дошло (напр.
     /// не удалось получить токен доступа).
     pub fn fail(&self, msg: String) {
+        // Дублируем в журнал: интерфейс покажет человеку короткий итог, а причина должна
+        // оставаться в логе отладки — иначе разбирать отказ будет нечем.
+        eprintln!("[vpn] отказ до подключения: {msg}");
         self.emit(VpnEvent::Error(msg));
         self.set_state(VpnState::Down);
     }
@@ -359,6 +362,9 @@ impl VpnController {
                 Ok(t) => t,
                 Err(e) => {
                     if !ever_up {
+                        // В журнал — полная цепочка причин: интерфейс показывает человеку итог
+                        // («сервер недоступен»), а разбираться приходится по логу.
+                        eprintln!("[vpn] configure TUN не удался: {e:#}");
                         self.emit(VpnEvent::Error(format!("{e:#}")));
                         self.set_state(VpnState::Down);
                         return Err(e);

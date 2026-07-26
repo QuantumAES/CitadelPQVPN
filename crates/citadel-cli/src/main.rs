@@ -75,7 +75,7 @@ fn print_help() {
          \x20 add --stdin            то же, ссылка со stdin (для скриптов)\n\
          \x20 remove ИМЯ|ID          удалить профиль\n\
          \x20 killswitch on|off      настройка kill-switch (со следующего подключения)\n\
-         \x20 killswitch --disarm    аварийно снять залипшие fail-closed правила\n\
+         \x20 killswitch --disarm    аварийно снять залипшие правила (сеть и DNS)\n\
          \x20 split off|include|exclude [CIDR…]   split-tunnel по назначениям\n\
          \x20 passwd                 сменить мастер-пароль хранилища\n\
          \x20 version                версии клиента и демона\n\
@@ -105,8 +105,14 @@ fn cmd_status() -> Result<()> {
              \x20 Снять: citadel-cli killswitch --disarm"
         );
     }
+    // Человеку — итог, а не текст ошибки движка: подробности всё равно есть в журнале демона.
     if !s.last_error.is_empty() {
-        println!("Ошибка:       {}", sanitize_text(&s.last_error, 512));
+        if s.label.is_empty() {
+            println!("Результат:    сервер недоступен");
+        } else {
+            println!("Результат:    сервер недоступен (профиль «{}»)", sanitize_text(&s.label, 64));
+        }
+        println!("              подробности: journalctl -u citadel-vpnd -n 50");
     }
     Ok(())
 }
@@ -269,7 +275,7 @@ fn cmd_killswitch(args: &[String]) -> Result<()> {
         }
         Some("--disarm") => {
             Client::default().disarm_killswitch()?;
-            println!("Fail-closed правила сняты, доступ в сеть восстановлен.");
+            println!("Fail-closed правила и правила DNS сняты, доступ в сеть восстановлен.");
         }
         None | Some("status") => {
             let st = Settings::load();

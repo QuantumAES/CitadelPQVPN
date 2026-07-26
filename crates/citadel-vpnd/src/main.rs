@@ -157,6 +157,14 @@ fn main() -> Result<()> {
              Снять: citadel-cli killswitch --disarm"
         );
     }
+    // Осиротевшие правила DNS защиты не дают (утечки без них нет — сессии тоже нет), зато машина
+    // остаётся без резолвинга: «интернет есть, имена не открываются». Молчать об этом нельзя.
+    if daemon.shared.lock().unwrap().net.dns_rules_orphaned(&daemon.tools) {
+        eprintln!(
+            "[vpnd] ВНИМАНИЕ: с прошлого запуска остались правила DNS (сессии нет) — имена \
+             резолвиться не будут. Снять: citadel-cli killswitch --disarm"
+        );
+    }
 
     let listener = bind_control_socket(&sock_path, &group)?;
     install_signal_handler(daemon.clone(), sock_path.clone());
@@ -520,9 +528,13 @@ fn supervise(d: Arc<Daemon>, chan: Arc<UnixStream>, generation: u64) {
         let _ = s.child.wait(); // не оставляем зомби
     }
     sh.net.teardown(&d.tools, clean);
+    // Метку профиля переносим в «пустой» статус: без неё клиент не может сказать, к ЧЕМУ не
+    // удалось подключиться, а человеку нужно именно это, а не текст ошибки движка.
+    let label = std::mem::take(&mut sh.status.label);
     sh.status = idle_status();
     sh.status.killswitch_armed = sh.net.killswitch_armed(&d.tools);
     if !clean {
+        sh.status.label = label;
         sh.status.last_error = "сессия прервана (движок завершился неожиданно)".into();
     }
     drop(sh);

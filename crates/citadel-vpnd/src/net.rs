@@ -12,7 +12,17 @@
 //!
 //! `/etc/resolv.conf` (L4): файл может быть симлинком на stub `systemd-resolved`. Перезапись «по
 //! ссылке» испортила бы сам stub и после disconnect оставила бы систему без резолвера, поэтому
-//! симлинк снимается и восстанавливается как симлинк, а обычный файл — сохраняется побайтно.
+//! новый резолвер кладётся рядом и **переименовывается поверх** (rename заменяет саму ссылку,
+//! атомарно и без окна «резолвера нет»), а исходное состояние — симлинк/файл/отсутствие —
+//! запоминается и возвращается при disconnect.
+//!
+//! Записать `/etc/resolv.conf` можно НЕ всегда: read-only `/etc` (контейнер, immutable-дистрибутив,
+//! сам юнит с `ProtectSystem=full` без `ReadWritePaths=/etc`), файл под bind-mount'ом или с
+//! иммутабельным атрибутом. Раньше это валило всю сессию («записать /etc/resolv.conf: Read-only
+//! file system»), хотя туннель уже стоял. Теперь способ настройки резолвера выбирается лестницей
+//! [`choose_dns`]: файл → systemd-resolved → resolvconf → принудительный заворот `:53` в туннель.
+//! Fail-closed при этом не ослабляется: F6-правила висят при любом способе, а если не сработал ни
+//! один — сессия по-прежнему отвергается, потому что иначе DNS ушёл бы мимо туннеля.
 
 use std::io::Write;
 use std::net::Ipv4Addr;
@@ -29,12 +39,19 @@ use citadel_vpnd::TUN_NAME;
 
 const RESOLV: &str = "/etc/resolv.conf";
 const RESOLV_BAK: &str = "/run/citadel-vpn/resolv.bak";
+/// Временный файл рядом с `resolv.conf`: пишем в него и переименовываем поверх (см. модульный
+/// комментарий). Тот же каталог обязателен — `rename` не работает между файловыми системами.
+const RESOLV_TMP: &str = "/etc/.citadel-resolv.tmp";
 
 /// Абсолютные пути к сетевым утилитам, проверенные на старте демона.
 pub struct Tools {
     pub ip: PathBuf,
     pub iptables: PathBuf,
     pub ip6tables: PathBuf,
+    /// `resolvectl` (systemd-resolved) — есть не везде, поэтому опционально.
+    pub resolvectl: Option<PathBuf>,
+    /// `resolvconf` (openresolv/resolvconf) — тоже опционально.
+    pub resolvconf: Option<PathBuf>,
 }
 
 impl Tools {
@@ -44,6 +61,8 @@ impl Tools {
             ip: find_tool("ip")?,
             iptables: find_tool("iptables")?,
             ip6tables: find_tool("ip6tables")?,
+            resolvectl: find_tool_opt("resolvectl"),
+            resolvconf: find_tool_opt("resolvconf"),
         })
     }
 }
@@ -69,6 +88,22 @@ fn find_tool(name: &str) -> Result<PathBuf> {
     bail!("не найдена утилита {name} (нужны пакеты iproute2 и iptables)")
 }
 
+/// Как [`find_tool`], но для необязательной утилиты: её отсутствие — не ошибка, просто этот
+/// способ настройки резолвера недоступен. Подозрительные права — тоже `None`: под root'ом мы
+/// такую утилиту не запустим, но и падать из-за неё не станем.
+fn find_tool_opt(name: &str) -> Option<PathBuf> {
+    match find_tool(name) {
+        Ok(p) => Some(p),
+        Err(e) => {
+            // «не найдена» — обычное дело, а вот кривые права стоит показать.
+            if !e.to_string().starts_with("не найдена") {
+                eprintln!("[vpnd] {name} не будет использован: {e}");
+            }
+            None
+        }
+    }
+}
+
 /// Запустить утилиту без окружения. stderr глушится: почти все вызовы идемпотентны
 /// (удаление несуществующего маршрута/цепочки — норма), диагностика — по коду возврата.
 fn run(tool: &Path, args: &[String]) -> bool {
@@ -87,6 +122,25 @@ fn run_str(tool: &Path, args: &[&str]) -> bool {
     run(tool, &owned)
 }
 
+/// Запустить утилиту, подав текст на stdin (`resolvconf -a` читает запись именно оттуда).
+fn run_stdin(tool: &Path, args: &[&str], input: &str) -> bool {
+    use std::io::Write as _;
+    let Ok(mut child) = Command::new(tool)
+        .args(args)
+        .env_clear()
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+    else {
+        return false;
+    };
+    if let Some(mut sin) = child.stdin.take() {
+        let _ = sin.write_all(input.as_bytes());
+    } // drop → EOF, иначе утилита ждёт ввод вечно
+    child.wait().map(|s| s.success()).unwrap_or(false)
+}
+
 /// Запустить утилиту и вернуть stdout (для `ip route get`).
 fn output(tool: &Path, args: &[&str]) -> Option<String> {
     let out = Command::new(tool).args(args).env_clear().stderr(Stdio::null()).output().ok()?;
@@ -103,8 +157,9 @@ pub struct NetState {
     bypass_routes: Vec<String>,
     /// F6-правила DNS активны для интерфейса.
     dns_ifn: Option<String>,
-    /// Резервная копия резолвера.
-    resolv_backup: Option<ResolvBackup>,
+    /// Каким способом настроен резолвер этой сессии (и что для этого сохранено). Выбирается
+    /// один раз: свернуть надо ровно то, что применяли.
+    dns: Option<DnsMethod>,
     /// Применённый набор правил kill-switch (сравнивается на реконнекте, чтобы НЕ пересоздавать
     /// цепочку без нужды — иначе на каждом реконнекте открывается микро-окно без защиты).
     ks_applied: Option<Vec<Vec<String>>>,
@@ -124,6 +179,34 @@ enum ResolvBackup {
     File,
     /// Файла не было вовсе.
     Missing,
+}
+
+/// Чем именно настроен резолвер туннеля. Порядок вариантов = порядок попыток в [`choose_dns`].
+enum DnsMethod {
+    /// Переписан `/etc/resolv.conf`; исходное состояние — внутри.
+    ResolvFile(ResolvBackup),
+    /// systemd-resolved: сервер назначен на сам интерфейс (`resolvectl`), файл не тронут.
+    Resolved,
+    /// openresolv/resolvconf: запись зарегистрирована под именем интерфейса.
+    Resolvconf,
+    /// Резолвер системы не трогали вовсе — весь `:53` заворачивается NAT'ом в туннель.
+    Redirect,
+}
+
+impl DnsMethod {
+    /// Полагается ли способ на локальный stub-резолвер (⇒ `:53` на `lo` нельзя дропать).
+    fn needs_loopback(&self) -> bool {
+        matches!(self, DnsMethod::Resolved | DnsMethod::Redirect)
+    }
+
+    fn label(&self) -> &'static str {
+        match self {
+            DnsMethod::ResolvFile(_) => "/etc/resolv.conf",
+            DnsMethod::Resolved => "systemd-resolved (resolvectl)",
+            DnsMethod::Resolvconf => "resolvconf",
+            DnsMethod::Redirect => "заворот :53 в туннель (NAT)",
+        }
+    }
 }
 
 impl NetState {
@@ -249,15 +332,33 @@ impl NetState {
     }
 
     /// F6: резолвер только через туннель + DROP на прочий `:53`.
+    ///
+    /// Зовётся на КАЖДЫЙ `TunSetup`, то есть и на реконнекте. Способ настройки выбирается один
+    /// раз (иначе повторный бэкап затёр бы оригинал нашим же файлом), но переприменяется: TUN
+    /// после реконнекта — новый интерфейс, настройки резолвера на старом умерли вместе с ним.
     fn setup_dns(&mut self, t: &Tools, ifn: &str, dns: Ipv4Addr) -> Result<()> {
-        if self.resolv_backup.is_none() {
-            self.resolv_backup = Some(backup_resolv()?);
+        let method = match self.dns.take() {
+            Some(m) => {
+                reapply_dns(t, &m, ifn, dns);
+                m
+            }
+            None => {
+                let m = choose_dns(t, ifn, dns)?;
+                eprintln!("[vpnd] DNS туннеля {dns}: {}", m.label());
+                m
+            }
+        };
+        // Сначала снять прошлые F6-правила, потом поставить: `-A` без этого копил бы по копии
+        // DROP на каждый реконнект, а свернуть удалось бы только одну — и после disconnect
+        // резолвер остался бы заблокирован намертво.
+        for cmd in plan::dns_rules_teardown(ifn) {
+            run(&t.iptables, &cmd);
         }
-        write_resolv(dns)?;
-        for cmd in plan::dns_rules(ifn) {
+        for cmd in plan::dns_rules(ifn, method.needs_loopback()) {
             run(&t.iptables, &cmd);
         }
         self.dns_ifn = Some(ifn.to_string());
+        self.dns = Some(method);
         Ok(())
     }
 
@@ -331,15 +432,14 @@ impl NetState {
     /// блок IPv6 оставляем**: трафик обязан оставаться заблокированным, пока человек не решит
     /// иначе. Ровно та же семантика, что у `citadel-helper` (байт `'Q'` = чистый разрыв).
     pub fn teardown(&mut self, t: &Tools, clean: bool) {
-        if let Some(ifn) = self.dns_ifn.take() {
-            for cmd in plan::dns_rules_teardown(&ifn) {
+        let ifn = self.dns_ifn.take();
+        if let Some(ifn) = &ifn {
+            for cmd in plan::dns_rules_teardown(ifn) {
                 run(&t.iptables, &cmd);
             }
         }
-        if let Some(b) = self.resolv_backup.take() {
-            if let Err(e) = restore_resolv(b) {
-                eprintln!("[vpnd] WARN: не удалось восстановить {RESOLV}: {e:#}");
-            }
+        if let Some(m) = self.dns.take() {
+            teardown_dns(t, m, ifn.as_deref());
         }
         for dst in std::mem::take(&mut self.bypass_routes) {
             run_str(&t.ip, &["route", "del", &dst]);
@@ -370,6 +470,13 @@ impl NetState {
     }
 
     /// Снять fail-closed правила (чистый disconnect, команда `--disarm`, остановка юнита).
+    ///
+    /// Снимается и всё, что относится к DNS: если демона убили в обход штатной свёртки (SIGKILL,
+    /// падение машины), в системе остаются `DROP` на `:53` мимо мёртвого интерфейса и — при
+    /// запасном способе — цепочка заворота `:53` в исчезнувший туннель. Утечки в этом нет, но
+    /// DNS не работает, и человек с «интернет есть, имена не резолвятся» должен уметь починить
+    /// это ОДНОЙ понятной командой (`citadel-cli killswitch --disarm`), а не гадать. Тот же
+    /// урок, что с залипшим kill-switch (L11).
     pub fn disarm(&mut self, t: &Tools) {
         for cmd in plan::killswitch_teardown() {
             run(&t.iptables, &cmd);
@@ -377,9 +484,26 @@ impl NetState {
         for cmd in plan::ipv6_block_teardown() {
             run(&t.ip6tables, &cmd);
         }
+        // Интерфейс демона всегда один и тот же (TUN_NAME) — осиротевшие правила адресуемы даже
+        // без памяти о прошлой сессии.
+        for cmd in plan::dns_rules_teardown(TUN_NAME) {
+            run(&t.iptables, &cmd);
+        }
+        for cmd in plan::dns_redirect_teardown() {
+            run(&t.iptables, &cmd);
+        }
         self.ks_applied = None;
         self.ipv6_blocked = false;
         self.allowed_extra.clear();
+    }
+
+    /// Остались ли от прошлого запуска правила DNS (без активной сессии это значит «имена не
+    /// резолвятся»). Проверяется по факту, а не по нашей памяти — демон мог быть убит.
+    pub fn dns_rules_orphaned(&self, t: &Tools) -> bool {
+        chain_exists(t, &t.iptables, plan::DNS_NAT_CHAIN)
+            || output(&t.iptables, &["-S", "OUTPUT"])
+                .map(|s| s.lines().any(|l| l.contains("dport 53") && l.contains(TUN_NAME)))
+                .unwrap_or(false)
     }
 
     /// Армирован ли kill-switch прямо сейчас (в т.ч. осиротевший от прошлого запуска, L11).
@@ -401,6 +525,160 @@ fn chain_exists(_t: &Tools, tool: &Path, chain: &str) -> bool {
         .unwrap_or(false)
 }
 
+// ───────────────────────────── резолвер (F6) ─────────────────────────────
+
+/// Выбрать и применить способ настройки резолвера. Порядок — от «как было принято» к самому
+/// жёсткому; следующий включается, только если предыдущий физически невозможен на этой машине.
+///
+/// Обещание одинаково для всех способов: имена резолвятся сервером туннеля, а весь прочий `:53`
+/// заблокирован (F6, ставится вызывающим). Разница только в том, ЧЕМ мы этого добиваемся.
+fn choose_dns(t: &Tools, ifn: &str, dns: Ipv4Addr) -> Result<DnsMethod> {
+    // 1. /etc/resolv.conf — обычный путь; ничего лишнего в системе не остаётся.
+    match backup_and_write_resolv(dns) {
+        Ok(b) => return Ok(DnsMethod::ResolvFile(b)),
+        Err(e) => eprintln!("[vpnd] {RESOLV} записать не удалось ({e:#}) — ищу другой способ"),
+    }
+    // 2. systemd-resolved: сервер вешается на интерфейс, файл не нужен вовсе.
+    if resolved_is_system_resolver(t) && apply_resolved(t, ifn, dns) {
+        return Ok(DnsMethod::Resolved);
+    }
+    // 3. resolvconf: он сам решит, куда писать (часто это /run, а не /etc).
+    if apply_resolvconf(t, ifn, dns) {
+        return Ok(DnsMethod::Resolvconf);
+    }
+    // 4. Резолвер системы не трогаем — заворачиваем весь :53 в туннель принудительно.
+    if apply_redirect(t, dns) {
+        eprintln!(
+            "[vpnd] резолвер системы настроить нечем — весь :53 принудительно заворачивается \
+             в туннель ({dns}); файл {RESOLV} остался как был"
+        );
+        return Ok(DnsMethod::Redirect);
+    }
+    bail!(
+        "не удалось настроить DNS туннеля ни одним способом: {RESOLV} недоступен для записи, \
+         systemd-resolved и resolvconf недоступны, заворот :53 через iptables nat не встал. \
+         Сессия отклонена, иначе DNS-запросы ушли бы мимо туннеля"
+    )
+}
+
+/// Переприменить уже выбранный способ (реконнект: интерфейс пересоздан, правила могли протухнуть).
+fn reapply_dns(t: &Tools, m: &DnsMethod, ifn: &str, dns: Ipv4Addr) {
+    let ok = match m {
+        // бэкап уже снят — здесь только перезапись (файл мог переписать NetworkManager/DHCP)
+        DnsMethod::ResolvFile(_) => write_resolv(dns).is_ok(),
+        DnsMethod::Resolved => apply_resolved(t, ifn, dns),
+        DnsMethod::Resolvconf => apply_resolvconf(t, ifn, dns),
+        DnsMethod::Redirect => apply_redirect(t, dns),
+    };
+    if !ok {
+        eprintln!("[vpnd] WARN: резолвер ({}) не переприменился на реконнекте", m.label());
+    }
+}
+
+/// Свернуть настройку резолвера: вернуть систему ровно в то состояние, из которого взяли.
+fn teardown_dns(t: &Tools, m: DnsMethod, ifn: Option<&str>) {
+    match m {
+        DnsMethod::ResolvFile(b) => {
+            if let Err(e) = restore_resolv(b) {
+                eprintln!("[vpnd] WARN: не удалось восстановить {RESOLV}: {e:#}");
+            }
+        }
+        DnsMethod::Resolved => {
+            if let (Some(rc), Some(ifn)) = (&t.resolvectl, ifn) {
+                run_str(rc, &["revert", ifn]);
+            }
+        }
+        DnsMethod::Resolvconf => {
+            if let (Some(rcf), Some(ifn)) = (&t.resolvconf, ifn) {
+                run_str(rcf, &["-d", &resolvconf_iface(ifn)]);
+            }
+        }
+        DnsMethod::Redirect => {
+            for cmd in plan::dns_redirect_teardown() {
+                run(&t.iptables, &cmd);
+            }
+        }
+    }
+}
+
+/// Является ли systemd-resolved резолвером системы. Проверка обязательна: `resolvectl dns`
+/// отработает «успешно» и на машине, где resolved стоит, но `resolv.conf` смотрит мимо него —
+/// и мы бы решили, что DNS настроен, оставив пользователя без резолвинга.
+fn resolved_is_system_resolver(t: &Tools) -> bool {
+    let Some(rc) = &t.resolvectl else { return false };
+    if !run_str(rc, &["status"]) {
+        return false; // сервис не отвечает по D-Bus — он не резолвер
+    }
+    if let Ok(target) = std::fs::read_link(RESOLV) {
+        if target.to_string_lossy().contains("systemd/resolve") {
+            return true;
+        }
+    }
+    // stub-адреса systemd-resolved; читаем «по ссылке» — нас интересует итоговое содержимое
+    std::fs::read_to_string(RESOLV)
+        .map(|s| s.contains("127.0.0.53") || s.contains("127.0.0.54"))
+        .unwrap_or(false)
+}
+
+/// systemd-resolved: назначить сервер туннеля на интерфейс и сделать его маршрутом для ВСЕХ имён
+/// (`~.` — routing-домен «всё»). Параллельные апстримы физических линков этим не отменяются, но
+/// им закрыт выход F6-правилами, так что ответить может только туннель.
+fn apply_resolved(t: &Tools, ifn: &str, dns: Ipv4Addr) -> bool {
+    let Some(rc) = &t.resolvectl else { return false };
+    let ip = dns.to_string();
+    if !run_str(rc, &["dns", ifn, &ip]) || !run_str(rc, &["domain", ifn, "~."]) {
+        return false;
+    }
+    // Дальше — best effort: не поддерживается на старых версиях, но и не критично.
+    run_str(rc, &["default-route", ifn, "yes"]);
+    run_str(rc, &["llmnr", ifn, "no"]);
+    run_str(rc, &["mdns", ifn, "no"]);
+    true
+}
+
+/// Имя записи для resolvconf: `<интерфейс>.<программа>` — так удаление снимает ровно нашу.
+fn resolvconf_iface(ifn: &str) -> String {
+    format!("{ifn}.citadel")
+}
+
+fn apply_resolvconf(t: &Tools, ifn: &str, dns: Ipv4Addr) -> bool {
+    let Some(rcf) = &t.resolvconf else { return false };
+    let body = format!("# CitadelPQVPN\nnameserver {dns}\noptions edns0\n");
+    run_stdin(rcf, &["-a", &resolvconf_iface(ifn)], &body)
+}
+
+/// Заворот всего `:53` в резолвер туннеля (таблица nat). Перед установкой снимаем прошлое —
+/// иначе `-N` упадёт на существующей цепочке, а хуки в OUTPUT задвоятся.
+fn apply_redirect(t: &Tools, dns: Ipv4Addr) -> bool {
+    for cmd in plan::dns_redirect_teardown() {
+        run(&t.iptables, &cmd);
+    }
+    let mut ok = true;
+    for cmd in plan::dns_redirect_rules(dns) {
+        ok &= run(&t.iptables, &cmd);
+    }
+    if !ok {
+        // Полумера хуже отсутствия: часть правил без DNAT — это просто дыра в F6.
+        for cmd in plan::dns_redirect_teardown() {
+            run(&t.iptables, &cmd);
+        }
+    }
+    ok
+}
+
+/// Снять бэкап и записать наш резолвер. При неудаче записи бэкап удаляется: `resolv.conf` не
+/// тронут, восстанавливать нечего, а лишний файл в `/run` только запутал бы следующий disconnect.
+fn backup_and_write_resolv(dns: Ipv4Addr) -> Result<ResolvBackup> {
+    let b = backup_resolv()?;
+    match write_resolv(dns) {
+        Ok(()) => Ok(b),
+        Err(e) => {
+            let _ = std::fs::remove_file(RESOLV_BAK);
+            Err(e)
+        }
+    }
+}
+
 /// Сохранить исходный резолвер (симлинк/файл/отсутствие) — см. L4.
 fn backup_resolv() -> Result<ResolvBackup> {
     match std::fs::symlink_metadata(RESOLV) {
@@ -411,40 +689,89 @@ fn backup_resolv() -> Result<ResolvBackup> {
         }
         Ok(_) => {
             let content = std::fs::read(RESOLV).context("прочитать resolv.conf")?;
-            write_private(Path::new(RESOLV_BAK), &content)?;
+            // Резервная копия в /run — только для root (в ней виден резолвер пользователя).
+            write_mode(Path::new(RESOLV_BAK), &content, 0o600)?;
             Ok(ResolvBackup::File)
         }
     }
 }
 
-/// Записать наш резолвер (обычным файлом, сняв симлинк, чтобы не портить цель).
+/// Записать наш резолвер обычным файлом поверх текущего (в т.ч. поверх симлинка — заменяется
+/// сама ссылка, её цель не портится).
 fn write_resolv(dns: Ipv4Addr) -> Result<()> {
-    let _ = std::fs::remove_file(RESOLV);
     let body = format!("# CitadelPQVPN: резолвер туннеля (оригинал восстановится при disconnect)\nnameserver {dns}\noptions edns0\n");
-    std::fs::write(RESOLV, body).with_context(|| format!("записать {RESOLV}"))?;
-    Ok(())
+    install_resolv(body.as_bytes())
+}
+
+/// Положить содержимое в `/etc/resolv.conf`.
+///
+/// Основной способ — временный файл рядом + `rename`: атомарно (никто не увидит машину без
+/// резолвера), заменяет и симлинк целиком, не портя его цель. Почему не `remove` + `write`, как
+/// было: между ними резолвера нет вовсе, а если запись не удастся — система останется без файла.
+///
+/// Запасной способ — запись «на месте», нужна там, где `rename` невозможен: в контейнерах
+/// `/etc/resolv.conf` подмонтирован bind-mount'ом, и переименование поверх точки монтирования
+/// даёт `EBUSY`, тогда как запись в сам файл проходит. Применяется ТОЛЬКО к обычному файлу:
+/// писать «по ссылке» нельзя — испортили бы stub systemd-resolved (L4).
+fn install_resolv(content: &[u8]) -> Result<()> {
+    let tmp = Path::new(RESOLV_TMP);
+    let _ = std::fs::remove_file(tmp);
+    // 0644 задаём явно: umask демона 0077, иначе резолвер стал бы нечитаемым для всех, кроме root.
+    let prepared = write_mode(tmp, content, 0o644);
+    let rename_err = match &prepared {
+        Ok(()) => match std::fs::rename(tmp, RESOLV) {
+            Ok(()) => return Ok(()),
+            Err(e) => {
+                let _ = std::fs::remove_file(tmp);
+                Some(e.to_string())
+            }
+        },
+        Err(e) => Some(format!("{e:#}")),
+    };
+    let is_symlink =
+        std::fs::symlink_metadata(RESOLV).map(|m| m.file_type().is_symlink()).unwrap_or(false);
+    if !is_symlink {
+        if let Err(e) = std::fs::write(RESOLV, content) {
+            bail!("записать {RESOLV}: {e} (подмена файлом: {})", rename_err.unwrap_or_default());
+        }
+        // Права на существующем файле не меняем: он мог быть создан не нами.
+        return Ok(());
+    }
+    bail!("записать {RESOLV}: {}", rename_err.unwrap_or_default())
 }
 
 /// Вернуть резолвер в исходное состояние.
 fn restore_resolv(b: ResolvBackup) -> Result<()> {
-    let _ = std::fs::remove_file(RESOLV);
     match b {
         ResolvBackup::Symlink(target) => {
-            std::os::unix::fs::symlink(&target, RESOLV)
-                .with_context(|| format!("восстановить симлинк {RESOLV} → {}", target.display()))?;
+            // Симлинк тоже ставим через rename: он атомарно заменяет наш файл ссылкой.
+            let tmp = Path::new(RESOLV_TMP);
+            let _ = std::fs::remove_file(tmp);
+            std::os::unix::fs::symlink(&target, tmp)
+                .with_context(|| format!("подготовить симлинк {RESOLV} → {}", target.display()))?;
+            std::fs::rename(tmp, RESOLV)
+                .inspect_err(|_| {
+                    let _ = std::fs::remove_file(tmp);
+                })
+                .with_context(|| format!("восстановить симлинк {RESOLV}"))?;
         }
         ResolvBackup::File => {
             let content = std::fs::read(RESOLV_BAK).context("прочитать резервную копию resolv.conf")?;
-            std::fs::write(RESOLV, content).context("восстановить resolv.conf")?;
+            install_resolv(&content).context("восстановить resolv.conf")?;
             let _ = std::fs::remove_file(RESOLV_BAK);
         }
-        ResolvBackup::Missing => {}
+        // Файла не было — убираем свой и оставляем как было.
+        ResolvBackup::Missing => {
+            let _ = std::fs::remove_file(RESOLV);
+        }
     }
     Ok(())
 }
 
-/// Запись файла с правами 0600 (резервные копии в /run не должны быть читаемы всем).
-fn write_private(path: &Path, content: &[u8]) -> Result<()> {
+/// Запись файла с явными правами. Права выставляются отдельным `chmod`, а не только флагом
+/// `mode()`: у демона umask 0077, и `resolv.conf` иначе получился бы root-only, то есть
+/// нечитаемым для всех приложений, которым он и предназначен.
+fn write_mode(path: &Path, content: &[u8], mode: u32) -> Result<()> {
     use std::os::unix::fs::OpenOptionsExt;
     if let Some(d) = path.parent() {
         std::fs::create_dir_all(d).ok();
@@ -453,9 +780,17 @@ fn write_private(path: &Path, content: &[u8]) -> Result<()> {
         .write(true)
         .create(true)
         .truncate(true)
-        .mode(0o600)
+        .mode(mode)
         .open(path)
         .with_context(|| format!("создать {}", path.display()))?;
     f.write_all(content)?;
+    f.flush()?;
+    std::fs::set_permissions(path, perms(mode))
+        .with_context(|| format!("права {mode:o} на {}", path.display()))?;
     Ok(())
+}
+
+fn perms(mode: u32) -> std::fs::Permissions {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::Permissions::from_mode(mode)
 }
