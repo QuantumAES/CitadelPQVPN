@@ -251,9 +251,11 @@ impl NetState {
             self.setup_dns(t, &ifn, dns)?;
         }
 
-        // 4. kill-switch (идемпотентно: одинаковый набор правил не переустанавливаем)
+        // 4. kill-switch (идемпотентно: одинаковый набор правил не переустанавливаем).
+        // `s.dns.is_some()` = рубеж для `:53` поставлен на шаге 3 ⇒ цепочке можно выпускать DNS
+        // без проверки интерфейса (после DNAT-заворота она врёт, см. plan::killswitch_rules).
         if s.killswitch {
-            self.ensure_killswitch(t, &ifn, &s.exit_ips, &s.bypass, engine_uid);
+            self.ensure_killswitch(t, &ifn, &s.exit_ips, &s.bypass, engine_uid, s.dns.is_some());
         }
 
         // 5. S2.2/A2: IPv6 fail-closed при full-tunnel или kill-switch (туннель IPv4-only)
@@ -372,6 +374,7 @@ impl NetState {
         exit_ips: &[Ipv4Addr],
         bypass: &[V4Net],
         engine_uid: Option<u32>,
+        dns_guarded: bool,
     ) {
         // Объединяем адреса из TunSetup с ранее разрешёнными (issuer/резервные exit'ы): иначе
         // пересборка цепочки на реконнекте снова отрезала бы issuer'а от движка.
@@ -381,7 +384,7 @@ impl NetState {
                 all.push(*ip);
             }
         }
-        let desired = plan::killswitch_rules(ifn, &all, bypass, engine_uid);
+        let desired = plan::killswitch_rules(ifn, &all, bypass, engine_uid, dns_guarded);
         if self.ks_applied.as_ref() == Some(&desired) && chain_exists(t, &t.iptables, plan::KS_CHAIN)
         {
             return;
@@ -465,7 +468,8 @@ impl NetState {
     /// (резолвить негде), нужен адрес. Компромисс осознанный: смысл режима именно в том, что до
     /// туннеля наружу не уходит ни одного пакета, включая DNS-запрос с именем вашего VPN-сервера.
     pub fn arm_lockdown(&mut self, t: &Tools) {
-        self.ensure_killswitch(t, TUN_NAME, &[], &[], None);
+        // dns_guarded=false: рубежа для `:53` ещё нет (туннеля тоже) — DNS обязан быть закрыт.
+        self.ensure_killswitch(t, TUN_NAME, &[], &[], None, false);
         self.ensure_ipv6_block(t);
     }
 
@@ -500,10 +504,15 @@ impl NetState {
     /// Остались ли от прошлого запуска правила DNS (без активной сессии это значит «имена не
     /// резолвятся»). Проверяется по факту, а не по нашей памяти — демон мог быть убит.
     pub fn dns_rules_orphaned(&self, t: &Tools) -> bool {
-        chain_exists(t, &t.iptables, plan::DNS_NAT_CHAIN)
-            || output(&t.iptables, &["-S", "OUTPUT"])
+        let leftovers = |args: &[&str]| {
+            output(&t.iptables, args)
                 .map(|s| s.lines().any(|l| l.contains("dport 53") && l.contains(TUN_NAME)))
                 .unwrap_or(false)
+        };
+        chain_exists(t, &t.iptables, plan::DNS_NAT_CHAIN)
+            || leftovers(&["-t", "mangle", "-S", "POSTROUTING"])
+            // …и правила прежних версий, где рубеж стоял в filter OUTPUT (обновление на ходу).
+            || leftovers(&["-S", "OUTPUT"])
     }
 
     /// Армирован ли kill-switch прямо сейчас (в т.ч. осиротевший от прошлого запуска, L11).
@@ -533,21 +542,28 @@ fn chain_exists(_t: &Tools, tool: &Path, chain: &str) -> bool {
 /// Обещание одинаково для всех способов: имена резолвятся сервером туннеля, а весь прочий `:53`
 /// заблокирован (F6, ставится вызывающим). Разница только в том, ЧЕМ мы этого добиваемся.
 fn choose_dns(t: &Tools, ifn: &str, dns: Ipv4Addr) -> Result<DnsMethod> {
+    // Ступени ДО указанной пропускаются (`CITADEL_DNS_FORCE`, см. [`forced_rung`]).
+    let skip = forced_rung();
     // 1. /etc/resolv.conf — обычный путь; ничего лишнего в системе не остаётся.
-    match backup_and_write_resolv(dns) {
-        Ok(b) => return Ok(DnsMethod::ResolvFile(b)),
-        Err(e) => eprintln!("[vpnd] {RESOLV} записать не удалось ({e:#}) — ищу другой способ"),
+    if skip <= 1 {
+        match backup_and_write_resolv(dns) {
+            Ok(b) => return Ok(DnsMethod::ResolvFile(b)),
+            Err(e) => {
+                eprintln!("[vpnd] {RESOLV} записать не удалось ({e:#}) — ищу другой способ");
+                hint_readonly_etc();
+            }
+        }
     }
     // 2. systemd-resolved: сервер вешается на интерфейс, файл не нужен вовсе.
-    if resolved_is_system_resolver(t) && apply_resolved(t, ifn, dns) {
+    if skip <= 2 && resolved_is_system_resolver(t) && apply_resolved(t, ifn, dns) {
         return Ok(DnsMethod::Resolved);
     }
     // 3. resolvconf: он сам решит, куда писать (часто это /run, а не /etc).
-    if apply_resolvconf(t, ifn, dns) {
+    if skip <= 3 && apply_resolvconf(t, ifn, dns) {
         return Ok(DnsMethod::Resolvconf);
     }
     // 4. Резолвер системы не трогаем — заворачиваем весь :53 в туннель принудительно.
-    if apply_redirect(t, dns) {
+    if apply_redirect(t, ifn, dns) {
         eprintln!(
             "[vpnd] резолвер системы настроить нечем — весь :53 принудительно заворачивается \
              в туннель ({dns}); файл {RESOLV} остался как был"
@@ -561,6 +577,77 @@ fn choose_dns(t: &Tools, ifn: &str, dns: Ipv4Addr) -> Result<DnsMethod> {
     )
 }
 
+/// Смонтирован ли `/etc` только для чтения (а не «конкретный файл под bind-mount'ом»,
+/// «иммутабельный атрибут» и прочие частные случаи). Проверяем пробной записью: единственный
+/// надёжный способ, потому что песочница systemd — это bind-mount, которого нет ни в `/etc/fstab`,
+/// ни в правах файла.
+fn etc_is_readonly() -> bool {
+    let probe = Path::new("/etc/.citadel-rw-probe");
+    match std::fs::OpenOptions::new().write(true).create(true).truncate(true).open(probe) {
+        Ok(_) => {
+            let _ = std::fs::remove_file(probe);
+            false
+        }
+        Err(e) => e.kind() == std::io::ErrorKind::ReadOnlyFilesystem,
+    }
+}
+
+/// Объяснить, ПОЧЕМУ резолвер не настроить обычным способом, и что с этим сделать.
+///
+/// Ровно этот случай стоил живой отладки: у пользователя GUI-клиент (его helper запускается через
+/// polkit, без песочницы) резолвер писал и работал, а консольный демон получал `EROFS` и молча
+/// уходил на запасную ступень. Юнит в комплекте разрешает запись (`ReadWritePaths=/etc`), но
+/// `daemon-reload` НЕ перечитывает песочницу уже запущенного процесса — то есть «фикс стоит на
+/// диске, а работает старая песочница». Такое надо говорить вслух и с готовой командой.
+fn hint_readonly_etc() {
+    if !etc_is_readonly() {
+        return; // причина в чём-то другом (bind-mount файла, immutable) — не выдумываем
+    }
+    // systemd выставляет INVOCATION_ID процессу юнита — по нему отличаем «нас запустил systemd».
+    let under_systemd = std::env::var_os("INVOCATION_ID").is_some();
+    let unit_allows_etc = ["/etc/systemd/system/citadel-vpnd.service", "/lib/systemd/system/citadel-vpnd.service"]
+        .iter()
+        .filter_map(|p| std::fs::read_to_string(p).ok())
+        .any(|s| {
+            s.lines().any(|l| {
+                let l = l.trim();
+                l.starts_with("ReadWritePaths=") && l.contains("/etc")
+            })
+        });
+    eprintln!("[vpnd] причина: /etc смонтирован только для чтения");
+    if under_systemd && unit_allows_etc {
+        eprintln!(
+            "[vpnd] ВНИМАНИЕ: юнит НА ДИСКЕ запись в /etc разрешает, а у работающего процесса /etc \
+             только для чтения — значит демон живёт со СТАРОЙ песочницей (daemon-reload её не \
+             меняет). Починить: sudo systemctl daemon-reload && sudo systemctl restart citadel-vpnd"
+        );
+    } else if under_systemd {
+        eprintln!(
+            "[vpnd] песочница юнита закрыла /etc на запись. Вернуть обычный путь настройки \
+             резолвера: добавить в юнит `ReadWritePaths=/etc`, затем daemon-reload + restart"
+        );
+    }
+}
+
+/// С какой ступени лестницы начинать (`CITADEL_DNS_FORCE=file|resolved|resolvconf|redirect`).
+///
+/// Нужно для e2e: в контейнере `/etc/resolv.conf` пишется, поэтому нижние ступени в стенде не
+/// проигрывались НИ РАЗУ — и именно в самой нижней («заворот `:53`») жил дефект, из-за которого
+/// туннель поднимался, но не носил ни DNS, ни трафик. Переменную задаёт только тот, кто пишет
+/// юнит (root), и она может лишь **ужесточить** способ: F6-правила ставятся при любом из них.
+fn forced_rung() -> u8 {
+    match std::env::var("CITADEL_DNS_FORCE").unwrap_or_default().trim() {
+        "" | "file" => 1,
+        "resolved" => 2,
+        "resolvconf" => 3,
+        "redirect" => 4,
+        other => {
+            eprintln!("[vpnd] CITADEL_DNS_FORCE={other:?} не распознан — иду лестницей с начала");
+            1
+        }
+    }
+}
+
 /// Переприменить уже выбранный способ (реконнект: интерфейс пересоздан, правила могли протухнуть).
 fn reapply_dns(t: &Tools, m: &DnsMethod, ifn: &str, dns: Ipv4Addr) {
     let ok = match m {
@@ -568,7 +655,7 @@ fn reapply_dns(t: &Tools, m: &DnsMethod, ifn: &str, dns: Ipv4Addr) {
         DnsMethod::ResolvFile(_) => write_resolv(dns).is_ok(),
         DnsMethod::Resolved => apply_resolved(t, ifn, dns),
         DnsMethod::Resolvconf => apply_resolvconf(t, ifn, dns),
-        DnsMethod::Redirect => apply_redirect(t, dns),
+        DnsMethod::Redirect => apply_redirect(t, ifn, dns),
     };
     if !ok {
         eprintln!("[vpnd] WARN: резолвер ({}) не переприменился на реконнекте", m.label());
@@ -649,12 +736,12 @@ fn apply_resolvconf(t: &Tools, ifn: &str, dns: Ipv4Addr) -> bool {
 
 /// Заворот всего `:53` в резолвер туннеля (таблица nat). Перед установкой снимаем прошлое —
 /// иначе `-N` упадёт на существующей цепочке, а хуки в OUTPUT задвоятся.
-fn apply_redirect(t: &Tools, dns: Ipv4Addr) -> bool {
+fn apply_redirect(t: &Tools, ifn: &str, dns: Ipv4Addr) -> bool {
     for cmd in plan::dns_redirect_teardown() {
         run(&t.iptables, &cmd);
     }
     let mut ok = true;
-    for cmd in plan::dns_redirect_rules(dns) {
+    for cmd in plan::dns_redirect_rules(dns, ifn) {
         ok &= run(&t.iptables, &cmd);
     }
     if !ok {

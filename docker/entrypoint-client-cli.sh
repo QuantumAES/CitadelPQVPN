@@ -205,6 +205,176 @@ iptables -S CITADEL_KS >/dev/null 2>&1 && ok "режим блокировки а
 citadel-cli killswitch --disarm 2>&1 | tail -1
 iptables -S CITADEL_KS >/dev/null 2>&1 && bad "защита не снялась" || ok "защита снята командой пользователя"
 
+# ─────────────────────────────────────────────────────────────────────────────
+# ПОЛНЫЙ ТУННЕЛЬ (0.0.0.0/0) + split-обход локальной подсети.
+#
+# Тесты 1–13 гоняют туннель на узких маршрутах (`1.1.1.1/32`), а у пользователя он ПОЛНЫЙ —
+# и ровно на нём вылезло «подключается, но интернета нет, локальные адреса пингуются». Это
+# другой режим кода: половинки `0.0.0.0/1`, выбор source-адреса ядром, bypass к exit'у,
+# NAT-заворот DNS. Без этого сценария в стенде класс дефектов «полный туннель не носит
+# трафик» не ловится вовсе.
+# ─────────────────────────────────────────────────────────────────────────────
+head1 "L-ТЕСТ 14 — ПОЛНЫЙ туннель (0.0.0.0/0): интернет идёт через exit"
+# Подсеть контейнера = «локалка» пользователя: её и просим обойти сплитом.
+LAN=$(ip -o -4 route show scope link | awk '/eth0/{print $1; exit}')
+LAN_GW=$(getent hosts exit | awk '{print $1; exit}')   # сосед по мосту (проверка обхода)
+echo "  локальная подсеть (обход): ${LAN:-нет} ; сосед: $LAN_GW"
+LINK_FULL=$(citadel-linkgen \
+    --servers "$EXIT_IP:4433" \
+    --server-name Citadel.exit \
+    --psk "$(cat /shared/obfs.psk)" \
+    --pin "$(cat /shared/exit.pin)" \
+    --mldsa-pub /shared/exit.mldsa \
+    --routes "0.0.0.0/0" \
+    --dns 1.1.1.1 \
+    --issuer "$ISSUER_IP:7000" \
+    --issuer-pin "$(cat /shared/issuer-tls.pin)" \
+    --client-seed "$SEED" 2>/dev/null | grep -m1 '^citadel://')
+printf '%s\n%s\n' "$LINK_FULL" "$PASSWD" | citadel-cli add --name full --stdin 2>&1 | tail -1
+[ -n "$LAN" ] && citadel-cli split exclude "$LAN" >/dev/null
+citadel-cli killswitch on >/dev/null
+printf '%s\n' "$PASSWD" | citadel-cli connect full 2>&1 | tail -4
+state=""
+for _ in $(seq 1 60); do
+    state=$(citadel-cli status 2>/dev/null | awk '/Состояние/{print $2}')
+    [ "$state" = "подключено" ] && break
+    sleep 1
+done
+if [ "$state" != "подключено" ]; then
+    bad "полный туннель не поднялся (состояние: $state)"
+    tail -30 /var/log/vpnd.log
+else
+    ok "полный туннель поднялся"
+    ip route | sed 's/^/      /'
+    ip route | grep -q "^0.0.0.0/1 .*citadel0" && ok "половинка 0.0.0.0/1 → citadel0" || bad "нет 0.0.0.0/1 в туннеле"
+    ip route | grep -q "^128.0.0.0/1 .*citadel0" && ok "половинка 128.0.0.0/1 → citadel0" || bad "нет 128.0.0.0/1 в туннеле"
+    # Анти-петля к exit'у: либо явный /32 мимо туннеля, либо exit on-link (в стенде он сосед по
+    # мосту — connected-route уже специфичнее половинок /1, и трогать его ВРЕДНО).
+    if ip route | grep -q "^$EXIT_IP.*via" || ip route get "$EXIT_IP" | grep -q "dev eth0"; then
+        ok "путь к exit'у идёт мимо туннеля (анти-петля): $(ip route get "$EXIT_IP" | head -1)"
+    else
+        bad "трафик к exit'у заворачивается в туннель — петля"
+    fi
+
+    # Главная проверка: адрес, которого НЕТ в маршрутах ссылки, обязан ходить через туннель.
+    if ping -c 3 -W 4 8.8.8.8 >/dev/null 2>&1; then
+        ok "ping 8.8.8.8 через полный туннель проходит"
+    else
+        bad "НЕТ ИНТЕРНЕТА через полный туннель (ping 8.8.8.8): ровно замечание пользователя"
+    fi
+    if ping -c 2 -W 4 1.1.1.1 >/dev/null 2>&1; then
+        ok "ping 1.1.1.1 (он же резолвер) проходит"
+    else
+        bad "1.1.1.1 недостижим через полный туннель"
+    fi
+    # TCP поверх туннеля: ловит MTU/MSS-дефекты, которые ICMP не показывает.
+    if curl -sS -m 15 -o /dev/null https://1.1.1.1/ 2>/dev/null; then
+        ok "TCP/TLS через туннель работает (curl https://1.1.1.1)"
+    else
+        bad "TCP/TLS через туннель не работает (MTU/MSS?)"
+    fi
+    # DNS: имена обязаны резолвиться (это и есть «интернета нет» для большинства).
+    if getent hosts example.com >/dev/null 2>&1; then
+        ok "имена резолвятся через туннель"
+    else
+        bad "DNS не работает при полном туннеле"
+        echo "      resolv.conf: $(tr '\n' ' ' < /etc/resolv.conf)"
+        iptables -t nat -S CITADEL_DNS 2>/dev/null | sed 's/^/      /'
+    fi
+    # Сплит: сосед по локальной подсети обязан оставаться доступным мимо туннеля.
+    if [ -n "$LAN_GW" ] && ping -c 2 -W 3 "$LAN_GW" >/dev/null 2>&1; then
+        ok "локальный адрес $LAN_GW доступен (сплит-обход работает)"
+    else
+        bad "локальный адрес $LAN_GW недоступен при полном туннеле"
+    fi
+fi
+citadel-cli disconnect >/dev/null 2>&1
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Последняя ступень лестницы DNS: «резолвер системы настроить нечем — заворачиваем :53 NAT'ом».
+# Именно она включается там, где /etc только для чтения (systemd-песочница, immutable-дистрибутив,
+# контейнер) — и именно она НИ РАЗУ не проигрывалась в стенде, потому что в контейнере
+# /etc/resolv.conf пишется. Форсируем ступень (CITADEL_DNS_FORCE) и ставим системным резолвером
+# адрес ЛОКАЛЬНОЙ подсети — так же, как у пользователя: только в этой комбинации виден дефект
+# «DNAT меняет назначение, но не источник» (пакет уходит в туннель с адресом локалки → exit
+# дропает его анти-спуфингом → «подключено, а интернета нет»).
+# ─────────────────────────────────────────────────────────────────────────────
+head1 "L-ТЕСТ 15 — DNS через принудительный заворот :53 (ступень «нечем настроить резолвер»)"
+kill "$VPND_PID" 2>/dev/null; sleep 2
+: > /var/log/vpnd-redirect.log
+CITADEL_DNS_FORCE=redirect $VPND >/var/log/vpnd-redirect.log 2>&1 &
+VPND_PID=$!
+for _ in $(seq 1 30); do [ -S /run/citadel-vpn/ctl.sock ] && break; sleep 0.5; done
+# «Резолвер провайдера» в локальной подсети — шлюз моста. Важно, что это НЕ резолвер туннеля:
+# запрос к 1.1.1.1 ушёл бы в туннель сам (host-route) и с правильным src, не проверив заворот.
+LAN_DNS=$(ip route show default | awk '{print $3; exit}')
+LAN_DNS="${LAN_DNS:-172.18.0.1}"
+cp /etc/resolv.conf /tmp/resolv.orig 2>/dev/null
+printf 'nameserver %s\noptions timeout:2 attempts:1\n' "$LAN_DNS" > /etc/resolv.conf
+echo "  системный резолвер на время теста: $LAN_DNS (адрес локальной подсети)"
+printf '%s\n' "$PASSWD" | citadel-cli connect full 2>&1 | tail -3
+state=""
+for _ in $(seq 1 60); do
+    state=$(citadel-cli status 2>/dev/null | awk '/Состояние/{print $2}')
+    [ "$state" = "подключено" ] && break
+    sleep 1
+done
+if [ "$state" != "подключено" ]; then
+    bad "сессия с заворотом DNS не поднялась (состояние: $state)"
+    tail -30 /var/log/vpnd-redirect.log
+else
+    grep -q "заворот :53" /var/log/vpnd-redirect.log \
+        && ok "выбрана ступень «заворот :53 в туннель»" \
+        || bad "ступень не выбрана — тест проверяет не то, что нужно"
+    iptables -t nat -S CITADEL_DNS >/dev/null 2>&1 && ok "цепочка заворота создана" || bad "нет цепочки CITADEL_DNS"
+    if iptables -t nat -S CITADEL_DNS_SNAT 2>/dev/null | grep -q MASQUERADE; then
+        ok "источник завёрнутых запросов подменяется на адрес туннеля (SNAT)"
+        iptables -t nat -S CITADEL_DNS_SNAT | sed 's/^/      /'
+    else
+        bad "нет SNAT для завёрнутых запросов — пакеты уйдут с адресом локалки"
+    fi
+    # Главное: имена обязаны резолвиться, хотя resolv.conf указывает в локальную подсеть.
+    if getent hosts example.com >/dev/null 2>&1; then
+        ok "имена резолвятся через заворот (запрос к $LAN_DNS уехал в туннель)"
+    else
+        bad "DNS не работает на ступени заворота: ровно замечание пользователя"
+        iptables -t nat -S CITADEL_DNS | sed 's/^/      /'
+    fi
+    # Клиентская диагностика: пакетов с чужим src быть НЕ должно (они гибнут на exit'е молча).
+    if grep -q "ЧУЖИМ адресом источника" /var/log/vpnd-redirect.log; then
+        bad "движок сообщил о пакетах с чужим src — заворот всё ещё калечит адрес источника:"
+        grep -m1 "ЧУЖИМ адресом источника" /var/log/vpnd-redirect.log | sed 's/^/      /'
+    else
+        ok "движок не видел пакетов с чужим адресом источника"
+    fi
+
+    # НЕГАТИВНЫЙ контроль: снимаем ровно SNAT — и всё обязано сломаться так же, как у
+    # пользователя. Так тест доказывает причинно-следственную связь, а не просто «сейчас работает»:
+    # если однажды SNAT снова потеряется, упадёт не абстрактный assert, а этот сценарий.
+    echo "  — контроль: снимаю SNAT и проверяю, что дефект возвращается…"
+    iptables -t nat -D POSTROUTING -j CITADEL_DNS_SNAT 2>/dev/null
+    if getent hosts example.net >/dev/null 2>&1; then
+        bad "без SNAT DNS всё равно работает — значит тест не проверяет причину дефекта"
+    else
+        ok "без SNAT имена не резолвятся (дефект воспроизводится ⇒ лечит именно SNAT)"
+    fi
+    sleep 10   # окно watchdog'а (8с) — движок должен успеть назвать причину
+    if grep -q "ЧУЖИМ адресом источника" /var/log/vpnd-redirect.log; then
+        ok "движок назвал причину вслух: $(grep -m1 -o 'последний [0-9.]*, а назначен нам [0-9.]*' /var/log/vpnd-redirect.log)"
+    else
+        bad "движок промолчал о пакетах с чужим src — диагностика не работает"
+    fi
+    iptables -t nat -I POSTROUTING 1 -j CITADEL_DNS_SNAT 2>/dev/null
+    getent hosts example.org >/dev/null 2>&1 \
+        && ok "SNAT возвращён — имена снова резолвятся" \
+        || bad "после возврата SNAT DNS не восстановился"
+fi
+citadel-cli disconnect >/dev/null 2>&1
+sleep 1
+iptables -t nat -S CITADEL_DNS >/dev/null 2>&1 && bad "цепочка заворота не снята" || ok "заворот снят при отключении"
+iptables -t nat -S CITADEL_DNS_SNAT >/dev/null 2>&1 && bad "цепочка SNAT не снята" || ok "SNAT-цепочка снята"
+cp /tmp/resolv.orig /etc/resolv.conf 2>/dev/null
+
 echo
 echo "===================================================================="
 echo "  ИТОГ e2e консольного клиента: успешно $PASS, провалено $FAIL"

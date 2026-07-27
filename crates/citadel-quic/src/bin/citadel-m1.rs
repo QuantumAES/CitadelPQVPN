@@ -776,7 +776,7 @@ async fn handle_client(
     // Регистрируем адрес в демуксе на время сессии → return-пакеты пойдут ИМЕННО этому клиенту
     // (не «украдёт» соседний pump). Снимаем регистрацию + освобождаем пул по завершении pump.
     let return_rx = router.register(addr);
-    let res = pump(tunnel, tun, Some(addr), rate_limit, admin_dst, Some(return_rx)).await;
+    let res = pump(tunnel, tun, Some(addr), None, rate_limit, admin_dst, Some(return_rx)).await;
     router.unregister(addr);
     pool.lock().unwrap().free(addr); // C4: вернуть адрес в пул
     if let Err(e) = res {

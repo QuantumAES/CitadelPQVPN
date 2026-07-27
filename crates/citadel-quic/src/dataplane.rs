@@ -218,6 +218,10 @@ pub async fn pump(
     tunnel: Tunnel,
     tun: Arc<dyn TunIo>,
     egress: Option<[u8; 4]>,
+    // Назначенный НАМ адрес — только на КЛИЕНТЕ (взаимоисключимо с `egress`) и только для
+    // диагностики: exit принимает inner-пакеты, лишь если src равен этому адресу (S0.2/H3), так
+    // что пакет с чужим src гарантированно умрёт там молча. Клиент это видит и говорит вслух.
+    client_src: Option<[u8; 4]>,
     rate_limit: Option<RateCfg>,
     admin_dst: Option<([u8; 4], u16)>,
     // Источник return-пакетов (TUN→сеть). На КЛИЕНТЕ — `None`: pump сам читает свой TUN. На EXIT —
@@ -226,7 +230,7 @@ pub async fn pump(
     // трафик (гонка multi-client → потеря/медленно/watchdog-шторм при >1 клиента).
     return_rx: Option<tokio::sync::mpsc::Receiver<Vec<u8>>>,
 ) -> Result<()> {
-    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
     use tokio::sync::mpsc;
     let (net_to_tun_tx, mut net_to_tun_rx) = mpsc::channel::<Vec<u8>>(1024);
 
@@ -307,6 +311,11 @@ pub async fn pump(
     // Сколько inner-пакетов не-IPv4 мы отбросили локально (см. ниже) — для диагностики окна.
     let non_v4 = Arc::new(AtomicU64::new(0));
     let send_non_v4 = non_v4.clone();
+    // Пакеты, ушедшие в туннель с адресом источника, который exit'у не назначен нам (см. ниже),
+    // и последний такой адрес — чтобы в одной строке лога назвать И симптом, И виновника.
+    let bad_src = Arc::new(AtomicU64::new(0));
+    let bad_src_last = Arc::new(AtomicU32::new(0));
+    let (send_bad_src, send_bad_src_last) = (bad_src.clone(), bad_src_last.clone());
     let sender = tokio::spawn(async move {
         while let Some(pkt) = tun_to_net_rx.recv().await {
             // S2.2/A2: туннель IPv4-only (адрес назначается v4, exit по default-deny дропает
@@ -314,9 +323,18 @@ pub async fn pump(
             // поэтому весь IPv6 приложений сыплется сюда. Гнать его на exit бессмысленно (там он
             // всё равно умрёт), зато он ломает диагностику живости: «шлём много, не принимаем
             // ничего» = ложное срабатывание watchdog → реконнект-шторм. Дропаем на месте и считаем.
-            if ip::parse_ipv4(&pkt).is_none() {
+            let Some(v4) = ip::parse_ipv4(&pkt) else {
                 send_non_v4.fetch_add(1, Ordering::Relaxed);
                 continue;
+            };
+            // Диагностика (не фильтр): src ≠ назначенный адрес ⇒ exit дропнет пакет анти-спуфингом
+            // и ответа не будет НИКОГДА. Отправляем всё равно — политику решает exit, а клиент лишь
+            // обязан объяснить человеку «туннель поднят, а трафика нет» вместо загадочных нулей.
+            if let Some(mine) = client_src {
+                if v4.src != mine {
+                    send_bad_src.fetch_add(1, Ordering::Relaxed);
+                    send_bad_src_last.store(u32::from_be_bytes(v4.src), Ordering::Relaxed);
+                }
             }
             let dg = datagram::encode(datagram::CTX_RAW_IP, &pkt);
             match send_conn.send_datagram(bytes::Bytes::from(dg)) {
@@ -365,11 +383,14 @@ pub async fn pump(
     let wd_rx = rx_count.clone();
     let wd_stop = stop.clone();
     let wd_non_v4 = non_v4.clone();
+    let (wd_bad_src, wd_bad_src_last) = (bad_src.clone(), bad_src_last.clone());
+    let wd_mine = client_src;
     // Диагностику окна печатает только КЛИЕНТ (`egress == None`): на exit'е это был бы лог о
     // трафике пользователя — против no-logs (см. handle_client).
     let wd_client = egress.is_none();
     let watchdog = tokio::spawn(async move {
         let (mut seen_tx, mut seen_rx, mut seen_v6, mut seen_urx) = (0u64, 0u64, 0u64, 0u64);
+        let mut seen_bad_src = 0u64;
         loop {
             tokio::time::sleep(WATCHDOG_INTERVAL).await;
             if wd_stop.load(Ordering::Acquire) {
@@ -407,6 +428,25 @@ pub async fn pump(
                     WATCHDOG_INTERVAL.as_secs(),
                     st.path.rtt.as_millis(),
                     st.path.current_mtu,
+                );
+            }
+            // Пакеты с чужим src: exit дропает их анти-спуфингом, поэтому «отправлено много,
+            // принято 0» — не загадка, а следствие. Называем адрес: по нему сразу видно природу
+            // (адрес локалки → NAT-заворот :53 без SNAT; 127.0.0.1 → петлевой bind; адрес другого
+            // интерфейса → приложение прибито к нему явно).
+            let bad_src = wd_bad_src.load(Ordering::Relaxed);
+            let bad_delta = bad_src.wrapping_sub(seen_bad_src);
+            seen_bad_src = bad_src;
+            if wd_client && bad_delta > 0 {
+                let last = std::net::Ipv4Addr::from(wd_bad_src_last.load(Ordering::Relaxed));
+                let mine = wd_mine.map(std::net::Ipv4Addr::from);
+                eprintln!(
+                    "[pump] ВНИМАНИЕ: {bad_delta} пакетов ушли в туннель с ЧУЖИМ адресом источника \
+                     (последний {last}, а назначен нам {}) — exit обязан дропать такие \
+                     анти-спуфингом (S0.2), ответа не будет. Причина обычно в подмене адреса \
+                     назначения без подмены источника (заворот :53 без SNAT) или в приложении, \
+                     привязанном к другому интерфейсу",
+                    mine.map(|m| m.to_string()).unwrap_or_else(|| "?".into())
                 );
             }
             // Отдельный сигнал про IPv6: он уходит в blackhole по дизайну (туннель IPv4-only) —

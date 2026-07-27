@@ -74,9 +74,23 @@ run_e2e() {
     docker compose -f docker/compose.cli.yml logs --no-log-prefix client-cli | sed -n '/L-ТЕСТ 1/,/ИТОГ/p'
     echo
     echo "===== ЖУРНАЛ ДЕМОНА (хвост) ====="
-    docker compose -f docker/compose.cli.yml exec -T client-cli tail -25 /var/log/vpnd.log 2>/dev/null || true
+    docker compose -f docker/compose.cli.yml exec -T client-cli tail -40 /var/log/vpnd.log 2>/dev/null || true
     echo
-    echo "Остановить: docker compose -f docker/compose.cli.yml down -v"
+    echo "===== EXIT (дропы egress-фильтра, если были) ====="
+    docker compose -f docker/compose.cli.yml logs --no-log-prefix exit 2>/dev/null \
+        | grep -E "S0.2|F2:|F7:" | tail -15 || true
+
+    # Стенд гасим ВСЕГДА (в т.ч. при провале тестов): оставленные контейнеры держат сеть,
+    # TUN-устройства и iptables-правила, а следующий прогон получает не чистое окружение.
+    if [ "${KEEP_STAND:-0}" = "1" ]; then
+        echo
+        echo "KEEP_STAND=1 — стенд оставлен. Погасить: docker compose -f docker/compose.cli.yml down -v"
+    else
+        echo
+        echo "[B/5] гашу стенд…"
+        docker compose -f docker/compose.cli.yml down -v --remove-orphans >/dev/null 2>&1
+        echo "      стенд погашен (KEEP_STAND=1 — оставить поднятым)"
+    fi
 }
 
 case "$MODE" in

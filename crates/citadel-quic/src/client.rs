@@ -286,7 +286,10 @@ pub async fn establish_session(cfg: &ClientConfig, force_tcp: bool) -> Result<Se
 pub async fn run_data_plane(session: Session, tun: Arc<dyn TunIo>) -> Result<()> {
     // клиент: egress-фильтр/rate-limit/admin-VIP выключены (это политика exit-стороны).
     // return_rx=None — у клиента один TUN и одно соединение, читает свой TUN сам (демукс — только exit).
-    pump(session.tunnel, tun, None, None, None, None).await
+    // client_src = назначенный адрес: pump не фильтрует по нему (это политика exit'а), но
+    // говорит вслух, если в туннель ушёл пакет с чужим src — иначе такой трафик умирает на exit'е
+    // молча и выглядит как «отправлено много, принято 0».
+    pump(session.tunnel, tun, None, Some(session.addr), None, None, None).await
 }
 
 /// Подключиться к ОДНОМУ exit'у: основной путь PQ-QUIC, при недоступности — obfs-over-TCP

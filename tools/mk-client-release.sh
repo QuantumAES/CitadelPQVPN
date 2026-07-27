@@ -128,7 +128,9 @@ $SUDO cp -r "$HERE/bundle" "$APP_DIR"
 # П.5: брендовые иконки (hicolor) из тарбола → системная тема.
 if [[ -d "$HERE/icons/hicolor" ]]; then
   $SUDO cp -r "$HERE/icons/hicolor/." /usr/share/icons/hicolor/
-  $SUDO gtk-update-icon-cache -q /usr/share/icons/hicolor 2>/dev/null || true
+  # Запасная копия для окружений, читающих только /usr/share/pixmaps.
+  [[ -f "$HERE/icons/hicolor/256x256/apps/citadelpqvpn.png" ]] \
+    && $SUDO install -Dm644 "$HERE/icons/hicolor/256x256/apps/citadelpqvpn.png" /usr/share/pixmaps/citadelpqvpn.png
 fi
 $SUDO tee /usr/share/applications/citadel-pqvpn.desktop >/dev/null <<DESKTOP
 [Desktop Entry]
@@ -139,7 +141,21 @@ Exec=$APP_DIR/app
 Icon=citadelpqvpn
 Categories=Network;
 Terminal=false
+# Привязка ОКНА к лаунчеру: WM_CLASS = APPLICATION_ID приложения (g_set_prgname в
+# linux/runner/my_application.cc). Без неё панель/док показывают окну generic-иконку.
+StartupWMClass=com.quantumaes.citadelpqvpn
 DESKTOP
+
+# Сброс кешей меню и темы иконок. `-f` обязателен: без него gtk-update-icon-cache отказывается
+# работать в теме без index.theme и оставляет СТАРЫЙ icon-theme.cache, а GTK при наличии кеша уже
+# не смотрит на файлы — иконка в меню и на рабочем столе остаётся прежней (ловили после обновления).
+$SUDO gtk-update-icon-cache -f -t -q /usr/share/icons/hicolor 2>/dev/null || true
+command -v xdg-icon-resource >/dev/null && $SUDO xdg-icon-resource forceupdate --theme hicolor 2>/dev/null || true
+command -v update-desktop-database >/dev/null && $SUDO update-desktop-database /usr/share/applications 2>/dev/null || true
+for kb in kbuildsycoca6 kbuildsycoca5; do
+  command -v "$kb" >/dev/null && "$kb" --noincremental >/dev/null 2>&1 && break
+done
+true
 
 echo
 echo

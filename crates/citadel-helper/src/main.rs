@@ -224,7 +224,18 @@ fn ip6tables(args: &[&str]) {
 fn setup_dns(ifn: &str, dns: &str) {
     ip(&["route", "replace", &format!("{dns}/32"), "dev", ifn]);
     let _ = std::fs::copy(RESOLV, RESOLV_BAK);
-    let _ = std::fs::write(RESOLV, format!("nameserver {dns}\noptions edns0\n"));
+    // Неудачу записи НЕЛЬЗЯ глотать: правила ниже блокируют `:53` мимо туннеля, и если резолвер
+    // остался прежним (read-only `/etc` на immutable-дистрибутиве, `chattr +i`, bind-mount), то
+    // снаружи это «подключено, а имена не резолвятся» без единой подсказки. Консольный демон в
+    // этом случае идёт лестницей способов (docs/LINUX-CLI.md «Резолвер (F6)»); helper GUI пока
+    // умеет только файл — поэтому обязан хотя бы сказать вслух, что именно не получилось.
+    if let Err(e) = std::fs::write(RESOLV, format!("nameserver {dns}\noptions edns0\n")) {
+        eprintln!(
+            "[helper] ВНИМАНИЕ: записать {RESOLV} не удалось ({e}) — резолвер туннеля НЕ назначен, \
+             а прочий :53 будет заблокирован (fail-closed) ⇒ имена резолвиться не будут. \
+             Причина обычно в read-only /etc или иммутабельном атрибуте файла."
+        );
+    }
     iptables(&["-A", "OUTPUT", "-p", "udp", "--dport", "53", "!", "-o", ifn, "-j", "DROP"]);
     iptables(&["-A", "OUTPUT", "-p", "tcp", "--dport", "53", "!", "-o", ifn, "-j", "DROP"]);
 }

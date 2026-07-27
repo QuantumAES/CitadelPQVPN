@@ -48,6 +48,23 @@ SUDO=""
 [[ "${EUID}" -eq 0 ]] || SUDO="sudo"
 log() { printf '\033[1;34m==>\033[0m %s\n' "$*"; }
 
+# Сбросить кеши меню и темы иконок.
+#
+# Почему обязательно `-f`: без него `gtk-update-icon-cache` отказывается работать, когда в теме нет
+# `index.theme`, и молча оставляет СТАРЫЙ `icon-theme.cache`. А GTK, увидев кеш, файлы на диске уже
+# не читает — новая иконка не появляется ни в меню, ни на рабочем столе, хотя лежит на месте
+# (ровно этот симптом ловили после обновления клиента).
+refresh_desktop_caches() {
+  $SUDO gtk-update-icon-cache -f -t -q /usr/share/icons/hicolor 2>/dev/null || true
+  command -v xdg-icon-resource >/dev/null && $SUDO xdg-icon-resource forceupdate --theme hicolor 2>/dev/null || true
+  command -v update-desktop-database >/dev/null && $SUDO update-desktop-database /usr/share/applications 2>/dev/null || true
+  # KDE держит свой сводный кеш меню; без пересборки запись остаётся с прежней иконкой.
+  for kb in kbuildsycoca6 kbuildsycoca5; do
+    command -v "$kb" >/dev/null && "$kb" --noincremental >/dev/null 2>&1 && break
+  done
+  true
+}
+
 # 1. runtime-зависимости
 log "Runtime-зависимости (iproute2, iptables, polkit)…"
 if command -v apt-get >/dev/null; then
@@ -120,7 +137,10 @@ if [[ "$WITH_APP" -eq 1 ]]; then
         src="$ICONSRC/${sz}x${sz}/apps/app.png"
         [[ -f "$src" ]] && $SUDO install -Dm644 "$src" "/usr/share/icons/hicolor/${sz}x${sz}/apps/citadelpqvpn.png"
       done
-      $SUDO gtk-update-icon-cache -q /usr/share/icons/hicolor 2>/dev/null || true
+      # Запасная копия для окружений, читающих только /usr/share/pixmaps.
+      [[ -f "$ICONSRC/256x256/apps/app.png" ]] \
+        && $SUDO install -Dm644 "$ICONSRC/256x256/apps/app.png" /usr/share/pixmaps/citadelpqvpn.png
+      refresh_desktop_caches
     fi
     $SUDO tee /usr/share/applications/citadel-pqvpn.desktop >/dev/null <<EOF
 [Desktop Entry]
@@ -131,7 +151,12 @@ Exec=$APP_DIR/app
 Icon=citadelpqvpn
 Categories=Network;
 Terminal=false
+# Привязка ОКНА к этому лаунчеру: WM_CLASS приложения = APPLICATION_ID (g_set_prgname в
+# linux/runner/my_application.cc). Без строки панель/док показывают запущенному окну
+# generic-иконку, хотя в меню иконка уже брендовая.
+StartupWMClass=com.quantumaes.citadelpqvpn
 EOF
+    refresh_desktop_caches
     log "App установлен (запуск: $APP_DIR/app или через меню «CitadelPQVPN»)"
   else
     echo "  app-бандл не найден ($BUNDLE) — собери: cd app && flutter build linux" >&2

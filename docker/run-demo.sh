@@ -33,5 +33,15 @@ docker compose -f docker/compose.yml logs --no-log-prefix issuer | grep -E "кл
 echo "===== CLIENT ====="
 docker compose -f docker/compose.yml logs --no-log-prefix client | sed -n '/ТЕСТ 1/,/Готово/p' || true
 
-echo
-echo "Остановить и убрать: docker compose -f docker/compose.yml down"
+
+# Стенд гасим ВСЕГДА (в т.ч. если тесты провалились): оставленные контейнеры держат сети, TUN и
+# iptables-правила, а следующий прогон должен стартовать в чистом окружении.
+if [ "${KEEP_STAND:-0}" = "1" ]; then
+    echo
+    echo "KEEP_STAND=1 — стенд оставлен. Погасить: docker compose -f docker/compose.yml down -v"
+else
+    echo
+    echo "[6/6] гашу стенд…"
+    docker compose -f docker/compose.yml down -v --remove-orphans >/dev/null 2>&1
+    echo "      стенд погашен (KEEP_STAND=1 — оставить поднятым)"
+fi
