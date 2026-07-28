@@ -16,7 +16,7 @@ use citadel_client::{clear_socket_protector, set_socket_protector, SocketProtect
 /// tokio-потоков движка (protect зовётся не из Java-потока).
 static VM: OnceLock<JavaVM> = OnceLock::new();
 
-/// GlobalRef на `CitadelVpnService` (захват в [`Java_com_example_app_CitadelVpnService_nativeRegister`]) —
+/// GlobalRef на `CitadelVpnService` (захват в [`Java_com_quantumaes_citadelpqvpn_CitadelVpnService_nativeRegister`]) —
 /// общий для `protectFd` (через [`JniProtector`]) и [`establish_tun`]. `Mutex<Option>`, а не `OnceLock`:
 /// сервис может пересоздаваться (onDestroy→onCreate) — ref тогда обновляется, а не залипает мёртвым.
 static SERVICE: Mutex<Option<GlobalRef>> = Mutex::new(None);
@@ -73,7 +73,7 @@ impl SocketProtector for JniProtector {
 /// Kotlin `CitadelVpnService.onCreate` → зарегистрировать сервис протектором (instance-метод:
 /// второй аргумент — сам `this`-сервис).
 #[no_mangle]
-pub extern "system" fn Java_com_example_app_CitadelVpnService_nativeRegister<'local>(
+pub extern "system" fn Java_com_quantumaes_citadelpqvpn_CitadelVpnService_nativeRegister<'local>(
     env: JNIEnv<'local>,
     service: JObject<'local>,
 ) {
@@ -93,7 +93,7 @@ pub extern "system" fn Java_com_example_app_CitadelVpnService_nativeRegister<'lo
 
 /// Kotlin `onDestroy` → снять протектор.
 #[no_mangle]
-pub extern "system" fn Java_com_example_app_CitadelVpnService_nativeUnregister<'local>(
+pub extern "system" fn Java_com_quantumaes_citadelpqvpn_CitadelVpnService_nativeUnregister<'local>(
     _env: JNIEnv<'local>,
     _service: JObject<'local>,
 ) {
@@ -106,7 +106,7 @@ pub extern "system" fn Java_com_example_app_CitadelVpnService_nativeUnregister<'
 /// Java-потока колбэка ConnectivityManager — env валиден, attach не нужен; аргументы не используются.
 /// NetworkCallback теперь в СЕРВИСЕ (переживает Activity), поэтому сигнал доходит и при закрытом окне.
 #[no_mangle]
-pub extern "system" fn Java_com_example_app_CitadelVpnService_nativeNetworkChanged<'local>(
+pub extern "system" fn Java_com_quantumaes_citadelpqvpn_CitadelVpnService_nativeNetworkChanged<'local>(
     _env: JNIEnv<'local>,
     _service: JObject<'local>,
 ) {

@@ -33,6 +33,7 @@
 from __future__ import annotations
 
 import json
+import math
 import shutil
 import sys
 from pathlib import Path
@@ -93,9 +94,17 @@ ANDROID_DENSITIES = {
     "xxhdpi": 324,
     "xxxhdpi": 432,
 }
-# Маска adaptive-иконки показывает центральные 72dp из 108dp. Арт рисуем ровно в них:
-# так он виден целиком при ЛЮБОЙ форме маски, а не обрезается на круглом лаунчере.
-SAFE_ZONE = 72 / 108
+# Маска adaptive-иконки вырезает из холста 108dp центральные 72dp — но вырезает ФОРМОЙ, и
+# круглый лаунчер даёт КРУГ Ø72dp, вписанный в этот квадрат (squircle/капля/скруглённый
+# квадрат его содержат, так что круг — худший случай).
+#
+# Поэтому вписывать арт в КВАДРАТ 72dp нельзя: его углы лежат ВНЕ круга и срезаются. У широкого
+# лого (360×188) полудиагональ выходила 40.6dp при радиусе маски 36dp — ровно те «немного
+# обрезанные углы» на круглом лаунчере.
+#
+# Вписываем по ДИАГОНАЛИ рамки арта в safe-круг Google Ø66dp: арт целиком внутри круга маски,
+# плюс 3dp запаса до кромки (без запаса лого упирается в неё и выглядит тесно).
+SAFE_CIRCLE = 66 / 108
 
 
 def best_android_master() -> Image.Image | None:
@@ -152,7 +161,7 @@ def sync_android() -> None:
             continue
         put(res / f"mipmap-{d}" / "ic_launcher.png", s.read_bytes())
 
-    # 2. adaptive-foreground: арт в центральных 72dp прозрачного холста 108dp
+    # 2. adaptive-foreground: арт вписан в safe-круг Ø66dp прозрачного холста 108dp
     master = best_android_master()
     if master is None:
         problems.append("не нашёл прозрачный мастер-арт для adaptive-foreground (app_icons/Linux/512x512)")
@@ -160,9 +169,9 @@ def sync_android() -> None:
         bbox = master.getbbox()  # обрезаем прозрачные поля мастера — иначе арт выйдет мельче
         art = master.crop(bbox) if bbox else master
         for d, canvas in ANDROID_DENSITIES.items():
-            safe = int(canvas * SAFE_ZONE)
-            # вписываем с сохранением пропорций: арт широкий, квадратный ресайз его раздавит
-            k = min(safe / art.width, safe / art.height)
+            # пропорции сохраняем (арт широкий, квадратный ресайз его раздавит), а масштаб
+            # берём из условия «диагональ рамки арта = диаметр safe-круга»
+            k = canvas * SAFE_CIRCLE / math.hypot(art.width, art.height)
             w, h = max(1, round(art.width * k)), max(1, round(art.height * k))
             layer = Image.new("RGBA", (canvas, canvas), (0, 0, 0, 0))
             layer.paste(art.resize((w, h), Image.LANCZOS), ((canvas - w) // 2, (canvas - h) // 2))

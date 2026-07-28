@@ -1,14 +1,17 @@
 name: windows
 
-# Валидация Windows-клиента (модель W2) на РЕАЛЬНОМ Windows/MSVC — то, что Linux
-# `x86_64-pc-windows-gnu` compile-check не покрывает полностью: WFP/FWPM, named-pipe,
-# SCM, CancelIoEx линкуются и типизируются под MSVC; пуре-тесты winnet/winsvc гоняются
-# на Windows. Установщик (Flutter-бандл + Inno) — отдельным job на push/dispatch.
+# Валидация Windows-клиента (модель W2) на НАСТОЯЩЕЙ Windows/MSVC — то, что кросс-чек
+# `x86_64-pc-windows-gnu` с Linux не покрывает: WFP/FWPM, named pipe, SCM, CancelIoEx
+# линкуются и типизируются под MSVC.
 #
-# ВАЖНО: GitHub-hosted раннер НЕ создаёт WinTUN-адаптер / WFP-фильтры / службу вживую
-# (нет админ-сессии/драйвера/интерактива) — это только КОМПИЛЯЦИЯ + юнит-тесты.
-# Реальный device-E2E (adapter/WFP/SCM/reconnect) — на настоящей Windows-машине
-# (self-hosted admin-раннер или вручную), см. packaging/windows/README.md.
+# ВАЖНО, что этот workflow НЕ проверяет: даже на self-hosted раннере job идёт без
+# интерактивной админ-сессии, поэтому WinTUN-адаптер, WFP-фильтры и служба вживую здесь не
+# поднимаются. Это компиляция + юнит-тесты + сборка установщика. Настоящий device-E2E
+# (адаптер / kill-switch / реконнект / трей) — руками на живой машине, чеклист в
+# packaging/windows/README.md.
+#
+# Про self-hosted: job'ы не запускаются для PR из форков — иначе чужой код исполнялся бы на
+# вашей Windows-машине. См. комментарий в ci.yml.
 
 on:
   push:
@@ -23,77 +26,100 @@ on:
   pull_request:
   workflow_dispatch:
 
+concurrency:
+  group: windows-${{ github.ref }}
+  cancel-in-progress: true
+
 env:
   CARGO_TERM_COLOR: always
 
 jobs:
   # Обязательный гейт: Windows-специфичный Rust собирается/тестируется/линтится под MSVC.
   rust:
-    name: rust MSVC (test + build + clippy)
-    runs-on: windows-latest
+    name: rust MSVC — тесты, сборка службы, clippy
+    runs-on: [self-hosted, windows, x64]
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+    timeout-minutes: 90
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@master
-        with:
-          toolchain: 1.96.0
-          targets: x86_64-pc-windows-msvc
-          components: clippy
-      # aws-lc-rs (через citadel-client → citadel-quic) на Windows требует nasm для asm-оптимизаций.
-      - name: nasm
-        uses: ilammy/setup-nasm@v1
-      - uses: Swatinem/rust-cache@v2
-      # Пуре-логика (IPC-кадры, WFP-план, маршруты, plan-оркестрация) — тесты на Windows.
-      # winnet/winsvc НЕ тянут aws-lc → быстро.
-      - name: test winnet + winsvc
+
+      - name: проверка инструментов
+        shell: pwsh
+        run: |
+          $rc = 0
+          function Need($cmd, $hint) {
+            if (-not (Get-Command $cmd -ErrorAction SilentlyContinue)) {
+              Write-Output "::error::на раннере нет $cmd ($hint)"; $script:rc = 1
+            }
+          }
+          Need cargo "rustup stable 1.96+ с таргетом x86_64-pc-windows-msvc"
+          # aws-lc-rs (через citadel-client → citadel-quic) собирает ассемблерные оптимизации.
+          Need nasm  "нужен aws-lc-rs; choco install nasm"
+          $targets = & rustup target list --installed
+          if ($targets -notcontains "x86_64-pc-windows-msvc") {
+            Write-Output "::error::нет таргета x86_64-pc-windows-msvc (rustup target add x86_64-pc-windows-msvc)"
+            $rc = 1
+          }
+          cargo --version; rustc --version
+          exit $rc
+
+      # Пуре-логика (IPC-кадры, WFP-план, маршруты, plan-оркестрация). winnet/winsvc не тянут
+      # aws-lc → прогон быстрый.
+      - name: тесты winnet + winsvc
         run: cargo test -p citadel-winnet -p citadel-winsvc --locked
-      # Служба целиком под MSVC: WinTUN (wintun.dll грузится рантаймом) + WFP (FWPM) + SCM линкуются.
-      - name: build service (release)
+
+      # Служба целиком под MSVC: WinTUN (wintun.dll грузится в рантайме) + WFP (FWPM) + SCM линкуются.
+      - name: сборка службы (release)
         run: cargo build -p citadel-winsvc --release --locked
-      # Провайдер (win_tun.rs: named pipe + CancelIoEx) + весь движок под MSVC, clippy как ошибка.
+
+      # Провайдер (win_tun.rs: named pipe + overlapped I/O + CancelIoEx) и весь движок под MSVC.
       - name: clippy windows-gated (-D warnings)
         run: cargo clippy -p citadel-winnet -p citadel-winsvc -p citadel-client --all-targets --locked -- -D warnings
 
   # Полный установщик: Flutter-бандл (+ Rust-ядро citadel_client.dll) + служба + WinTUN + Inno.
-  # Не на каждый PR (тяжёлый; app/rust требует Flutter). Артефакт — НЕПОДПИСАННЫЙ (в CI нет cert).
+  # Не на каждый PR (тяжёлый). Артефакт НЕПОДПИСАННЫЙ — Authenticode-сертификата в CI нет;
+  # подписанный установщик релиза собирает release.yml на этом же раннере.
   installer:
-    name: build installer (Flutter + Inno)
-    runs-on: windows-latest
+    name: сборка установщика (Flutter + Inno)
+    runs-on: [self-hosted, windows, x64]
     needs: rust
     if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
+    timeout-minutes: 90
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@master
-        with:
-          toolchain: 1.96.0
-          targets: x86_64-pc-windows-msvc
-      - name: nasm
-        uses: ilammy/setup-nasm@v1
-      - uses: Swatinem/rust-cache@v2
-      - name: Flutter (stable)
-        uses: subosito/flutter-action@v2
-        with:
-          channel: stable
-          cache: true
-      - name: enable windows desktop
-        run: flutter config --enable-windows-desktop
-      # Если app/rust/src/frb_generated.rs НЕ закоммичен — здесь нужен шаг flutter_rust_bridge_codegen.
+
+      - name: проверка инструментов
+        shell: pwsh
+        run: |
+          $rc = 0
+          function Need($cmd, $hint) {
+            if (-not (Get-Command $cmd -ErrorAction SilentlyContinue)) {
+              Write-Output "::error::на раннере нет $cmd ($hint)"; $script:rc = 1
+            }
+          }
+          Need cargo   "rustup stable 1.96+"
+          Need flutter "stable 3.44+ с включённым windows-desktop"
+          Need ISCC    "Inno Setup 6; choco install innosetup (и добавь в PATH)"
+          # wintun.dll не качаем на лету: тянуть в сборку бинарь стороннего драйвера по сети —
+          # ровно тот supply-chain, от которого проект защищается подписью артефактов.
+          # Кладётся на раннер один раз, см. packaging/windows/README.md.
+          if (-not (Test-Path "packaging\windows\wintun.dll")) {
+            Write-Output "::error::нет packaging\windows\wintun.dll (положить на раннер из дистрибутива wintun.net)"
+            $rc = 1
+          }
+          exit $rc
+
       - name: flutter pub get
         working-directory: app
         run: flutter pub get
-      - name: Inno Setup
-        run: choco install innosetup --no-progress -y
-      - name: download WinTUN (amd64)
+
+      - name: сборка установщика (без Authenticode)
         shell: pwsh
-        run: |
-          $ver = '0.14.1'
-          Invoke-WebRequest "https://www.wintun.net/builds/wintun-$ver.zip" -OutFile wintun.zip
-          Expand-Archive wintun.zip -DestinationPath wintun-extract
-          Copy-Item "wintun-extract\wintun\bin\amd64\wintun.dll" "packaging\windows\wintun.dll"
-      - name: build installer (unsigned)
-        shell: pwsh
-        run: .\packaging\windows\build-windows.ps1 -Version 1.0.0-ci
+        run: .\packaging\windows\build-windows.ps1 -Version 0.0.0-ci
+
       - uses: actions/upload-artifact@v4
         with:
           name: CitadelPQVPN-Setup-unsigned
           path: packaging/windows/Output/*.exe
           if-no-files-found: error
+          retention-days: 14

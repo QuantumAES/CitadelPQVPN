@@ -1,57 +1,166 @@
 name: CI
 
-# Gate 0 (docs/SECURITY-ROADMAP.md §2): страховка security-трека — воркспейс-тесты,
-# clippy -D warnings и docker-харнес прогоняются на каждый push/PR. Без зелёного CI
-# security-фиксы не мёржатся (регрессии в 40+ юнит и 15 e2e-тестах иначе неизбежны).
+# Gate 0 (docs/SECURITY-ROADMAP.md §2): страховка security-трека. Воркспейс-тесты,
+# clippy -D warnings и docker-харнесы прогоняются на каждый push/PR. Без зелёного CI
+# security-фиксы не мёржатся — регрессии в 200+ юнит и 70+ e2e-тестах иначе неизбежны.
+#
+# ПРОГОН НА SELF-HOSTED РАННЕРЕ. Отсюда два следствия, которые важнее скорости:
+#
+#   1. Раннер — это чья-то настоящая машина, а job на ней выполняет код из репозитория.
+#      Поэтому job'ы НЕ запускаются для pull request'ов из форков (см. `if:` ниже): иначе
+#      любой посторонний, открывший PR, исполнял бы свой скрипт на этом хосте с правами
+#      раннера. Для форков нужен GitHub-hosted прогон или ручное одобрение мейнтейнером
+#      (Settings → Actions → Fork pull request workflows).
+#   2. Workflow НИЧЕГО не устанавливает на машину и не меняет её глобально: ни rustup,
+#      ни apt, ни Flutter. Он проверяет, что нужное есть, и внятно падает, если нет.
+#      Состав инструментов раннера — docs/BUILD-INSTALL.md, ставится tools/setup-dev-env.sh.
 
 on:
   push:
-    branches: [main]
+    branches: [main, dev]
   pull_request:
   workflow_dispatch:
+
+# Пушнули дважды подряд — старый прогон незачем доводить до конца: раннер один, очередь общая.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
 
 env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  # Быстрый обязательный гейт: собрать/протестировать движковый воркспейс (crates/*) и
-  # прогнать clippy как ошибку. app/rust (FRB-мост) — отдельный крейт с flutter_rust_bridge,
-  # вне этого воркспейса; его сборка требует Flutter и выносится в отдельный workflow позже.
-  test:
-    name: workspace test + clippy (rust 1.96)
-    runs-on: ubuntu-latest
+  # ── Обязательный гейт: движковый воркспейс (crates/*) собирается, линтуется, проходит тесты.
+  # app/rust (FRB-мост) — отдельный крейт вне воркспейса, он в job'е `app` ниже.
+  rust:
+    name: воркспейс — clippy + тесты
+    runs-on: [self-hosted, linux, x64]
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+    timeout-minutes: 90
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@master
-        with:
-          toolchain: 1.96.0
-          components: clippy
-      - name: apt deps (cmake/clang для aws-lc-rs)
-        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends cmake clang
-      - uses: Swatinem/rust-cache@v2
+
+      - name: PATH раннера
+        run: |
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+          echo "$HOME/flutter/bin" >> "$GITHUB_PATH"
+
+      - name: проверка инструментов
+        run: |
+          set -u
+          rc=0
+          need() { command -v "$1" >/dev/null 2>&1 || { echo "::error::на раннере нет $1 ($2)"; rc=1; }; }
+          need cargo   "rustup stable 1.96+, см. tools/setup-dev-env.sh"
+          need cmake   "нужен aws-lc-rs"
+          need clang   "нужен aws-lc-rs"
+          # Ровно та ошибка, на которую легко потратить полдня: системный cargo 1.85 не собирает
+          # зависимости этого проекта, а сообщение об этом приходит откуда-то из глубины сборки.
+          ver="$(cargo --version | awk '{print $2}')"
+          if [ "$(printf '%s\n1.96.0\n' "$ver" | sort -V | head -1)" != "1.96.0" ]; then
+            echo "::error::cargo $ver старее 1.96 (вероятно, системный /bin/cargo вместо rustup)"; rc=1
+          fi
+          cargo --version; rustc --version
+          exit $rc
+
       - name: clippy (-D warnings)
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
-      - name: test
+
+      - name: тесты воркспейса
         run: cargo test --workspace --locked
 
-  # Полный e2e: собрать бинарь на хосте, поднять docker-compose (2×exit + client + issuer),
-  # прогнать 15 тестов (ping/HTTP через PQ-QUIC, pinning, egress, obfs, drop-priv, DNS-leak,
-  # токены, rate-limit, миграция, TCP-fallback, failover, split, crypto-agility, PQ-auth).
-  # Требует модуль tun на раннере; отделён от обязательного гейта (не на каждый PR).
-  demo:
-    name: docker e2e harness (15 тестов)
-    runs-on: ubuntu-latest
-    needs: test
-    if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
+  # ── Клиентское приложение: анализатор Dart, кросс-компиляция под Windows и инварианты,
+  # которые не ловятся ни сборкой, ни тестами (иконки, JNI-символы).
+  app:
+    name: приложение — analyze, windows-gnu, инварианты
+    runs-on: [self-hosted, linux, x64]
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@master
-        with:
-          toolchain: 1.96.0
-      - name: apt deps
-        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends cmake clang zstd
-      - uses: Swatinem/rust-cache@v2
-      - name: enable tun
-        run: sudo modprobe tun && ls -l /dev/net/tun
-      - name: run demo harness
+
+      - name: PATH раннера
+        run: |
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+          echo "$HOME/flutter/bin" >> "$GITHUB_PATH"
+
+      - name: проверка инструментов
+        run: |
+          set -u
+          rc=0
+          need() { command -v "$1" >/dev/null 2>&1 || { echo "::error::на раннере нет $1 ($2)"; rc=1; }; }
+          need flutter "stable 3.44+, см. docs/BUILD-INSTALL.md"
+          need cargo   "rustup stable 1.96+"
+          need python3 "нужен для проверок инвариантов"
+          exit $rc
+
+      # Связывание JNI происходит в рантайме: разъехавшиеся имя пакета и символ Java_… дают
+      # собравшийся APK, который падает при старте VpnService. Проверка стоит миллисекунды.
+      - name: JNI-мост Kotlin ↔ Rust
+        run: python3 tools/check-android-jni.py
+
+      # Иконки в дереве проекта обязаны соответствовать мастер-набору app_icons/. Разошлись —
+      # значит арт поменяли, а разложить забыли, и релиз уедет со старой иконкой.
+      - name: иконки соответствуют app_icons/
+        run: python3 tools/sync-app-icons.py --check
+
+      - name: flutter pub get
+        working-directory: app
+        run: flutter pub get
+
+      - name: flutter analyze
+        working-directory: app
+        run: flutter analyze
+
+      # Windows-специфичный код (winnet/winsvc/win_tun) под MSVC проверяется в windows.yml на
+      # настоящей Windows. Здесь — дешёвый кросс-чек windows-gnu: ломающая правка в общем коде
+      # видна сразу, не дожидаясь windows-раннера.
+      - name: кросс-чек x86_64-pc-windows-gnu
+        run: |
+          if ! rustup target list --installed | grep -qx x86_64-pc-windows-gnu; then
+            echo "::warning::нет таргета x86_64-pc-windows-gnu — кросс-чек пропущен"
+            echo "  поставить: rustup target add x86_64-pc-windows-gnu"
+            exit 0
+          fi
+          cargo check --target x86_64-pc-windows-gnu \
+            -p citadel-winnet -p citadel-winsvc -p citadel-client --locked
+
+  # ── Тяжёлые e2e в контейнерах: настоящий туннель, настоящие iptables/TUN.
+  # Не на каждый PR — на push и по кнопке.
+  e2e:
+    name: docker e2e — туннель + консольный клиент
+    runs-on: [self-hosted, linux, x64]
+    needs: rust
+    if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: PATH раннера
+        run: echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+
+      - name: проверка окружения
+        run: |
+          set -u
+          rc=0
+          command -v docker >/dev/null || { echo "::error::на раннере нет docker"; rc=1; }
+          docker compose version >/dev/null 2>&1 || { echo "::error::нет docker compose v2"; rc=1; }
+          # Стенд создаёт реальные TUN-устройства: без /dev/net/tun контейнеры поднимутся, а
+          # туннель молча не встанет — лучше сказать об этом здесь.
+          [ -c /dev/net/tun ] || { echo "::error::нет /dev/net/tun (нужен modprobe tun на раннере)"; rc=1; }
+          exit $rc
+
+      # Оба харнеса гасят свои стенды сами (в т.ч. при провале) и возвращают код: провал
+      # сценария = красный job, а не «зелёный прогон с грустными логами».
+      - name: харнес туннеля (docker/run-demo.sh)
         run: bash docker/run-demo.sh
+
+      - name: харнес консольного клиента (docker/run-cli-tests.sh)
+        run: bash docker/run-cli-tests.sh
+
+      # Стенды гасятся внутри скриптов; здесь — страховка на случай отмены job'а посреди
+      # прогона: брошенные контейнеры держат сети и iptables-правила следующего прогона.
+      - name: подчистить стенды
+        if: always()
+        run: |
+          docker compose -f docker/compose.yml down -v --remove-orphans 2>/dev/null || true
+          docker compose -f docker/compose.cli.yml down -v --remove-orphans 2>/dev/null || true

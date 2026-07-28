@@ -23,6 +23,8 @@ for _ in $(seq 1 280); do
     sleep 1
 done
 
+CLIENT_LOG="$(docker compose -f docker/compose.yml logs --no-log-prefix client 2>/dev/null || true)"
+
 echo "[5/5] логи:"
 echo "===== EXIT (F2/F7 дропы) ====="
 docker compose -f docker/compose.yml logs --no-log-prefix exit | grep -E "F2:|F7:" | tail -n 12 || true
@@ -33,6 +35,29 @@ docker compose -f docker/compose.yml logs --no-log-prefix issuer | grep -E "кл
 echo "===== CLIENT ====="
 docker compose -f docker/compose.yml logs --no-log-prefix client | sed -n '/ТЕСТ 1/,/Готово/p' || true
 
+
+# ── ВЕРДИКТ ────────────────────────────────────────────────────────────────────────────────
+# Раньше скрипт всегда завершался успешно: он печатал логи, а решение «прошло или нет» человек
+# принимал глазами. В CI глаз нет — жёлтый прогон с провалившимся туннелем выглядел зелёным,
+# то есть гейт docker-e2e не гейтил ничего. Теперь вердикт считается здесь:
+#   * стенд обязан дойти до конца сценария ("Готово." от клиента) — иначе это таймаут/падение;
+#   * ни одной строки-провала: entrypoint-client.sh печатает их как "[!] … ✗".
+FAILED="$(printf '%s\n' "$CLIENT_LOG" | grep -F '✗' || true)"
+PASSED="$(printf '%s\n' "$CLIENT_LOG" | grep -cF 'OK ✔' || true)"
+RC=0
+
+echo
+echo "===== ВЕРДИКТ ====="
+if ! printf '%s\n' "$CLIENT_LOG" | grep -q "Готово."; then
+    echo "ПРОВАЛ: клиент не дошёл до конца сценария (нет «Готово.») — таймаут или падение стенда"
+    RC=1
+elif [ -n "$FAILED" ]; then
+    echo "ПРОВАЛ: провалившиеся проверки:"
+    printf '%s\n' "$FAILED" | sed 's/^/  /'
+    RC=1
+else
+    echo "УСПЕХ: пройдено проверок — $PASSED, провалов нет"
+fi
 
 # Стенд гасим ВСЕГДА (в т.ч. если тесты провалились): оставленные контейнеры держат сети, TUN и
 # iptables-правила, а следующий прогон должен стартовать в чистом окружении.
@@ -45,3 +70,5 @@ else
     docker compose -f docker/compose.yml down -v --remove-orphans >/dev/null 2>&1
     echo "      стенд погашен (KEEP_STAND=1 — оставить поднятым)"
 fi
+
+exit "$RC"

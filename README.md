@@ -1,98 +1,222 @@
-# CitadelPQVPN — постквантовый консьюмерский VPN
+<div align="center">
 
-Постквантовый VPN нового поколения: **QUIC/MASQUE**, гибридный обмен ключами `X25519 + ML-KEM-768`,
-обфускация под анти-DPI, анонимная аутентификация и квантово-стойкая подпись сервера.
-Rust + проверенные библиотеки (quinn, rustls/aws-lc-rs). Полный профиль и обоснования —
-в [`docs/SPEC.md`](docs/SPEC.md).
+<img src="app_icons/Linux/256x256/apps/app.png" alt="CitadelPQVPN" width="180">
 
-> ⚠️ **Статус: исследовательский PoC (v0.1).** Код **не проходил независимый аудит безопасности**
-> и **не предназначен для защиты в реальных условиях цензуры/слежки**. Не полагайтесь на него там,
-> где от приватности зависит безопасность. Цель проекта — продемонстрировать архитектуру и собрать
-> её до конца дорожной карты M0–M7.
+# CitadelPQVPN
 
-## Что внутри (вся roadmap M0–M7 ✅)
+**Постквантовый VPN для людей, а не для лаборатории.**
+Гибридный обмен ключами `X25519 + ML-KEM-768` поверх QUIC/MASQUE, обфускация трафика под
+анти-DPI, анонимная аутентификация без учётных записей — и обычные клиенты под Android,
+Linux и Windows.
 
-- **PQ-транспорт (M0):** гибридный QUIC-хендшейк `X25519MLKEM768` (анти-Harvest-Now-Decrypt-Later).
-- **Туннель (M1–M2):** CONNECT-IP поверх QUIC DATAGRAM, динамический адрес капсулой, NAT, pinning
-  сертификата (F1), egress-фильтр против пивота во внутреннюю сеть (F2), сброс привилегий (F4),
-  DNS-leak protection + DoH (F6).
-- **Обфускация L1 (M3):** symmetric PSK-gated обёртка (Shadowsocks-2022-стиль) → на проводе
-  псевдослучайный поток, probe-resistance (F3) и анти-DPI (F5). Анти-fingerprint по размеру
-  (bucketed padding) и времени (DAITA-стиль пейсинг + chaff) — ось I5.
-- **Анти-абуз (F7):** per-client token-bucket rate-limit на exit.
-- **Resilience (M4):** TCP/443-fallback (obfs-over-TCP, когда UDP/QUIC заблокирован) +
-  миграция соединения (WiFi↔LTE / NAT-rebind) по QUIC Connection ID.
-- **Анонимность (M5):** unlinkable токены (blind RSA, RFC 9474) + интерактивный issuer↔exit split
-  (издатель подписывает вслепую) + выбор exit из списка с failover.
-- **Зрелость (M6):** robustness-fuzzing парсеров, criterion-бенчмарки ([`docs/BENCHMARKS.md`](docs/BENCHMARKS.md)),
-  кеш KDF/cipher в hot-path, crypto-agility (выбор KX-suite, TLS-negotiate).
-- **PQ-аутентификация (M7):** гибрид Ed25519 (TLS-cert+pin) + **ML-DSA-65** (FIPS 204) —
-  сервер ML-DSA-подписывает привязку сессии, клиент проверяет → анти-MITM устойчиво к CRQC.
+[![CI](https://github.com/QuantumAES/CitadelPQVPN/actions/workflows/ci.yml/badge.svg)](https://github.com/QuantumAES/CitadelPQVPN/actions/workflows/ci.yml)
+[![windows](https://github.com/QuantumAES/CitadelPQVPN/actions/workflows/windows.yml/badge.svg)](https://github.com/QuantumAES/CitadelPQVPN/actions/workflows/windows.yml)
+[![release](https://img.shields.io/github/v/release/QuantumAES/CitadelPQVPN?include_prereleases&label=релиз)](https://github.com/QuantumAES/CitadelPQVPN/releases/latest)
+[![license](https://img.shields.io/badge/license-Apache--2.0-blue)](LICENSE)
 
-Модель угроз и сопоставление findings → код — в [`docs/THREAT-MODEL-STRIDE.md`](docs/THREAT-MODEL-STRIDE.md).
+</div>
 
-## Архитектура (слои)
+> ### ⚠️ Публичная бета
+>
+> Это **первый публичный релиз**. Криптография собрана из проверенных библиотек (rustls/aws-lc-rs,
+> quinn, BLAKE3), протокол и клиенты покрыты тестами и тремя внутренними security-ревью — но
+> **независимого внешнего аудита не было**. Если от вашей приватности зависит свобода или
+> безопасность, не полагайтесь на этот проект как на единственную меру защиты.
+>
+> Известные ограничения релиза перечислены ниже, в разделе «[Чего пока нет](#чего-пока-нет)».
+
+## Как это выглядит
+
+| Android | Linux | Windows |
+|:---:|:---:|:---:|
+| <img src="docs/screenshots/android-connected.png" width="200"> | <img src="docs/screenshots/linux-gui.png" width="320"> | <img src="docs/screenshots/windows-connected.png" width="320"> |
+| Туннель поднят | Графический клиент | Клиент и служба |
+
+| Раздельный туннель (Android) | Консольный клиент (Linux) |
+|:---:|:---:|
+| <img src="docs/screenshots/android-split.png" width="200"> | <img src="docs/screenshots/linux-cli.png" width="320"> |
+
+## Зачем это нужно
+
+**Постквантовая защита сегодня, а не после появления квантового компьютера.** Трафик,
+записанный сейчас, расшифровывают позже — атака «harvest now, decrypt later». Ключи сессии
+согласуются гибридно (`X25519MLKEM768`): чтобы вскрыть запись, нужно сломать *обе* схемы,
+классическую и постквантовую. Подлинность сервера подтверждается парой Ed25519 + **ML-DSA-65**
+(FIPS 204), поэтому и подмена сервера не становится проще с приходом CRQC.
+
+**Соединение не выглядит как VPN.** Первый уровень — обфускация под общим PSK: на проводе
+псевдослучайный поток без опознаваемых заголовков, со случайным паддингом и защитой от
+активного зондирования (на пробу без ключа сервер просто молчит). Если UDP заблокирован,
+клиент сам уходит на TCP/443.
+
+**Сервер не знает, кто вы.** Доступ подтверждается анонимным токеном (слепая подпись RSA,
+RFC 9474): издатель подписывает, не видя токена, а exit проверяет, не зная, кому он выдан.
+Учётных записей, почты и телефона нет. Exit и издатель по умолчанию **не ведут журналов**
+с адресами, идентификаторами и назначениями.
+
+**Свой сервер, а не чужой сервис.** Exit разворачивается одной командой на любом VPS;
+подписанные бинари, проверка подписи установщиком. Никакой инфраструктуры проекта в схеме нет.
+
+### Что умеют клиенты
+
+- **Kill-switch** — при обрыве туннеля трафик блокируется, а не утекает мимо: iptables на
+  Linux, WFP на Windows. На Android ту же роль выполняет штатный переключатель ОС
+  «Постоянная VPN» → «Блокировать соединения без VPN».
+- **Раздельное туннелирование** — по приложениям (Android) и по назначениям/подсетям
+  (Android, Linux, Windows).
+- **Защита от утечки DNS** — резолвинг только через туннель, при желании DoH.
+- **Профили и хранилище** — несколько exit'ов, переключение и failover; секреты лежат в
+  зашифрованном хранилище (Argon2id + AES-256-GCM), мастер-пароль задаёте вы.
+- **Подключение по ссылке или QR** — `citadel://…`; полные ключи не передаются, ссылка несёт
+  лишь обязательства `H(pub)`, клиент дотягивает и сверяет их сам.
+- **Реконнект при смене сети** — Wi-Fi ↔ LTE и NAT-rebind переживаются миграцией соединения
+  QUIC, без перезапуска туннеля.
+- **Запрет снимков экрана** на Android (включён по умолчанию).
+
+## Установка
+
+Все артефакты — на странице [релизов](https://github.com/QuantumAES/CitadelPQVPN/releases/latest).
+Перед установкой стоит [проверить подпись](#проверка-подлинности): она для того и существует.
+
+**Android** — `CitadelPQVPN-<версия>.apk`, установка из файла (потребуется разрешить установку
+из неизвестных источников). Google Play не используется.
+
+**Linux, графический клиент:**
+
+```bash
+tar --zstd -xf citadel-desktop-linux-x86_64.tar.zst
+cd citadel-desktop-linux-* && ./install.sh          # спросит sudo
+sudo usermod -aG citadel-vpn "$USER"                # затем ПЕРЕЛОГИНЬТЕСЬ
+/opt/citadel-pqvpn/app
+```
+
+**Linux, консольный клиент** (демон + TUI, с разделением привилегий):
+
+```bash
+tar --zstd -xf citadel-cli-linux-x86_64.tar.zst
+cd citadel-cli-linux-* && sudo ./install.sh
+sudo usermod -aG citadel-vpn "$USER"                # затем ПЕРЕЛОГИНЬТЕСЬ
+citadel-cli
+```
+
+Право поднимать туннель даёт членство в группе `citadel-vpn`, и установщик никого туда не
+добавляет сам: её участник управляет маршрутизацией всей машины. Без членства клиент скажет
+«нет доступа к сокету» — это не поломка, а именно это правило.
+
+**Windows 10/11 (x64)** — `CitadelPQVPN-Setup-<версия>.exe`, запуск от администратора.
+Ставит приложение, драйвер WinTUN и системную службу `citadel-svc`, которая держит адаптер,
+маршруты и фильтры kill-switch. Установщик не подписан Authenticode, поэтому SmartScreen
+покажет «Неизвестный издатель»: «Подробнее» → «Выполнить в любом случае». Подлинность
+проверяется по `sha256sums` и подписи minisign — ими и стоит пользоваться.
+
+### Проверка подлинности
+
+Хеши всех артефактов релиза лежат в `sha256sums`, а сам файл подписан релизным ключом проекта:
+
+```bash
+minisign -V -P RWSErwVVdH0bhg9dQViFezkqCQPfWpZt18rK0irjOOpNfUW3G4hkoNp4 -m sha256sums
+sha256sum -c sha256sums --ignore-missing
+```
+
+Тот же публичный ключ — в [`packaging/release/citadel-release.pub`](packaging/release/citadel-release.pub)
+и вшит в серверный установщик.
+
+## Свой exit-сервер
+
+Нужен любой VPS с публичным адресом (Debian/Ubuntu, root). Версия указывается явно —
+установщик намеренно не умеет «latest»: подставлять в привилегированную установку то, что
+сегодня оказалось свежим релизом, — плохая идея.
+
+```bash
+curl -fsSLO https://github.com/QuantumAES/CitadelPQVPN/releases/download/v0.8.0/install-citadel-server.sh
+CITADEL_VERSION=v0.8.0 bash install-citadel-server.sh
+```
+
+Установщик проверяет подпись бинарей вшитым ключом, поднимает exit и издателя токенов,
+генерирует ключевой материал **на сервере** (секреты не покидают машину) и печатает
+`citadel://`-ссылку — её и открывают клиентом. Дальше абоненты добавляются и отзываются
+по защищённому каналу *внутри самого туннеля*: административный порт снаружи закрыт.
+
+Подробности и модель угроз — [`docs/SPEC.md`](docs/SPEC.md),
+[`docs/THREAT-MODEL-STRIDE.md`](docs/THREAT-MODEL-STRIDE.md).
+
+## Как устроено
 
 ```
-L4 control   токены/issuance, выбор exit, ADDRESS_ASSIGN (capsules)
-L3 data      CONNECT-IP, IP-пакеты как QUIC DATAGRAM            ── citadel-masque, citadel-tun
-L2 сессия    PQ-QUIC + TLS 1.3 (X25519MLKEM768), pinning, ML-DSA ── citadel-quic
-L1 обфускация ChaCha20-Poly1305 PSK-wrap + padding/пейсинг       ── citadel-obfs
-L0 транспорт UDP (основной) / TCP:443 (fallback)
+L4 управление  токены и выдача, выбор exit, назначение адреса (capsules)
+L3 данные      CONNECT-IP: IP-пакеты как QUIC DATAGRAM        ── citadel-masque, citadel-tun
+L2 сессия      PQ-QUIC + TLS 1.3 (X25519MLKEM768), pin, ML-DSA ── citadel-quic
+L1 обфускация  ChaCha20-Poly1305 PSK-wrap, паддинг, пейсинг    ── citadel-obfs
+L0 транспорт   UDP (основной) / TCP:443 (обход блокировки)
 ```
 
 | Крейт | Назначение |
 |---|---|
-| `citadel-obfs` | obfs L1 (PSK-gated AEAD, padding-политика, chaff) + байт-точные тест-векторы |
-| `citadel-masque` | CONNECT-IP data plane: varint, datagram, capsules, IPv4/ICMP/UDP/DNS |
-| `citadel-tun` | TUN-устройство (Linux `/dev/net/tun`) |
-| `citadel-token` | анонимные токены (blind RSA) — роли клиент/издатель |
-| `citadel-quic` | PQ-QUIC, obfs-socket, rate-limit, TCP-fallback, миграция, crypto-agility, PQ-auth; бинари `citadel-m0` (хендшейк-PoC), `citadel-m1` (туннель) |
+| `citadel-obfs` | обфускация L1: PSK-gated AEAD, паддинг, анти-реплей, байт-точные тест-векторы |
+| `citadel-masque` | плоскость данных CONNECT-IP: varint, датаграммы, капсулы, IPv4/ICMP/UDP/DNS |
+| `citadel-tun` | TUN-устройство (Linux) |
+| `citadel-token` | анонимные токены (слепая RSA): роли клиента и издателя |
+| `citadel-quic` | PQ-QUIC, obfs-сокет, rate-limit, TCP-fallback, миграция, PQ-аутентификация |
+| `citadel-client` | движок как встраиваемая библиотека + хранилище профилей и креды |
+| `citadel-helper` | привилегированный помощник Linux-GUI (polkit): TUN и маршруты, fd по SCM_RIGHTS |
+| `citadel-vpnd` / `citadel-engine` / `citadel-cli` | консольный клиент: демон под root, движок без привилегий, TUI |
+| `citadel-winnet` / `citadel-winsvc` | Windows: сеть, WFP, WinTUN и служба-плумбер |
 
-## Быстрый старт
+Клиентское приложение — Flutter поверх этого движка через `flutter_rust_bridge`
+([`docs/CLIENT-ARCH.md`](docs/CLIENT-ARCH.md), консольный — [`docs/LINUX-CLI.md`](docs/LINUX-CLI.md)).
 
-**Юнит-тесты (49, включая байт-точные obfs-векторы и fuzzing):**
+## Сборка и тесты
+
+Требуется rustup **stable 1.96+** (системный `cargo` 1.85 не соберёт зависимости),
+`cmake` и `clang` для `aws-lc-rs`, Flutter 3.44+ для приложения. Полная настройка окружения —
+`tools/setup-dev-env.sh`, подробности — [`docs/BUILD-INSTALL.md`](docs/BUILD-INSTALL.md).
+
 ```bash
-# aws-lc-rs требует cmake; ставим в локальный venv без root (разово)
-python3 -m venv .venv && .venv/bin/pip install cmake blake3 cryptography
-PATH="$PWD/.venv/bin:$PATH" cargo test --workspace
+cargo test --workspace                     # юнит-тесты движка (200+)
+cargo clippy --workspace --all-targets -- -D warnings
+
+bash docker/run-demo.sh                    # e2e: настоящий туннель в контейнерах
+bash docker/run-cli-tests.sh               # e2e: консольный клиент, привилегии, kill-switch
 ```
 
-**Бенчмарки:**
-```bash
-PATH="$PWD/.venv/bin:$PATH" cargo bench -p citadel-obfs   # см. docs/BENCHMARKS.md
-```
+Оба харнеса поднимают стенд (издатель + два exit'а + клиент), прогоняют сценарии — ping и HTTP
+через туннель, egress-фильтр, устойчивость к зондированию, сброс привилегий, утечки DNS,
+rate-limit, миграцию, TCP-fallback, failover, слепую выдачу токенов, PQ-аутентификацию с
+негативными проверками, административный канал — и **сами гасят стенд**, что бы ни случилось.
+Провал сценария означает ненулевой код возврата: те же команды выполняет CI.
 
-**Полное демо — реальный туннель в Docker (15 сценариев M0–M7):**
-```bash
-bash docker/run-demo.sh                     # собрать → поднять issuer+2×exit+client → тесты
-docker compose -f docker/compose.yml down   # остановить
-```
+## Документация
 
-Демо поднимает `issuer` + два `exit` + `client` в bridge-сети и прогоняет 15 тестов:
-ping/HTTP через PQ-QUIC, egress-фильтр (F2), probe-resistance (F3), сброс привилегий (F4),
-DNS-leak/DoH (F6), отказ поддельному токену (M4), rate-limit (F7), миграция (M4),
-TCP/443-fallback (M4), multi-server failover (M5), слепой issuance (M5), crypto-agility (M6),
-PQ-auth ML-DSA-65 позитив+негатив (M7).
+| Документ | О чём |
+|---|---|
+| [`docs/SPEC.md`](docs/SPEC.md) | протокол целиком: слои, капсулы, форматы, обоснования решений |
+| [`docs/THREAT-MODEL-STRIDE.md`](docs/THREAT-MODEL-STRIDE.md) | модель угроз и сопоставление находок с кодом |
+| [`docs/SECURITY-ROADMAP.md`](docs/SECURITY-ROADMAP.md) | security-трек и журнал внутренних ревью |
+| [`docs/PHASE0-OBFS.md`](docs/PHASE0-OBFS.md) | обфускация L1: формат, паддинг, анти-зондирование |
+| [`docs/CLIENT-ARCH.md`](docs/CLIENT-ARCH.md) | устройство клиентов (Android, Linux GUI, Windows) |
+| [`docs/LINUX-CLI.md`](docs/LINUX-CLI.md) | консольный клиент и его модель привилегий |
+| [`docs/BUILD-INSTALL.md`](docs/BUILD-INSTALL.md) | сборка, окружение, подпись APK |
+| [`docs/RELEASE.md`](docs/RELEASE.md) | CI/CD, раннеры, секреты, выпуск релиза |
+| [`docs/BENCHMARKS.md`](docs/BENCHMARKS.md) | замеры криптографии и обфускации |
 
-Топология: `client TUN → [PQ-QUIC X25519MLKEM768 / obfs L1] → exit TUN → NAT → интернет`.
+## Чего пока нет
 
-## Безопасность и секреты
+- **Внешнего аудита безопасности.** Внутренних ревью было три (см. `docs/SECURITY-ROADMAP.md`),
+  внешнего — ни одного.
+- **Клиентов под iOS/iPadOS и macOS.** Архитектура выбрана (Apple Network Extension), работа
+  не начата: сборка требует macOS и Xcode.
+- **Подписи Authenticode** у Windows-установщика и публикации в Google Play.
+- **Только x86-64** в готовых сборках десктопа и сервера; ARM собирается из исходников.
+- Скорость не оптимизировалась: приоритетом были корректность и приватность.
 
-- **Никаких секретов в репозитории.** Общий obfs-PSK, RSA-ключ издателя, ML-DSA-ключ exit,
-  pin сертификата — **генерируются в рантайме** (в Docker-томе `pinshare`), не версионируются
-  (см. `.gitignore`). В проде PSK/ключи доставляются по аутентифицированному каналу провижининга
-  (docs/PHASE0-OBFS §8).
-- Своё крипто не пишется — только проверенные примитивы (BLAKE3, ChaCha20-Poly1305, aws-lc-rs).
-- Перед публичным форком замените `repository` в `Cargo.toml`.
+## Безопасность
 
-## Нюансы окружения
+Нашли проблему — пожалуйста, не открывайте публичный issue. Используйте
+[приватный отчёт GitHub](https://github.com/QuantumAES/CitadelPQVPN/security/advisories/new).
 
-- **`aws-lc-rs` требует `cmake`** (в `.venv`, без root) → перед `cargo` нужен `PATH="$PWD/.venv/bin:$PATH"`.
-- **rustc 1.85 (без rustup)** → в `Cargo.lock` закреплён `time=0.3.41`.
-- **Docker-образ** `debian:trixie-slim` (glibc как на хосте): бинарь собирается на хосте и копируется внутрь.
-- **TUN в контейнере** требует `--cap-add=NET_ADMIN` + `--device=/dev/net/tun` (заданы в compose);
-  локальная оболочка без CAP_NET_ADMIN реальный TUN не создаёт — поэтому туннель демонстрируется в Docker.
+Секретов в репозитории нет и быть не должно: PSK, ключи издателя и exit'а, pin сертификата
+генерируются в рантайме на сервере. Релизный minisign-ключ хранится вне репозитория и вне
+GitHub — подписывает сборочная машина.
 
 ## Лицензия
 

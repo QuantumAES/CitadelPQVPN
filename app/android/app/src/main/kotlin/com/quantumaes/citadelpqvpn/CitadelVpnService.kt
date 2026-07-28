@@ -1,4 +1,4 @@
-package com.example.app
+package com.quantumaes.citadelpqvpn
 
 import android.app.Notification
 import android.app.NotificationChannel

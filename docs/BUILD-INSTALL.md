@@ -60,8 +60,40 @@ cd app
 flutter build apk --release                     # все ABI; либо конкретные:
 flutter build apk --release --target-platform android-arm64,android-x64
 # → build/app/outputs/flutter-apk/app-release.apk
-#   (release использует debug-signing из шаблона Flutter → APK устанавливается без своего keystore)
 ```
+
+### Подпись APK
+
+`applicationId` приложения — **`com.quantumaes.citadelpqvpn`**. Менять его нельзя: для Android
+это другое приложение, обновление поверх не встанет. Имя пакета зашито ещё и в имена
+JNI-символов (`Java_com_quantumaes_citadelpqvpn_CitadelVpnService_…` в `app/rust/src/android_jni.rs`),
+причём связываются они в рантайме — расхождение даст собравшийся APK, который падает при
+старте VpnService. Инвариант сторожит `tools/check-android-jni.py` (гоняется в CI).
+
+Keystore Gradle ищет в двух местах, ни одно из них не в репозитории:
+
+1. `app/android/key.properties` (в `.gitignore`):
+
+   ```properties
+   storeFile=/абсолютный/путь/citadel-release.jks
+   storePassword=…
+   keyAlias=citadel
+   keyPassword=…
+   ```
+
+2. переменные окружения — так делает CI:
+   `CITADEL_KEYSTORE`, `CITADEL_KEYSTORE_PASSWORD`, `CITADEL_KEY_ALIAS`, `CITADEL_KEY_PASSWORD`.
+
+Создать keystore (**сделайте офлайн-бэкап: потеря = невозможность выпускать обновления**):
+
+```sh
+keytool -genkeypair -v -keystore citadel-release.jks -alias citadel \
+        -keyalg RSA -keysize 4096 -validity 10000
+```
+
+Ключа нет — Gradle откатывается на debug-ключ и говорит об этом в логе сборки. Такой APK
+годится только для локальной проверки, и `tools/mk-client-release.sh` откажется класть его в
+релиз (обход для своих сборок — `CITADEL_ALLOW_DEBUG_APK=1`).
 
 Установка:
 

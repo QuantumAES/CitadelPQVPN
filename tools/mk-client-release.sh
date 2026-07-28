@@ -17,9 +17,10 @@
 # Env: FLUTTER=/path/to/flutter/bin/flutter (по умолч. ~/flutter/bin/flutter),
 #      CITADEL_RELEASE_KEY_DIR (секрет minisign), CITADEL_RELEASE_PUB (self-verify).
 #
-# NB (подпись APK): сейчас Gradle подписывает release debug-ключом (app/android/app/build.gradle.kts).
-# Для pre это ок (переустановка поверх работает на той же машине сборки), но источник «не проверен».
-# Доверенный источник — release-keystore (follow-up).
+# Подпись APK: Gradle берёт релизный keystore из app/android/key.properties либо из окружения
+# CITADEL_KEYSTORE/_PASSWORD/_KEY_ALIAS/_KEY_PASSWORD (app/android/app/build.gradle.kts). Если
+# ключа нет, Gradle молча откатывается на debug-ключ — такой APK в релиз не кладём, скрипт
+# останавливается (обход: CITADEL_ALLOW_DEBUG_APK=1 для локальных проверок).
 # ─────────────────────────────────────────────────────────────────────────────
 set -euo pipefail
 
@@ -55,7 +56,15 @@ case "$(uname -m)" in
   *) die "неподдерживаемая арка: $(uname -m)" ;;
 esac
 
-echo "[mk-client] version=$VERSION arch=$SUFFIX out=$OUT flutter=$FLUTTER"
+# Версия внутри самих сборок, а не только в имени файла. Без этого APK и десктоп-бандл всегда
+# сообщают ОС «1.0.0+1» из шаблона pubspec: в списке приложений Android и в свойствах файла
+# видна не та версия, что в релизе, а установка поверх не отличает старое от нового.
+#   versionName — тег без ведущего "v" (строка произвольная, суффикс -pre допустим);
+#   versionCode — обязан быть целым и монотонным, берём число коммитов в истории.
+BUILD_NAME="${VERSION#v}"
+BUILD_NUMBER="$(git rev-list --count HEAD 2>/dev/null || echo 1)"
+
+echo "[mk-client] version=$VERSION ($BUILD_NAME+$BUILD_NUMBER) arch=$SUFFIX out=$OUT flutter=$FLUTTER"
 mkdir -p "$OUT"
 
 # ── 1. привилегированный хелпер (release) ──
@@ -64,7 +73,9 @@ cargo build --release -p citadel-helper
 
 # ── 2. Linux desktop-бандл (flutter build linux) ──
 echo "[mk-client] flutter build linux --release…"
-( cd "$REPO_ROOT/app" && "$FLUTTER" build linux --release --dart-define=CITADEL_VERSION="$VERSION" )
+( cd "$REPO_ROOT/app" && "$FLUTTER" build linux --release \
+    --dart-define=CITADEL_VERSION="$VERSION" \
+    --build-name="$BUILD_NAME" --build-number="$BUILD_NUMBER" )
 BUNDLE="$REPO_ROOT/app/build/linux/x64/release/bundle"
 [[ -d "$BUNDLE" ]] || die "нет linux-бандла: $BUNDLE"
 
@@ -298,17 +309,39 @@ if [[ "$NO_APK" -eq 1 ]]; then
   echo "[mk-client] --no-apk: сборка APK пропущена (Linux-бандл собран)."
 else
   echo "[mk-client] flutter build apk --release…"
-  ( cd "$REPO_ROOT/app" && "$FLUTTER" build apk --release --dart-define=CITADEL_VERSION="$VERSION" )
+  ( cd "$REPO_ROOT/app" && "$FLUTTER" build apk --release \
+      --dart-define=CITADEL_VERSION="$VERSION" \
+      --build-name="$BUILD_NAME" --build-number="$BUILD_NUMBER" )
   APK="$REPO_ROOT/app/build/app/outputs/flutter-apk/app-release.apk"
   [[ -f "$APK" ]] || die "нет APK: $APK"
+
+  # Кто подписал APK. Debug-ключ здесь — не мелочь: такой APK не обновится поверх релизного и
+  # его происхождение ничем не подтверждается, поэтому в релиз он попадать не должен молча.
+  if command -v apksigner >/dev/null 2>&1; then
+    if apksigner verify --print-certs "$APK" 2>/dev/null | grep -qi "CN=Android Debug"; then
+      echo "[mk-client] ВНИМАНИЕ: APK подписан DEBUG-ключом (нет key.properties / CITADEL_KEYSTORE)."
+      echo "            Для публикуемого релиза задай релизный keystore — см. docs/BUILD-INSTALL.md."
+      [[ "${CITADEL_ALLOW_DEBUG_APK:-0}" = "1" ]] || die "отказываюсь класть debug-APK в релиз (CITADEL_ALLOW_DEBUG_APK=1 — если осознанно)"
+    else
+      echo "[mk-client] APK подписан релизным ключом ✔"
+    fi
+  else
+    echo "[mk-client] NB: apksigner не найден — подпись APK не проверена"
+  fi
   cp "$APK" "$OUT/CitadelPQVPN-$VERSION.apk"
   printf '  %-34s %s\n' "CitadelPQVPN-$VERSION.apk" "$(du -h "$OUT/CitadelPQVPN-$VERSION.apk" | cut -f1)"
 fi
 
-# ── 5. sha256sums по ВСЕМ артефактам релиза (сервер .zst + клиент .tar.zst/.apk) + подпись ──
+# ── 5. sha256sums по ВСЕМ артефактам релиза + подпись ──
+#
+# Считаем по всему, что лежит в dist/<version>/: сервер (.zst), Linux/CLI-бандлы (.tar.zst),
+# Android (.apk) И Windows-установщик (.exe), если его туда положили. Установщик собирается на
+# ДРУГОЙ машине (windows-раннер) и приезжает сюда артефактом workflow — но подпись у релиза
+# одна, и он обязан быть под ней: иначе единственный артефакт, который пользователь запускает
+# с правами администратора, остаётся тем, чью подлинность проверить нечем.
 cd "$OUT"
 shopt -s nullglob
-sha256sum ./*.zst ./*.apk 2>/dev/null | sed 's#\./##' > sha256sums
+sha256sum ./*.zst ./*.apk ./*.exe 2>/dev/null | sed 's#\./##' > sha256sums
 shopt -u nullglob
 echo "[mk-client] sha256sums:"; sed 's/^/  /' sha256sums
 

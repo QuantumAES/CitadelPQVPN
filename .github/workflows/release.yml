@@ -1,0 +1,238 @@
+name: release
+
+# Публикация релиза по тегу vX.Y.Z: собрать всё, подписать ОДНОЙ подписью, выложить в GitHub Release.
+#
+# Конвейер намеренно не изобретает свою сборку — он вызывает те же скрипты, которыми релиз
+# собирают руками (tools/mk-release.sh, mk-client-release.sh, publish-release.sh). Иначе
+# «собрано на машине» и «собрано в CI» со временем расходятся, и расхождение обнаруживается
+# на пользователях.
+#
+# Порядок важен:
+#   1. windows-раннер собирает установщик и отдаёт его артефактом workflow;
+#   2. linux-раннер собирает серверные бинари БЕЗ подписи (mk-release.sh чистит dist/<tag>,
+#      поэтому он обязан отработать ДО того, как туда лёг .exe);
+#   3. установщик кладётся в dist/<tag>;
+#   4. mk-client-release.sh собирает клиентов, пере-считывает sha256sums по ВСЕМУ содержимому
+#      каталога (включая .exe) и подписывает их релизным minisign-ключом — один раз;
+#   5. publish-release.sh пере-проверяет подпись и хеши и создаёт GitHub Release.
+#
+# Секреты (Settings → Secrets and variables → Actions):
+#   CITADEL_RELEASE_PASSWORD   пароль minisign-секрета. САМ КЛЮЧ в секретах не хранится: он
+#                              лежит файлом на linux-раннере (~/.citadel/release/citadel-release.key)
+#                              и не покидает эту машину.
+#   ANDROID_KEYSTORE_BASE64    релизный keystore Android (base64), ANDROID_KEYSTORE_PASSWORD,
+#                              ANDROID_KEY_ALIAS, ANDROID_KEY_PASSWORD.
+# Токен для gh — штатный GITHUB_TOKEN, отдельный PAT не нужен.
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Тег релиза (например v0.8.0) — должен существовать в репозитории'
+        required: true
+
+permissions:
+  contents: write        # создать GitHub Release и залить ассеты
+
+concurrency:
+  group: release-${{ github.event.inputs.tag || github.ref_name }}
+  cancel-in-progress: false   # релиз на середине не отменяем
+
+env:
+  CARGO_TERM_COLOR: always
+  TAG: ${{ github.event.inputs.tag || github.ref_name }}
+
+jobs:
+  # ── Гейт. Тег мог быть поставлен на коммит, который никогда не проходил CI, поэтому
+  # проверяем ровно то, что публикуем, а не то, что когда-то было зелёным на ветке.
+  gate:
+    name: гейт — clippy, тесты, e2e
+    runs-on: [self-hosted, linux, x64]
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.tag || github.ref }}
+
+      - name: PATH раннера
+        run: echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+
+      - name: clippy (-D warnings)
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+
+      - name: тесты воркспейса
+        run: cargo test --workspace --locked
+
+      - name: JNI-мост Kotlin ↔ Rust
+        run: python3 tools/check-android-jni.py
+
+      - name: иконки соответствуют app_icons/
+        run: python3 tools/sync-app-icons.py --check
+
+      - name: харнес туннеля
+        run: bash docker/run-demo.sh
+
+      - name: харнес консольного клиента
+        run: bash docker/run-cli-tests.sh
+
+      - name: подчистить стенды
+        if: always()
+        run: |
+          docker compose -f docker/compose.yml down -v --remove-orphans 2>/dev/null || true
+          docker compose -f docker/compose.cli.yml down -v --remove-orphans 2>/dev/null || true
+
+  # ── Windows-установщик. Собирается на windows-раннере и передаётся артефактом на linux-раннер,
+  # где его накрывает общая подпись релиза.
+  windows:
+    name: Windows — установщик
+    runs-on: [self-hosted, windows, x64]
+    needs: gate
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.tag || github.ref }}
+
+      - name: проверка инструментов
+        shell: pwsh
+        run: |
+          $rc = 0
+          foreach ($t in @('cargo','flutter','ISCC')) {
+            if (-not (Get-Command $t -ErrorAction SilentlyContinue)) {
+              Write-Output "::error::на раннере нет $t"; $rc = 1
+            }
+          }
+          if (-not (Test-Path "packaging\windows\wintun.dll")) {
+            Write-Output "::error::нет packaging\windows\wintun.dll (см. packaging/windows/README.md)"; $rc = 1
+          }
+          exit $rc
+
+      - name: flutter pub get
+        working-directory: app
+        run: flutter pub get
+
+      # Версия без ведущего "v": она уходит в VERSIONINFO службы и в свойства установщика,
+      # где ожидается числовой формат.
+      - name: сборка установщика
+        shell: pwsh
+        run: |
+          $ver = "${{ env.TAG }}" -replace '^v',''
+          Write-Host "версия установщика: $ver"
+          .\packaging\windows\build-windows.ps1 -Version $ver
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows-installer
+          path: packaging/windows/Output/*.exe
+          if-no-files-found: error
+          retention-days: 14
+
+  # ── Сборка остального, подпись и публикация.
+  publish:
+    name: сборка, подпись и публикация
+    runs-on: [self-hosted, linux, x64]
+    needs: [gate, windows]
+    timeout-minutes: 120
+    steps:
+      # fetch-depth: 0 — не украшательство: publish-release.sh проверяет, запушен ли коммит
+      # (git branch -r --contains HEAD), а mk-client-release.sh берёт versionCode из числа
+      # коммитов. На мелком клоне первое молча ошибается, второе даёт versionCode=1.
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.tag || github.ref }}
+          fetch-depth: 0
+
+      - name: PATH раннера
+        run: |
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+          echo "$HOME/flutter/bin" >> "$GITHUB_PATH"
+
+      - name: проверка инструментов и ключей
+        env:
+          RELEASE_PASSWORD: ${{ secrets.CITADEL_RELEASE_PASSWORD }}
+          KEYSTORE_B64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+        run: |
+          set -u
+          rc=0
+          need() { command -v "$1" >/dev/null 2>&1 || { echo "::error::на раннере нет $1 ($2)"; rc=1; }; }
+          need cargo    "rustup stable 1.96+"
+          need flutter  "stable 3.44+"
+          need minisign "подпись артефактов релиза"
+          need zstd     "упаковка артефактов"
+          need gh       "публикация релиза; авторизация через GH_TOKEN"
+          need apksigner "проверка подписи APK (Android build-tools)"
+          key="${CITADEL_RELEASE_KEY_DIR:-$HOME/.citadel/release}/citadel-release.key"
+          [ -f "$key" ] || { echo "::error::на раннере нет minisign-секрета $key (tools/gen-release-key.sh)"; rc=1; }
+          [ -n "${RELEASE_PASSWORD:-}" ] || { echo "::error::не задан секрет CITADEL_RELEASE_PASSWORD"; rc=1; }
+          [ -n "${KEYSTORE_B64:-}" ] || { echo "::error::не задан секрет ANDROID_KEYSTORE_BASE64"; rc=1; }
+          case "${TAG}" in v*) ;; *) echo "::error::тег «${TAG}» не начинается с v"; rc=1 ;; esac
+          exit $rc
+
+      # Keystore кладём ВНЕ рабочего каталога: всё, что лежит в нём, рискует попасть в артефакт
+      # или в бандл сборки. Файл удаляется финальным шагом, который выполняется всегда.
+      - name: развернуть Android-keystore
+        env:
+          KEYSTORE_B64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+        run: |
+          ks="$RUNNER_TEMP/citadel-release.jks"
+          umask 077
+          printf '%s' "$KEYSTORE_B64" | base64 -d > "$ks"
+          echo "CITADEL_KEYSTORE=$ks" >> "$GITHUB_ENV"
+
+      # 1. Серверные бинари. --no-sign: подпись ставится один раз в конце, по всему релизу.
+      - name: серверные бинари (exit, issuer, linkgen)
+        run: tools/mk-release.sh "$TAG" --no-sign
+
+      # 2. Установщик с windows-раннера — в тот же каталог, ДО пересчёта хешей.
+      - uses: actions/download-artifact@v4
+        with:
+          name: windows-installer
+          path: dist/${{ env.TAG }}
+
+      # 3. Клиенты (APK + Linux GUI + CLI) и общий sha256sums по ВСЕМУ каталогу, включая .exe.
+      - name: клиенты и общие хеши
+        env:
+          CITADEL_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          CITADEL_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          CITADEL_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+        run: tools/mk-client-release.sh "$TAG" --no-sign
+
+      # 4. Подпись — отдельным шагом, и вот почему. У minisign нет флага для пароля: без
+      # терминала он читает его со stdin. Отдавать пароль на stdin скрипту, который внутри
+      # запускает gradle и flutter, — значит надеяться, что строку не вычитает кто-то из них
+      # раньше. Здесь stdin читает ровно один процесс.
+      - name: подпись релиза
+        env:
+          RELEASE_PASSWORD: ${{ secrets.CITADEL_RELEASE_PASSWORD }}
+        run: |
+          key="${CITADEL_RELEASE_KEY_DIR:-$HOME/.citadel/release}/citadel-release.key"
+          printf '%s\n' "$RELEASE_PASSWORD" | minisign -S -s "$key" -m "dist/$TAG/sha256sums" \
+            -t "CitadelPQVPN $TAG $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          minisign -V -p packaging/release/citadel-release.pub -m "dist/$TAG/sha256sums"
+
+      - name: что публикуем
+        run: ls -lh "dist/$TAG" && cat "dist/$TAG/sha256sums"
+
+      # 4. Пере-проверка подписи и хешей + создание релиза. Скрипт идемпотентен: повторный
+      #    запуск обновляет ассеты и notes существующего релиза.
+      - name: публикация GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: tools/publish-release.sh "$TAG"
+
+      # Хеши и подпись остаются в артефактах прогона: по ним видно, что именно выложено,
+      # даже если ассеты релиза потом заменят.
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: release-checksums
+          path: |
+            dist/${{ env.TAG }}/sha256sums
+            dist/${{ env.TAG }}/sha256sums.minisig
+          if-no-files-found: warn
+
+      - name: убрать keystore с раннера
+        if: always()
+        run: rm -f "$RUNNER_TEMP/citadel-release.jks"

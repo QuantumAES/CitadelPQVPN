@@ -110,36 +110,33 @@ Workflow **`.github/workflows/windows.yml`** (триггеры: push в `main`/`
 
 | Job | Что делает | Раннер |
 |-----|-----------|--------|
-| `rust` (обязательный) | `cargo test -p citadel-winnet -p citadel-winsvc` + `cargo build -p citadel-winsvc --release` + `cargo clippy` (winnet/winsvc/client) `-D warnings` под **MSVC** | `windows-latest` |
-| `installer` (push/dispatch) | Flutter-бандл + служба + WinTUN + Inno → артефакт `CitadelPQVPN-Setup-unsigned` | `windows-latest` |
+| `rust` (обязательный) | `cargo test -p citadel-winnet -p citadel-winsvc` + `cargo build -p citadel-winsvc --release` + `cargo clippy` (winnet/winsvc/client) `-D warnings` под **MSVC** | `self-hosted, windows, x64` |
+| `installer` (push/dispatch) | Flutter-бандл + служба + WinTUN + Inno → артефакт `CitadelPQVPN-Setup-unsigned` | `self-hosted, windows, x64` |
+
+Релизный установщик собирает `release.yml` на том же раннере — см. `docs/RELEASE.md`.
 
 **Что CI ЛОВИТ:** компиляция и линковка под MSVC (WFP/FWPM, named-pipe, SCM, CancelIoEx — то, что
 Linux `windows-gnu` не покрывает полностью) + пуре-юнит-тесты winnet/winsvc на Windows.
 
-**Чего CI НЕ ловит (нужна настоящая машина):** создание WinTUN-адаптера, WFP-фильтры, регистрация/старт
-службы, packet-pump, reconnect — GitHub-hosted раннер это не запускает (нет админ-сессии, драйвера, интерактива).
-Полный **device-E2E** (§4) — только на реальном Windows с админом.
+**Чего CI НЕ ловит (нужна настоящая машина с админом):** создание WinTUN-адаптера, WFP-фильтры,
+регистрация/старт службы, packet-pump, reconnect. Агент раннера работает без интерактивной
+админ-сессии, поэтому рантайм здесь не проверяется. Полный **device-E2E** — §4, руками.
 
-### GitHub-hosted `windows-latest` (что уже есть / что доставляет workflow)
-- **Предустановлено:** VS2022 Build Tools (MSVC + Windows SDK), CMake, rustup, choco, git.
-- **Доставляет workflow:** `nasm` (для aws-lc-rs), Flutter (`subosito/flutter-action`), Inno Setup (`choco`),
-  `wintun.dll` (скачивается с wintun.net). MSVC-таргет — дефолт на Windows-раннере.
+### Что должно быть на windows-раннере
 
-### Self-hosted раннер (нужен для реального E2E)
-Если хотите гонять **рантайм-тесты WinTUN/WFP/службы** в CI — только self-hosted на реальной/VM Windows:
-1. **ОС:** Windows 10/11 x64 (или Server 2022), **не** Core (нужен GUI-стек для WinTUN/интерактива).
-2. **Поставить** всё из §1 (VS2022 C++, Flutter, rustup+msvc-target, Inno6, nasm) + положить `wintun.dll`.
-3. **Runner-агент:** GitHub → repo Settings → Actions → Runners → New self-hosted runner (Windows x64),
-   распаковать, `./config.cmd`, зарегистрировать с меткой (напр. `windows-e2e`).
-4. **Права:** для установки службы/создания адаптера раннер должен работать **с админ-правами** —
-   запускать агент **интерактивно от админа** (`./run.cmd`), НЕ как ограниченную службу (LocalService).
-   Драйвер WinTUN ставится при первом создании адаптера — нужен админ и подписанный `wintun.dll` (он подписан WireGuard).
-5. **Изоляция:** такой раннер меняет системную сеть (адаптер/маршруты/WFP) — держите на выделенной VM,
-   с snapshot-откатом; НЕ на shared-хосте.
-6. В workflow-job для E2E: `runs-on: [self-hosted, windows-e2e]` + шаги установки/старта службы и smoke-теста.
-
-> Рекомендация: обязательный гейт (`rust`) — на GitHub-hosted (дёшево, ловит компиляцию/линт); реальный
-> E2E — вручную по §4 ЛИБО на выделенном self-hosted admin-раннере (по желанию).
+1. **ОС:** Windows 10/11 x64 (или Server 2022), **не** Core.
+2. Всё из §1: VS2022 Desktop C++, rustup + таргет `x86_64-pc-windows-msvc`, `nasm`, Flutter
+   (windows-desktop), Inno Setup 6 с `ISCC` в `PATH`.
+3. **`packaging\windows\wintun.dll`** (amd64) — положить один раз вручную. Workflow его больше не
+   скачивает: тянуть по сети бинарь стороннего драйвера прямо в установщик — тот самый
+   supply-chain-риск, от которого проект защищается подписью артефактов. Обновляя, сверьте хеш.
+4. **Агент:** GitHub → Settings → Actions → Runners → New self-hosted runner (Windows x64),
+   метки по умолчанию (`self-hosted`, `Windows`, `X64`) — их и ждут workflow'ы.
+5. **PATH:** агент видит окружение службы, а не вашей интерактивной сессии. Если `cargo`/`ISCC`
+   есть в консоли, но job'а падает с «нет X» — правьте окружение агента.
+6. **Изоляция:** если когда-нибудь добавите рантайм-E2E, такой прогон меняет системную сеть
+   (адаптер, маршруты, WFP) — только выделенная VM со snapshot-откатом, не shared-хост, и агент
+   запускается интерактивно от админа (`./run.cmd`).
 
 ## 7. Быстрая ручная итерация (без полного бандла)
 - Только служба (быстро, без Flutter): `cargo build -p citadel-winsvc --release --target x86_64-pc-windows-msvc`

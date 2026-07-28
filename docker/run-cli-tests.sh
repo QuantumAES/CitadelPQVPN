@@ -69,9 +69,12 @@ run_e2e() {
         sleep 1
     done
 
+    local log
+    log="$(docker compose -f docker/compose.cli.yml logs --no-log-prefix client-cli 2>/dev/null || true)"
+
     echo
     echo "===== КЛИЕНТ (консольный, трек L) ====="
-    docker compose -f docker/compose.cli.yml logs --no-log-prefix client-cli | sed -n '/L-ТЕСТ 1/,/ИТОГ/p'
+    printf '%s\n' "$log" | sed -n '/L-ТЕСТ 1/,/ИТОГ/p'
     echo
     echo "===== ЖУРНАЛ ДЕМОНА (хвост) ====="
     docker compose -f docker/compose.cli.yml exec -T client-cli tail -40 /var/log/vpnd.log 2>/dev/null || true
@@ -79,6 +82,27 @@ run_e2e() {
     echo "===== EXIT (дропы egress-фильтра, если были) ====="
     docker compose -f docker/compose.cli.yml logs --no-log-prefix exit 2>/dev/null \
         | grep -E "S0.2|F2:|F7:" | tail -15 || true
+
+    # ── ВЕРДИКТ ──────────────────────────────────────────────────────────────────────────
+    # Вывод логов сам по себе гейтом не является: без явного кода возврата CI считал прогон
+    # успешным даже когда клиент не поднимал туннель. Считаем итог по строке, которую печатает
+    # сам сценарий ("ИТОГ e2e …: успешно N, провалено M"), и требуем, чтобы он вообще дошёл до неё.
+    local summary fails
+    summary="$(printf '%s\n' "$log" | grep -F 'ИТОГ e2e' | tail -1)"
+    E2E_RC=0
+    echo
+    echo "===== ВЕРДИКТ (e2e консольного клиента) ====="
+    if [ -z "$summary" ]; then
+        echo "ПРОВАЛ: сценарий не дошёл до итога (таймаут ~240с, падение демона или стенда)"
+        E2E_RC=1
+    else
+        fails="$(printf '%s\n' "$summary" | sed -n 's/.*провалено \([0-9]\+\).*/\1/p')"
+        echo "$summary"
+        if [ "${fails:-1}" != "0" ]; then
+            printf '%s\n' "$log" | grep -F '✗' | sed 's/^/  /'
+            E2E_RC=1
+        fi
+    fi
 
     # Стенд гасим ВСЕГДА (в т.ч. при провале тестов): оставленные контейнеры держат сеть,
     # TUN-устройства и iptables-правила, а следующий прогон получает не чистое окружение.
@@ -91,6 +115,8 @@ run_e2e() {
         docker compose -f docker/compose.cli.yml down -v --remove-orphans >/dev/null 2>&1
         echo "      стенд погашен (KEEP_STAND=1 — оставить поднятым)"
     fi
+
+    return "$E2E_RC"
 }
 
 case "$MODE" in

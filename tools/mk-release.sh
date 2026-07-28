@@ -7,7 +7,13 @@
 # Артефакты → dist/<version>/. Их выкладывают в GitHub Release; сервер-инсталлер
 # тянет .zst + sha256sums + .minisig и проверяет подпись публичным ключом (supply-chain).
 #
-#   tools/mk-release.sh [version]        # version по умолчанию из git describe
+#   tools/mk-release.sh [version] [--no-sign]
+#     version   по умолчанию из git describe
+#     --no-sign только собрать и посчитать хеши. Нужно в конвейере релиза: следом идёт
+#               mk-client-release.sh, который пере-считывает sha256sums по ВСЕМ артефактам
+#               (сервер + клиенты + Windows-установщик) и подписывает их ОДИН раз. Две подписи
+#               подряд — это лишний ввод пароля и промежуточный .minisig, который всё равно
+#               перезапишется.
 #
 # Ключи (совпадают с tools/gen-release-key.sh):
 #   секрет: $CITADEL_RELEASE_KEY_DIR|~/.citadel/release/citadel-release.key (пароль спросит)
@@ -23,17 +29,29 @@ cd "$REPO_ROOT"
 # run-demo.sh): если .venv есть — первой в PATH (иначе системный/flutter cmake может конфликтовать).
 [ -d "$REPO_ROOT/.venv/bin" ] && export PATH="$REPO_ROOT/.venv/bin:$PATH"
 
-VERSION="${1:-$(git describe --tags --always --dirty 2>/dev/null || echo dev)}"
+NO_SIGN=0
+ARGS=()
+for a in "$@"; do
+  case "$a" in
+    --no-sign) NO_SIGN=1 ;;
+    *) ARGS+=("$a") ;;
+  esac
+done
+
+VERSION="${ARGS[0]:-$(git describe --tags --always --dirty 2>/dev/null || echo dev)}"
 SEC="${CITADEL_RELEASE_KEY_DIR:-$HOME/.citadel/release}/citadel-release.key"
 PUB="${CITADEL_RELEASE_PUB:-$REPO_ROOT/packaging/release/citadel-release.pub}"
 OUT="$REPO_ROOT/dist/$VERSION"
 
 die() { printf 'ОШИБКА: %s\n' "$*" >&2; exit 1; }
-for t in minisign zstd sha256sum cargo; do
+for t in zstd sha256sum cargo; do
   command -v "$t" >/dev/null 2>&1 || die "$t не установлен"
 done
-[[ -f "$SEC" ]] || die "секрет релиза не найден: $SEC (сгенерируй tools/gen-release-key.sh)"
-[[ -f "$PUB" ]] || die "публичный ключ не найден: $PUB"
+[[ $NO_SIGN -eq 1 ]] || command -v minisign >/dev/null 2>&1 || die "minisign не установлен"
+if [[ $NO_SIGN -eq 0 ]]; then
+  [[ -f "$SEC" ]] || die "секрет релиза не найден: $SEC (сгенерируй tools/gen-release-key.sh)"
+  [[ -f "$PUB" ]] || die "публичный ключ не найден: $PUB"
+fi
 
 # арка → суффикс артефакта (совпадает с ServerArch::artifact_suffix в citadel-client)
 case "$(uname -m)" in
@@ -71,12 +89,16 @@ cd "$OUT"
 sha256sum ./*.zst | sed 's#\./##' > sha256sums
 echo "[mk-release] sha256sums:"; sed 's/^/  /' sha256sums
 
-echo "[mk-release] подпись sha256sums релизным ключом (minisign может спросить пароль)…"
-minisign -S -s "$SEC" -m sha256sums \
-  -t "CitadelPQVPN $VERSION $SUFFIX $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+if [[ $NO_SIGN -eq 1 ]]; then
+  echo "[mk-release] --no-sign: подпись НЕ ставится (её поставит mk-client-release.sh по всем артефактам)"
+else
+  echo "[mk-release] подпись sha256sums релизным ключом (minisign может спросить пароль)…"
+  minisign -S -s "$SEC" -m sha256sums \
+    -t "CitadelPQVPN $VERSION $SUFFIX $(date -u +%Y-%m-%dT%H:%M:%SZ)"
 
-echo "[mk-release] self-verify публичным ключом…"
-minisign -V -p "$PUB" -m sha256sums
+  echo "[mk-release] self-verify публичным ключом…"
+  minisign -V -p "$PUB" -m sha256sums
+fi
 
 cat <<EOF
 

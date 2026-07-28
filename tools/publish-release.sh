@@ -32,7 +32,7 @@ gh auth status >/dev/null 2>&1 || die "gh не авторизован: gh auth l
 
 # ── обязательные артефакты ──
 [[ -f "$DIST/sha256sums" && -f "$DIST/sha256sums.minisig" ]] || die "нет sha256sums(.minisig) в $DIST"
-shopt -s nullglob; zst=("$DIST"/*.zst); apk=("$DIST"/*.apk); shopt -u nullglob
+shopt -s nullglob; zst=("$DIST"/*.zst); apk=("$DIST"/*.apk); win=("$DIST"/*.exe); shopt -u nullglob
 ((${#zst[@]})) || die "в $DIST нет *.zst — пере-собери mk-release.sh"
 
 # ── ПЕРЕ-ПРОВЕРКА перед публикацией ──
@@ -52,7 +52,7 @@ fi
 PRE=(); case "$TAG" in *-pre*|*-rc*|*-beta*|*-alpha*) PRE=(--prerelease) ;; esac
 
 INSTALLER_SHA="$(sha256sum "$INSTALLER" | cut -d' ' -f1)"
-assets=("${zst[@]}" "${apk[@]}" "$DIST/sha256sums" "$DIST/sha256sums.minisig" "$INSTALLER")
+assets=("${zst[@]}" "${apk[@]}" "${win[@]}" "$DIST/sha256sums" "$DIST/sha256sums.minisig" "$INSTALLER")
 
 # ── клиентские артефакты (если собраны mk-client-release.sh) — для notes ──
 #
@@ -60,8 +60,9 @@ assets=("${zst[@]}" "${apk[@]}" "$DIST/sha256sums" "$DIST/sha256sums.minisig" "$
 # артефакт, не описанный в notes, на странице релиза выглядит как безымянный архив, и им никто
 # не пользуется. Ровно так до этого выпадал консольный клиент (трек L): тарбол выкладывался,
 # но в notes его не было.
-APK_NAME=""; GUI_NAME=""; CLI_NAME=""
+APK_NAME=""; GUI_NAME=""; CLI_NAME=""; WIN_NAME=""
 for f in "${apk[@]}"; do APK_NAME="$(basename "$f")"; done
+for f in "${win[@]}"; do WIN_NAME="$(basename "$f")"; done
 shopt -s nullglob
 for f in "$DIST"/citadel-desktop-linux-*.tar.zst; do GUI_NAME="$(basename "$f")"; done
 for f in "$DIST"/citadel-cli-linux-*.tar.zst;     do CLI_NAME="$(basename "$f")"; done
@@ -71,10 +72,11 @@ shopt -u nullglob
 [[ -n "$CLI_NAME" ]] || echo "[publish] NB: в $DIST нет citadel-cli-linux-*.tar.zst (собран с --no-cli?)"
 [[ -n "$GUI_NAME" ]] || echo "[publish] NB: в $DIST нет citadel-desktop-linux-*.tar.zst"
 [[ -n "$APK_NAME" ]] || echo "[publish] NB: в $DIST нет APK (собран с --no-apk?)"
+[[ -n "$WIN_NAME" ]] || echo "[publish] NB: в $DIST нет Windows-установщика (*.exe с windows-раннера)"
 
 CLIENTS_BLOCK=""
 add() { CLIENTS_BLOCK+="$1"$'\n'; }
-if [[ -n "$APK_NAME" || -n "$GUI_NAME" || -n "$CLI_NAME" ]]; then
+if [[ -n "$APK_NAME" || -n "$GUI_NAME" || -n "$CLI_NAME" || -n "$WIN_NAME" ]]; then
   add ""
   add "Клиенты:"
   if [[ -n "$APK_NAME" ]]; then
@@ -102,6 +104,16 @@ if [[ -n "$APK_NAME" || -n "$GUI_NAME" || -n "$CLI_NAME" ]]; then
     add "  Установка поверх прежней версии сама перезапускает демон: без этого в памяти оставался"
     add "  бы старый процесс, и обновление не вступило бы в силу. Активная сессия при этом рвётся"
     add "  чисто — kill-switch снимается."
+  fi
+  if [[ -n "$WIN_NAME" ]]; then
+    add ""
+    add "  Windows 10/11 (x64) — $WIN_NAME (запуск от администратора):"
+    add "  ставит приложение и системную службу citadel-svc (она держит WinTUN-адаптер,"
+    add "  маршруты и WFP-фильтры kill-switch), плюс драйвер WinTUN."
+    add ""
+    add "  Установщик НЕ подписан Authenticode: SmartScreen покажет «Неизвестный издатель» —"
+    add "  «Подробнее» → «Выполнить в любом случае». Подлинность проверяется по sha256sums"
+    add "  и подписи minisign ниже, ими и стоит пользоваться."
   fi
 fi
 
