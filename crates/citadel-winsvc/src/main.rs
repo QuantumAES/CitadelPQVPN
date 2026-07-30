@@ -37,7 +37,8 @@ fn main() -> anyhow::Result<()> {
 mod windows_svc {
     use std::ffi::OsString;
     use std::sync::atomic::{AtomicBool, AtomicIsize, Ordering};
-    use std::sync::Arc;
+    use std::sync::{Arc, Condvar, Mutex};
+    use std::time::Duration;
 
     use citadel_winnet::{
         decode_config, encode_packet, encode_ready_err, encode_ready_ok, TunReady, TunSetup,
@@ -68,8 +69,134 @@ mod windows_svc {
     const SERVICE_NAME: &str = "CitadelPQVPN";
     /// Флаг остановки (ставит control-handler на Stop/Shutdown); serve-цикл его опрашивает.
     static SHUTDOWN: AtomicBool = AtomicBool::new(false);
-    /// Текущий хэндл пайпа (для `cancel_accept` → CancelIoEx прерывает блокирующий accept/pump).
-    static CURRENT_PIPE: AtomicIsize = AtomicIsize::new(0);
+    /// Хэндл СЛУШАЮЩЕГО инстанса пайпа (для `cancel_accept` → CancelIoEx прерывает `ConnectNamedPipe`).
+    /// Инстанс сессии сюда НЕ попадает: он живёт в [`SessionSlot`] своего рабочего потока.
+    static LISTENING_PIPE: AtomicIsize = AtomicIsize::new(0);
+
+    /// Сколько ждать сворачивания ВЫТЕСНЯЕМОЙ сессии, прежде чем отказать новому клиенту. Teardown —
+    /// это `route delete` + удаление WinTUN-адаптера (device removal на Windows штатно занимает
+    /// единицы секунд), поэтому запас щедрый; смысл границы — не зависнуть навсегда, а ответить
+    /// клиенту внятной ошибкой.
+    const PREEMPT_TIMEOUT: Duration = Duration::from_secs(20);
+    /// Сколько ждать окончания уже идущей сессии, прежде чем отклонить `TAG_QUIT` (выход приложения
+    /// приходит сразу после `disconnect`, и сессия в этот момент ещё может доворачивать teardown).
+    const QUIT_GRACE: Duration = Duration::from_secs(5);
+    /// Сколько ждать завершения рабочих потоков на остановке службы (SCM Stop не должен висеть).
+    const WORKERS_JOIN_TIMEOUT: Duration = Duration::from_secs(15);
+    /// Сколько ждать запрос от подключившегося клиента (фаза handshake, локальный пайп).
+    const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(30);
+
+    /// Слот активной сессии туннеля: служба владеет ОДНИМ WinTUN-адаптером, поэтому сессия
+    /// одновременно ровно одна, и новый аутентифицированный клиент (реконнект приложения, повторный
+    /// запуск) **вытесняет** прежнюю.
+    ///
+    /// Так закрывается корень «Все копии канала заняты (os error 231)»: раньше serve-цикл держал
+    /// ЕДИНСТВЕННЫЙ инстанс пайпа на всю сессию и создавал следующий только после полного teardown.
+    /// Пока сессия жива, новый `CreateFileW` получал `ERROR_PIPE_BUSY`, а в окне между инстансами —
+    /// `ERROR_FILE_NOT_FOUND`. Если же сессия зависала (writer-поток в `WriteFile` на пайпе клиента,
+    /// который перестал читать, но хэндл ещё не закрыл), служба оставалась занятой НАВСЕГДА: туннель
+    /// не поднимался ни по одной ссылке, и `TAG_QUIT` не доходил — `citadel-svc.exe` висел в задачах
+    /// после выхода из приложения. Теперь акцептор всегда держит свободный инстанс, а сессию
+    /// вытесняет явно.
+    ///
+    /// Хэндл пайпа сессии закрывает САМ слот ([`SessionSlot::finish`]) под тем же мьютексом, под
+    /// которым вытесняющий поток зовёт `CancelIoEx` — иначе была бы гонка «отмена по уже закрытому
+    /// (и, возможно, переиспользованному ядром) хэндлу».
+    struct SessionSlot {
+        /// Хэндл пайпа этой сессии (`isize`, чтобы структура была `Send`/`Sync`).
+        pipe: isize,
+        /// `true` — сессия свёрнута полностью и хэндл закрыт.
+        done: Mutex<bool>,
+        done_cv: Condvar,
+    }
+    // SAFETY: хэндл трогают только под `done`-мьютексом (закрытие) либо его владелец-поток.
+    unsafe impl Send for SessionSlot {}
+    unsafe impl Sync for SessionSlot {}
+
+    impl SessionSlot {
+        fn new(pipe: HANDLE) -> Arc<Self> {
+            Arc::new(SessionSlot {
+                pipe: pipe as isize,
+                done: Mutex::new(false),
+                done_cv: Condvar::new(),
+            })
+        }
+
+        /// Завершить обслуживание: отключить и закрыть пайп, разбудить ожидающего вытеснителя.
+        /// Закрытие идёт ПОД мьютексом — вытесняющий поток зовёт `CancelIoEx` под ним же.
+        fn finish(&self) {
+            let mut done = self.done.lock().unwrap();
+            // SAFETY: pipe — валидный хэндл этой сессии, закрывается ровно один раз (флаг `done`).
+            unsafe {
+                DisconnectNamedPipe(self.pipe as HANDLE);
+                CloseHandle(self.pipe as HANDLE);
+            }
+            *done = true;
+            self.done_cv.notify_all();
+        }
+
+        /// Прервать I/O сессии и дождаться её сворачивания. `false` — не уложилась в `timeout`.
+        fn cancel_and_wait(&self, timeout: Duration) -> bool {
+            let done = self.done.lock().unwrap();
+            if !*done {
+                // SAFETY: под мьютексом хэндл ещё не закрыт (его закрывает `finish` под ним же).
+                unsafe { CancelIoEx(self.pipe as HANDLE, std::ptr::null()) };
+            }
+            let (done, _) =
+                self.done_cv.wait_timeout_while(done, timeout, |d| !*d).unwrap();
+            *done
+        }
+    }
+
+    /// Текущая сессия туннеля (если поднята). Вытеснение — [`claim_session_slot`].
+    static SESSION: Mutex<Option<Arc<SessionSlot>>> = Mutex::new(None);
+
+    /// Занять слот сессии под нового клиента, свернув прежнюю. `false` — прежняя не свернулась за
+    /// [`PREEMPT_TIMEOUT`]: поднимать туннель НЕЛЬЗЯ (два WinTUN-адаптера с одним именем + гонка за
+    /// маршруты), клиент получит READY-err с причиной.
+    fn claim_session_slot(slot: &Arc<SessionSlot>) -> bool {
+        let old = SESSION.lock().unwrap().replace(slot.clone());
+        let Some(old) = old else { return true };
+        eprintln!("[svc] новый клиент вытесняет прежнюю сессию — сворачиваю её");
+        if old.cancel_and_wait(PREEMPT_TIMEOUT) {
+            eprintln!("[svc] прежняя сессия свёрнута — поднимаю новую");
+            return true;
+        }
+        // Сюда попадать не должны (сворачивание разбужено и CancelIoEx'ом, и shutdown'ом WinTUN-
+        // сессии), но если случилось — поднимать туннель поверх нельзя: второй WinTUN-адаптер с тем
+        // же именем сделает `netsh name=Citadel` неоднозначным и разнесёт маршруты. Возвращаем в слот
+        // ПРЕЖНЮЮ сессию (состояние службы должно оставаться правдивым) и просим службу завершиться:
+        // на следующей попытке приложение поднимет её заново через SCM и получит чистое состояние.
+        // Ценой временного fail-open по WFP — те же семантики, что при любом падении службы, и
+        // единственная альтернатива вечно неработающему туннелю.
+        eprintln!(
+            "[svc] прежняя сессия НЕ свернулась за {PREEMPT_TIMEOUT:?} — отказываю клиенту и \
+             завершаю службу (следующая попытка поднимет её заново)"
+        );
+        {
+            let mut g = SESSION.lock().unwrap();
+            if g.as_ref().is_some_and(|cur| Arc::ptr_eq(cur, slot)) {
+                *g = Some(old);
+            }
+        }
+        SHUTDOWN.store(true, Ordering::Release);
+        cancel_accept();
+        false
+    }
+
+    /// Освободить слот, если он всё ещё наш (нас могли уже вытеснить — тогда слот принадлежит новому
+    /// клиенту и трогать его нельзя).
+    fn release_session_slot(slot: &Arc<SessionSlot>) {
+        let mut g = SESSION.lock().unwrap();
+        if g.as_ref().is_some_and(|cur| Arc::ptr_eq(cur, slot)) {
+            *g = None;
+        }
+    }
+
+    /// Есть ли сейчас активная сессия туннеля (для `TAG_QUIT`: не гасим службу под живым туннелем).
+    fn session_active() -> bool {
+        SESSION.lock().unwrap().is_some()
+    }
 
     /// HANDLE (`*mut c_void`) не `Send` — обёртка для передачи пайпа в поток WinTUN→пайп. Пайп
     /// OVERLAPPED-режима: одновременные WriteFile (этот поток) и ReadFile (поток пайп→WinTUN) на одном
@@ -101,8 +228,26 @@ mod windows_svc {
 
         /// Одна overlapped Read/Write → число переданных байт. `write=false` → ReadFile.
         fn one(&self, h: HANDLE, ptr: *mut u8, len: u32, write: bool) -> anyhow::Result<u32> {
+            self.one_within(h, ptr, len, write, None)
+        }
+
+        /// Как [`one`], но с необязательной границей ожидания: `Some(d)` — не дождались за `d`,
+        /// отменяем операцию и возвращаем ошибку. Нужно на фазе handshake: подключившийся клиент
+        /// обязан сразу прислать `TAG_CONFIG`/`TAG_QUIT`, и молчун не должен держать рабочий поток
+        /// службы (и инстанс пайпа) бесконечно.
+        fn one_within(
+            &self,
+            h: HANDLE,
+            ptr: *mut u8,
+            len: u32,
+            write: bool,
+            limit: Option<Duration>,
+        ) -> anyhow::Result<u32> {
+            use windows_sys::Win32::Foundation::WAIT_OBJECT_0;
+            use windows_sys::Win32::System::Threading::WaitForSingleObject;
             // SAFETY: h — валидный overlapped-хэндл пайпа; ptr/len — валидный буфер; ov живёт до
-            // конца GetOverlappedResult (блокирует до завершения), self.event — валидное событие.
+            // конца GetOverlappedResult (он зовётся на ВСЕХ путях выхода, в т.ч. после отмены по
+            // таймауту — иначе ядро писало бы в освобождённый стек), self.event — валидное событие.
             unsafe {
                 let mut ov: OVERLAPPED = std::mem::zeroed();
                 ov.hEvent = self.event;
@@ -118,9 +263,21 @@ mod windows_svc {
                         anyhow::bail!("{} err={e}", if write { "WriteFile" } else { "ReadFile" });
                     }
                 }
+                let mut timed_out = false;
+                if let Some(d) = limit {
+                    let ms = d.as_millis().min(u32::MAX as u128 - 1) as u32;
+                    if WaitForSingleObject(self.event, ms) != WAIT_OBJECT_0 {
+                        CancelIoEx(h, &ov);
+                        timed_out = true;
+                    }
+                }
                 let mut done = 0u32;
                 // bWait=TRUE: ждём на ov.hEvent; отмена через CancelIoEx завершит с ошибкой (Err).
-                if GetOverlappedResult(h, &ov, &mut done, 1) == 0 {
+                let got = GetOverlappedResult(h, &ov, &mut done, 1);
+                if timed_out {
+                    anyhow::bail!("клиент молчит дольше {limit:?} — обрываю");
+                }
+                if got == 0 {
                     anyhow::bail!("GetOverlappedResult err={}", GetLastError());
                 }
                 Ok(done)
@@ -128,9 +285,22 @@ mod windows_svc {
         }
 
         fn read_exact(&self, h: HANDLE, buf: &mut [u8]) -> anyhow::Result<()> {
+            self.read_exact_within(h, buf, None)
+        }
+
+        /// [`read_exact`] с общей границей на всё чтение (см. [`one_within`]).
+        fn read_exact_within(
+            &self,
+            h: HANDLE,
+            buf: &mut [u8],
+            limit: Option<Duration>,
+        ) -> anyhow::Result<()> {
+            let deadline = limit.map(|d| std::time::Instant::now() + d);
             let mut off = 0;
             while off < buf.len() {
-                let n = self.one(h, buf[off..].as_mut_ptr(), (buf.len() - off) as u32, false)?;
+                let left = deadline.map(|dl| dl.saturating_duration_since(std::time::Instant::now()));
+                let n =
+                    self.one_within(h, buf[off..].as_mut_ptr(), (buf.len() - off) as u32, false, left)?;
                 if n == 0 {
                     anyhow::bail!("пайп закрыт (EOF) при чтении");
                 }
@@ -233,7 +403,7 @@ mod windows_svc {
     /// Консольный dev-режим: тот же serve-цикл без SCM (работает до kill / Ctrl-C).
     pub fn run_console() -> anyhow::Result<()> {
         eprintln!("[svc] citadel-svc: dev-console режим");
-        serve(&SHUTDOWN, false) // dev: служба под юзером, клиент из build-дерева → client-auth выкл
+        serve(false) // dev: служба под юзером, клиент из build-дерева → client-auth выкл
     }
 
     // SCM-boilerplate: ffi_service_main парсит аргументы и зовёт service_main на фоновом потоке.
@@ -268,6 +438,7 @@ mod windows_svc {
                 ServiceControl::Stop | ServiceControl::Shutdown => {
                     SHUTDOWN.store(true, Ordering::Release);
                     cancel_accept();
+                    cancel_active_session();
                     ServiceControlHandlerResult::NoError
                 }
                 _ => ServiceControlHandlerResult::NotImplemented,
@@ -278,7 +449,15 @@ mod windows_svc {
             ServiceState::Running,
             ServiceControlAccept::STOP | ServiceControlAccept::SHUTDOWN,
         ))?;
-        let _ = serve(&SHUTDOWN, true); // SCM/LocalSystem → W3 client-auth enforce
+        // Само-лечение прав на КАЖДОМ старте (LocalSystem имеет WRITE_DAC на свою запись в SCM):
+        // дескриптор мог остаться дефолтным, если при установке `sc sdset` не отработал (инсталлятор
+        // код возврата не проверяет), а установки прежних сборок про него не знали вовсе. Симптом
+        // ровно один и труднодиагностируемый: приложение без прав администратора не поднимает
+        // туннель («OpenService: Отказано в доступе», os 5), причём ломается ОТЛОЖЕННО — пока службу
+        // не остановят при выходе из приложения, всё работает. Служба AutoStart ⇒ ближайшая
+        // перезагрузка (или `net start` из инсталлятора) чинит установку сама.
+        grant_start_to_interactive_users();
+        let _ = serve(true); // SCM/LocalSystem → W3 client-auth enforce
         status_handle
             .set_service_status(status(ServiceState::Stopped, ServiceControlAccept::empty()))?;
         Ok(())
@@ -325,22 +504,31 @@ mod windows_svc {
                 s
             }
         };
-        service.set_description(
+        // ПЕРВЫМ делом — право запуска интерактивному пользователю: без него неприв. приложение не
+        // поднимет службу, и туннель не встанет вовсе («OpenService: Отказано в доступе», os 5).
+        // Раньше этот вызов стоял последним, за двумя `?`-шагами: любая их осечка (а инсталлятор код
+        // возврата `citadel-svc install` не проверяет) оставляла службу с дефолтным дескриптором —
+        // молча и навсегда. Косметика (описание, recovery) ниже уже не критична: логируем и живём.
+        grant_start_to_interactive_users();
+        if let Err(e) = service.set_description(
             "CitadelPQVPN — постквантовый VPN: WinTUN + WFP kill-switch (модель W2)",
-        )?;
+        ) {
+            eprintln!("[svc] описание службы не задано (не критично): {e}");
+        }
         // SCM-recovery: авто-рестарт при КРАШЕ (не чистом стопе) — смягчает окно fail-closed, если
         // служба упадёт с активным туннелем; после рестарта WFP переармируется на следующем connect.
         let restart = |secs| ServiceAction {
             action_type: ServiceActionType::Restart,
             delay: Duration::from_secs(secs),
         };
-        service.update_failure_actions(ServiceFailureActions {
+        if let Err(e) = service.update_failure_actions(ServiceFailureActions {
             reset_period: ServiceFailureResetPeriod::After(Duration::from_secs(86400)),
             reboot_msg: None,
             command: None,
             actions: Some(vec![restart(5), restart(5), restart(30)]),
-        })?;
-        grant_start_to_interactive_users();
+        }) {
+            eprintln!("[svc] авто-рестарт при краше не настроен (не критично): {e}");
+        }
         eprintln!("[svc] служба '{SERVICE_NAME}' установлена (авто-рестарт при краше)");
         Ok(())
     }
@@ -374,11 +562,15 @@ mod windows_svc {
                 eprintln!("[svc] SDDL службы: интерактивному пользователю разрешён SERVICE_START")
             }
             Ok(o) => eprintln!(
-                "[svc] sc sdset не удался ({}) — служба останется AutoStart: {}",
+                "[svc] ⚠ sc sdset не удался ({}) — неприв. приложение НЕ сможет запустить службу \
+                 («OpenService: Отказано в доступе»): {} {}",
                 o.status,
-                String::from_utf8_lossy(&o.stdout).trim()
+                String::from_utf8_lossy(&o.stdout).trim(),
+                String::from_utf8_lossy(&o.stderr).trim()
             ),
-            Err(e) => eprintln!("[svc] sc sdset не запущен ({e}) — служба останется AutoStart"),
+            Err(e) => eprintln!(
+                "[svc] ⚠ sc sdset не запущен ({e}) — неприв. приложение НЕ сможет запустить службу"
+            ),
         }
     }
 
@@ -394,18 +586,26 @@ mod windows_svc {
         Ok(())
     }
 
-    /// serve-цикл: принимать клиентов по одному, пока не выставлен `shutdown`. Прерывается на Stop
-    /// через `cancel_accept` (CancelIoEx на текущем пайпе разбудит блокирующий ConnectNamedPipe/pump).
-    fn serve(shutdown: &AtomicBool, enforce_client_auth: bool) -> anyhow::Result<()> {
+    /// Акцептор: держит СВОБОДНЫЙ слушающий инстанс пайпа и отдаёт каждое соединение рабочему потоку,
+    /// сам немедленно возвращаясь к `ConnectNamedPipe`. Ключевой инвариант: **подключиться к службе
+    /// можно всегда** — и во время активной сессии (реконнект вытеснит её, см. [`claim_session_slot`]),
+    /// и во время её сворачивания. Раньше цикл обслуживал клиента сам, поэтому единственный инстанс
+    /// был занят всю сессию → `ERROR_PIPE_BUSY` (231) на реконнекте, `ERROR_FILE_NOT_FOUND` (2) в окне
+    /// пересоздания и вечная блокировка службы при зависшей сессии.
+    ///
+    /// Прерывается на Stop через `cancel_accept` (CancelIoEx на слушающем инстансе + отмена сессии);
+    /// флаг остановки — общий [`SHUTDOWN`], его же ставит рабочий поток на `TAG_QUIT`.
+    fn serve(enforce_client_auth: bool) -> anyhow::Result<()> {
         eprintln!("[svc] слушаю {PIPE_NAME} (client-auth W3: {})", if enforce_client_auth { "вкл" } else { "выкл (dev-console)" });
-        // Overlapped-контекст serve-потока: используется для connect + config-handshake + чтения
-        // pump'а (всё на этом потоке, последовательно). Writer-поток pump'а держит СВОЙ Ov.
+        // Overlapped-контекст акцептора: только ConnectNamedPipe. Каждый рабочий поток заводит свой Ov.
         let ov = Ov::new()?;
-        while !shutdown.load(Ordering::Acquire) {
+        let mut workers: Vec<std::thread::JoinHandle<()>> = Vec::new();
+        while !SHUTDOWN.load(Ordering::Acquire) {
             let h = create_pipe_instance()?;
-            CURRENT_PIPE.store(h as isize, Ordering::Release);
+            LISTENING_PIPE.store(h as isize, Ordering::Release);
             let connected = overlapped_connect(h, &ov);
-            if shutdown.load(Ordering::Acquire) {
+            LISTENING_PIPE.store(0, Ordering::Release);
+            if SHUTDOWN.load(Ordering::Acquire) {
                 unsafe { CloseHandle(h) };
                 break;
             }
@@ -415,11 +615,12 @@ mod windows_svc {
             }
             // W3: аутентифицировать клиента ДО чтения config (это недоверенный ввод, управляющий
             // привилегированной реконфигурацией сети). SCM-режим (LocalSystem) → enforce; dev-console
-            // (служба под юзером, клиент из build-дерева) → пропускаем.
+            // (служба под юзером, клиент из build-дерева) → пропускаем. Проверка быстрая (OpenProcess
+            // + QueryFullProcessImageNameW), поэтому остаётся на акцепторе: отсев чужого процесса не
+            // должен стоить рабочего потока.
             if enforce_client_auth {
                 if let Err(e) = verify_client_is_installed_app(h) {
                     eprintln!("[svc] отклонён клиент пайпа (W3): {e:#}");
-                    CURRENT_PIPE.store(0, Ordering::Release);
                     unsafe {
                         DisconnectNamedPipe(h);
                         CloseHandle(h);
@@ -427,17 +628,30 @@ mod windows_svc {
                     continue;
                 }
             }
-            let quit = handle_client(h, &ov);
-            CURRENT_PIPE.store(0, Ordering::Release);
-            unsafe {
-                DisconnectNamedPipe(h);
-                CloseHandle(h);
-            }
-            if quit {
-                // TAG_QUIT: приложение закрылось → служба больше не нужна. Флаг завершает цикл
-                // (в SCM-режиме run_service выставит Stopped и процесс уйдёт из списка задач).
-                shutdown.store(true, Ordering::Release);
-            }
+            // Соединение уходит рабочему потоку вместе с владением хэндлом (закроет его `slot.finish`).
+            let slot = SessionSlot::new(h);
+            workers.retain(|w| !w.is_finished());
+            workers.push(std::thread::spawn(move || {
+                let quit = handle_client(&slot);
+                slot.finish();
+                if quit {
+                    // TAG_QUIT: приложение закрылось → служба больше не нужна. Флаг + отмена accept'а
+                    // (в SCM-режиме run_service выставит Stopped и процесс уйдёт из списка задач).
+                    SHUTDOWN.store(true, Ordering::Release);
+                    cancel_accept();
+                }
+            }));
+        }
+        // Дождаться рабочих потоков: у активной сессии внутри — teardown (маршруты/адаптер/WFP), его
+        // нельзя обрывать выходом процесса. Но и висеть на Stop нельзя (SCM убьёт службу жёстко),
+        // поэтому ожидание ограничено.
+        cancel_active_session();
+        let deadline = std::time::Instant::now() + WORKERS_JOIN_TIMEOUT;
+        while workers.iter().any(|w| !w.is_finished()) && std::time::Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        for w in workers.into_iter().filter(|w| w.is_finished()) {
+            let _ = w.join();
         }
         eprintln!("[svc] serve остановлен");
         Ok(())
@@ -494,17 +708,32 @@ mod windows_svc {
         }
     }
 
-    /// Прервать блокирующий ConnectNamedPipe/ReadFile на текущем пайпе (control-handler на Stop).
+    /// Прервать блокирующий `ConnectNamedPipe` на слушающем инстансе (control-handler на Stop,
+    /// рабочий поток после `TAG_QUIT`). Сессию это не трогает — её сворачивает [`cancel_active_session`].
     fn cancel_accept() {
-        let h = CURRENT_PIPE.load(Ordering::Acquire);
+        let h = LISTENING_PIPE.load(Ordering::Acquire);
         if h != 0 {
-            // SAFETY: h — текущий валидный хэндл пайпа; CancelIoEx безопасен из другого потока.
+            // SAFETY: h — текущий слушающий хэндл пайпа; CancelIoEx безопасен из другого потока и на
+            // хэндле без активного I/O (вернёт FALSE — игнорируем).
             unsafe { CancelIoEx(h as HANDLE, std::ptr::null()) };
         }
     }
 
-    /// Создать новый инстанс named pipe (полудуплекс байт-поток). TODO(3c): SECURITY_ATTRIBUTES —
-    /// сузить ACL до SYSTEM+администраторов (сейчас дефолтный дескриптор).
+    /// Прервать I/O активной сессии, чтобы её рабочий поток вышел в teardown (остановка службы).
+    fn cancel_active_session() {
+        let slot = SESSION.lock().unwrap().clone();
+        if let Some(slot) = slot {
+            // Не ждём здесь: ожидание рабочих потоков (с общей границей) делает вызывающий.
+            let done = slot.done.lock().unwrap();
+            if !*done {
+                // SAFETY: под мьютексом хэндл ещё не закрыт (`finish` закрывает его под ним же).
+                unsafe { CancelIoEx(slot.pipe as HANDLE, std::ptr::null()) };
+            }
+        }
+    }
+
+    /// Создать новый инстанс named pipe (дуплекс, байт-поток) с ACL из [`PIPE_SDDL`]. Инстансов
+    /// одновременно несколько: один слушающий (акцептор) + по одному на обслуживаемое соединение.
     fn create_pipe_instance() -> anyhow::Result<HANDLE> {
         let name = wide(PIPE_NAME);
         // ACL пайпа из SDDL (см. PIPE_SDDL). При неудаче построения — предупреждаем и НЕ падаем
@@ -565,23 +794,39 @@ mod windows_svc {
         Quit,
     }
 
-    /// Обслужить одного клиента: config-handshake → оркестрация → READY → (pump). При ошибке
-    /// bring_up отвечаем READY-err (приложение покажет причину).
-    /// `true` — клиент попросил остановить службу (serve-цикл выходит, процесс завершается).
-    fn handle_client(h: HANDLE, ov: &Ov) -> bool {
-        let setup = match read_request(ov, h) {
-            Ok(Request::Quit) => {
-                // Сессии сейчас нет (serve обслуживает по одному клиенту) ⇒ ни адаптера, ни WFP
-                // снимать не нужно: выходим сразу, teardown уже отработал на прошлом клиенте.
-                eprintln!("[svc] клиент запросил остановку службы (выход приложения) — завершаюсь");
-                return true;
+    /// Обслужить одного клиента (на своём рабочем потоке): config-handshake → вытеснение прежней
+    /// сессии → оркестрация → READY → pump. При ошибке отвечаем READY-err (приложение покажет
+    /// причину). `true` — клиент попросил остановить службу.
+    fn handle_client(slot: &Arc<SessionSlot>) -> bool {
+        let h = slot.pipe as HANDLE;
+        let ov = match Ov::new() {
+            Ok(o) => o,
+            Err(e) => {
+                eprintln!("[svc] Ov рабочего потока не создан: {e:#}");
+                return false;
             }
+        };
+        let setup = match read_request(&ov, h) {
+            Ok(Request::Quit) => return handle_quit(),
             Ok(Request::Config(s)) => *s,
             Err(e) => {
                 eprintln!("[svc] чтение config: {e:#}");
                 return false;
             }
         };
+        // Слот занимаем ДО bring_up: адаптер один, и прежняя сессия (реконнект приложения, повторный
+        // запуск) должна быть свёрнута полностью, иначе получим второй WinTUN с тем же именем и
+        // гонку за маршруты. Не свернулась за отведённое время — честно отказываем.
+        if !claim_session_slot(slot) {
+            let _ = ov.write_all(
+                h,
+                &encode_ready_err(
+                    "прежняя сессия туннеля не свернулась вовремя — повторите попытку \
+                     (или перезапустите службу CitadelPQVPN)",
+                ),
+            );
+            return false;
+        }
         let plan = plan_session(&setup, ADAPTER_NAME);
         eprintln!(
             "[svc] сессия: {} netsh-команд, bypass={:?}, wfp-фильтров={} (KS и/или IPv6-блок)",
@@ -592,7 +837,7 @@ mod windows_svc {
         match bring_up(&plan) {
             Ok(session) => {
                 let _ = ov.write_all(h, &encode_ready_ok(&TunReady { adapter_luid: session.luid }));
-                let clean = pump(h, &session, ov);
+                let clean = pump(h, &session, &ov);
                 teardown(session, clean);
             }
             Err(e) => {
@@ -600,25 +845,47 @@ mod windows_svc {
                 let _ = ov.write_all(h, &encode_ready_err(&format!("{e:#}")));
             }
         }
+        release_session_slot(slot);
         false
+    }
+
+    /// `TAG_QUIT` — приложение выходит и просит погасить службу (не держать elevated-процесс без
+    /// клиента). Гасим ТОЛЬКО без активного туннеля: иначе любой процесс, прошедший W3, снял бы
+    /// вместе со службой WinTUN-адаптер и WFP-kill-switch у работающей сессии (fail-open = деанон).
+    /// Короткая отсрочка — под штатную гонку: приложение шлёт QUIT сразу после `disconnect`, и
+    /// прежняя сессия в этот момент ещё доворачивает teardown.
+    fn handle_quit() -> bool {
+        let deadline = std::time::Instant::now() + QUIT_GRACE;
+        while session_active() && std::time::Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        if session_active() {
+            eprintln!("[svc] TAG_QUIT отклонён: туннель активен — службу не гашу (fail-closed)");
+            return false;
+        }
+        eprintln!("[svc] клиент запросил остановку службы (выход приложения) — завершаюсь");
+        true
     }
 
     /// Прочитать управляющий кадр фазы конфигурации: `TAG_CONFIG ‖ u32(len,BE) ‖ cbor(TunSetup)`
     /// либо `TAG_QUIT` (без тела).
     fn read_request(ov: &Ov, h: HANDLE) -> anyhow::Result<Request> {
+        // Клиент шлёт запрос сразу после подключения; молчун не должен вечно держать рабочий поток
+        // и инстанс пайпа (данные фазы handshake коротки, сеть не участвует — секунды с запасом).
+        let limit = Some(HANDSHAKE_TIMEOUT);
         let mut tag = [0u8; 1];
-        ov.read_exact(h, &mut tag)?;
+        ov.read_exact_within(h, &mut tag, limit)?;
         match tag[0] {
             TAG_QUIT => Ok(Request::Quit),
             TAG_CONFIG => {
                 let mut lenb = [0u8; 4];
-                ov.read_exact(h, &mut lenb)?;
+                ov.read_exact_within(h, &mut lenb, limit)?;
                 let len = u32::from_be_bytes(lenb) as usize;
                 if len > MAX_CONFIG {
                     anyhow::bail!("config-кадр слишком большой: {len} > {MAX_CONFIG}");
                 }
                 let mut body = vec![0u8; len];
-                ov.read_exact(h, &mut body)?;
+                ov.read_exact_within(h, &mut body, limit)?;
                 Ok(Request::Config(Box::new(decode_config(&body)?)))
             }
             other => anyhow::bail!("ожидался TAG_CONFIG/TAG_QUIT, получен 0x{other:02x}"),
@@ -853,7 +1120,16 @@ mod windows_svc {
             }
         }
         stop.store(true, Ordering::Relaxed);
-        let _ = s.session.shutdown(); // разбудить receive_blocking в t1 (иначе висит без пакетов)
+        // Разбудить t1 ОБОИМИ способами, иначе join висит вечно вместе со всей службой:
+        //  • `session.shutdown()` — если поток стоит в `receive_blocking` (пакетов из WinTUN нет);
+        //  • `CancelIoEx` — если он стоит в overlapped-`WriteFile` (клиент перестал читать пайп, но
+        //    хэндл ещё держит: 64 КБ буфера пайпа заполнены, запись «в ожидании» навсегда). Именно
+        //    этот случай раньше замораживал serve-цикл — пайп оставался занят, туннель больше не
+        //    поднимался ни по одной ссылке, а `TAG_QUIT` не доходил (citadel-svc.exe висел в задачах).
+        let _ = s.session.shutdown();
+        // SAFETY: pipe — валидный хэндл этой сессии (закрывает его владеющий SessionSlot после pump);
+        // CancelIoEx безопасен из любого потока и на хэндле без активного I/O.
+        unsafe { CancelIoEx(pipe, std::ptr::null()) };
         let _ = t1.join();
         clean.load(Ordering::Relaxed)
     }

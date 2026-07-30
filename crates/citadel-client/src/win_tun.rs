@@ -82,8 +82,27 @@ impl OvIo {
 
     /// Одна overlapped Read/Write → число переданных байт. `write=false` → ReadFile.
     fn one(&self, h: isize, ptr: *mut u8, len: u32, write: bool) -> io::Result<u32> {
+        self.one_within(h, ptr, len, write, None)
+    }
+
+    /// Как [`one`], но с необязательной границей ожидания. `Some(d)` — ждём завершения не дольше `d`,
+    /// затем ОТМЕНЯЕМ операцию и возвращаем `TimedOut`. Нужно на фазе конфигурации: там ответ даёт
+    /// привилегированная служба, и если она встанет (создание адаптера, `netsh`, вытеснение прежней
+    /// сессии), приложение без границы висело бы в «подключение» бесконечно, без единой строки в UI.
+    /// Data-path границы не имеет (пакета можно ждать сколько угодно) — там пробуждение через `cancel`.
+    fn one_within(
+        &self,
+        h: isize,
+        ptr: *mut u8,
+        len: u32,
+        write: bool,
+        limit: Option<std::time::Duration>,
+    ) -> io::Result<u32> {
+        use windows_sys::Win32::Foundation::WAIT_OBJECT_0;
+        use windows_sys::Win32::System::Threading::WaitForSingleObject;
         // SAFETY: h — валидный overlapped-хэндл пайпа; ptr/len — валидный буфер; ov живёт до конца
-        // GetOverlappedResult (блокирует до завершения); event — валидное событие OvIo.
+        // GetOverlappedResult (он вызывается на ВСЕХ путях выхода, в т.ч. после отмены по таймауту —
+        // иначе ядро писало бы в освобождённый стек); event — валидное событие OvIo.
         unsafe {
             let mut ov: OVERLAPPED = std::mem::zeroed();
             ov.hEvent = self.event as HANDLE;
@@ -99,9 +118,26 @@ impl OvIo {
                     return Err(io::Error::from_raw_os_error(e as i32));
                 }
             }
+            let mut timed_out = false;
+            if let Some(d) = limit {
+                let ms = d.as_millis().min(u32::MAX as u128 - 1) as u32;
+                if WaitForSingleObject(self.event as HANDLE, ms) != WAIT_OBJECT_0 {
+                    // Не дождались — снимаем ИМЕННО эту операцию и всё равно забираем результат ниже
+                    // (GetOverlappedResult с bWait=TRUE вернётся сразу после её отмены ядром).
+                    CancelIoEx(h as HANDLE, &ov);
+                    timed_out = true;
+                }
+            }
             let mut done = 0u32;
-            // bWait=TRUE: ждём на ov.hEvent; CancelIoEx (реконнект/disconnect) завершит с ошибкой.
-            if GetOverlappedResult(h as HANDLE, &ov, &mut done, 1) == 0 {
+            // bWait=TRUE: ждём на ov.hEvent; CancelIoEx (реконнект/disconnect/таймаут) завершит с ошибкой.
+            let got = GetOverlappedResult(h as HANDLE, &ov, &mut done, 1);
+            if timed_out {
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "служба citadel-svc не ответила вовремя",
+                ));
+            }
+            if got == 0 {
                 return Err(io::Error::last_os_error());
             }
             Ok(done)
@@ -109,9 +145,27 @@ impl OvIo {
     }
 
     fn read_exact(&self, h: isize, buf: &mut [u8]) -> io::Result<()> {
+        self.read_exact_within(h, buf, None)
+    }
+
+    /// [`read_exact`] с общей границей на всё чтение (см. [`one_within`]).
+    fn read_exact_within(
+        &self,
+        h: isize,
+        buf: &mut [u8],
+        limit: Option<std::time::Duration>,
+    ) -> io::Result<()> {
+        let deadline = limit.map(|d| std::time::Instant::now() + d);
         let mut off = 0;
         while off < buf.len() {
-            let n = self.one(h, buf[off..].as_mut_ptr(), (buf.len() - off) as u32, false)?;
+            let left = deadline.map(|dl| dl.saturating_duration_since(std::time::Instant::now()));
+            let n = self.one_within(
+                h,
+                buf[off..].as_mut_ptr(),
+                (buf.len() - off) as u32,
+                false,
+                left,
+            )?;
             if n == 0 {
                 return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "пайп закрыт (EOF)"));
             }
@@ -140,16 +194,27 @@ impl Drop for OvIo {
     }
 }
 
-/// Открыть named pipe службы в overlapped-режиме. При `ERROR_PIPE_BUSY` (все инстансы заняты, os 231)
-/// ждём освобождения (`WaitNamedPipe`) и ретраим до дедлайна. Служба держит ОДИН инстанс и блокируется
-/// в pump на всю сессию, а `disconnect()` при смене профиля — fire-and-forget: старая сессия отпускает
-/// пайп и служба пересоздаёт инстанс НЕ мгновенно (teardown route/WFP). Без ожидания новый connect
-/// падал бы «Все копии канала заняты». Несуществующий пайп (служба не запущена) → не BUSY → сразу Err.
-fn open_overlapped_pipe(path: &str) -> io::Result<PipeHandle> {
-    use windows_sys::Win32::Foundation::{GetLastError, ERROR_PIPE_BUSY};
+/// Сколько ждать доступности пайпа при подключении сессии. Служба может в этот момент сворачивать
+/// прежнюю сессию (удаление WinTUN-адаптера — единицы секунд) или только что стартовать по SCM.
+const PIPE_OPEN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
+/// То же для служебных запросов на выходе из приложения (`TAG_QUIT`): выход важнее гарантии.
+const PIPE_QUIT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
+
+/// Открыть named pipe службы в overlapped-режиме, ретраясь до `timeout` на ДВУХ переходных отказах:
+///
+/// * `ERROR_PIPE_BUSY` (231, «Все копии канала заняты») — свободного инстанса сейчас нет; ждём
+///   `WaitNamedPipe`;
+/// * `ERROR_FILE_NOT_FOUND` (2) — слушающего инстанса нет ВОВСЕ: служба перезапускается по SCM
+///   (recovery/`StartService` только что вернул управление) либо пересоздаёт инстанс. Раньше этот
+///   код выходил сразу, и реконнект, попавший в окно, падал с «Не удается найти указанный файл»,
+///   хотя через долю секунды всё было готово.
+///
+/// Прочие ошибки (отказано в доступе и т.п.) — сразу наверх: ретраить их бессмысленно.
+fn open_overlapped_pipe_within(path: &str, timeout: std::time::Duration) -> io::Result<PipeHandle> {
+    use windows_sys::Win32::Foundation::{GetLastError, ERROR_FILE_NOT_FOUND, ERROR_PIPE_BUSY};
     use windows_sys::Win32::System::Pipes::WaitNamedPipeW;
     let name = wide(path);
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    let deadline = std::time::Instant::now() + timeout;
     loop {
         // SAFETY: name — валидная UTF-16 строка; прочие аргументы — константы/null.
         let h = unsafe {
@@ -168,12 +233,17 @@ fn open_overlapped_pipe(path: &str) -> io::Result<PipeHandle> {
         }
         // SAFETY: читаем код сразу после неудачного CreateFileW.
         let err = unsafe { GetLastError() };
-        if err != ERROR_PIPE_BUSY || std::time::Instant::now() >= deadline {
+        let transient = err == ERROR_PIPE_BUSY || err == ERROR_FILE_NOT_FOUND;
+        if !transient || std::time::Instant::now() >= deadline {
             return Err(io::Error::from_raw_os_error(err as i32));
         }
-        // Все инстансы заняты → ждём до 500мс освобождения, затем ретрай CreateFileW (дедлайн ~5с).
-        // SAFETY: name валиден; таймаут в мс.
-        unsafe { WaitNamedPipeW(name.as_ptr(), 500) };
+        if err == ERROR_PIPE_BUSY {
+            // Ждём освобождения инстанса (до 500мс), затем ретрай CreateFileW.
+            // SAFETY: name валиден; таймаут в мс.
+            unsafe { WaitNamedPipeW(name.as_ptr(), 500) };
+        } else {
+            std::thread::sleep(std::time::Duration::from_millis(150));
+        }
     }
 }
 
@@ -254,13 +324,28 @@ impl TunProvider for WindowsTunProvider {
         // Приложение гасит службу при выходе (см. [`service_request_quit`]) → к моменту коннекта её
         // может не быть в памяти. Поднимаем через SCM (право SERVICE_START выдано инсталлятором
         // интерактивному пользователю). Best-effort: если не вышло — ниже понятная ошибка пайпа.
-        if let Err(e) = service_ensure_running() {
-            eprintln!("[win] служба citadel-svc не запущена и не стартанула: {e:#}");
-        }
+        let svc_hint = match service_ensure_running() {
+            Ok(()) => None,
+            Err(e) => {
+                eprintln!("[win] служба citadel-svc не запущена и не стартовала: {e:#}");
+                Some(format!("{e:#}"))
+            }
+        };
         // Подключиться к службе (overlapped-хэндл). Отсутствие пайпа = служба не установлена/не
-        // запущена (понятная ошибка вместо «file not found»).
-        let pipe = open_overlapped_pipe(&self.pipe_path).with_context(|| {
-            format!("служба citadel-svc недоступна ({}) — установлена и запущена?", self.pipe_path)
+        // запущена — тогда в причину подставляем диагноз SCM (он объясняет, ЧТО чинить), а не
+        // безликое «Не удается найти указанный файл».
+        let pipe = open_overlapped_pipe_within(&self.pipe_path, PIPE_OPEN_TIMEOUT).map_err(|e| {
+            let base = anyhow::Error::new(e);
+            match &svc_hint {
+                Some(h) => base.context(format!(
+                    "служба citadel-svc недоступна ({}): {h}",
+                    self.pipe_path
+                )),
+                None => base.context(format!(
+                    "служба citadel-svc недоступна ({}) — установлена и запущена?",
+                    self.pipe_path
+                )),
+            }
         })?;
         // W4: сервер пайпа обязан быть привилегированным (SYSTEM/Admins), а не сквоттером под юзером —
         // проверяем ДО отправки конфига/доверия каналу (анти-impersonation туннельного data-path).
@@ -330,13 +415,38 @@ fn service_state(svc: *mut std::ffi::c_void) -> Result<u32> {
     }
 }
 
+/// Запущена ли служба (только право `SERVICE_QUERY_STATUS` — оно есть у любого пользователя даже с
+/// дефолтным дескриптором службы). `Err` — служба не установлена / SCM недоступен.
+fn service_is_running() -> Result<bool> {
+    use windows_sys::Win32::System::Services::{SERVICE_QUERY_STATUS, SERVICE_RUNNING};
+    with_service(SERVICE_QUERY_STATUS, |svc| Ok(service_state(svc)? == SERVICE_RUNNING))
+}
+
+/// Есть ли у ТЕКУЩЕГО пользователя право запустить службу (`SERVICE_START`). Его выдаёт установка
+/// (`citadel-svc install` → `sc sdset`) и подтверждает сама служба на каждом старте; на установках,
+/// где этого не случилось, право отсутствует — и приложение не должно гасить службу при выходе,
+/// иначе поднять её обратно уже не сможет (ловушка «работает только от имени администратора»).
+pub fn service_can_start() -> bool {
+    use windows_sys::Win32::System::Services::SERVICE_START;
+    with_service(SERVICE_START, |_| Ok(())).is_ok()
+}
+
 /// Убедиться, что служба `citadel-svc` запущена; если нет — стартовать через SCM и подождать
 /// перехода в Running (до ~5 с). Право `SERVICE_START` интерактивному пользователю выдаёт
-/// инсталлятор (`citadel-svc install` → `sc sdset`), UAC не требуется.
+/// инсталлятор (`citadel-svc install` → `sc sdset`) и подтверждает служба на каждом старте, UAC не
+/// требуется.
+///
+/// Статус спрашиваем ОТДЕЛЬНЫМ, минимальным доступом: `OpenService` с `SERVICE_START` отказывает
+/// целиком, если права нет, — и раньше уже РАБОТАЮЩАЯ служба выглядела как «Отказано в доступе»,
+/// хотя делать было нечего и туннель поднялся бы. Теперь нехватка прав всплывает только там, где
+/// она действительно мешает: службу надо стартовать, а нечем.
 pub fn service_ensure_running() -> Result<()> {
     use windows_sys::Win32::System::Services::{
         StartServiceW, SERVICE_QUERY_STATUS, SERVICE_RUNNING, SERVICE_START, SERVICE_START_PENDING,
     };
+    if service_is_running()? {
+        return Ok(());
+    }
     with_service(SERVICE_QUERY_STATUS | SERVICE_START, |svc| {
         let state = service_state(svc)?;
         if state == SERVICE_RUNNING {
@@ -365,6 +475,20 @@ pub fn service_ensure_running() -> Result<()> {
         }
         bail!("служба {SERVICE_NAME} не перешла в Running за 5 с")
     })
+    .map_err(|e| {
+        // Отказ в доступе на СТАРТЕ службы — это не «сломался Windows», а незавершённая установка.
+        // Даём человеку ровно тот текст, по которому понятно, что делать (и почему «от имени
+        // администратора» — обходной путь, а не решение).
+        if format!("{e:#}").contains("os error 5") {
+            anyhow::anyhow!(
+                "служба CitadelPQVPN остановлена, а прав на её запуск у пользователя нет \
+                 (установка не выдала SERVICE_START). Перезагрузите компьютер — служба стартует \
+                 автоматически, либо переустановите приложение: {e:#}"
+            )
+        } else {
+            e
+        }
+    })
 }
 
 /// Попросить службу завершиться (`TAG_QUIT` по пайпу) — зовётся при ВЫХОДЕ из приложения, чтобы
@@ -372,29 +496,27 @@ pub fn service_ensure_running() -> Result<()> {
 /// может уже не быть, а если идёт чужая сессия — serve-цикл занят и коннект не пройдёт (и не должен:
 /// активный туннель этим не рвём). Ошибку зовущий вправе игнорировать — выход не блокируем.
 pub fn service_request_quit() -> Result<()> {
-    use windows_sys::Win32::System::Services::{SERVICE_QUERY_STATUS, SERVICE_RUNNING};
     // Гасить нечего (не установлена / уже остановлена) → мгновенный выход БЕЗ ретраев ниже:
     // иначе каждый выход из приложения стоил бы пользователю лишних секунд ожидания.
-    if with_service(SERVICE_QUERY_STATUS, service_state)? != SERVICE_RUNNING {
+    if !service_is_running()? {
         return Ok(());
     }
-    // Сразу после disconnect служба ещё в teardown (снятие WFP/маршрутов, netsh) — слушающего
-    // инстанса пайпа в этот момент НЕТ, и CreateFileW падает не в ERROR_PIPE_BUSY, а в
-    // ERROR_FILE_NOT_FOUND. Поэтому коротко ретраим открытие (~2.5 с), пока serve-цикл вернётся
-    // к accept; дольше не ждём — выход из приложения важнее, чем гарантия остановки службы.
-    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(2500);
-    let pipe = loop {
-        match open_overlapped_pipe(PIPE_PATH) {
-            Ok(p) => break p,
-            Err(_) if std::time::Instant::now() < deadline => {
-                std::thread::sleep(std::time::Duration::from_millis(150));
-            }
-            Err(e) => {
-                return Err(anyhow::Error::new(e))
-                    .with_context(|| format!("служба citadel-svc недоступна ({PIPE_PATH})"))
-            }
-        }
-    };
+    // Не гасим службу, если поднять её обратно не сможем: без права SERVICE_START следующий запуск
+    // приложения (без прав администратора) упрётся в «OpenService: Отказано в доступе» и туннель не
+    // встанет вовсе. Лишний процесс в задачах — меньшее зло, чем неработающий VPN; сама служба
+    // выдаёт это право себе на каждом старте, так что состояние временное.
+    if !service_can_start() {
+        eprintln!(
+            "[win] служба citadel-svc оставлена работать: у пользователя нет права SERVICE_START, \
+             обратно её было бы не поднять (переустановка/перезагрузка выдаст право)"
+        );
+        return Ok(());
+    }
+    // Служба всегда держит свободный слушающий инстанс, но могла как раз перезапускаться — короткий
+    // ретрай внутри open (≤3с). Дольше не ждём: выход из приложения важнее гарантии остановки.
+    let pipe = open_overlapped_pipe_within(PIPE_PATH, PIPE_QUIT_TIMEOUT)
+        .map_err(anyhow::Error::new)
+        .with_context(|| format!("служба citadel-svc недоступна ({PIPE_PATH})"))?;
     // W4-проверку владельца намеренно не делаем: кадр из одного байта без секретов, максимум
     // сквоттер его «съест» (служба тогда просто продолжит работать — не деградация безопасности).
     let io = OvIo::new().context("создать write-событие пайпа")?;
@@ -402,11 +524,17 @@ pub fn service_request_quit() -> Result<()> {
     Ok(())
 }
 
+/// Сколько ждать READY от службы. Внутри у неё: вытеснение прежней сессии (до 20с), создание
+/// WinTUN-адаптера, `netsh`, WFP. Граница нужна, чтобы приложение не висело в «подключение»
+/// бесконечно, если служба встанет: движок получит ошибку и уйдёт в обычный реконнект-backoff.
+const READY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+
 /// Прочитать управляющий кадр READY от службы: `TAG_READY ‖ status ‖ u32(len) ‖ body`.
 /// status==0 → body=CBOR(TunReady); ≠0 → body=UTF-8 причина (пробрасываем как ошибку).
 fn read_ready(io: &OvIo, h: isize) -> Result<TunReady> {
     let mut hdr = [0u8; 6]; // TAG_READY(1) + status(1) + len(4, BE)
-    io.read_exact(h, &mut hdr).context("читать READY-заголовок от службы")?;
+    io.read_exact_within(h, &mut hdr, Some(READY_TIMEOUT))
+        .context("читать READY-заголовок от службы")?;
     if hdr[0] != winnet::TAG_READY {
         bail!("неожиданный тег ответа службы: 0x{:02x}", hdr[0]);
     }
@@ -416,7 +544,7 @@ fn read_ready(io: &OvIo, h: isize) -> Result<TunReady> {
         bail!("READY-тело от службы слишком длинное: {len} > {}", winnet::MAX_READY_BODY);
     }
     let mut body = vec![0u8; len];
-    io.read_exact(h, &mut body).context("читать READY-тело")?;
+    io.read_exact_within(h, &mut body, Some(READY_TIMEOUT)).context("читать READY-тело")?;
     if status != 0 {
         bail!("служба отклонила поднятие адаптера: {}", String::from_utf8_lossy(&body));
     }

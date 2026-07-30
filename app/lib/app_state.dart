@@ -248,14 +248,31 @@ class AppState extends ChangeNotifier {
         transport = ev.transport;
         cidr = ev.cidr;
       case 'error':
-        _setError('Сервер недоступен', 'подробности в журнале отладки', ev.error);
+        final (title, hint) = _classify(ev.error);
+        _setError(title, hint, ev.error);
     }
     notifyListeners();
   }
 
   void _onStreamError(Object e) {
-    _setError('Сервер недоступен', 'подробности в журнале отладки', '$e');
+    final (title, hint) = _classify('$e');
+    _setError(title, hint, '$e');
     notifyListeners();
+  }
+
+  /// Отнести отказ движка к виду, понятному человеку. По умолчанию это «сервер недоступен» — но
+  /// далеко не всякий отказ про сервер, и молча выдавать этот заголовок вредно: пользователь идёт
+  /// чинить не то (менял бы профиль там, где не запущена служба Windows). Разбираем ровно те случаи,
+  /// где виновник ЛОКАЛЬНЫЙ и человек может что-то сделать; остальное — прежний общий текст, а полная
+  /// цепочка причин в любом случае лежит в журнале отладки.
+  static (String, String) _classify(String err) {
+    if (err.contains('citadel-svc') || err.contains('CitadelPQVPN')) {
+      if (err.contains('SERVICE_START') || err.contains('os error 5')) {
+        return ('Служба CitadelPQVPN не запущена', 'перезагрузите компьютер или переустановите приложение');
+      }
+      return ('Служба CitadelPQVPN недоступна', 'проверьте, что она установлена и запущена');
+    }
+    return ('Сервер недоступен', 'подробности в журнале отладки');
   }
 
   void _onState(String s) {

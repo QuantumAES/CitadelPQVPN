@@ -65,9 +65,12 @@ Name: "{autodesktop}\{#AppName}"; Filename: "{app}\{#AppExe}"; Tasks: desktopico
 
 [Run]
 ; Зарегистрировать службу (установщик уже elevated → citadel-svc install создаёт службу в SCM).
+; Он же выдаёт интерактивному пользователю право SERVICE_START (sc sdset) — без него приложение без
+; прав администратора не поднимет туннель («OpenService: Отказано в доступе»).
 Filename: "{app}\{#SvcExe}"; Parameters: "install"; StatusMsg: "Регистрация службы {#SvcName}…"; Flags: runhidden waituntilterminated
-; Запустить службу сейчас (AutoStart подхватит и на следующих загрузках).
-Filename: "{sys}\net.exe"; Parameters: "start {#SvcName}"; Flags: runhidden waituntilterminated; Check: not IsUpgrade
+; Запустить службу сейчас — ВСЕГДА, в т.ч. при обновлении: PrepareToInstall её остановил, чтобы
+; заменить занятые файлы, и без этого шага компьютер остался бы с погашенной службой.
+Filename: "{sys}\net.exe"; Parameters: "start {#SvcName}"; Flags: runhidden waituntilterminated
 ; Запустить приложение ПОД ПОЛЬЗОВАТЕЛЕМ (runasoriginaluser — де-эскалация из elevated-установщика).
 Filename: "{app}\{#AppExe}"; Description: "{cm:LaunchProgram,{#AppName}}"; Flags: nowait postinstall skipifsilent runasoriginaluser
 
@@ -77,10 +80,14 @@ Filename: "{sys}\net.exe"; Parameters: "stop {#SvcName}"; Flags: runhidden waitu
 Filename: "{app}\{#SvcExe}"; Parameters: "uninstall"; Flags: runhidden waituntilterminated; RunOnceId: "DelSvc"
 
 [Code]
-{ Апгрейд: пропустить `net start` (служба уже есть/запущена; install переустановит конфиг). }
-function IsUpgrade(): Boolean;
-var prev: String;
+{ Обновление поверх работающей установки: citadel-svc.exe и wintun.dll держит ЗАПУЩЕННАЯ служба, и
+  без остановки Inno не может их заменить — файлы уезжают в «замену при перезагрузке», а до неё в
+  памяти продолжает работать СТАРАЯ служба (ровно тот класс «фикс на диске есть, а в памяти нет»,
+  который уже стоил разбирательства на Linux-демоне). Поэтому гасим службу до копирования файлов;
+  обратно её поднимает шаг `net start` в [Run]. }
+function PrepareToInstall(var NeedsRestart: Boolean): String;
+var rc: Integer;
 begin
-  Result := RegQueryStringValue(HKLM, 'SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\{#SetupSetting("AppId")}_is1', 'UninstallString', prev)
-         or RegQueryStringValue(HKLM64, 'SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\{#SetupSetting("AppId")}_is1', 'UninstallString', prev);
+  Result := '';
+  Exec(ExpandConstant('{sys}\net.exe'), 'stop {#SvcName}', '', SW_HIDE, ewWaitUntilTerminated, rc);
 end;
