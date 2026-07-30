@@ -26,6 +26,7 @@ windows-sys = { version = "0.60", features = [
     "Win32_System_Console",         # GetStdHandle/SetStdHandle/STD_ERROR_HANDLE
     "Win32_System_Pipes",           # CreatePipe
     "Win32_Storage_FileSystem",     # WriteFile (тираж в исходный stderr)
+    "Win32_System_Threading",       # TerminateProcess — немедленный выход (desktop_exit_now)
 ] }
 
 # Android: JNI-мост Rust→VpnService.protect() (анти-петля, C3.3).

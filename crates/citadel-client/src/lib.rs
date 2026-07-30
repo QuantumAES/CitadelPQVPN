@@ -47,7 +47,7 @@ pub use admin::{
     admin_issue, admin_list, admin_probe_dst, admin_revoke, build_subscriber_link, IssuedLink,
     SubscriberEntry,
 };
-pub use vault::{IssuedRecord, Profile, Vault};
+pub use vault::{IssuedRecord, Profile, Vault, VaultOpenError, MIN_PASSPHRASE_LEN};
 #[cfg(any(target_os = "linux", target_os = "android"))]
 pub use gui_tun::GuiTunProvider;
 #[cfg(windows)]

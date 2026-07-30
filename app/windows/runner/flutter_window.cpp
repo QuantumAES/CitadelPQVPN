@@ -397,7 +397,11 @@ FlutterWindow::MessageHandler(HWND hwnd, UINT const message,
 
   switch (message) {
     case WM_FONTCHANGE:
-      flutter_controller_->engine()->ReloadSystemFonts();
+      // Проверка на nullptr: сообщение может прийти уже после OnDestroy (движок снесён) — в
+      // шаблоне Flutter здесь безусловное разыменование, то есть падение на выходе.
+      if (flutter_controller_) {
+        flutter_controller_->engine()->ReloadSystemFonts();
+      }
       break;
   }
 

@@ -6,7 +6,7 @@
 import '../frb_generated.dart';
 import 'package:flutter_rust_bridge/flutter_rust_bridge_for_generated.dart';
 
-// These functions are ignored because they are not marked as `pub`: `android_start`, `debug_flag_file`, `dto_to_split`, `idle`, `killswitch_file`, `link_from`, `load_split_config`, `off`, `parse_split`, `profile_to_dto`, `profile_uri`, `rt`, `screenshot_block_file`, `serialize_split`, `spawn_controller`, `split_file`, `start_connect`, `state_dto`, `to_dto`, `update_android_status`, `update_last_exit`, `vault_path`, `vpn_state_str`, `with_vault`
+// These functions are ignored because they are not marked as `pub`: `android_start`, `debug_flag_file`, `dto_to_split`, `first_line`, `guarded_parse_link`, `idle`, `io_kind_in_chain`, `is_not_found`, `is_permission_denied`, `killswitch_file`, `link_from`, `load_split_config`, `off`, `parse_split`, `profile_to_dto`, `profile_uri`, `read_error`, `rt`, `screenshot_block_file`, `serialize_split`, `spawn_controller`, `split_file`, `start_connect`, `state_dto`, `to_dto`, `update_android_status`, `update_last_exit`, `vault_error`, `vault_path`, `vpn_state_str`, `with_vault`, `write_error`, `xdg_store_path`
 // These types are ignored because they are neither used by any `pub` functions nor (for structs and enums) marked `#[frb(unignore)]`: `AndroidStatus`, `AndroidTunProvider`
 // These function are ignored because they are on traits that is not defined in current crate (put an empty `#[frb]` on it to unignore): `clone`, `configure`
 
@@ -65,7 +65,16 @@ bool vaultIsUnlocked() => RustLib.instance.api.crateApiCitadelVaultIsUnlocked();
 /// Заблокировать (забыть ключ из памяти).
 void vaultLock() => RustLib.instance.api.crateApiCitadelVaultLock();
 
-/// Открыть хранилище мастер-паролем (PBKDF2 — намеренно НЕ sync: тяжело, уводим с UI-потока).
+/// Где лежит файл хранилища (диагностика в UI: «нет доступа» без пути — бесполезное сообщение).
+String vaultLocation() => RustLib.instance.api.crateApiCitadelVaultLocation();
+
+/// Минимальная длина мастер-пароля из ядра — чтобы UI проверял ДО дорогого Argon2-derive и
+/// называл человеку то же число, что enforce'ит крипта (без второй захардкоженной константы).
+int vaultMinPasswordLen() =>
+    RustLib.instance.api.crateApiCitadelVaultMinPasswordLen();
+
+/// Открыть хранилище мастер-паролем (Argon2id — намеренно НЕ sync: тяжело, уводим с UI-потока).
+/// Ошибка приходит в UI уже человеческой фразой (см. [`vault_error`]).
 Future<void> vaultUnlock({required String passphrase}) =>
     RustLib.instance.api.crateApiCitadelVaultUnlock(passphrase: passphrase);
 
@@ -73,7 +82,10 @@ Future<void> vaultUnlock({required String passphrase}) =>
 Future<void> vaultCreate({required String passphrase}) =>
     RustLib.instance.api.crateApiCitadelVaultCreate(passphrase: passphrase);
 
-/// Сменить мастер-пароль (текущий проверяется повторным open).
+/// Сменить мастер-пароль. Три отказа — три РАЗНЫХ ответа, потому что чинятся они по-разному:
+/// новый пароль не проходит политику (её видно до дорогого derive), текущий пароль не тот,
+/// файл не удалось перезаписать. Раньше всё это приходило в UI как «текущий пароль неверен» —
+/// и пользователь перебирал верный пароль, пока ядро жаловалось на длину нового.
 Future<void> vaultChangePassword({required String old, required String new_}) =>
     RustLib.instance.api.crateApiCitadelVaultChangePassword(
       old: old,
@@ -83,16 +95,21 @@ Future<void> vaultChangePassword({required String old, required String new_}) =>
 /// Список профилей (vault должен быть разблокирован).
 List<ProfileDto> vaultList() => RustLib.instance.api.crateApiCitadelVaultList();
 
-/// Добавить профиль из `citadel://`-ссылки (валидируется).
-ProfileDto vaultAdd({required String name, required String uri}) =>
+/// Добавить профиль из `citadel://`-ссылки (валидируется через тот же анти-перебор-гейт, что и
+/// живое превью, — иначе «добавить» осталось бы быстрым способом проверять догадки).
+/// Не `sync`: гейт спит, а на UI-потоке спать нельзя.
+Future<ProfileDto> vaultAdd({required String name, required String uri}) =>
     RustLib.instance.api.crateApiCitadelVaultAdd(name: name, uri: uri);
 
 /// Удалить профиль по id.
 void vaultRemove({required String id}) =>
     RustLib.instance.api.crateApiCitadelVaultRemove(id: id);
 
-/// Разобрать `citadel://`-ссылку → превью для UI (живая валидация при вставке).
-LinkSummaryDto parseLinkSummary({required String uri}) =>
+/// Разобрать `citadel://`-ссылку → превью для UI (валидация при вставке).
+///
+/// НЕ `sync` и намеренно небыстрая: см. [`guarded_parse_link`] — мгновенный вердикт «распознана /
+/// не распознана» на каждый чих клавиатуры был бесплатным оракулом для подбора ссылки.
+Future<LinkSummaryDto> parseLinkSummary({required String uri}) =>
     RustLib.instance.api.crateApiCitadelParseLinkSummary(uri: uri);
 
 /// C7.4: QR-матрица `citadel://`-ссылки (экран выдачи доступа абоненту). Sync — кодирование QR
@@ -143,6 +160,24 @@ void vpnDisconnect() => RustLib.instance.api.crateApiCitadelVpnDisconnect();
 /// платформах и при недоступной службе — тихий no-op (выход из приложения не блокируем).
 void desktopServiceQuit() =>
     RustLib.instance.api.crateApiCitadelDesktopServiceQuit();
+
+/// Windows: завершить процесс НЕМЕДЛЕННО — последний шаг выхода из приложения.
+///
+/// Зачем так, а не `windowManager.destroy()`. `destroy()` лишь шлёт `WM_QUIT`: цикл сообщений
+/// выходит, а дальше рантайм разбирает движок Flutter, плагины и COM — уже после `CoUninitialize()`
+/// в runner'е — пока живы наши нативные потоки (лог-захват stderr, реконнект-воркеры, tokio) и
+/// FRB-стримы, которые в этот момент ещё могут постить в гаснущий изолят. Разбор такого хозяйства
+/// в правильном порядке нам не нужен: к моменту вызова всё, что должно пережить выход, уже на
+/// диске (vault пишется атомарно на каждую операцию), kill-switch снят disconnect'ом, служба
+/// уведомлена, иконка трея убрана. Поэтому просто выходим с кодом 0 — это и есть то, что делают
+/// десктопные приложения с нативными фоновыми потоками (ср. `TerminateCurrentProcessImmediately`
+/// в Chromium), и заодно исчезает окно WER «Программа прекратила работу» на штатном закрытии.
+///
+/// `TerminateProcess`, а не `ExitProcess`: последний рассылает `DLL_PROCESS_DETACH` уже после
+/// остановки остальных потоков — поток, замороженный внутри аллокатора, оставил бы захваченный
+/// heap-лок, и detach-обработчик мог бы на нём повиснуть (выход «зависает» вместо мгновенного).
+/// На прочих платформах — no-op: там выход и так штатный.
+void desktopExitNow() => RustLib.instance.api.crateApiCitadelDesktopExitNow();
 
 /// Прогнать тест-кейсы подключения к exit'у профиля/ссылки, стримя результат по шагам
 /// (DNS → QUIC/UDP → TCP → establish → egress). Диагностика идёт тем же путём, что реальный

@@ -11,7 +11,7 @@
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, OnceLock};
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{anyhow, bail, Result};
 use flutter_rust_bridge::frb;
 
 use crate::frb_generated::StreamSink;
@@ -357,16 +357,109 @@ pub fn split_config() -> SplitTunnelDto {
 
 /// Каталог данных, заданный платформой (Android передаёт filesDir через [`set_data_dir`]).
 /// Если задан — хранилище кладём прямо в него (он уже приватный и writable, без подпапки `.config`).
-/// Иначе (десктоп) — `$XDG_CONFIG_HOME|~/.config/citadel-pqvpn`.
+/// Иначе: Windows — `%LOCALAPPDATA%\CitadelPQVPN`, прочие — `$XDG_CONFIG_HOME|~/.config/citadel-pqvpn`.
 fn vault_path() -> PathBuf {
     if let Some(dir) = DATA_DIR.get() {
         return dir.join("vault.bin");
     }
+    #[cfg(windows)]
+    {
+        windows_store_path().clone()
+    }
+    #[cfg(not(windows))]
+    {
+        xdg_store_path()
+    }
+}
+
+/// Unix-путь хранилища (Linux/macOS-desktop): `$XDG_CONFIG_HOME|~/.config/citadel-pqvpn/vault.bin`.
+/// На Windows остаётся только как адрес СТАРОГО (сломанного) расположения — для миграции.
+fn xdg_store_path() -> PathBuf {
     let base = std::env::var_os("XDG_CONFIG_HOME")
         .map(PathBuf::from)
         .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".config")))
         .unwrap_or_else(|| PathBuf::from("."));
     base.join("citadel-pqvpn").join("vault.bin")
+}
+
+/// Windows: `%LOCALAPPDATA%\CitadelPQVPN\vault.bin` (+ разовый перенос старого хранилища).
+///
+/// Почему отдельная ветка. Общий резолвер ищет `XDG_CONFIG_HOME`/`HOME`, а на Windows их обычно нет
+/// (профиль задают `LOCALAPPDATA`/`USERPROFILE`), поэтому он сваливался в `.` — то есть хранилище
+/// оказывалось в РАБОЧЕМ КАТАЛОГЕ ПРОЦЕССА. Для установленного приложения это `C:\Program Files\
+/// CitadelPQVPN`, и последствия ровно те, на которые жаловались:
+///   • создание хранилища падало с «Отказано в доступе» (обычному пользователю туда не писать);
+///   • если файл там всё же появился (запуск от администратора), смена пароля не сохранялась:
+///     ЧТЕНИЕ из Program Files разрешено всем, а запись — нет, и отказ выглядел как «неверный пароль»;
+///   • путь зависел от того, откуда запущен процесс, поэтому «обычный» и «от имени администратора»
+///     запуски могли видеть РАЗНЫЕ хранилища.
+/// `%LOCALAPPDATA%` (а не Roaming) — потому что vault несёт bearer-креды: их не надо синхронизировать
+/// по доменному профилю. Доступ разграничивает ACL профиля пользователя.
+#[cfg(windows)]
+fn windows_store_path() -> &'static PathBuf {
+    static PATH: OnceLock<PathBuf> = OnceLock::new();
+    PATH.get_or_init(|| {
+        let base = std::env::var_os("LOCALAPPDATA")
+            .map(PathBuf::from)
+            .or_else(|| {
+                std::env::var_os("USERPROFILE")
+                    .map(|p| PathBuf::from(p).join("AppData").join("Local"))
+            })
+            // Профиля пользователя нет вовсе (среда сломана) — прежнее поведение, чтобы не падать.
+            .unwrap_or_else(|| PathBuf::from("."));
+        let path = base.join("CitadelPQVPN").join("vault.bin");
+        if !path.is_file() {
+            migrate_legacy_windows_store(&path);
+        }
+        path
+    })
+}
+
+/// Разовый перенос хранилища со старого (cwd-зависимого) места в `%LOCALAPPDATA%`: иначе апгрейд
+/// стёр бы пользователю профили — с его точки зрения приложение «забыло всё». Переносим весь
+/// каталог: рядом с `vault.bin` лежат настройки (`killswitch`, `debug`, `split`, `screenshot_block`).
+/// Best-effort: не смогли скопировать — работаем с чистого места (о чём говорим в журнал); не смогли
+/// удалить оригинал (типично для `Program Files` без прав) — предупреждаем, что копия осталась.
+#[cfg(windows)]
+fn migrate_legacy_windows_store(new_vault: &std::path::Path) {
+    let legacy_vault = xdg_store_path();
+    if !legacy_vault.is_file() {
+        return;
+    }
+    let (Some(legacy_dir), Some(new_dir)) = (legacy_vault.parent(), new_vault.parent()) else {
+        return;
+    };
+    if let Err(e) = std::fs::create_dir_all(new_dir) {
+        eprintln!("[vault] не создать {}: {e}", new_dir.display());
+        return;
+    }
+    let Ok(entries) = std::fs::read_dir(legacy_dir) else { return };
+    let mut moved = 0usize;
+    for entry in entries.flatten() {
+        if !entry.path().is_file() {
+            continue;
+        }
+        let dst = new_dir.join(entry.file_name());
+        match std::fs::copy(entry.path(), &dst) {
+            Ok(_) => {
+                moved += 1;
+                if let Err(e) = std::fs::remove_file(entry.path()) {
+                    eprintln!(
+                        "[vault] старая копия {} осталась на месте ({e}) — удалите её вручную",
+                        entry.path().display()
+                    );
+                }
+            }
+            Err(e) => eprintln!("[vault] не перенести {}: {e}", entry.path().display()),
+        }
+    }
+    if moved > 0 {
+        eprintln!(
+            "[vault] хранилище перенесено {} → {} ({moved} файл(ов))",
+            legacy_dir.display(),
+            new_dir.display()
+        );
+    }
 }
 
 /// Задать каталог данных приложения (вызывается из Dart на старте, до любых vault-операций).
@@ -431,25 +524,103 @@ pub fn vault_lock() {
     *VAULT.lock().unwrap() = None;
 }
 
-/// Открыть хранилище мастер-паролем (PBKDF2 — намеренно НЕ sync: тяжело, уводим с UI-потока).
+/// Где лежит файл хранилища (диагностика в UI: «нет доступа» без пути — бесполезное сообщение).
+#[frb(sync)]
+pub fn vault_location() -> String {
+    vault_path().display().to_string()
+}
+
+/// Минимальная длина мастер-пароля из ядра — чтобы UI проверял ДО дорогого Argon2-derive и
+/// называл человеку то же число, что enforce'ит крипта (без второй захардкоженной константы).
+#[frb(sync)]
+pub fn vault_min_password_len() -> u32 {
+    citadel_client::MIN_PASSPHRASE_LEN as u32
+}
+
+/// Открыть хранилище мастер-паролем (Argon2id — намеренно НЕ sync: тяжело, уводим с UI-потока).
+/// Ошибка приходит в UI уже человеческой фразой (см. [`vault_error`]).
 pub fn vault_unlock(passphrase: String) -> Result<()> {
-    let v = Vault::open(vault_path(), &passphrase)?;
+    let path = vault_path();
+    let v = Vault::open_detailed(&path, &passphrase).map_err(|e| vault_error(e, &path))?;
     *VAULT.lock().unwrap() = Some(v);
     Ok(())
 }
 
 /// Создать новое хранилище под мастер-паролем (первый запуск / первое сохранение).
 pub fn vault_create(passphrase: String) -> Result<()> {
-    let v = Vault::create(vault_path(), &passphrase)?;
+    citadel_client::vault::check_passphrase(&passphrase)?; // политика — до файловых операций
+    let path = vault_path();
+    let v = Vault::create(&path, &passphrase).map_err(|e| write_error(e, &path, "Создать"))?;
     *VAULT.lock().unwrap() = Some(v);
     Ok(())
 }
 
-/// Сменить мастер-пароль (текущий проверяется повторным open).
+/// Сменить мастер-пароль. Три отказа — три РАЗНЫХ ответа, потому что чинятся они по-разному:
+/// новый пароль не проходит политику (её видно до дорогого derive), текущий пароль не тот,
+/// файл не удалось перезаписать. Раньше всё это приходило в UI как «текущий пароль неверен» —
+/// и пользователь перебирал верный пароль, пока ядро жаловалось на длину нового.
 pub fn vault_change_password(old: String, new: String) -> Result<()> {
-    Vault::open(vault_path(), &old).context("текущий пароль неверен")?;
+    citadel_client::vault::check_passphrase(&new)?; // про НОВЫЙ пароль — единственная политика здесь
+    let path = vault_path();
+    if !Vault::password_matches(&path, &old).map_err(|e| read_error(e, &path))? {
+        bail!("Текущий пароль неверен");
+    }
     let mut g = VAULT.lock().unwrap();
-    g.as_mut().ok_or_else(|| anyhow!("хранилище заблокировано"))?.change_password(&new)
+    g.as_mut()
+        .ok_or_else(|| anyhow!("Хранилище заблокировано — разблокируйте его и повторите"))?
+        .change_password(&new)
+        .map_err(|e| write_error(e, &path, "Сохранить"))
+}
+
+/// Отказ открытия хранилища → фраза для человека. Верхняя строка попадает в диалог, полная цепочка
+/// причин — в журнал отладки (S1.4: журнал локальный, ring-буфер).
+fn vault_error(e: citadel_client::VaultOpenError, path: &std::path::Path) -> anyhow::Error {
+    match e {
+        citadel_client::VaultOpenError::WrongPassword => anyhow!("Неверный мастер-пароль"),
+        citadel_client::VaultOpenError::Unavailable(e) => read_error(e, path),
+    }
+}
+
+/// Отказ ЧТЕНИЯ файла хранилища (не про пароль): «нет доступа», «файла нет», всё прочее.
+fn read_error(e: anyhow::Error, path: &std::path::Path) -> anyhow::Error {
+    eprintln!("[vault] чтение {}: {e:#}", path.display());
+    if is_permission_denied(&e) {
+        return anyhow!("Нет доступа к файлу хранилища:\n{}", path.display());
+    }
+    if is_not_found(&e) {
+        return anyhow!("Файл хранилища не найден:\n{}", path.display());
+    }
+    anyhow!("Хранилище недоступно: {}", first_line(&e))
+}
+
+/// Отказ ЗАПИСИ файла хранилища. `action` — «Создать»/«Сохранить» (начало фразы).
+fn write_error(e: anyhow::Error, path: &std::path::Path, action: &str) -> anyhow::Error {
+    eprintln!("[vault] запись {}: {e:#}", path.display());
+    let msg = first_line(&e);
+    let dir = path.parent().unwrap_or(path).display();
+    if is_permission_denied(&e) {
+        return anyhow!("Нет доступа к папке хранилища:\n{dir}");
+    }
+    anyhow!("{action} хранилище не удалось: {msg}")
+}
+
+/// Первая строка `Debug`-цепочки anyhow — самый верхний, человеческий контекст (остальное —
+/// «Caused by:» для журнала, в диалоге оно только мешает).
+fn first_line(e: &anyhow::Error) -> String {
+    format!("{e}").lines().next().unwrap_or_default().to_string()
+}
+
+/// Есть ли в цепочке причин io-ошибка данного вида (текст ОС локализован — сверяем по `ErrorKind`).
+fn io_kind_in_chain(e: &anyhow::Error, kind: std::io::ErrorKind) -> bool {
+    e.chain().any(|c| c.downcast_ref::<std::io::Error>().is_some_and(|io| io.kind() == kind))
+}
+
+fn is_permission_denied(e: &anyhow::Error) -> bool {
+    io_kind_in_chain(e, std::io::ErrorKind::PermissionDenied)
+}
+
+fn is_not_found(e: &anyhow::Error) -> bool {
+    io_kind_in_chain(e, std::io::ErrorKind::NotFound)
 }
 
 /// Список профилей (vault должен быть разблокирован).
@@ -460,11 +631,15 @@ pub fn vault_list() -> Result<Vec<ProfileDto>> {
     Ok(v.list().iter().map(profile_to_dto).collect())
 }
 
-/// Добавить профиль из `citadel://`-ссылки (валидируется).
-#[frb(sync)]
+/// Добавить профиль из `citadel://`-ссылки (валидируется через тот же анти-перебор-гейт, что и
+/// живое превью, — иначе «добавить» осталось бы быстрым способом проверять догадки).
+/// Не `sync`: гейт спит, а на UI-потоке спать нельзя.
 pub fn vault_add(name: String, uri: String) -> Result<ProfileDto> {
+    if guarded_parse_link(&uri).is_none() {
+        bail!("Ссылка не распознана");
+    }
     let mut g = VAULT.lock().unwrap();
-    let v = g.as_mut().ok_or_else(|| anyhow!("хранилище заблокировано"))?;
+    let v = g.as_mut().ok_or_else(|| anyhow!("Хранилище заблокировано"))?;
     Ok(profile_to_dto(&v.add(&name, &uri)?))
 }
 
@@ -475,11 +650,13 @@ pub fn vault_remove(id: String) -> Result<()> {
     g.as_mut().ok_or_else(|| anyhow!("хранилище заблокировано"))?.remove(&id)
 }
 
-/// Разобрать `citadel://`-ссылку → превью для UI (живая валидация при вставке).
-#[frb(sync)]
+/// Разобрать `citadel://`-ссылку → превью для UI (валидация при вставке).
+///
+/// НЕ `sync` и намеренно небыстрая: см. [`guarded_parse_link`] — мгновенный вердикт «распознана /
+/// не распознана» на каждый чих клавиатуры был бесплатным оракулом для подбора ссылки.
 pub fn parse_link_summary(uri: String) -> LinkSummaryDto {
-    match citadel_client::api::parse_link(uri) {
-        Ok(s) => LinkSummaryDto {
+    match guarded_parse_link(&uri) {
+        Some(s) => LinkSummaryDto {
             valid: true,
             servers: s.servers.join(", "),
             server_name: s.server_name,
@@ -489,8 +666,54 @@ pub fn parse_link_summary(uri: String) -> LinkSummaryDto {
             has_obfs: s.has_obfs,
             is_admin: s.is_admin,
         },
-        Err(_) => LinkSummaryDto::default(),
+        None => LinkSummaryDto::default(),
     }
+}
+
+/// Минимальное время ответа проверки, шаг удорожания на каждую неудачу подряд и потолок ожидания
+/// (сброс — на первой распознанной ссылке). Числа скромные намеренно: см. оговорку о границах
+/// применимости в [`guarded_parse_link`] — платить за это секундами UX бессмысленно.
+const LINK_CHECK_MIN: std::time::Duration = std::time::Duration::from_millis(600);
+const LINK_CHECK_STEP: std::time::Duration = std::time::Duration::from_millis(600);
+const LINK_CHECK_MAX: std::time::Duration = std::time::Duration::from_secs(4);
+
+/// Счётчик подряд идущих нераспознанных ссылок (штраф темпа). Живёт в процессе: перезапуск
+/// приложения сбрасывает — против онлайн-подбора этого достаточно, дольше держать штраф значило бы
+/// наказывать человека, который просто закрыл окно.
+static LINK_FAILS: Mutex<u32> = Mutex::new(0);
+
+/// Разбор `citadel://`-ссылки с ограничением темпа проверок:
+///   • ответ не раньше [`LINK_CHECK_MIN`] — и для валидной, и для битой ссылки (тайминг сам по
+///     себе не должен их различать);
+///   • каждая следующая неудача подряд дороже предыдущей (до [`LINK_CHECK_MAX`]);
+///   • проверки сериализованы одним мьютексом — параллельными вызовами задержку не обойти.
+///
+/// ГРАНИЦЫ ПРИМЕНИМОСТИ — чтобы никто не принял это за защиту от подбора ссылки. Разбор проверяет
+/// СТРУКТУРУ (`base64url` → CBOR → версия → dns/routes), а не секреты: любые 32 случайных байта в
+/// поле `obfs_psk` дают вердикт «валидна». Подобрать через него ключи нельзя в принципе. Полезен
+/// вердикт лишь для восстановления УЖЕ утёкшей, но повреждённой ссылки — а такую атаку ведут не
+/// через наш UI: формат открытый, парсер публичный (репозиторий, `citadel-linkgen`, сам бинарь
+/// клиента), и догадки проверяются офлайн своей копией кода со скоростью миллионов в секунду.
+/// Настоящий рубеж против подбора кред — сетевой (квоты issuer/exit, single-session lease, отзыв),
+/// а против утечки ссылки — гигиена (vault, FLAG_SECURE, no-logs). Здесь же — гигиена темпа и
+/// главное: вердикт «не распознана» больше не выскакивает на каждый символ недописанной ссылки.
+fn guarded_parse_link(uri: &str) -> Option<citadel_client::api::CredentialSummary> {
+    let started = std::time::Instant::now();
+    // Лок держим ВКЛЮЧАЯ сон — это и есть сериализация темпа, а не оплошность.
+    let mut fails = LINK_FAILS.lock().unwrap();
+    let parsed = citadel_client::api::parse_link(uri.to_string()).ok();
+    let wait = if parsed.is_some() {
+        LINK_CHECK_MIN
+    } else {
+        LINK_CHECK_MIN
+            .saturating_add(LINK_CHECK_STEP.saturating_mul(*fails))
+            .min(LINK_CHECK_MAX)
+    };
+    if let Some(left) = wait.checked_sub(started.elapsed()) {
+        std::thread::sleep(left);
+    }
+    *fails = if parsed.is_some() { 0 } else { fails.saturating_add(1) };
+    parsed
 }
 
 /// C7.4: QR-матрица `citadel://`-ссылки (экран выдачи доступа абоненту). Sync — кодирование QR
@@ -841,6 +1064,32 @@ pub fn desktop_service_quit() {
     #[cfg(windows)]
     if let Err(e) = citadel_client::win_tun::service_request_quit() {
         eprintln!("[app] остановка службы citadel-svc пропущена: {e:#}");
+    }
+}
+
+/// Windows: завершить процесс НЕМЕДЛЕННО — последний шаг выхода из приложения.
+///
+/// Зачем так, а не `windowManager.destroy()`. `destroy()` лишь шлёт `WM_QUIT`: цикл сообщений
+/// выходит, а дальше рантайм разбирает движок Flutter, плагины и COM — уже после `CoUninitialize()`
+/// в runner'е — пока живы наши нативные потоки (лог-захват stderr, реконнект-воркеры, tokio) и
+/// FRB-стримы, которые в этот момент ещё могут постить в гаснущий изолят. Разбор такого хозяйства
+/// в правильном порядке нам не нужен: к моменту вызова всё, что должно пережить выход, уже на
+/// диске (vault пишется атомарно на каждую операцию), kill-switch снят disconnect'ом, служба
+/// уведомлена, иконка трея убрана. Поэтому просто выходим с кодом 0 — это и есть то, что делают
+/// десктопные приложения с нативными фоновыми потоками (ср. `TerminateCurrentProcessImmediately`
+/// в Chromium), и заодно исчезает окно WER «Программа прекратила работу» на штатном закрытии.
+///
+/// `TerminateProcess`, а не `ExitProcess`: последний рассылает `DLL_PROCESS_DETACH` уже после
+/// остановки остальных потоков — поток, замороженный внутри аллокатора, оставил бы захваченный
+/// heap-лок, и detach-обработчик мог бы на нём повиснуть (выход «зависает» вместо мгновенного).
+/// На прочих платформах — no-op: там выход и так штатный.
+#[frb(sync)]
+pub fn desktop_exit_now() {
+    #[cfg(windows)]
+    {
+        use windows_sys::Win32::System::Threading::{GetCurrentProcess, TerminateProcess};
+        // SAFETY: псевдо-хэндл текущего процесса всегда валиден; вызов не возвращается.
+        unsafe { TerminateProcess(GetCurrentProcess(), 0) };
     }
 }
 

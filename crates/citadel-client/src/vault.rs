@@ -32,14 +32,36 @@ const VERSION_PBKDF2: u8 = 1;
 const SALT_LEN: usize = 16;
 const KEY_LEN: usize = 32;
 /// Argon2id-параметры (C1): memory-hard KDF против GPU/ASIC-перебора мастер-пароля (vault хранит
-/// bearer-креды: obfs_psk/seed/pins). OWASP-рекомендация: m=19 MiB, t=2, p=1 — memory-hard (память —
-/// основной фактор GPU-стойкости), но щадит RAM/латентность на слабых мобильных (unlock редкий).
-/// Параметры хранятся В ФАЙЛЕ → можно поднять позже без слома существующих vault'ов.
-const ARGON_M_KIB: u32 = 19 * 1024; // 19 MiB (OWASP min)
-const ARGON_T: u32 = 2; // проходов
+/// bearer-креды: obfs_psk/seed/pins). Параметры хранятся В ФАЙЛЕ → поднимаются без слома
+/// существующих хранилищ (старые до-считываются своими, а затем прозрачно пере-шифровываются —
+/// см. [`Vault::open_v2`]).
+///
+/// Целимся НЕ в OWASP-минимум (m=19 MiB, t=2 — это ~45 мс, то есть дешёвый перебор), а в ~1–2 с на
+/// разблокировку: она происходит раз за запуск, и лишняя секунда человеку не мешает, а стоимость
+/// офлайн-перебора украденного файла растёт на два порядка.
+///
+/// На Android память дороже времени (бюджетные устройства и OOM-killer), поэтому там меньше
+/// памяти и больше проходов при сопоставимом времени.
+#[cfg(target_os = "android")]
+const ARGON_M_KIB: u32 = 64 * 1024; // 64 MiB — не провоцируем OOM на дешёвых телефонах
+#[cfg(target_os = "android")]
+const ARGON_T: u32 = 8; // время добираем проходами
+#[cfg(not(target_os = "android"))]
+const ARGON_M_KIB: u32 = 256 * 1024; // 256 MiB (desktop: памяти хватает, GPU-перебор дорожает)
+#[cfg(not(target_os = "android"))]
+const ARGON_T: u32 = 4; // проходов
 const ARGON_P: u32 = 1; // parallelism (без тредпула → кроссплатформенно)
+
+/// «Стоимость» набора Argon2-параметров для сравнения (память × проходы). Нужна, чтобы при
+/// открытии поднимать СЛАБЫЕ файлы до текущих настроек и НЕ понижать те, что созданы сильнее
+/// (в т.ч. на другой платформе: у Android и десктопа разный баланс памяти/времени).
+fn argon_cost(m_kib: u32, t: u32) -> u64 {
+    u64::from(m_kib) * u64::from(t)
+}
 /// Минимальная длина мастер-пароля (backstop; визуальную «силу» показывает UI отдельно).
-const MIN_PASSPHRASE_LEN: usize = 8;
+/// Публичная: UI обязан проверять то же самое ДО дорогого Argon2-derive и говорить человеку
+/// конкретное число, а не «не удалось» (иначе пользователь угадывает политику вслепую).
+pub const MIN_PASSPHRASE_LEN: usize = 8;
 /// Заголовок v2: magic+ver+m_kib+t+p+salt+nonce = 45. v1 (legacy): magic+ver+iters+salt+nonce = 37.
 const HEADER_LEN_V2: usize = 4 + 1 + 4 + 4 + 4 + SALT_LEN + NONCE_LEN;
 const HEADER_LEN_V1: usize = 4 + 1 + 4 + SALT_LEN + NONCE_LEN;
@@ -106,6 +128,40 @@ impl Drop for Vault {
     }
 }
 
+/// Почему не открылось хранилище. Разделение обязательное, а не косметическое: «пароль не подошёл»
+/// — это про ввод пользователя, а «файла нет / нет доступа / он повреждён» — про машину, и путать
+/// их в UI нельзя (человек перебирает пароли там, где надо чинить права на папку).
+#[derive(Debug)]
+pub enum VaultOpenError {
+    /// AEAD не сошёлся: введённый мастер-пароль неверен (либо файл подменён/побит).
+    WrongPassword,
+    /// Всё остальное: файла нет, нет прав, битый заголовок, неподдерживаемая версия, битый CBOR.
+    Unavailable(anyhow::Error),
+}
+
+impl std::fmt::Display for VaultOpenError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::WrongPassword => write!(f, "неверный мастер-пароль"),
+            Self::Unavailable(e) => write!(f, "{e}"),
+        }
+    }
+}
+
+impl std::error::Error for VaultOpenError {}
+
+impl VaultOpenError {
+    /// Схлопнуть в обычную `anyhow`-ошибку (для вызывающих, которым причина не важна).
+    /// Своего `From` быть не может: `anyhow` уже покрывает любые `std::error::Error`, а его
+    /// обёртка потеряла бы цепочку причин `Unavailable`.
+    fn flatten(self) -> anyhow::Error {
+        match self {
+            Self::WrongPassword => anyhow!("неверный мастер-пароль или повреждённое хранилище"),
+            Self::Unavailable(e) => e,
+        }
+    }
+}
+
 impl Vault {
     /// Существует ли файл хранилища (UI решает: разблокировать vs создать).
     pub fn exists(path: impl AsRef<Path>) -> bool {
@@ -135,22 +191,53 @@ impl Vault {
     /// Открыть существующее хранилище мастер-паролем. Неверный пароль → ошибка. v2 (Argon2id) —
     /// штатно; v1 (PBKDF2) — расшифровывается и МИГРИРУЕТ на Argon2id (пере-сохранение файла, C1).
     pub fn open(path: impl AsRef<Path>, passphrase: &str) -> Result<Vault> {
+        Self::open_detailed(path, passphrase).map_err(VaultOpenError::flatten)
+    }
+
+    /// Как [`Vault::open`], но с разделением причин ([`VaultOpenError`]) — для UI, который обязан
+    /// сказать «пароль неверен» ровно тогда, когда неверен именно пароль.
+    pub fn open_detailed(
+        path: impl AsRef<Path>,
+        passphrase: &str,
+    ) -> std::result::Result<Vault, VaultOpenError> {
         let path = path.as_ref().to_path_buf();
-        let raw = std::fs::read(&path).with_context(|| format!("читать vault {}", path.display()))?;
+        let raw = std::fs::read(&path)
+            .with_context(|| format!("читать хранилище {}", path.display()))
+            .map_err(VaultOpenError::Unavailable)?;
         if raw.len() < 5 || &raw[0..4] != MAGIC {
-            bail!("повреждённый файл хранилища (не CitadelPQVPN vault)");
+            return Err(VaultOpenError::Unavailable(anyhow!(
+                "повреждённый файл хранилища (не CitadelPQVPN vault): {}",
+                path.display()
+            )));
         }
         match raw[4] {
             VERSION => Self::open_v2(path, passphrase, &raw),
             VERSION_PBKDF2 => Self::open_v1_migrate(path, passphrase, &raw),
-            v => bail!("неподдерживаемая версия хранилища: {v}"),
+            v => Err(VaultOpenError::Unavailable(anyhow!(
+                "неподдерживаемая версия хранилища: {v}"
+            ))),
+        }
+    }
+
+    /// Подходит ли мастер-пароль к файлу хранилища: `Ok(true|false)` — про пароль, `Err` — про
+    /// доступность файла. Нужна там, где хранилище УЖЕ открыто в памяти и переоткрывать его незачем
+    /// (смена пароля: подтверждаем текущий, не трогая рабочую копию).
+    pub fn password_matches(path: impl AsRef<Path>, passphrase: &str) -> Result<bool> {
+        match Self::open_detailed(path, passphrase) {
+            Ok(_) => Ok(true),
+            Err(VaultOpenError::WrongPassword) => Ok(false),
+            Err(VaultOpenError::Unavailable(e)) => Err(e),
         }
     }
 
     /// v2: Argon2id-заголовок `m_kib‖t‖p‖salt‖nonce` → derive → decrypt.
-    fn open_v2(path: PathBuf, passphrase: &str, raw: &[u8]) -> Result<Vault> {
+    fn open_v2(
+        path: PathBuf,
+        passphrase: &str,
+        raw: &[u8],
+    ) -> std::result::Result<Vault, VaultOpenError> {
         if raw.len() < HEADER_LEN_V2 {
-            bail!("повреждённый v2-заголовок хранилища");
+            return Err(VaultOpenError::Unavailable(anyhow!("повреждённый v2-заголовок хранилища")));
         }
         let m_kib = u32::from_be_bytes(raw[5..9].try_into().unwrap());
         let t = u32::from_be_bytes(raw[9..13].try_into().unwrap());
@@ -160,22 +247,41 @@ impl Vault {
         let mut nonce = [0u8; NONCE_LEN];
         nonce.copy_from_slice(&raw[17 + SALT_LEN..HEADER_LEN_V2]);
 
-        let key = derive_key_argon2(passphrase, &salt, m_kib, t, p)?;
+        let key = derive_key_argon2(passphrase, &salt, m_kib, t, p)
+            .map_err(VaultOpenError::Unavailable)?;
         let mut in_out = raw[HEADER_LEN_V2..].to_vec();
+        // AEAD не сошёлся = пароль (штатный случай), а не поломка машины — отдельная ветка.
         let plain = key
             .open_in_place(Nonce::assume_unique_for_key(nonce), Aad::empty(), &mut in_out)
-            .map_err(|_| anyhow!("неверный мастер-пароль или повреждённое хранилище"))?;
-        let data: VaultData =
-            ciborium::from_reader(&plain[..]).context("разобрать профили (CBOR)")?;
+            .map_err(|_| VaultOpenError::WrongPassword)?;
+        let data: VaultData = ciborium::from_reader(&plain[..])
+            .context("разобрать профили (CBOR)")
+            .map_err(VaultOpenError::Unavailable)?;
         in_out.zeroize(); // S1.3/M7: затереть расшифрованный plaintext профилей (секреты)
-        Ok(Vault { path, key, salt, m_kib, t, p, data })
+        let mut v = Vault { path, key, salt, m_kib, t, p, data };
+        // Файл сделан на слабых параметрах (старая версия клиента) — поднимаем до текущих прямо
+        // сейчас: пароль в руках, момент единственный. Не смогли пере-записать — не беда, работаем
+        // на прочитанных параметрах (открытие хранилища важнее апгрейда его стойкости).
+        if argon_cost(m_kib, t) < argon_cost(ARGON_M_KIB, ARGON_T) {
+            match v.rekey(passphrase) {
+                Ok(()) => eprintln!(
+                    "[vault] параметры Argon2id подняты: m={m_kib}KiB,t={t} → m={ARGON_M_KIB}KiB,t={ARGON_T}"
+                ),
+                Err(e) => eprintln!("[vault] апгрейд параметров Argon2id пропущен: {e:#}"),
+            }
+        }
+        Ok(v)
     }
 
     /// v1 (legacy PBKDF2): расшифровать старым ключом, затем МИГРИРОВАТЬ на Argon2id — новый salt,
     /// Argon2-ключ, пере-сохранить как v2 (прозрачный upgrade при первом открытии, C1).
-    fn open_v1_migrate(path: PathBuf, passphrase: &str, raw: &[u8]) -> Result<Vault> {
+    fn open_v1_migrate(
+        path: PathBuf,
+        passphrase: &str,
+        raw: &[u8],
+    ) -> std::result::Result<Vault, VaultOpenError> {
         if raw.len() < HEADER_LEN_V1 {
-            bail!("повреждённый v1-заголовок хранилища");
+            return Err(VaultOpenError::Unavailable(anyhow!("повреждённый v1-заголовок хранилища")));
         }
         let iters = u32::from_be_bytes(raw[5..9].try_into().unwrap());
         let mut salt = [0u8; SALT_LEN];
@@ -183,20 +289,24 @@ impl Vault {
         let mut nonce = [0u8; NONCE_LEN];
         nonce.copy_from_slice(&raw[9 + SALT_LEN..HEADER_LEN_V1]);
 
-        let key = derive_key_pbkdf2(passphrase, &salt, iters)?;
+        let key =
+            derive_key_pbkdf2(passphrase, &salt, iters).map_err(VaultOpenError::Unavailable)?;
         let mut in_out = raw[HEADER_LEN_V1..].to_vec();
         let plain = key
             .open_in_place(Nonce::assume_unique_for_key(nonce), Aad::empty(), &mut in_out)
-            .map_err(|_| anyhow!("неверный мастер-пароль или повреждённое хранилище"))?;
-        let data: VaultData =
-            ciborium::from_reader(&plain[..]).context("разобрать профили (CBOR)")?;
+            .map_err(|_| VaultOpenError::WrongPassword)?;
+        let data: VaultData = ciborium::from_reader(&plain[..])
+            .context("разобрать профили (CBOR)")
+            .map_err(VaultOpenError::Unavailable)?;
         in_out.zeroize();
 
         // миграция → Argon2id v2 (новый salt + ключ, пере-сохранить файл)
+        let migrate = |e: anyhow::Error| VaultOpenError::Unavailable(e);
         let rng = SystemRandom::new();
         let mut new_salt = [0u8; SALT_LEN];
-        rng.fill(&mut new_salt).map_err(|_| anyhow!("RNG"))?;
-        let new_key = derive_key_argon2(passphrase, &new_salt, ARGON_M_KIB, ARGON_T, ARGON_P)?;
+        rng.fill(&mut new_salt).map_err(|_| migrate(anyhow!("RNG")))?;
+        let new_key = derive_key_argon2(passphrase, &new_salt, ARGON_M_KIB, ARGON_T, ARGON_P)
+            .map_err(migrate)?;
         let v = Vault {
             path,
             key: new_key,
@@ -206,9 +316,15 @@ impl Vault {
             p: ARGON_P,
             data,
         };
-        v.save()?; // перезаписать файл как v2 (Argon2id)
+        v.save().map_err(migrate)?; // перезаписать файл как v2 (Argon2id)
         eprintln!("[vault] мигрирован PBKDF2(v1) → Argon2id(v2)");
         Ok(v)
+    }
+
+    /// Путь файла хранилища (диагностика: в сообщениях об ошибках человеку нужно знать, ГДЕ лежит
+    /// его хранилище — на Windows это уже стоило разбирательства).
+    pub fn path(&self) -> &Path {
+        &self.path
     }
 
     /// Список профилей (копия для UI).
@@ -285,18 +401,40 @@ impl Vault {
     }
 
     /// Сменить мастер-пароль (новый salt + перешифровка). Vault уже разблокирован — текущий
-    /// пароль проверяется на уровне FFI повторным `open`.
+    /// пароль проверяется вызывающим ([`Vault::password_matches`]).
+    ///
+    /// Если записать файл не удалось (нет прав на папку, кончилось место), ключ в памяти
+    /// ВОЗВРАЩАЕТСЯ к прежнему: иначе разблокированное хранилище осталось бы зашифрованным новым
+    /// паролем только в оперативке, а на диске — старым, и следующая же запись профиля сделала бы
+    /// файл нечитаемым обоими паролями.
     pub fn change_password(&mut self, new_passphrase: &str) -> Result<()> {
         check_passphrase(new_passphrase)?;
+        self.rekey(new_passphrase)
+    }
+
+    /// Пере-шифровать файл под `passphrase` с ТЕКУЩИМИ Argon2-параметрами (новый salt + ключ).
+    /// Общий шаг для смены пароля и для апгрейда параметров старого хранилища.
+    fn rekey(&mut self, passphrase: &str) -> Result<()> {
         let rng = SystemRandom::new();
         let mut salt = [0u8; SALT_LEN];
         rng.fill(&mut salt).map_err(|_| anyhow!("RNG"))?;
-        self.key = derive_key_argon2(new_passphrase, &salt, ARGON_M_KIB, ARGON_T, ARGON_P)?;
+        let new_key = derive_key_argon2(passphrase, &salt, ARGON_M_KIB, ARGON_T, ARGON_P)?;
+        let prev = (
+            std::mem::replace(&mut self.key, new_key),
+            self.salt,
+            self.m_kib,
+            self.t,
+            self.p,
+        );
         self.salt = salt;
         self.m_kib = ARGON_M_KIB;
         self.t = ARGON_T;
         self.p = ARGON_P;
-        self.save()
+        if let Err(e) = self.save() {
+            (self.key, self.salt, self.m_kib, self.t, self.p) = prev; // откат: диск — источник истины
+            return Err(e);
+        }
+        Ok(())
     }
 
     /// Сериализовать + зашифровать + атомарно записать (temp → rename).
@@ -405,12 +543,12 @@ fn derive_key_pbkdf2(passphrase: &str, salt: &[u8], iters: u32) -> Result<LessSa
 
 /// Политика мастер-пароля (backstop): не пустой и не короче [`MIN_PASSPHRASE_LEN`]. Визуальную
 /// оценку силы показывает UI; здесь — жёсткий минимум перед дорогим Argon2-derive.
-fn check_passphrase(p: &str) -> Result<()> {
+pub fn check_passphrase(p: &str) -> Result<()> {
     if p.is_empty() {
-        bail!("мастер-пароль не может быть пустым");
+        bail!("Пароль не может быть пустым");
     }
     if p.chars().count() < MIN_PASSPHRASE_LEN {
-        bail!("мастер-пароль слишком короткий (минимум {MIN_PASSPHRASE_LEN} символов)");
+        bail!("Пароль слишком короткий: минимум {MIN_PASSPHRASE_LEN} символов");
     }
     Ok(())
 }
@@ -507,6 +645,38 @@ mod tests {
         std::fs::remove_file(&path).ok();
     }
 
+    /// Хранилище, созданное прежними (слабыми) Argon2-параметрами, при открытии поднимается до
+    /// текущих: пароль тот же, профили на месте, а файл на диске пере-шифрован — иначе усиление KDF
+    /// не дошло бы до тех, у кого хранилище уже есть.
+    #[test]
+    fn weak_argon_params_upgraded_on_open() {
+        let path = tmp_path("argon-upgrade");
+        let pass = "upgradepass1";
+        let uri = sample_uri();
+        {
+            // файл со слабыми параметрами (прежний OWASP-минимум: m=19 MiB, t=2)
+            let mut v = Vault::create(&path, pass).unwrap();
+            v.add("p", &uri).unwrap();
+            let weak = 19 * 1024;
+            v.key = derive_key_argon2(pass, &v.salt, weak, 2, ARGON_P).unwrap();
+            v.m_kib = weak;
+            v.t = 2;
+            v.save().unwrap();
+        }
+        let raw = std::fs::read(&path).unwrap();
+        assert_eq!(u32::from_be_bytes(raw[5..9].try_into().unwrap()), 19 * 1024, "исходно слабый");
+
+        let v = Vault::open(&path, pass).unwrap();
+        assert_eq!(v.list().len(), 1, "профили пережили апгрейд");
+        drop(v);
+        let raw = std::fs::read(&path).unwrap();
+        assert_eq!(u32::from_be_bytes(raw[5..9].try_into().unwrap()), ARGON_M_KIB);
+        assert_eq!(u32::from_be_bytes(raw[9..13].try_into().unwrap()), ARGON_T);
+        assert!(Vault::open(&path, pass).is_ok(), "тот же пароль открывает поднятый файл");
+        assert!(Vault::open(&path, "wrongpass1").is_err());
+        std::fs::remove_file(&path).ok();
+    }
+
     /// C1: старый v1-файл (PBKDF2) читается и МИГРИРУЕТ на Argon2id (v2) при открытии — прозрачный
     /// upgrade без потери профилей; после миграции файл — v2, повторное открытие работает.
     #[test]
@@ -574,6 +744,30 @@ mod tests {
         assert_eq!(v.list().len(), 1);
         assert!(v.remove("nope").is_err());
         assert!(v.add("bad", "not-a-citadel-link").is_err()); // мусор не кладём
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// UI обязан отличать «пароль не тот» от «хранилища нет / не читается»: в первом случае человек
+    /// пробует другой пароль, во втором — чинит доступ к файлу. Раньше обе ситуации приходили одной
+    /// ошибкой, и смена пароля рапортовала «текущий пароль неверен» на отказ в доступе к файлу.
+    #[test]
+    fn password_matches_separates_wrong_password_from_unavailable() {
+        let path = tmp_path("verify");
+        Vault::create(&path, "verifypass1").unwrap();
+        assert!(Vault::password_matches(&path, "verifypass1").unwrap(), "верный пароль");
+        assert!(!Vault::password_matches(&path, "wrongpass1").unwrap(), "неверный — это Ok(false)");
+
+        let missing = tmp_path("verify-missing");
+        let err = Vault::password_matches(&missing, "verifypass1");
+        assert!(err.is_err(), "нет файла — это Err (не «неверный пароль»)");
+        assert!(matches!(
+            Vault::open_detailed(&path, "wrongpass1"),
+            Err(VaultOpenError::WrongPassword)
+        ));
+        assert!(matches!(
+            Vault::open_detailed(&missing, "verifypass1"),
+            Err(VaultOpenError::Unavailable(_))
+        ));
         std::fs::remove_file(&path).ok();
     }
 

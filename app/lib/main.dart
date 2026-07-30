@@ -5,6 +5,7 @@ import 'package:path_provider/path_provider.dart';
 import 'package:window_manager/window_manager.dart';
 
 import 'package:app/app_state.dart';
+import 'package:app/errors.dart';
 import 'package:app/home_page.dart';
 import 'package:app/windows_tray.dart';
 import 'package:app/src/rust/api/citadel.dart';
@@ -153,7 +154,15 @@ class _CitadelAppState extends State<CitadelApp> with WindowListener {
     // без приложения. ПОСЛЕ disconnect: пока идёт сессия, служба занята pump'ом и запрос не примет.
     // На следующем подключении провайдер поднимет её обратно через SCM. На Linux/macOS — no-op.
     desktopServiceQuit();
-    await WindowsTray.dispose();
+    await WindowsTray.dispose(); // иконка должна исчезнуть до выхода, иначе останется «призрак»
+    // Windows: выходим сразу (см. desktop_exit_now) — `destroy()` там разбирает движок и плагины
+    // при живых нативных потоках уже после CoUninitialize, и это заканчивалось окном WER
+    // «Программа прекратила работу» на штатном закрытии. Всё, что должно пережить выход, уже на
+    // диске: vault пишется атомарно, kill-switch снят, служба уведомлена.
+    if (Platform.isWindows) {
+      desktopExitNow();
+      return; // сюда управление не возвращается
+    }
     await windowManager.destroy();
   }
 
@@ -252,8 +261,11 @@ class _UnlockScreenState extends State<UnlockScreen> {
     });
     try {
       await widget.state.unlock(_pw.text);
-    } catch (_) {
-      setState(() => _error = 'Неверный мастер-пароль');
+    } catch (e) {
+      // Текст берём от ядра: оно отличает «неверный пароль» от «нет доступа к файлу хранилища»
+      // (с путём) — раньше любая причина выглядела как неверный пароль, и человек перебирал его
+      // там, где надо было чинить доступ.
+      setState(() => _error = humanError(e));
     } finally {
       if (mounted) setState(() => _busy = false);
     }
@@ -299,13 +311,16 @@ class _UnlockScreenState extends State<UnlockScreen> {
                   autofocus: true,
                   obscureText: true,
                   onSubmitted: (_) => _submit(),
-                  decoration: InputDecoration(
+                  decoration: const InputDecoration(
                     labelText: 'Мастер-пароль',
-                    prefixIcon: const Icon(Icons.key_outlined),
-                    border: const OutlineInputBorder(),
-                    errorText: _error,
+                    prefixIcon: Icon(Icons.key_outlined),
+                    border: OutlineInputBorder(),
                   ),
                 ),
+                if (_error != null) ...[
+                  const SizedBox(height: 12),
+                  ErrorNote(text: _error!),
+                ],
                 const SizedBox(height: 16),
                 FilledButton(
                   onPressed: _busy ? null : _submit,

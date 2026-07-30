@@ -178,10 +178,11 @@ class AppState extends ChangeNotifier {
 
   /// Добавить профиль и подключиться. Профиль сохраняется в vault **сразу** (а не по успеху
   /// коннекта) — конфиг не теряется при неудаче; ненужный пользователь удалит сам.
-  void addAndConnect(String name, String uri) {
+  /// `vaultAdd` асинхронный: ядро валидирует ссылку через тот же ограничитель темпа, что и превью.
+  Future<void> addAndConnect(String name, String uri) async {
     String? id;
     try {
-      id = vaultAdd(name: name, uri: uri).id;
+      id = (await vaultAdd(name: name, uri: uri)).id;
       _reloadProfiles();
       notifyListeners();
     } catch (_) {

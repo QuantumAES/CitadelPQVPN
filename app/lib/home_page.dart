@@ -7,6 +7,7 @@ import 'package:flutter/services.dart';
 import 'package:app/android_vpn.dart';
 import 'package:app/app_state.dart';
 import 'package:app/debug_panel.dart';
+import 'package:app/errors.dart';
 import 'package:app/qr_scan_page.dart';
 import 'package:app/src/rust/api/citadel.dart';
 import 'package:app/split_tunnel_page.dart';
@@ -287,6 +288,19 @@ class _HomePageState extends State<HomePage> {
               ),
             // Admin (C7.4): реестр абонентов живёт в меню admin-профиля («Абоненты»), не здесь —
             // операции идут по туннелю этого профиля, SSH-путь удалён.
+            // Где лежит файл хранилища. Не мелочь: разбор жалобы «пароль не меняется» на Windows
+            // упёрся именно в то, что путь был не виден, а зависел от того, откуда запущен процесс.
+            // Тап — копирует путь (в поддержку/для проверки прав на папку).
+            ListTile(
+              leading: const Icon(Icons.folder_outlined),
+              title: const Text('Хранилище профилей'),
+              subtitle: Text(vaultLocation(), style: const TextStyle(fontSize: 11)),
+              onTap: () async {
+                await Clipboard.setData(ClipboardData(text: vaultLocation()));
+                if (sheetCtx.mounted) Navigator.pop(sheetCtx);
+                _toast('Путь хранилища скопирован');
+              },
+            ),
             ListTile(
               leading: const Icon(Icons.info_outline),
               title: const Text('О приложении'),
@@ -323,49 +337,110 @@ class _HomePageState extends State<HomePage> {
     if (ok == true) await AndroidVpn.openVpnSettings();
   }
 
+  /// Смена мастер-пароля. Диалог не закрывается, пока ядро не подтвердит успех: отказ показывается
+  /// прямо в форме и ТЕМ текстом, который вернуло ядро. Прежняя версия закрывалась сразу и писала
+  /// в тосте «текущий пароль неверен» на любую ошибку — в том числе на слишком короткий новый
+  /// пароль и на отказ записи файла, из-за чего смена выглядела сломанной при верном пароле.
   Future<void> _changePassword() async {
     final oldC = TextEditingController();
     final newC = TextEditingController();
-    final ok = await showDialog<bool>(
+    final new2C = TextEditingController();
+    final minLen = vaultMinPasswordLen();
+    final done = await showDialog<bool>(
       context: context,
-      builder: (dctx) => AlertDialog(
-        title: const Text('Сменить мастер-пароль'),
-        content: Column(
-          mainAxisSize: MainAxisSize.min,
-          children: [
-            TextField(
-              controller: oldC,
-              obscureText: true,
-              decoration: const InputDecoration(labelText: 'Текущий пароль'),
+      barrierDismissible: false,
+      builder: (dctx) {
+        String? err;
+        bool busy = false;
+        return StatefulBuilder(builder: (dctx, setLocal) {
+          Future<void> submit() async {
+            if (oldC.text.isEmpty) {
+              setLocal(() => err = 'Введите текущий пароль');
+              return;
+            }
+            if (newC.text.characters.length < minLen) {
+              setLocal(() => err = 'Новый пароль слишком короткий: минимум $minLen символов');
+              return;
+            }
+            if (newC.text != new2C.text) {
+              setLocal(() => err = 'Новые пароли не совпадают');
+              return;
+            }
+            setLocal(() {
+              busy = true;
+              err = null;
+            });
+            try {
+              await s.changePassword(oldC.text, newC.text);
+              if (dctx.mounted) Navigator.pop(dctx, true);
+            } catch (e) {
+              setLocal(() {
+                busy = false;
+                err = humanError(e);
+              });
+            }
+          }
+
+          return AlertDialog(
+            title: const Text('Сменить мастер-пароль'),
+            content: SingleChildScrollView(
+              child: Column(
+                mainAxisSize: MainAxisSize.min,
+                crossAxisAlignment: CrossAxisAlignment.stretch,
+                children: [
+                  TextField(
+                    controller: oldC,
+                    autofocus: true,
+                    obscureText: true,
+                    enabled: !busy,
+                    decoration: const InputDecoration(labelText: 'Текущий пароль'),
+                  ),
+                  const SizedBox(height: 12),
+                  TextField(
+                    controller: newC,
+                    obscureText: true,
+                    enabled: !busy,
+                    decoration: InputDecoration(
+                      labelText: 'Новый пароль',
+                      helperText: 'минимум $minLen символов',
+                    ),
+                  ),
+                  const SizedBox(height: 12),
+                  TextField(
+                    controller: new2C,
+                    obscureText: true,
+                    enabled: !busy,
+                    onSubmitted: busy ? null : (_) => submit(),
+                    decoration: const InputDecoration(labelText: 'Повторите новый пароль'),
+                  ),
+                  if (err != null) ...[
+                    const SizedBox(height: 12),
+                    ErrorNote(text: err!),
+                  ],
+                ],
+              ),
             ),
-            const SizedBox(height: 8),
-            TextField(
-              controller: newC,
-              obscureText: true,
-              decoration: const InputDecoration(labelText: 'Новый пароль'),
-            ),
-          ],
-        ),
-        actions: [
-          TextButton(
-              onPressed: () => Navigator.pop(dctx, false),
-              child: const Text('Отмена')),
-          FilledButton(
-              onPressed: () => Navigator.pop(dctx, true),
-              child: const Text('Сменить')),
-        ],
-      ),
+            actions: [
+              TextButton(
+                onPressed: busy ? null : () => Navigator.pop(dctx, false),
+                child: const Text('Отмена'),
+              ),
+              FilledButton(
+                onPressed: busy ? null : submit,
+                child: busy
+                    ? const SizedBox(
+                        height: 18, width: 18, child: CircularProgressIndicator(strokeWidth: 2))
+                    : const Text('Сменить'),
+              ),
+            ],
+          );
+        });
+      },
     );
-    if (ok == true) {
-      try {
-        await s.changePassword(oldC.text, newC.text);
-        _toast('Мастер-пароль изменён');
-      } catch (_) {
-        _toast('Не удалось: текущий пароль неверен');
-      }
-    }
+    if (done == true) _toast('Мастер-пароль изменён');
     oldC.dispose();
     newC.dispose();
+    new2C.dispose();
   }
 
   // ─────────────────────────── общие диалоги ───────────────────────────
@@ -395,6 +470,10 @@ class _HomePageState extends State<HomePage> {
   }
 
   /// Диалог ввода пароля (с опциональным подтверждением для создания). Возвращает true при успехе.
+  ///
+  /// Ошибку показываем отдельным блоком с переносом строк, а не в `errorText` поля: тот однострочный
+  /// и обрезал сообщение — ровно поэтому «не видно сообщение об ошибке полностью» при первой
+  /// установке пароля. Текст берём человеческий ([`humanError`]), без служебной обёртки FFI.
   Future<bool> _passwordDialog({
     required String title,
     required String action,
@@ -404,68 +483,98 @@ class _HomePageState extends State<HomePage> {
   }) async {
     final pw = TextEditingController();
     final pw2 = TextEditingController();
+    final minLen = vaultMinPasswordLen();
     final ok = await showDialog<bool>(
       context: context,
+      barrierDismissible: false,
       builder: (dctx) {
         String? err;
+        bool busy = false;
         return StatefulBuilder(builder: (dctx, setLocal) {
           Future<void> submit() async {
             if (pw.text.isEmpty) {
               setLocal(() => err = 'Пароль не может быть пустым');
               return;
             }
+            // Политику длины проверяем здесь же: то же число, что enforce'ит ядро (оно и отдаёт
+            // его через FFI), но человек узнаёт о ней сразу, а не после Argon2-derive. Только при
+            // создании: у существующего хранилища пароль мог быть задан прежней политикой.
+            if (confirm && pw.text.characters.length < minLen) {
+              setLocal(() => err = 'Пароль слишком короткий: минимум $minLen символов');
+              return;
+            }
             if (confirm && pw.text != pw2.text) {
               setLocal(() => err = 'Пароли не совпадают');
               return;
             }
+            setLocal(() {
+              busy = true;
+              err = null;
+            });
             try {
               await onSubmit(pw.text);
               if (dctx.mounted) Navigator.pop(dctx, true);
             } catch (e) {
-              // При создании «неверного пароля» не бывает — показываем реальную ошибку
-              // (например, недоступный каталог), иначе бы маскировали её под пароль.
-              setLocal(() => err = confirm
-                  ? 'Не удалось создать: ${_short(e)}'
-                  : 'Неверный пароль');
+              setLocal(() {
+                busy = false;
+                err = humanError(e);
+              });
             }
           }
 
           return AlertDialog(
             title: Text(title),
-            content: Column(
-              mainAxisSize: MainAxisSize.min,
-              children: [
-                if (hint != null)
-                  Padding(
-                    padding: const EdgeInsets.only(bottom: 12),
-                    child: Text(hint,
-                        style: Theme.of(dctx).textTheme.bodySmall),
-                  ),
-                TextField(
-                  controller: pw,
-                  autofocus: true,
-                  obscureText: true,
-                  decoration:
-                      InputDecoration(labelText: 'Пароль', errorText: err),
-                  onSubmitted: confirm ? null : (_) => submit(),
-                ),
-                if (confirm) ...[
-                  const SizedBox(height: 8),
+            content: SingleChildScrollView(
+              child: Column(
+                mainAxisSize: MainAxisSize.min,
+                crossAxisAlignment: CrossAxisAlignment.stretch,
+                children: [
+                  if (hint != null)
+                    Padding(
+                      padding: const EdgeInsets.only(bottom: 12),
+                      child: Text(hint,
+                          style: Theme.of(dctx).textTheme.bodySmall),
+                    ),
                   TextField(
-                    controller: pw2,
+                    controller: pw,
+                    autofocus: true,
                     obscureText: true,
-                    decoration:
-                        const InputDecoration(labelText: 'Повторите пароль'),
-                    onSubmitted: (_) => submit(),
+                    enabled: !busy,
+                    decoration: InputDecoration(
+                      labelText: 'Пароль',
+                      helperText: confirm ? 'минимум $minLen символов' : null,
+                    ),
+                    onSubmitted: confirm || busy ? null : (_) => submit(),
                   ),
+                  if (confirm) ...[
+                    const SizedBox(height: 12),
+                    TextField(
+                      controller: pw2,
+                      obscureText: true,
+                      enabled: !busy,
+                      decoration:
+                          const InputDecoration(labelText: 'Повторите пароль'),
+                      onSubmitted: busy ? null : (_) => submit(),
+                    ),
+                  ],
+                  if (err != null) ...[
+                    const SizedBox(height: 12),
+                    ErrorNote(text: err!),
+                  ],
                 ],
-              ],
+              ),
             ),
             actions: [
               TextButton(
-                  onPressed: () => Navigator.pop(dctx, false),
+                  onPressed: busy ? null : () => Navigator.pop(dctx, false),
                   child: const Text('Отмена')),
-              FilledButton(onPressed: submit, child: Text(action)),
+              FilledButton(
+                onPressed: busy ? null : submit,
+                child: busy
+                    ? const SizedBox(
+                        height: 18, width: 18, child: CircularProgressIndicator(strokeWidth: 2))
+                    : Text(action),
+              ),
             ],
           );
         });
@@ -480,12 +589,6 @@ class _HomePageState extends State<HomePage> {
     if (!mounted) return;
     ScaffoldMessenger.of(context)
         .showSnackBar(SnackBar(content: Text(msg)));
-  }
-
-  /// Короткое читабельное представление FFI-ошибки для inline-показа в диалоге.
-  static String _short(Object e) {
-    final s = e.toString().replaceAll('\n', ' ').trim();
-    return s.length > 120 ? '${s.substring(0, 117)}…' : s;
   }
 }
 
@@ -859,9 +962,43 @@ class _AddProfileSheetState extends State<AddProfileSheet> {
   final _name = TextEditingController();
   LinkSummaryDto? _summary;
 
+  /// Пауза после последнего нажатия, по истечении которой ссылку отдаём на проверку. Без неё
+  /// вердикт «ссылка не распознана» выскакивал на КАЖДЫЙ символ недописанной ссылки: и раздражает,
+  /// и превращает разбор в посимвольный оракул (проверка в ядре к тому же ограничивает темп).
+  static const _debounce = Duration(milliseconds: 500);
+  Timer? _pending;
+
+  /// Текст, к которому относится идущая проверка: ответ на устаревший текст выбрасываем (проверка
+  /// небыстрая, а пользователь за это время мог дописать ссылку).
+  String _checking = '';
+  bool _busy = false;
+
   void _onLinkChanged(String v) {
+    _pending?.cancel();
     final t = v.trim();
-    setState(() => _summary = t.isEmpty ? null : parseLinkSummary(uri: t));
+    if (t.isEmpty) {
+      setState(() {
+        _summary = null;
+        _busy = false;
+      });
+      return;
+    }
+    // Пока не проверили — ни «валидна», ни «не распознана»: показываем ожидание.
+    setState(() {
+      _summary = null;
+      _busy = true;
+    });
+    _pending = Timer(_debounce, () => _check(t));
+  }
+
+  Future<void> _check(String uri) async {
+    _checking = uri;
+    final res = await parseLinkSummary(uri: uri);
+    if (!mounted || _checking != uri) return; // ответ на уже неактуальный текст
+    setState(() {
+      _summary = res;
+      _busy = false;
+    });
   }
 
   Future<void> _paste() async {
@@ -897,6 +1034,7 @@ class _AddProfileSheetState extends State<AddProfileSheet> {
 
   @override
   void dispose() {
+    _pending?.cancel();
     _link.dispose();
     _name.dispose();
     super.dispose();
@@ -944,7 +1082,18 @@ class _AddProfileSheetState extends State<AddProfileSheet> {
               label: const Text('Сканировать QR камерой'),
             ),
           ],
-          if (_summary != null) ...[
+          if (_busy) ...[
+            const SizedBox(height: 12),
+            Row(
+              children: [
+                const SizedBox(
+                    height: 16, width: 16, child: CircularProgressIndicator(strokeWidth: 2)),
+                const SizedBox(width: 10),
+                Text('Проверяем ссылку…',
+                    style: Theme.of(context).textTheme.bodyMedium),
+              ],
+            ),
+          ] else if (_summary != null) ...[
             const SizedBox(height: 12),
             _LinkPreview(summary: _summary!),
           ],
