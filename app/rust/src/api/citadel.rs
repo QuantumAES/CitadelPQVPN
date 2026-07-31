@@ -1055,6 +1055,16 @@ pub fn android_stop_session() {
     *ANDROID_SINK.lock().unwrap() = None;
 }
 
+/// Android: есть ли активная нативная сессия (живой `VpnController` — включая фазу переподключения:
+/// он остаётся в [`ACTIVE`], пока сессию не остановили явно). Зовётся из JNI при воскрешении
+/// `CitadelVpnService` системой, чтобы отличить «процесс жив, туннель работает» от «процесс убили,
+/// восстанавливать нечего» (см. `Java_..._nativeHasSession`).
+#[cfg(target_os = "android")]
+pub(crate) fn has_active_session() -> bool {
+    // Отравленный мьютекс (паника под локом) — сам по себе повод считать сессию нежизнеспособной.
+    ACTIVE.lock().map(|g| g.is_some()).unwrap_or(false)
+}
+
 /// Android: сигнал «сменилась underlying-сеть» (WiFi↔LTE/toggle) → активный `VpnController`
 /// оборвёт текущий pump и переустановит сессию над новой сетью СРАЗУ (не ждёт pump-watchdog ~8с).
 /// No-op, если активной сессии нет. Зовётся из JNI `Java_..._nativeNetworkChanged` (NetworkCallback

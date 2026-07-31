@@ -1,23 +1,62 @@
 import 'package:flutter/material.dart';
-import 'package:flutter_rust_bridge/flutter_rust_bridge.dart' show AnyhowException;
+import 'package:flutter_rust_bridge/flutter_rust_bridge.dart'
+    show AnyhowException, PanicException;
+
+/// Технические хвосты, которых человеку в сообщении об отказе видеть не нужно. Текст режется по
+/// ПЕРВОМУ встреченному маркеру — всё, что дальше, уходит только в журнал отладки.
+///
+/// Порядок в списке не важен (ищем самый ранний индекс), важен состав:
+///   * `Caused by:`      — цепочка причин `anyhow` (`Debug`-вид);
+///   * `Stack backtrace:` — блок кадров, который `anyhow` дописывает при захваченном backtrace.
+///     Он появлялся, потому что шаблонный `setup_default_user_utils()` ставил процессу
+///     `RUST_BACKTRACE=1` (убрано в `api::simple::init_app`); маркер оставляем как страховку —
+///     backtrace может включить и окружение, а UI обязан оставаться чистым в любом случае;
+///   * `stack backtrace:` — тот же блок до капитализации (зависит от версии backtrace-rs);
+///   * `Backtrace [` / `<disabled>` — `Debug` у `std::backtrace::Backtrace`: FRB приклеивает его
+///     к тексту `PanicException` без разделителя.
+const _cutMarkers = <String>[
+  '\nCaused by:',
+  '\nStack backtrace:',
+  '\nstack backtrace:',
+  'Backtrace [',
+  '<disabled>',
+];
+
+/// Предел длины сообщения в диалоге: паника ядра или отказ ОС бывают длиной в абзац, а диалог
+/// должен остаться читаемым.
+const _limit = 300;
 
 /// Ошибка ядра → фраза для человека.
 ///
-/// Через FRB ошибка приезжает как `AnyhowException`, внутри — `Debug`-вид `anyhow`: верхняя строка
-/// (её ядро формулирует по-человечески), а следом «Caused by:» с технической цепочкой. Диалогу
-/// нужна ровно верхняя строка: цепочка не помещается в поле, обрывается многоточием и пугает
-/// пользователя — а её место в журнале отладки, куда ядро её и пишет.
+/// Через FRB ошибка приезжает как `AnyhowException` (паника — как `PanicException`), внутри —
+/// `Debug`-вид `anyhow`: верхняя строка (её ядро формулирует по-человечески), а следом служебные
+/// блоки. Диалогу нужна ровно верхняя строка: остальное не помещается в поле, обрывается
+/// многоточием и пугает пользователя — а его место в журнале отладки, куда ядро его и пишет.
 ///
 /// Многострочность СОХРАНЯЕМ: ядро намеренно переносит на вторую строку путь к файлу («Нет доступа
 /// к папке хранилища:\nC:\…»), и склеивать это в одну строку значит снова получить обрезанный текст.
+///
+/// Функция — ЕДИНСТВЕННЫЙ путь текста ошибки на экран: любой `catch (e)`, показывающий что-то
+/// пользователю, обязан идти через неё, а не через `'$e'` (тот ещё и обернёт всё в
+/// `AnyhowException(...)`).
 String humanError(Object e) {
-  final raw = e is AnyhowException ? e.message : e.toString();
-  final head = raw.split('\nCaused by:').first.trim();
+  var head = _rawMessage(e);
+  for (final marker in _cutMarkers) {
+    final i = head.indexOf(marker);
+    if (i >= 0) head = head.substring(0, i);
+  }
+  head = head.trim();
   if (head.isEmpty) return 'Неизвестная ошибка';
-  // Страховка от совсем длинного текста (например, паника ядра): диалог должен остаться читаемым.
-  const limit = 300;
-  return head.length > limit ? '${head.substring(0, limit - 1)}…' : head;
+  return head.length > _limit ? '${head.substring(0, _limit - 1)}…' : head;
 }
+
+/// Развернуть обёртку FFI: у `AnyhowException`/`PanicException` берём само сообщение, иначе —
+/// `toString()`. Без этого `'$e'` дал бы человеку `AnyhowException(Неверный мастер-пароль)`.
+String _rawMessage(Object e) => switch (e) {
+      AnyhowException(:final message) => message,
+      PanicException(:final message) => message,
+      _ => e.toString(),
+    };
 
 /// Блок с сообщением об отказе (диалоги пароля, экран разблокировки).
 ///

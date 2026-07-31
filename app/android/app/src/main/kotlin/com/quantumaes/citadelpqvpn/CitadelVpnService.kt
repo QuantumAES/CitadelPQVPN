@@ -3,6 +3,7 @@ package com.quantumaes.citadelpqvpn
 import android.app.Notification
 import android.app.NotificationChannel
 import android.app.NotificationManager
+import android.app.PendingIntent
 import android.content.Intent
 import android.content.pm.ServiceInfo
 import android.net.ConnectivityManager
@@ -59,6 +60,11 @@ class CitadelVpnService : VpnService() {
     // JNI (S2): смена underlying-сети → разбудить нативный connect-loop (Rust notify_network_changed)
     private external fun nativeNetworkChanged()
 
+    // JNI: жива ли нативная сессия движка в ЭТОМ процессе (Rust `has_active_session`). Нужен на
+    // воскрешении сервиса системой: у свежего процесса сессии нет, и это надо отличать от штатного
+    // старта, где сессию поднимет приложение сразу после `startService` (см. onStartCommand).
+    private external fun nativeHasSession(): Boolean
+
     // Мониторинг underlying-сети (WiFi/LTE) живёт в СЕРВИСЕ (переживает Activity → сигнал доходит и
     // при закрытом окне; в S1 он был в MainActivity и умирал с окном).
     private var netCallback: ConnectivityManager.NetworkCallback? = null
@@ -86,7 +92,39 @@ class CitadelVpnService : VpnService() {
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         startForegroundNotif()
+        // `intent == null` — сервис ВОСКРЕШЁН системой по START_STICKY после того, как процесс был
+        // убит (нехватка памяти, чистка «недавних» на OEM-прошивках — на устройствах эпохи
+        // Android 9 это рядовое событие). Восстановить сессию мы при этом не можем по построению:
+        // ссылка профиля лежит в зашифрованном хранилище и без мастер-пароля недоступна.
+        //
+        // Значит, туннеля нет — и постоянная нотификация вместе с системной иконкой ключа в
+        // статус-баре сейчас утверждали бы обратное. Это худший из возможных исходов: человек
+        // считает трафик защищённым, а он идёт открытым. Гасим сервис — отсутствие защиты должно
+        // быть видно; сессию поднимет приложение при следующем подключении.
+        if (intent == null && !nativeHasSession()) {
+            android.util.Log.w(
+                "CitadelVpn",
+                "сервис воскрешён без нативной сессии (процесс был убит) — гашу, чтобы не показывать защиту, которой нет"
+            )
+            stopTun()
+            return START_NOT_STICKY
+        }
         return START_STICKY
+    }
+
+    /**
+     * Пользователь закрыл приложение (смахнул из «недавних»). Туннель обязан остаться: окно — лишь
+     * пульт, сессию держит нативный движок в этом же процессе, а сервис — его foreground-якорь.
+     *
+     * Базовая реализация `Service.onTaskRemoved` пуста, и метод переопределён ради двух вещей:
+     * (а) зафиксировать намерение «сессию НЕ трогаем» рядом с `android:stopWithTask="false"` в
+     * манифесте; (б) переподтвердить foreground-нотификацию — часть прошивок в этот момент снимает
+     * её, и процесс из «perceptible» проваливается в кэш, откуда его убивают первым (после чего
+     * сервис воскресает уже без сессии — см. onStartCommand).
+     */
+    override fun onTaskRemoved(rootIntent: Intent?) {
+        android.util.Log.d("CitadelVpn", "onTaskRemoved: окно закрыто, сессию держим")
+        startForegroundNotif()
     }
 
     /** Построить TUN по параметрам, назначенным движком, вернуть detached fd для Rust. Зовётся из
@@ -373,7 +411,27 @@ class CitadelVpnService : VpnService() {
             .setContentText(text)
             .setSmallIcon(android.R.drawable.ic_lock_lock)
             .setOngoing(true)
+            .setContentIntent(openAppIntent()) // тап → окно приложения
             .build()
+
+    /**
+     * «Открыть приложение» по тапу на постоянной нотификации. При закрытом окне она — единственное,
+     * что видно о сессии, и до сих пор была мёртвой: вернуться к управлению можно было только через
+     * лаунчер. `ACTION_MAIN`+`CATEGORY_LAUNCHER` с явным компонентом поднимают СУЩЕСТВУЮЩУЮ задачу,
+     * а не создают вторую поверх (иначе новый экземпляр Activity перерисовал бы состояние с нуля).
+     *
+     * `FLAG_IMMUTABLE` обязателен с API 31 и доступен с API 23 (у нас minSdk 24) — ставим всегда:
+     * менять этот intent извне некому.
+     */
+    private fun openAppIntent(): PendingIntent {
+        val i = Intent(this, MainActivity::class.java)
+            .setAction(Intent.ACTION_MAIN)
+            .addCategory(Intent.CATEGORY_LAUNCHER)
+            .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_RESET_TASK_IF_NEEDED)
+        return PendingIntent.getActivity(
+            this, 0, i, PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+        )
+    }
 
     /**
      * Отразить состояние сессии в постоянной нотификации. Зовётся из Rust через JNI на каждую смену

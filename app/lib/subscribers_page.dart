@@ -2,6 +2,7 @@ import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 
 import 'package:app/app_state.dart';
+import 'package:app/errors.dart';
 import 'package:app/src/rust/api/admin.dart';
 import 'package:app/src/rust/api/citadel.dart';
 
@@ -68,7 +69,7 @@ class _SubscribersPageState extends State<SubscribersPage> {
           return await op();
         } catch (e) {
           if (attempt >= retries || !mounted) {
-            if (mounted) setState(() => _error = _short('$e'));
+            if (mounted) setState(() => _error = _short(humanError(e)));
             return null;
           }
           await Future.delayed(delay); // admin-путь после туннеля мог ещё не подняться
@@ -395,6 +396,8 @@ class _SubscribersPageState extends State<SubscribersPage> {
     return '${d.year}-${two(d.month)}-${two(d.day)}';
   }
 
+  /// Однострочная форма для узкой плашки отказа. Текст сюда приходит уже человеческим (см.
+  /// [humanError]) — здесь только схлопываем переносы и подрезаем длину.
   static String _short(String s) {
     final t = s.replaceAll('\n', ' ').trim();
     return t.length > 200 ? '${t.substring(0, 197)}…' : t;

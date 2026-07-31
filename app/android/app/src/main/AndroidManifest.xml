@@ -19,10 +19,16 @@
         android:name="${applicationName}"
         android:icon="@mipmap/ic_launcher">
         <!-- VpnService движка CitadelPQVPN (трек C3) -->
+        <!-- stopWithTask="false": закрытие приложения («смахнули из недавних») туннель не рвёт —
+             сессию держит нативный движок, сервис ей foreground-якорь. Значение совпадает с
+             умолчанием платформы и проставлено ЯВНО намеренно: это инвариант продукта (VPN живёт
+             в фоне), и он не должен зависеть от того, как трактует умолчание конкретная прошивка.
+             Парный код — CitadelVpnService.onTaskRemoved. -->
         <service
             android:name=".CitadelVpnService"
             android:exported="false"
             android:permission="android.permission.BIND_VPN_SERVICE"
+            android:stopWithTask="false"
             android:foregroundServiceType="systemExempted">
             <intent-filter>
                 <action android:name="android.net.VpnService"/>

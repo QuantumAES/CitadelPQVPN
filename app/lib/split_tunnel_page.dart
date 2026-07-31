@@ -3,6 +3,7 @@ import 'dart:io';
 import 'package:flutter/material.dart';
 
 import 'package:app/android_vpn.dart';
+import 'package:app/errors.dart';
 import 'package:app/src/rust/api/citadel.dart';
 
 /// C8.3 split-tunneling. Две независимые оси:
@@ -273,7 +274,7 @@ class _AppPickerPageState extends State<_AppPickerPage> {
       final apps = await AndroidVpn.listInstalledApps();
       if (mounted) setState(() => _all = apps);
     } catch (e) {
-      if (mounted) setState(() => _error = e.toString());
+      if (mounted) setState(() => _error = humanError(e));
     }
   }
 

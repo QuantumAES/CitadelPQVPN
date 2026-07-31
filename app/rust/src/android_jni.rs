@@ -113,6 +113,20 @@ pub extern "system" fn Java_com_quantumaes_citadelpqvpn_CitadelVpnService_native
     crate::api::citadel::notify_active_network_changed();
 }
 
+/// Kotlin `CitadelVpnService.onStartCommand` → жива ли нативная сессия в этом процессе.
+///
+/// Спрашивается ровно в одном случае: сервис воскрешён системой по `START_STICKY` (`intent == null`).
+/// Если процесс перед этим убили, здесь новые пустые статики — сессии нет, и сервису незачем висеть
+/// с нотификацией «Подключение…» над отсутствующим туннелем. Штатный старт (`startService` из
+/// приложения) сюда не заходит: там сессия появляется мгновением позже.
+#[no_mangle]
+pub extern "system" fn Java_com_quantumaes_citadelpqvpn_CitadelVpnService_nativeHasSession<'local>(
+    _env: JNIEnv<'local>,
+    _service: JObject<'local>,
+) -> jni::sys::jboolean {
+    u8::from(crate::api::citadel::has_active_session())
+}
+
 /// Показать состояние сессии в постоянной нотификации (`CitadelVpnService.setStatus`). Зовётся из
 /// форвард-задачи событий движка на каждую смену состояния — включая случай, когда окна приложения
 /// нет: нотификация тогда единственный индикатор, и «туннель активен» в ней при пропавшей сети —
