@@ -223,8 +223,11 @@ impl PinnedServerCert {
 }
 
 impl std::fmt::Debug for PinnedServerCert {
+    /// Без значения pin: `Debug` верификатора попадает в диагностику rustls/quinn, а pin — это
+    /// идентификатор сертификата exit'а, которому не место в журнале на устройстве (см. лог
+    /// «pinning …: серт-pin активен» в `client.rs`).
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "PinnedServerCert({})", hex::encode(self.pin))
+        f.write_str("PinnedServerCert(pin скрыт)")
     }
 }
 

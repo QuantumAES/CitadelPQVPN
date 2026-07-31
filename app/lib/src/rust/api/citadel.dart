@@ -105,6 +105,20 @@ Future<ProfileDto> vaultAdd({required String name, required String uri}) =>
 void vaultRemove({required String id}) =>
     RustLib.instance.api.crateApiCitadelVaultRemove(id: id);
 
+/// Переименовать профиль (пункт «Переименовать» в меню профиля). Имя — отображаемое поле, ядро
+/// само чистит его от управляющих символов и ужимает до предела; пустое — отказ.
+void vaultRename({required String id, required String name}) =>
+    RustLib.instance.api.crateApiCitadelVaultRename(id: id, name: name);
+
+/// Переместить профиль на одну позицию вверх (`up=true`) или вниз в списке. Порядок хранится в
+/// самом vault, поэтому переживает перезапуск и переносится вместе с хранилищем.
+void vaultMove({required String id, required bool up}) =>
+    RustLib.instance.api.crateApiCitadelVaultMove(id: id, up: up);
+
+/// Предел длины имени профиля из ядра — чтобы поле ввода в UI ограничивало ровно тем же числом,
+/// а не «своим» (иначе человек набирает имя, которое молча обрежется).
+int vaultMaxNameLen() => RustLib.instance.api.crateApiCitadelVaultMaxNameLen();
+
 /// Разобрать `citadel://`-ссылку → превью для UI (валидация при вставке).
 ///
 /// НЕ `sync` и намеренно небыстрая: см. [`guarded_parse_link`] — мгновенный вердикт «распознана /

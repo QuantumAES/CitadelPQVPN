@@ -383,7 +383,11 @@ pub(crate) async fn try_quic_connect(
         let qcfg = match cfg.pin_for(pin_host) {
             PinMode::Pinned(p) => {
                 if !logged_pin {
-                    eprintln!("[citadel-m1:client] pinning {pin_host}: {}", hex::encode(p));
+                    // Сам pin (hex) в журнал НЕ пишем: это стабильный идентификатор сертификата
+                    // конкретного exit'а — по нему журнал, отданный в поддержку/утёкший с
+                    // устройства, связывает пользователя с сервером. Для диагностики достаточно
+                    // факта «pin активен»: несовпадение и так видно по отказу TLS.
+                    eprintln!("[citadel-m1:client] pinning {pin_host}: серт-pin активен");
                     logged_pin = true;
                 }
                 crate::client_config_pinned(crate::kx_groups_for(&cfg.kx_suite), p)?

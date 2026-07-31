@@ -260,11 +260,13 @@ impl VpnController {
                         self.emit(VpnEvent::Error(why.into()));
                         eprintln!("[vpn] {why} (через {backoff:?})");
                         self.set_state(if ever_up { VpnState::Migrating } else { VpnState::Connecting });
-                        if self.sleep_or_stop(backoff).await {
-                            self.set_state(VpnState::Down);
-                            return Ok(());
+                        match self.backoff_wait(backoff).await {
+                            Some(next) => backoff = next,
+                            None => {
+                                self.set_state(VpnState::Down);
+                                return Ok(());
+                            }
                         }
-                        backoff = next_backoff(backoff);
                         continue;
                     }
                     None => {} // первый заход: токен из ссылки/vault ещё не предъявлялся — пробуем им
@@ -305,11 +307,13 @@ impl VpnController {
                     self.emit(VpnEvent::Error(format!("{e:#}")));
                     eprintln!("[vpn] establish не удался: {e:#} — ретрай через {:?}", backoff);
                     self.set_state(if ever_up { VpnState::Migrating } else { VpnState::Connecting });
-                    if self.sleep_or_stop(backoff).await {
-                        self.set_state(VpnState::Down);
-                        return Ok(());
+                    match self.backoff_wait(backoff).await {
+                        Some(next) => backoff = next,
+                        None => {
+                            self.set_state(VpnState::Down);
+                            return Ok(());
+                        }
                     }
-                    backoff = next_backoff(backoff);
                     continue;
                 }
             };
@@ -371,11 +375,13 @@ impl VpnController {
                     }
                     eprintln!("[vpn] реконнект: configure TUN не удался: {e:#} — ретрай через {:?}", backoff);
                     self.set_state(VpnState::Migrating);
-                    if self.sleep_or_stop(backoff).await {
-                        self.set_state(VpnState::Down);
-                        return Ok(());
+                    match self.backoff_wait(backoff).await {
+                        Some(next) => backoff = next,
+                        None => {
+                            self.set_state(VpnState::Down);
+                            return Ok(());
+                        }
                     }
-                    backoff = next_backoff(backoff);
                     continue;
                 }
             };
@@ -426,24 +432,37 @@ impl VpnController {
             if net_changed {
                 backoff = RECONNECT_BACKOFF_START;
             } else {
-                if self.sleep_or_stop(backoff).await {
-                    self.set_state(VpnState::Down);
-                    return Ok(());
+                match self.backoff_wait(backoff).await {
+                    Some(next) => backoff = next,
+                    None => {
+                        self.set_state(VpnState::Down);
+                        return Ok(());
+                    }
                 }
-                backoff = next_backoff(backoff);
             }
         }
     }
 
-    /// Подождать `d` ИЛИ пробуждение по `disconnect`. `true` — пользователь остановил (прервать
-    /// реконнект); `false` — таймаут истёк, продолжаем попытки.
-    async fn sleep_or_stop(&self, d: Duration) -> bool {
+    /// Пауза перед следующей попыткой реконнекта. Возвращает backoff для СЛЕДУЮЩЕЙ паузы либо
+    /// `None`, если пользователь остановил сессию (вызывающий выходит из цикла).
+    ///
+    /// Просыпается досрочно не только на `disconnect`, но и на смену сети: без этого возврат связи
+    /// (сеть появилась после «нет сети вовсе») ждал бы истечения текущего backoff — до 30с при
+    /// уже доступном интернете. Сигнал есть ровно тогда, когда ОС сообщила о новой underlying-сети,
+    /// поэтому backoff при нём сбрасывается: это не «очередная неудачная попытка», а новые условия.
+    async fn backoff_wait(&self, cur: Duration) -> Option<Duration> {
         if self.stopped.load(Ordering::SeqCst) {
-            return true;
+            return None;
         }
         tokio::select! {
-            _ = tokio::time::sleep(d) => self.stopped.load(Ordering::SeqCst),
-            _ = self.shutdown.notified() => true,
+            _ = tokio::time::sleep(cur) => {
+                if self.stopped.load(Ordering::SeqCst) { None } else { Some(next_backoff(cur)) }
+            }
+            _ = self.shutdown.notified() => None,
+            _ = self.network_changed.notified() => {
+                eprintln!("[vpn] смена сети во время паузы реконнекта — пробую сразу");
+                Some(RECONNECT_BACKOFF_START)
+            }
         }
     }
 
@@ -594,11 +613,36 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn sleep_or_stop_returns_immediately_when_stopped() {
+    async fn backoff_wait_returns_immediately_when_stopped() {
         let c = VpnController::new();
         c.disconnect(); // ставит stopped
-        // не ждёт 10с — сразу true (реконнект прерывается пользовательским disconnect)
-        assert!(c.sleep_or_stop(Duration::from_secs(10)).await);
+        // не ждёт 10с — сразу None (реконнект прерывается пользовательским disconnect)
+        assert!(c.backoff_wait(Duration::from_secs(10)).await.is_none());
+    }
+
+    /// Пауза между попытками истекла штатно → backoff растёт (следующая пауза длиннее).
+    #[tokio::test]
+    async fn backoff_wait_grows_after_plain_timeout() {
+        let c = VpnController::new();
+        let next = c.backoff_wait(Duration::from_millis(1)).await;
+        assert_eq!(next, Some(Duration::from_millis(2)));
+    }
+
+    /// Сеть вернулась во время паузы реконнекта (Android: onAvailable после «нет сети вовсе») →
+    /// ждать до конца backoff нельзя, иначе интернет уже есть, а туннель поднимается через 30с.
+    /// Просыпаемся досрочно и сбрасываем backoff.
+    #[tokio::test]
+    async fn backoff_wait_wakes_on_network_change_and_resets_backoff() {
+        let c = Arc::new(VpnController::new());
+        let c2 = c.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            c2.notify_network_changed();
+        });
+        let started = std::time::Instant::now();
+        let next = c.backoff_wait(RECONNECT_BACKOFF_MAX).await;
+        assert_eq!(next, Some(RECONNECT_BACKOFF_START), "backoff сброшен: условия новые");
+        assert!(started.elapsed() < Duration::from_secs(5), "проснулись досрочно, а не через 30с");
     }
 
     /// C5.4b: pre-connect провал (напр. фетч Layer-1 токена не удался) эмитит Error → Down,

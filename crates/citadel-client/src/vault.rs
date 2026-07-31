@@ -62,6 +62,12 @@ fn argon_cost(m_kib: u32, t: u32) -> u64 {
 /// Публичная: UI обязан проверять то же самое ДО дорогого Argon2-derive и говорить человеку
 /// конкретное число, а не «не удалось» (иначе пользователь угадывает политику вслепую).
 pub const MIN_PASSPHRASE_LEN: usize = 8;
+/// Потолок длины имени профиля. Имя — чисто отображаемое поле, но приходит от человека и
+/// попадает в список/заголовки/журнал: длинную «простыню» и управляющие символы (перевод строки)
+/// режем на входе, а не в каждом месте показа.
+pub const MAX_PROFILE_NAME_LEN: usize = 64;
+/// Префикс авто-имени профиля, когда пользователь своё не задал: `Citadel001`, `Citadel002`, …
+const DEFAULT_NAME_PREFIX: &str = "Citadel";
 /// Заголовок v2: magic+ver+m_kib+t+p+salt+nonce = 45. v1 (legacy): magic+ver+iters+salt+nonce = 37.
 const HEADER_LEN_V2: usize = 4 + 1 + 4 + 4 + 4 + SALT_LEN + NONCE_LEN;
 const HEADER_LEN_V1: usize = 4 + 1 + 4 + SALT_LEN + NONCE_LEN;
@@ -333,13 +339,14 @@ impl Vault {
     }
 
     /// Добавить профиль из `citadel://`-ссылки (валидируется). Возвращает созданный профиль.
+    /// Пустое имя → авто-имя [`Vault::next_default_name`] (`Citadel001`, …).
     pub fn add(&mut self, name: &str, uri: &str) -> Result<Profile> {
         // валидность ссылки — до сохранения секрета (мусор в vault не кладём)
         CredentialLink::from_uri(uri).context("невалидная citadel://-ссылка")?;
-        let name = name.trim();
+        let name = sanitize_name(name);
         let p = Profile {
             id: random_id()?,
-            name: if name.is_empty() { default_name(uri) } else { name.to_string() },
+            name: if name.is_empty() { self.next_default_name() } else { name },
             uri: uri.to_string(),
             created: now_unix(),
             last_exit: None,
@@ -347,6 +354,58 @@ impl Vault {
         self.data.profiles.push(p.clone());
         self.save()?;
         Ok(p)
+    }
+
+    /// Переименовать профиль. Пустое (после очистки) имя — отказ: «профиль без имени» в списке
+    /// неотличим от соседей, а молча подставлять авто-имя вместо введённого человеком — врать ему.
+    pub fn rename(&mut self, id: &str, name: &str) -> Result<()> {
+        let name = sanitize_name(name);
+        if name.is_empty() {
+            bail!("Имя профиля не может быть пустым");
+        }
+        let p = self
+            .data
+            .profiles
+            .iter_mut()
+            .find(|p| p.id == id)
+            .ok_or_else(|| anyhow!("профиль не найден: {id}"))?;
+        if p.name == name {
+            return Ok(()); // ничего не изменилось — не переписываем файл
+        }
+        p.name = name;
+        self.save()
+    }
+
+    /// Переместить профиль на одну позицию вверх/вниз. Порядок профилей в файле — и есть порядок
+    /// списка в UI (отдельного поля сортировки нет: список короткий, а ручной порядок должен
+    /// переживать перезапуск и смену устройства вместе с хранилищем). На краю списка — no-op.
+    pub fn move_profile(&mut self, id: &str, up: bool) -> Result<()> {
+        let i = self
+            .data
+            .profiles
+            .iter()
+            .position(|p| p.id == id)
+            .ok_or_else(|| anyhow!("профиль не найден: {id}"))?;
+        let j = if up {
+            i.checked_sub(1)
+        } else {
+            (i + 1 < self.data.profiles.len()).then_some(i + 1)
+        };
+        let Some(j) = j else { return Ok(()) };
+        self.data.profiles.swap(i, j);
+        self.save()
+    }
+
+    /// Первое свободное авто-имя `CitadelNNN`. Занятые номера берём из ИМЁН существующих профилей
+    /// (а не из их количества): иначе после удаления профиля новый получил бы имя-двойник.
+    fn next_default_name(&self) -> String {
+        let used: std::collections::BTreeSet<u32> =
+            self.data.profiles.iter().filter_map(|p| default_name_number(&p.name)).collect();
+        let mut n: u32 = 1;
+        while used.contains(&n) {
+            n += 1;
+        }
+        format!("{DEFAULT_NAME_PREFIX}{n:03}")
     }
 
     /// Удалить профиль по id.
@@ -564,12 +623,22 @@ fn now_unix() -> u64 {
     SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
 }
 
-/// Имя по умолчанию из первого хоста ссылки (если пользователь не задал).
-fn default_name(uri: &str) -> String {
-    CredentialLink::from_uri(uri)
-        .ok()
-        .and_then(|l| l.servers.first().cloned())
-        .unwrap_or_else(|| "профиль".into())
+/// Очистить пользовательское имя профиля: убрать управляющие символы (перевод строки в имени
+/// ломает и список, и журнал), обрезать пробелы и ужать до [`MAX_PROFILE_NAME_LEN`].
+/// Пустая строка на выходе = «имя не задано» (вызывающий подставит авто-имя либо откажет).
+fn sanitize_name(name: &str) -> String {
+    let cleaned: String = name.chars().filter(|c| !c.is_control()).collect();
+    cleaned.trim().chars().take(MAX_PROFILE_NAME_LEN).collect::<String>().trim_end().to_string()
+}
+
+/// Номер авто-имени (`Citadel007` → 7); любое другое имя — `None`. Нужен, чтобы нумерация
+/// продолжалась после удалений и не сталкивалась с именем, введённым/переименованным вручную.
+fn default_name_number(name: &str) -> Option<u32> {
+    let digits = name.strip_prefix(DEFAULT_NAME_PREFIX)?;
+    if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    digits.parse().ok()
 }
 
 #[cfg(test)]
@@ -827,13 +896,79 @@ mod tests {
         std::fs::remove_file(&path).ok();
     }
 
+    /// Имя не задано → `Citadel001`, `Citadel002`, … Нумерация идёт по ЗАНЯТЫМ именам: после
+    /// удаления освободившийся номер переиспользуется, а имя, заданное человеком, не подменяется.
     #[test]
-    fn default_name_from_host() {
+    fn default_name_is_numbered_citadel() {
         let path = tmp_path("defname");
         let uri = sample_uri();
         let mut v = Vault::create(&path, "defnamepass1").unwrap();
-        let p = v.add("   ", &uri).unwrap(); // пустое имя → хост из ссылки
-        assert_eq!(p.name, "exit.example:4433");
+        assert_eq!(v.add("   ", &uri).unwrap().name, "Citadel001");
+        let second = v.add("", &uri).unwrap();
+        assert_eq!(second.name, "Citadel002");
+        assert_eq!(v.add("домашний", &uri).unwrap().name, "домашний", "заданное имя не трогаем");
+        assert_eq!(v.add("", &uri).unwrap().name, "Citadel003");
+        v.remove(&second.id).unwrap();
+        assert_eq!(v.add("", &uri).unwrap().name, "Citadel002", "освободившийся номер переиспользуем");
+        // управляющие символы и длина: имя — отображаемое поле, мусор в него не пускаем
+        assert_eq!(v.add("  ноут\nвторая строка ", &uri).unwrap().name, "ноутвторая строка");
+        let long = v.add(&"я".repeat(200), &uri).unwrap();
+        assert_eq!(long.name.chars().count(), MAX_PROFILE_NAME_LEN);
+        assert_eq!(v.add("\u{7}\u{1}", &uri).unwrap().name, "Citadel004", "имя из одних управляющих = пустое");
         std::fs::remove_file(&path).ok();
+    }
+
+    /// Переименование: сохраняется на диск, пустое имя отвергается, неизвестный id — ошибка.
+    #[test]
+    fn rename_persists_and_rejects_empty() {
+        let path = tmp_path("rename");
+        let uri = sample_uri();
+        let id = {
+            let mut v = Vault::create(&path, "renamepass1").unwrap();
+            let p = v.add("", &uri).unwrap();
+            v.rename(&p.id, "  рабочий  ").unwrap();
+            assert_eq!(v.list()[0].name, "рабочий");
+            assert!(v.rename(&p.id, "   ").is_err(), "пустое имя — отказ");
+            assert!(v.rename("нет-такого", "имя").is_err());
+            p.id
+        };
+        let v = Vault::open(&path, "renamepass1").unwrap();
+        assert_eq!(v.list()[0].name, "рабочий", "переименование пережило переоткрытие");
+        assert_eq!(v.list()[0].id, id);
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// Порядок профилей = порядок в файле: перемещение вверх/вниз переживает переоткрытие,
+    /// на краях списка — молчаливый no-op (кнопка в UI просто не даёт эффекта, а не ломается).
+    #[test]
+    fn move_profile_reorders_and_persists() {
+        let path = tmp_path("reorder");
+        let uri = sample_uri();
+        let (a, b, c) = {
+            let mut v = Vault::create(&path, "reorderpass1").unwrap();
+            let a = v.add("a", &uri).unwrap().id;
+            let b = v.add("b", &uri).unwrap().id;
+            let c = v.add("c", &uri).unwrap().id;
+            v.move_profile(&c, true).unwrap(); // c вверх → a, c, b
+            assert_eq!(names(&v), vec!["a", "c", "b"]);
+            v.move_profile(&a, false).unwrap(); // a вниз → c, a, b
+            assert_eq!(names(&v), vec!["c", "a", "b"]);
+            v.move_profile(&c, true).unwrap(); // уже первый — no-op
+            v.move_profile(&b, false).unwrap(); // уже последний — no-op
+            assert_eq!(names(&v), vec!["c", "a", "b"]);
+            assert!(v.move_profile("нет-такого", true).is_err());
+            (a, b, c)
+        };
+        let v = Vault::open(&path, "reorderpass1").unwrap();
+        assert_eq!(
+            v.list().iter().map(|p| p.id.clone()).collect::<Vec<_>>(),
+            vec![c, a, b],
+            "порядок пережил переоткрытие"
+        );
+        std::fs::remove_file(&path).ok();
+    }
+
+    fn names(v: &Vault) -> Vec<String> {
+        v.list().into_iter().map(|p| p.name).collect()
     }
 }

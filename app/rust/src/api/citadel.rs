@@ -650,6 +650,29 @@ pub fn vault_remove(id: String) -> Result<()> {
     g.as_mut().ok_or_else(|| anyhow!("хранилище заблокировано"))?.remove(&id)
 }
 
+/// Переименовать профиль (пункт «Переименовать» в меню профиля). Имя — отображаемое поле, ядро
+/// само чистит его от управляющих символов и ужимает до предела; пустое — отказ.
+#[frb(sync)]
+pub fn vault_rename(id: String, name: String) -> Result<()> {
+    let mut g = VAULT.lock().unwrap();
+    g.as_mut().ok_or_else(|| anyhow!("Хранилище заблокировано"))?.rename(&id, &name)
+}
+
+/// Переместить профиль на одну позицию вверх (`up=true`) или вниз в списке. Порядок хранится в
+/// самом vault, поэтому переживает перезапуск и переносится вместе с хранилищем.
+#[frb(sync)]
+pub fn vault_move(id: String, up: bool) -> Result<()> {
+    let mut g = VAULT.lock().unwrap();
+    g.as_mut().ok_or_else(|| anyhow!("Хранилище заблокировано"))?.move_profile(&id, up)
+}
+
+/// Предел длины имени профиля из ядра — чтобы поле ввода в UI ограничивало ровно тем же числом,
+/// а не «своим» (иначе человек набирает имя, которое молча обрежется).
+#[frb(sync)]
+pub fn vault_max_name_len() -> u32 {
+    citadel_client::MAX_PROFILE_NAME_LEN as u32
+}
+
 /// Разобрать `citadel://`-ссылку → превью для UI (валидация при вставке).
 ///
 /// НЕ `sync` и намеренно небыстрая: см. [`guarded_parse_link`] — мгновенный вердикт «распознана /
@@ -952,6 +975,12 @@ fn android_start(uri: &str, profile_id: Option<String>, sink: StreamSink<VpnEven
             // Обновить статус (нюанс 2) — и выйти, если сессию сменили (устаревшее поколение).
             if !update_android_status(&ev, generation) {
                 break;
+            }
+            // Постоянная нотификация — единственное, что видно о сессии при закрытом окне: держим
+            // её текст в согласии с состоянием движка (переподключение ≠ «туннель активен»).
+            #[cfg(target_os = "android")]
+            if let VpnEvent::State(s) = &ev {
+                crate::android_jni::set_status(vpn_state_str(*s));
             }
             update_last_exit(&profile_id, &ev);
             // Переслать в текущий изолят (если подписан); мёртвый sink снимаем до re-attach.

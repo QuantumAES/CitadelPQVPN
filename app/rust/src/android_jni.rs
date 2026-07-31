@@ -113,6 +113,38 @@ pub extern "system" fn Java_com_quantumaes_citadelpqvpn_CitadelVpnService_native
     crate::api::citadel::notify_active_network_changed();
 }
 
+/// Показать состояние сессии в постоянной нотификации (`CitadelVpnService.setStatus`). Зовётся из
+/// форвард-задачи событий движка на каждую смену состояния — включая случай, когда окна приложения
+/// нет: нотификация тогда единственный индикатор, и «туннель активен» в ней при пропавшей сети —
+/// прямая ложь. Best-effort: сервис не зарегистрирован / JNI не дался → молча пропускаем (текст
+/// нотификации не стоит того, чтобы ронять сессию).
+pub fn set_status(state: &str) {
+    let Some(vm) = VM.get() else { return };
+    let Some(service) = SERVICE.lock().unwrap().clone() else { return };
+    let mut env = match vm.attach_current_thread() {
+        Ok(e) => e,
+        Err(e) => {
+            eprintln!("[jni] setStatus: attach_current_thread: {e}");
+            return;
+        }
+    };
+    let Ok(state_j) = env.new_string(state) else { return };
+    let res = env.call_method(
+        service.as_obj(),
+        "setStatus",
+        "(Ljava/lang/String;)V",
+        &[JValue::Object(&state_j)],
+    );
+    // Как и в остальных мостах: висящее Java-исключение обязано быть очищено ДО дропа env,
+    // иначе detach потока валит процесс («JNI DETECTED ERROR»).
+    if env.exception_check().unwrap_or(false) {
+        let _ = env.exception_clear();
+    }
+    if let Err(e) = res {
+        eprintln!("[jni] CitadelVpnService.setStatus: {e}");
+    }
+}
+
 /// Построить TUN через `CitadelVpnService.establishTun(...)` (JNI, Rust→Kotlin) → detached fd.
 /// Зовётся из `AndroidTunProvider::configure` в нативном `VpnController::connect`-loop
 /// (tokio-поток, НЕ Java-поток → `attach_current_thread`, как `protectFd`). routes/dns передаём

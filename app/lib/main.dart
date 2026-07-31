@@ -6,6 +6,7 @@ import 'package:window_manager/window_manager.dart';
 
 import 'package:app/app_state.dart';
 import 'package:app/errors.dart';
+import 'package:app/format.dart';
 import 'package:app/home_page.dart';
 import 'package:app/windows_tray.dart';
 import 'package:app/src/rust/api/citadel.dart';
@@ -125,7 +126,8 @@ class _CitadelAppState extends State<CitadelApp> with WindowListener {
   /// «Отключить». Так состояние читается у свёрнутого приложения, без его открытия.
   void _syncTray() {
     final (phase, tip) = switch (state.phase) {
-      VpnPhase.up => ('up', 'CitadelPQVPN — туннель активен${state.exit.isEmpty ? '' : ' (${state.exit})'}'),
+      // Узел выхода — без порта, как и на главном экране (см. format.dart).
+      VpnPhase.up => ('up', 'CitadelPQVPN — туннель активен${state.exit.isEmpty ? '' : ' (${hostOnly(state.exit)})'}'),
       VpnPhase.connecting => ('connecting', 'CitadelPQVPN — подключение…'),
       VpnPhase.error => (
           'error',

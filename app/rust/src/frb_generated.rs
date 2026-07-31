@@ -38,7 +38,7 @@ flutter_rust_bridge::frb_generated_boilerplate!(
     default_rust_auto_opaque = RustAutoOpaqueMoi,
 );
 pub(crate) const FLUTTER_RUST_BRIDGE_CODEGEN_VERSION: &str = "2.12.0";
-pub(crate) const FLUTTER_RUST_BRIDGE_CODEGEN_CONTENT_HASH: i32 = 1319274675;
+pub(crate) const FLUTTER_RUST_BRIDGE_CODEGEN_CONTENT_HASH: i32 = -1849053047;
 
 // Section: executor
 
@@ -1339,6 +1339,35 @@ fn wire__crate__api__citadel__vault_lock_impl(
         },
     )
 }
+fn wire__crate__api__citadel__vault_max_name_len_impl(
+    ptr_: flutter_rust_bridge::for_generated::PlatformGeneralizedUint8ListPtr,
+    rust_vec_len_: i32,
+    data_len_: i32,
+) -> flutter_rust_bridge::for_generated::WireSyncRust2DartSse {
+    FLUTTER_RUST_BRIDGE_HANDLER.wrap_sync::<flutter_rust_bridge::for_generated::SseCodec, _>(
+        flutter_rust_bridge::for_generated::TaskInfo {
+            debug_name: "vault_max_name_len",
+            port: None,
+            mode: flutter_rust_bridge::for_generated::FfiCallMode::Sync,
+        },
+        move || {
+            let message = unsafe {
+                flutter_rust_bridge::for_generated::Dart2RustMessageSse::from_wire(
+                    ptr_,
+                    rust_vec_len_,
+                    data_len_,
+                )
+            };
+            let mut deserializer =
+                flutter_rust_bridge::for_generated::SseDeserializer::new(message);
+            deserializer.end();
+            transform_result_sse::<_, ()>((move || {
+                let output_ok = Result::<_, ()>::Ok(crate::api::citadel::vault_max_name_len())?;
+                Ok(output_ok)
+            })())
+        },
+    )
+}
 fn wire__crate__api__citadel__vault_min_password_len_impl(
     ptr_: flutter_rust_bridge::for_generated::PlatformGeneralizedUint8ListPtr,
     rust_vec_len_: i32,
@@ -1368,6 +1397,39 @@ fn wire__crate__api__citadel__vault_min_password_len_impl(
         },
     )
 }
+fn wire__crate__api__citadel__vault_move_impl(
+    ptr_: flutter_rust_bridge::for_generated::PlatformGeneralizedUint8ListPtr,
+    rust_vec_len_: i32,
+    data_len_: i32,
+) -> flutter_rust_bridge::for_generated::WireSyncRust2DartSse {
+    FLUTTER_RUST_BRIDGE_HANDLER.wrap_sync::<flutter_rust_bridge::for_generated::SseCodec, _>(
+        flutter_rust_bridge::for_generated::TaskInfo {
+            debug_name: "vault_move",
+            port: None,
+            mode: flutter_rust_bridge::for_generated::FfiCallMode::Sync,
+        },
+        move || {
+            let message = unsafe {
+                flutter_rust_bridge::for_generated::Dart2RustMessageSse::from_wire(
+                    ptr_,
+                    rust_vec_len_,
+                    data_len_,
+                )
+            };
+            let mut deserializer =
+                flutter_rust_bridge::for_generated::SseDeserializer::new(message);
+            let api_id = <String>::sse_decode(&mut deserializer);
+            let api_up = <bool>::sse_decode(&mut deserializer);
+            deserializer.end();
+            transform_result_sse::<_, flutter_rust_bridge::for_generated::anyhow::Error>(
+                (move || {
+                    let output_ok = crate::api::citadel::vault_move(api_id, api_up)?;
+                    Ok(output_ok)
+                })(),
+            )
+        },
+    )
+}
 fn wire__crate__api__citadel__vault_remove_impl(
     ptr_: flutter_rust_bridge::for_generated::PlatformGeneralizedUint8ListPtr,
     rust_vec_len_: i32,
@@ -1394,6 +1456,39 @@ fn wire__crate__api__citadel__vault_remove_impl(
             transform_result_sse::<_, flutter_rust_bridge::for_generated::anyhow::Error>(
                 (move || {
                     let output_ok = crate::api::citadel::vault_remove(api_id)?;
+                    Ok(output_ok)
+                })(),
+            )
+        },
+    )
+}
+fn wire__crate__api__citadel__vault_rename_impl(
+    ptr_: flutter_rust_bridge::for_generated::PlatformGeneralizedUint8ListPtr,
+    rust_vec_len_: i32,
+    data_len_: i32,
+) -> flutter_rust_bridge::for_generated::WireSyncRust2DartSse {
+    FLUTTER_RUST_BRIDGE_HANDLER.wrap_sync::<flutter_rust_bridge::for_generated::SseCodec, _>(
+        flutter_rust_bridge::for_generated::TaskInfo {
+            debug_name: "vault_rename",
+            port: None,
+            mode: flutter_rust_bridge::for_generated::FfiCallMode::Sync,
+        },
+        move || {
+            let message = unsafe {
+                flutter_rust_bridge::for_generated::Dart2RustMessageSse::from_wire(
+                    ptr_,
+                    rust_vec_len_,
+                    data_len_,
+                )
+            };
+            let mut deserializer =
+                flutter_rust_bridge::for_generated::SseDeserializer::new(message);
+            let api_id = <String>::sse_decode(&mut deserializer);
+            let api_name = <String>::sse_decode(&mut deserializer);
+            deserializer.end();
+            transform_result_sse::<_, flutter_rust_bridge::for_generated::anyhow::Error>(
+                (move || {
+                    let output_ok = crate::api::citadel::vault_rename(api_id, api_name)?;
                     Ok(output_ok)
                 })(),
             )
@@ -1891,9 +1986,9 @@ fn pde_ffi_dispatcher_primary_impl(
             wire__crate__api__citadel__vault_change_password_impl(port, ptr, rust_vec_len, data_len)
         }
         34 => wire__crate__api__citadel__vault_create_impl(port, ptr, rust_vec_len, data_len),
-        42 => wire__crate__api__citadel__vault_unlock_impl(port, ptr, rust_vec_len, data_len),
-        43 => wire__crate__api__citadel__vpn_connect_impl(port, ptr, rust_vec_len, data_len),
-        44 => {
+        45 => wire__crate__api__citadel__vault_unlock_impl(port, ptr, rust_vec_len, data_len),
+        46 => wire__crate__api__citadel__vpn_connect_impl(port, ptr, rust_vec_len, data_len),
+        47 => {
             wire__crate__api__citadel__vpn_connect_profile_impl(port, ptr, rust_vec_len, data_len)
         }
         _ => unreachable!(),
@@ -1933,9 +2028,12 @@ fn pde_ffi_dispatcher_sync_impl(
         37 => wire__crate__api__citadel__vault_list_impl(ptr, rust_vec_len, data_len),
         38 => wire__crate__api__citadel__vault_location_impl(ptr, rust_vec_len, data_len),
         39 => wire__crate__api__citadel__vault_lock_impl(ptr, rust_vec_len, data_len),
-        40 => wire__crate__api__citadel__vault_min_password_len_impl(ptr, rust_vec_len, data_len),
-        41 => wire__crate__api__citadel__vault_remove_impl(ptr, rust_vec_len, data_len),
-        45 => wire__crate__api__citadel__vpn_disconnect_impl(ptr, rust_vec_len, data_len),
+        40 => wire__crate__api__citadel__vault_max_name_len_impl(ptr, rust_vec_len, data_len),
+        41 => wire__crate__api__citadel__vault_min_password_len_impl(ptr, rust_vec_len, data_len),
+        42 => wire__crate__api__citadel__vault_move_impl(ptr, rust_vec_len, data_len),
+        43 => wire__crate__api__citadel__vault_remove_impl(ptr, rust_vec_len, data_len),
+        44 => wire__crate__api__citadel__vault_rename_impl(ptr, rust_vec_len, data_len),
+        48 => wire__crate__api__citadel__vpn_disconnect_impl(ptr, rust_vec_len, data_len),
         _ => unreachable!(),
     }
 }

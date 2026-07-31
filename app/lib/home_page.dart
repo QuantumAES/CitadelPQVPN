@@ -8,6 +8,7 @@ import 'package:app/android_vpn.dart';
 import 'package:app/app_state.dart';
 import 'package:app/debug_panel.dart';
 import 'package:app/errors.dart';
+import 'package:app/format.dart';
 import 'package:app/qr_scan_page.dart';
 import 'package:app/src/rust/api/citadel.dart';
 import 'package:app/split_tunnel_page.dart';
@@ -159,16 +160,21 @@ class _HomePageState extends State<HomePage> {
                       style: Theme.of(context).textTheme.titleSmall),
                 ),
                 const SizedBox(height: 8),
-                ...s.profiles.map((p) => _ProfileTile(
-                      profile: p,
-                      active: s.activeProfileId == p.id,
-                      phase: s.phase,
-                      onTap: () => _tapProfile(p),
-                      onDelete: () => _deleteProfile(p),
-                      onDisconnect: s.disconnect,
-                      onSubscribers:
-                          p.isAdmin ? () => _openSubscribers(p) : null,
-                    )),
+                for (final (i, p) in s.profiles.indexed)
+                  _ProfileTile(
+                    profile: p,
+                    active: s.activeProfileId == p.id,
+                    phase: s.phase,
+                    onTap: () => _tapProfile(p),
+                    onDelete: () => _deleteProfile(p),
+                    onDisconnect: s.disconnect,
+                    onRename: () => _renameProfile(p),
+                    onMove: ({required bool up}) => _moveProfile(p, up: up),
+                    canMoveUp: i > 0,
+                    canMoveDown: i < s.profiles.length - 1,
+                    onSubscribers:
+                        p.isAdmin ? () => _openSubscribers(p) : null,
+                  ),
               ],
             ],
           );
@@ -193,6 +199,72 @@ class _HomePageState extends State<HomePage> {
       destructive: true,
     );
     if (ok == true) s.removeProfile(p.id);
+  }
+
+  /// Переименовать профиль. Имя — только вывеска в списке: ссылка, ключи и порядок не меняются.
+  /// Отказ ядра (пустое имя, закрытое хранилище) показываем прямо в форме, а не тостом вдогонку.
+  Future<void> _renameProfile(ProfileDto p) async {
+    final ctrl = TextEditingController(text: p.name);
+    final maxLen = vaultMaxNameLen();
+    final done = await showDialog<bool>(
+      context: context,
+      builder: (dctx) {
+        String? err;
+        return StatefulBuilder(builder: (dctx, setLocal) {
+          void submit() {
+            try {
+              s.renameProfile(p.id, ctrl.text);
+              Navigator.pop(dctx, true);
+            } catch (e) {
+              setLocal(() => err = humanError(e));
+            }
+          }
+
+          return AlertDialog(
+            title: const Text('Переименовать профиль'),
+            content: SingleChildScrollView(
+              child: Column(
+                mainAxisSize: MainAxisSize.min,
+                crossAxisAlignment: CrossAxisAlignment.stretch,
+                children: [
+                  TextField(
+                    controller: ctrl,
+                    autofocus: true,
+                    maxLength: maxLen,
+                    onSubmitted: (_) => submit(),
+                    decoration: const InputDecoration(
+                      labelText: 'Имя профиля',
+                      border: OutlineInputBorder(),
+                    ),
+                  ),
+                  if (err != null) ...[
+                    const SizedBox(height: 4),
+                    ErrorNote(text: err!),
+                  ],
+                ],
+              ),
+            ),
+            actions: [
+              TextButton(
+                  onPressed: () => Navigator.pop(dctx, false),
+                  child: const Text('Отмена')),
+              FilledButton(onPressed: submit, child: const Text('Сохранить')),
+            ],
+          );
+        });
+      },
+    );
+    ctrl.dispose();
+    if (done == true) _toast('Профиль переименован');
+  }
+
+  /// Переставить профиль в списке. Порядок хранится в vault — переживает перезапуск.
+  void _moveProfile(ProfileDto p, {required bool up}) {
+    try {
+      s.moveProfile(p.id, up: up);
+    } catch (e) {
+      _toast(humanError(e));
+    }
   }
 
   // ─────────────────────────── настройки ───────────────────────────
@@ -304,12 +376,75 @@ class _HomePageState extends State<HomePage> {
             ListTile(
               leading: const Icon(Icons.info_outline),
               title: const Text('О приложении'),
-              subtitle: Text('Постквантовый VPN · $appVersion · ядро v${coreVersion()}'),
+              subtitle: Text('CitadelPQVPN · версия $appVersion'),
+              onTap: () {
+                Navigator.pop(sheetCtx);
+                _showAbout();
+              },
             ),
           ],
         ),
         ),
       ),
+    );
+  }
+
+  /// «О приложении»: что это, чем отличается, какая версия. Версии — двумя строками и с
+  /// возможностью скопировать: при разборе жалобы первым делом спрашивают именно их, а сборка
+  /// приложения и версия ядра расходятся (ядро обновляется отдельно от оболочки).
+  Future<void> _showAbout() async {
+    final core = coreVersion();
+    final versions = 'CitadelPQVPN $appVersion · ядро v$core';
+    await showDialog<void>(
+      context: context,
+      builder: (dctx) {
+        final cs = Theme.of(dctx).colorScheme;
+        return AlertDialog(
+          title: Row(
+            children: [
+              Image.asset('assets/logo.png', width: 32, height: 32),
+              const SizedBox(width: 12),
+              const Expanded(child: Text('CitadelPQVPN')),
+            ],
+          ),
+          content: SingleChildScrollView(
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text(
+                  'Постквантовый VPN.\n\n'
+                  'Сессия защищена гибридным обменом ключами X25519 + ML-KEM-768 и '
+                  'подписью сервера ML-DSA-65: перехваченный сегодня трафик не расшифровать '
+                  'и завтрашним квантовым компьютером.\n\n'
+                  'Трафик маскируется под обычный поток данных, профили и ключи лежат в '
+                  'зашифрованном хранилище на устройстве, сервер не ведёт журналов подключений.',
+                  style: Theme.of(dctx).textTheme.bodyMedium,
+                ),
+                const SizedBox(height: 16),
+                Text('Версия', style: Theme.of(dctx).textTheme.labelLarge),
+                const SizedBox(height: 4),
+                Text('Приложение: $appVersion',
+                    style: Theme.of(dctx).textTheme.bodySmall?.copyWith(color: cs.outline)),
+                Text('Ядро: v$core',
+                    style: Theme.of(dctx).textTheme.bodySmall?.copyWith(color: cs.outline)),
+              ],
+            ),
+          ),
+          actions: [
+            TextButton(
+              onPressed: () async {
+                await Clipboard.setData(ClipboardData(text: versions));
+                if (dctx.mounted) Navigator.pop(dctx);
+                _toast('Версия скопирована');
+              },
+              child: const Text('Скопировать версию'),
+            ),
+            FilledButton(
+                onPressed: () => Navigator.pop(dctx), child: const Text('Закрыть')),
+          ],
+        );
+      },
     );
   }
 
@@ -739,10 +874,13 @@ class _StatusCard extends StatelessWidget {
         label = 'Не защищено';
     }
 
+    // Что показываем о живой сессии: узел выхода и транспорт. Ни номера порта, ни назначенного
+    // нам внутреннего адреса с маской (`state.cidr`) здесь нет — человеку они бесполезны, а
+    // скриншот главного экрана перестаёт выдавать конфигурацию сервера и адрес клиента.
+    // Для разбора всё это по-прежнему в журнале отладки и диагностике.
     final details = <String>[
-      if (state.exit.isNotEmpty) state.exit,
+      if (state.exit.isNotEmpty) hostOnly(state.exit),
       if (state.transport.isNotEmpty) state.transport,
-      if (state.cidr.isNotEmpty) state.cidr,
     ].join('  ·  ');
 
     // В отказе показываем ПРОФИЛЬ, к которому пытались подключиться, и подсказку по этому виду
@@ -824,6 +962,10 @@ class _ProfileTile extends StatelessWidget {
     required this.onTap,
     required this.onDelete,
     required this.onDisconnect,
+    required this.onRename,
+    required this.onMove,
+    required this.canMoveUp,
+    required this.canMoveDown,
     this.onSubscribers,
   });
   final ProfileDto profile;
@@ -832,6 +974,11 @@ class _ProfileTile extends StatelessWidget {
   final VoidCallback onTap;
   final VoidCallback onDelete;
   final VoidCallback onDisconnect;
+  final VoidCallback onRename;
+  /// Переместить профиль в списке: `up=true` — выше, иначе ниже.
+  final void Function({required bool up}) onMove;
+  final bool canMoveUp;
+  final bool canMoveDown;
   /// C7.4: открыть экран абонентов (не null только у admin-профиля).
   final VoidCallback? onSubscribers;
 
@@ -868,8 +1015,10 @@ class _ProfileTile extends StatelessWidget {
         subtitle: Column(
           crossAxisAlignment: CrossAxisAlignment.start,
           children: [
+            // Адреса серверов — без портов (см. format.dart): номер порта человеку ничего не
+            // говорит, а список на экране выдаёт конфигурацию exit'ов.
             if (profile.servers.isNotEmpty)
-              Text(profile.servers,
+              Text(hostsOnly(profile.servers),
                   maxLines: 1, overflow: TextOverflow.ellipsis),
             if (chips.isNotEmpty)
               Padding(
@@ -880,10 +1029,22 @@ class _ProfileTile extends StatelessWidget {
         ),
         trailing: PopupMenuButton<String>(
           onSelected: (v) {
-            if (v == 'delete') onDelete();
-            if (v == 'connect') onTap();
-            if (v == 'disconnect') onDisconnect();
-            if (v == 'subscribers') onSubscribers?.call();
+            switch (v) {
+              case 'delete':
+                onDelete();
+              case 'connect':
+                onTap();
+              case 'disconnect':
+                onDisconnect();
+              case 'subscribers':
+                onSubscribers?.call();
+              case 'rename':
+                onRename();
+              case 'up':
+                onMove(up: true);
+              case 'down':
+                onMove(up: false);
+            }
           },
           itemBuilder: (_) => [
             if (active && (phase == VpnPhase.up || phase == VpnPhase.connecting))
@@ -892,6 +1053,13 @@ class _ProfileTile extends StatelessWidget {
               const PopupMenuItem(value: 'connect', child: Text('Подключить')),
             if (onSubscribers != null)
               const PopupMenuItem(value: 'subscribers', child: Text('Абоненты')),
+            const PopupMenuItem(value: 'rename', child: Text('Переименовать')),
+            // Пункты перемещения показываем только там, где им есть куда двигать: неактивный
+            // пункт меню человек всё равно нажмёт и решит, что функция сломана.
+            if (canMoveUp)
+              const PopupMenuItem(value: 'up', child: Text('Переместить выше')),
+            if (canMoveDown)
+              const PopupMenuItem(value: 'down', child: Text('Переместить ниже')),
             const PopupMenuItem(value: 'delete', child: Text('Удалить')),
           ],
         ),
@@ -1163,8 +1331,10 @@ class _LinkPreview extends StatelessWidget {
             children: [
               Icon(Icons.dns_outlined, size: 18, color: cs.primary),
               const SizedBox(width: 8),
+              // Тоже без портов — превью ссылки и список профилей должны говорить об одном и том
+              // же одинаково (сама ссылка с портами остаётся в поле ввода выше).
               Expanded(
-                  child: Text(summary.servers,
+                  child: Text(hostsOnly(summary.servers),
                       maxLines: 1, overflow: TextOverflow.ellipsis)),
             ],
           ),

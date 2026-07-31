@@ -38,6 +38,14 @@ class CitadelVpnService : VpnService() {
         const val CHANNEL_ID = "citadel_vpn"
         const val NOTIF_ID = 1
 
+        // Тексты постоянной нотификации по состоянию сессии. Она — единственное, что видно о VPN
+        // при закрытом окне, поэтому «туннель активен» в ней должно означать ровно то, что сказано:
+        // при пропаже сети движок уходит в переподключение, и нотификация обязана это показать.
+        const val STATUS_UP = "Постквантовый туннель активен"
+        const val STATUS_CONNECTING = "Подключение…"
+        const val STATUS_RECONNECTING = "Нет соединения — восстанавливаю"
+        const val STATUS_DOWN = "Туннель не активен"
+
         init {
             // та же .so, что грузит Flutter/frb; нужна, чтобы резолвились JNI-методы native*
             System.loadLibrary("rust_lib_app")
@@ -58,6 +66,14 @@ class CitadelVpnService : VpnService() {
     // Была ли уже underlying-сеть: отличает ПЕРВЫЙ onAvailable (туннель поднимается — реконнект не
     // нужен) от возврата сети после onLost (toggle WiFi — реконнект НУЖЕН).
     private var hadNetwork: Boolean = false
+    // Живые underlying-сети (только те, что прошли фильтр NetworkRequest: WiFi/LTE с интернетом).
+    // Нужны, чтобы при потере ТЕКУЩЕЙ сети сразу перейти на оставшуюся: onAvailable по ней уже
+    // прошёл и второй раз не придёт, а спрашивать ConnectivityManager при поднятом VPN бесполезно —
+    // activeNetwork вернёт саму VPN-сеть. Трогается только из потока NetworkCallback.
+    private val liveNetworks = LinkedHashMap<Long, Network>()
+    // Текст последней foreground-нотификации — чтобы не дёргать NotificationManager вхолостую.
+    @Volatile
+    private var statusText: String = STATUS_CONNECTING
 
     override fun onCreate() {
         super.onCreate()
@@ -235,6 +251,7 @@ class CitadelVpnService : VpnService() {
         val cb = object : ConnectivityManager.NetworkCallback() {
             override fun onAvailable(network: Network) {
                 val id = network.networkHandle
+                liveNetworks[id] = network
                 // Реконнект нужен, если сеть сменилась ЛИБО вернулась после потери текущей (onLost
                 // обнулил currentNetworkId в -1). Пропускаем только САМЫЙ первый onAvailable
                 // (hadNetwork=false — туннель и так поднимается над этой сетью).
@@ -248,10 +265,28 @@ class CitadelVpnService : VpnService() {
             }
 
             override fun onLost(network: Network) {
-                android.util.Log.d("CitadelNet", "onLost id=${network.networkHandle} cur=$currentNetworkId")
-                // Потеряли текущую сеть → -1; следующий onAvailable (даже той же сети с новым handle)
-                // станет "changed" → форс реконнект. hadNetwork НЕ сбрасываем.
-                if (network.networkHandle == currentNetworkId) currentNetworkId = -1L
+                val id = network.networkHandle
+                liveNetworks.remove(id)
+                android.util.Log.d("CitadelNet", "onLost id=$id cur=$currentNetworkId live=${liveNetworks.size}")
+                if (id != currentNetworkId) return // упала не та сеть, поверх которой идёт туннель
+                // Потеряли сеть, которая несла туннель. Молчать нельзя: пакеты уходят в никуда, а
+                // движок этого не видит (обратного трафика нет и при простое, watchdog срабатывает
+                // только под нагрузкой, quinn ждёт idle-timeout) — и приложение продолжает
+                // показывать «Защищено» при отсутствии интернета. Будим connect-loop: он оборвёт
+                // мёртвый pump и уйдёт в переподключение.
+                val alt = liveNetworks.values.lastOrNull()
+                if (alt != null) {
+                    // Осталась другая сеть (выключили WiFi при живом LTE) — переезжаем на неё сразу;
+                    // её onAvailable уже был и повторно не придёт.
+                    currentNetworkId = alt.networkHandle
+                    setUnderlyingNetworks(arrayOf(alt))
+                } else {
+                    // Сети нет вовсе. Снимаем указание на мёртвую underlying-сеть (null = «как у
+                    // системы»), иначе система считает VPN идущим поверх того, чего больше нет.
+                    currentNetworkId = -1L
+                    setUnderlyingNetworks(null)
+                }
+                nativeNetworkChanged()
             }
         }
         netCallback = cb
@@ -273,6 +308,7 @@ class CitadelVpnService : VpnService() {
         netCallback = null
         currentNetworkId = -1L
         hadNetwork = false
+        liveNetworks.clear()
     }
 
     private fun splitCidr(cidr: String): Pair<String, Int> {
@@ -323,16 +359,42 @@ class CitadelVpnService : VpnService() {
                 NotificationChannel(CHANNEL_ID, "CitadelPQVPN", NotificationManager.IMPORTANCE_LOW)
             )
         }
-        val n: Notification = Notification.Builder(this, CHANNEL_ID)
-            .setContentTitle("CitadelPQVPN")
-            .setContentText("Постквантовый туннель активен")
-            .setSmallIcon(android.R.drawable.ic_lock_lock)
-            .setOngoing(true)
-            .build()
+        val n = buildNotif(statusText)
         if (Build.VERSION.SDK_INT >= 34) {
             startForeground(NOTIF_ID, n, ServiceInfo.FOREGROUND_SERVICE_TYPE_SYSTEM_EXEMPTED)
         } else {
             startForeground(NOTIF_ID, n)
+        }
+    }
+
+    private fun buildNotif(text: String): Notification =
+        Notification.Builder(this, CHANNEL_ID)
+            .setContentTitle("CitadelPQVPN")
+            .setContentText(text)
+            .setSmallIcon(android.R.drawable.ic_lock_lock)
+            .setOngoing(true)
+            .build()
+
+    /**
+     * Отразить состояние сессии в постоянной нотификации. Зовётся из Rust через JNI на каждую смену
+     * состояния движка (`idle|connecting|up|migrating|down`) — в том числе когда окна приложения
+     * нет вовсе: тогда нотификация — единственный индикатор, и она не должна утверждать, что
+     * туннель активен, пока движок переподключается (например, при пропавшей сети).
+     * NotificationManager потокобезопасен, поэтому вызов из tokio-потока движка допустим.
+     */
+    fun setStatus(state: String) {
+        val text = when (state) {
+            "up" -> STATUS_UP
+            "connecting" -> STATUS_CONNECTING
+            "migrating" -> STATUS_RECONNECTING
+            else -> STATUS_DOWN // down|idle
+        }
+        if (text == statusText) return
+        statusText = text
+        try {
+            getSystemService(NotificationManager::class.java)?.notify(NOTIF_ID, buildNotif(text))
+        } catch (e: Exception) {
+            android.util.Log.w("CitadelVpn", "не обновить нотификацию: ${e.message}")
         }
     }
 }

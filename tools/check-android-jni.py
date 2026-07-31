@@ -42,6 +42,56 @@ def gradle_value(key: str) -> str | None:
     return m.group(1) if m else None
 
 
+def check_rust_to_kotlin_calls(rust_src: str) -> None:
+    """Обратное направление моста: `env.call_method(service, "имя", …)` из Rust в Kotlin.
+
+    Здесь имя метода — тоже строка, разрешаемая в рантайме, и опечатка так же не ломает сборку:
+    `protectFd`/`establishTun`/`setStatus` просто не найдутся, и это всплывёт как «сокет не
+    защищён» / «нет TUN» / «нотификация не обновляется» уже на устройстве. Сверяем по имени и
+    числу аргументов (полный разбор JVM-сигнатуры тут не нужен: он ловил бы те же опечатки).
+    """
+    kt_files = {kt.stem: kt for kt in KOTLIN_ROOT.rglob("*.kt")}
+    # Только вызовы НА НАШЕМ сервисе (`…service.as_obj()`): `toString()` на Java-исключении и прочие
+    # вызовы на объектах платформы к Kotlin-классам отношения не имеют.
+    calls = re.findall(r'call_method\(\s*[\w.&]*service\.as_obj\(\),\s*"(\w+)",\s*"([^"]+)"', rust_src)
+    if not calls:
+        problems.append(f"{RUST.relative_to(REPO)}: не нашёл ни одного вызова Kotlin-метода — мост Rust→Kotlin исчез?")
+    for method, sig in calls:
+        found = False
+        for stem, kt in kt_files.items():
+            m = re.search(rf"\bfun\s+{re.escape(method)}\s*\(([^)]*)\)", kt.read_text())
+            if not m:
+                continue
+            found = True
+            args = [a for a in m.group(1).split(",") if a.strip()]
+            want = jvm_arg_count(sig)
+            if want != len(args):
+                problems.append(
+                    f"{kt.relative_to(REPO)}: fun {method}() принимает {len(args)} арг., "
+                    f"а Rust зовёт его с сигнатурой {sig} ({want} арг.)"
+                )
+            break
+        if not found:
+            problems.append(
+                f"{RUST.relative_to(REPO)}: Rust зовёт метод {method}(), которого нет ни в одном "
+                "Kotlin-классе (NoSuchMethodError в рантайме, сборка при этом пройдёт)"
+            )
+
+
+def jvm_arg_count(sig: str) -> int:
+    """Число аргументов в JVM-сигнатуре вида `(Ljava/lang/String;II)V`."""
+    inner = sig[sig.index("(") + 1 : sig.index(")")]
+    count, i = 0, 0
+    while i < len(inner):
+        while inner[i] == "[":  # массив — часть следующего типа
+            i += 1
+        if inner[i] == "L":  # объект: до ближайшей ';'
+            i = inner.index(";", i)
+        i += 1
+        count += 1
+    return count
+
+
 def main() -> int:
     for f in (GRADLE, RUST):
         if not f.is_file():
@@ -93,6 +143,8 @@ def main() -> int:
 
     for sym in sorted(rust_symbols - used):
         problems.append(f"{RUST.relative_to(REPO)}: символ {sym} не соответствует ни одному external fun")
+
+    check_rust_to_kotlin_calls(rust_src)
 
     if problems:
         print("JNI-мост НЕ сходится:", file=sys.stderr)
