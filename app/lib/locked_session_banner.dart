@@ -1,0 +1,96 @@
+import 'package:flutter/material.dart';
+
+import 'package:app/format.dart';
+
+/// Плашка живой сессии на экране разблокировки хранилища.
+///
+/// Блокировка хранилища и закрытие окна туннель не останавливают: сессию держит движок, а на
+/// Android — ещё и foreground-сервис, переживающий Activity. Но экран пароля закрывает собой всё
+/// остальное, и без этой плашки работающий VPN оказывался невидимым и неуправляемым — со стороны
+/// это выглядело ровно как «туннель отвалился». Показываем состояние и даём отключить, не требуя
+/// сперва ввести мастер-пароль: отключение сессии секретов не касается.
+///
+/// Виджет намеренно не знает про `AppState`: принимает снимок состояния значениями, поэтому
+/// проверяется обычным widget-тестом без нативного ядра (см. `app/test/locked_session_banner_test.dart`).
+class LockedSessionBanner extends StatelessWidget {
+  const LockedSessionBanner({
+    super.key,
+    required this.busy,
+    required this.up,
+    required this.exit,
+    required this.onDisconnect,
+  });
+
+  /// Есть ли сессия, о которой стоит говорить (подключение или поднятый туннель).
+  final bool busy;
+
+  /// Туннель поднят (иначе — идёт подключение).
+  final bool up;
+
+  /// Узел выхода как его знает движок (`host:port`); пусто — ещё не выбран.
+  final String exit;
+
+  /// Отключить сессию (замок хранилища этого НЕ делает — только явное действие человека).
+  final VoidCallback onDisconnect;
+
+  @override
+  Widget build(BuildContext context) {
+    if (!busy) return const SizedBox.shrink();
+    final dark = Theme.of(context).brightness == Brightness.dark;
+    final bg = up
+        ? (dark ? Colors.green.shade900 : Colors.green.shade50)
+        : (dark ? Colors.amber.shade900 : Colors.amber.shade50);
+    final fg = up
+        ? (dark ? Colors.green.shade200 : Colors.green.shade800)
+        : (dark ? Colors.amber.shade200 : Colors.amber.shade900);
+    // Узел выхода — без порта, как и на главном экране (см. format.dart).
+    final where = exit.isEmpty ? '' : hostOnly(exit);
+
+    return Container(
+      margin: const EdgeInsets.only(top: 20),
+      padding: const EdgeInsets.all(14),
+      decoration: BoxDecoration(color: bg, borderRadius: BorderRadius.circular(16)),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.stretch,
+        children: [
+          Row(
+            children: [
+              if (up)
+                Icon(Icons.shield, color: fg, size: 22)
+              else
+                SizedBox(
+                  height: 20,
+                  width: 20,
+                  child: CircularProgressIndicator(strokeWidth: 2.2, color: fg),
+                ),
+              const SizedBox(width: 10),
+              Expanded(
+                child: Text(
+                  up ? 'Туннель активен' : 'Подключение…',
+                  style: Theme.of(context)
+                      .textTheme
+                      .titleSmall
+                      ?.copyWith(color: fg, fontWeight: FontWeight.w600),
+                ),
+              ),
+            ],
+          ),
+          if (where.isNotEmpty) ...[
+            const SizedBox(height: 4),
+            Text(where,
+                style: Theme.of(context)
+                    .textTheme
+                    .bodySmall
+                    ?.copyWith(color: fg.withValues(alpha: 0.9))),
+          ],
+          const SizedBox(height: 10),
+          FilledButton.tonalIcon(
+            onPressed: onDisconnect,
+            icon: const Icon(Icons.power_settings_new, size: 18),
+            label: const Text('Отключить'),
+          ),
+        ],
+      ),
+    );
+  }
+}

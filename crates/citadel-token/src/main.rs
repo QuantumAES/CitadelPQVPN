@@ -50,16 +50,19 @@ fn registry_path(dir: &str) -> String {
     format!("{dir}/registry")
 }
 
-/// Реестр — строки `<pub_hex> <valid_until_unix> <status>`. Возвращает true, если pub найден,
+/// Реестр — строки `<client_id_hex> <valid_until_unix> <status>`. Возвращает true, если id найден,
 /// `active` и не истёк. Читается на КАЖДЫЙ auth → отзыв/добавление действуют сразу (≤ след. коннект).
 /// C7.1: разбор строк — общий `admin::parse_registry` (первое совпадение решает, как раньше).
-fn registry_allows(dir: &str, pub_key: &[u8], now: u64) -> bool {
+///
+/// PQ-трек: `client_id` — уже не «Ed25519 pub абонента», а `BLAKE3(ed_pub ‖ mldsa_pub)` его
+/// гибридной идентичности ([`citadel_token::pqid`]); длина и формат файла те же.
+fn registry_allows(dir: &str, client_id: &[u8], now: u64) -> bool {
     let Ok(content) = std::fs::read_to_string(registry_path(dir)) else {
         return false; // нет реестра → никто не авторизован (secure default)
     };
     citadel_token::admin::parse_registry(&content)
         .iter()
-        .find(|e| e.client_id[..] == *pub_key)
+        .find(|e| e.client_id[..] == *client_id)
         .is_some_and(|e| e.status == "active" && now < e.valid_until)
 }
 
@@ -89,7 +92,7 @@ fn bootstrap_registry(dir: &str) -> Result<()> {
                 .ok()
                 .and_then(|v| v.try_into().ok())
                 .context("Citadel_REGISTER_SEEDS: seed должен быть 32 байта hex")?;
-            pubs.push(citadel_token::ed25519_pub_from_seed(&seed)?);
+            pubs.push(citadel_token::pqid::id_from_seed(&seed)?);
         }
     }
     if pubs.is_empty() {
@@ -98,7 +101,8 @@ fn bootstrap_registry(dir: &str) -> Result<()> {
     let existing = std::fs::read_to_string(registry_path(dir)).unwrap_or_default();
     let far = now_unix() + 10 * 365 * 24 * 3600;
     let merged = merge_registry(&existing, &pubs, far);
-    std::fs::write(registry_path(dir), &merged).context("запись реестра")?;
+    // P1: реестр — приватные данные абонентской базы; читает его только издатель (600).
+    citadel_token::admin::atomic_write(&registry_path(dir), &merged).context("запись реестра")?;
     eprintln!(
         "[issuer] реестр Layer-1: {} абонент(ов) (bootstrap-merge; revoke переживает рестарт)",
         merged.lines().filter(|l| !l.trim().is_empty()).count()
@@ -148,7 +152,7 @@ fn run_registry(args: &[String]) -> Result<()> {
             // Провижининг нового абонента: из его seed выводим pub (client_id) и регистрируем ЕГО.
             // Seed НЕ сохраняется (уходит абоненту в ссылке) — в реестре только публичный id.
             let seed = parse_hex32(args.get(3), "seed (64 hex)")?;
-            let pk = citadel_token::ed25519_pub_from_seed(&seed)?;
+            let pk = citadel_token::pqid::id_from_seed(&seed)?;
             let vu = parse_valid_until(args.get(4).map(String::as_str))?;
             let cur = std::fs::read_to_string(&path).unwrap_or_default();
             atomic_write(&path, &registry_apply_add(&cur, &pk, vu))?;
@@ -179,6 +183,7 @@ fn run_registry(args: &[String]) -> Result<()> {
 ///
 /// Env: `Citadel_ADMIN_ADDR` (host:port; из туннеля — `10.7.0.1:<admin_port>`),
 ///      `Citadel_ISSUER_PIN` (hex32 — тот же TLS-pin issuer'а, что для token-fetch),
+///      `Citadel_ISSUER_MLDSA` (hex32 — обязательство PQ-идентичности издателя из ссылки),
 ///      `Citadel_ADMIN_SEED` (hex32 — admin-seed из мастер-ссылки).
 fn run_admin_channel(args: &[String]) -> Result<()> {
     let addr = std::env::var("Citadel_ADMIN_ADDR")
@@ -187,13 +192,17 @@ fn run_admin_channel(args: &[String]) -> Result<()> {
         std::env::var("Citadel_ISSUER_PIN").ok().as_ref(),
         "Citadel_ISSUER_PIN (TLS-pin issuer, 64 hex)",
     )?;
+    let issuer_mldsa = parse_hex32(
+        std::env::var("Citadel_ISSUER_MLDSA").ok().as_ref(),
+        "Citadel_ISSUER_MLDSA (обязательство PQ-идентичности издателя, 64 hex)",
+    )?;
     let seed = parse_hex32(
         std::env::var("Citadel_ADMIN_SEED").ok().as_ref(),
         "Citadel_ADMIN_SEED (admin-seed, 64 hex)",
     )?;
     // S2.1/A1-остаток: obfs-обёртка admin-канала (probe-resistance) — PSK из env, как token-fetch.
     let obfs_psk = obfs_psk_from_env();
-    let mut c = citadel_token::admin::AdminClient::connect(&addr, &pin, &seed, obfs_psk)
+    let mut c = citadel_token::admin::AdminClient::connect(&addr, &pin, &issuer_mldsa, &seed, obfs_psk)
         .context("admin-канал: connect/auth")?;
     match args.get(2).map(String::as_str) {
         Some("list") => {
@@ -274,10 +283,11 @@ fn main() -> Result<()> {
     match role.as_str() {
         "issuer" | "serve" => run_issuer(),
         "client" | "fetch" => run_client_fetch(),
+        "pubsync" => run_pubsync(),
         "pubkey" => run_pubkey(),
         "batch" => run_batch(),
         other => Err(anyhow::anyhow!(
-            "Citadel_TOKEN_ROLE должен быть issuer|client|pubkey|batch (или arg[1]=registry), а не {other:?}"
+            "Citadel_TOKEN_ROLE должен быть issuer|client|pubsync|pubkey|batch (или arg[1]=registry), а не {other:?}"
         )),
     }
 }
@@ -319,6 +329,16 @@ fn run_issuer() -> Result<()> {
         hex::encode(identity.pin)
     );
     let scfg = identity.server_config()?;
+    let cert_pin = identity.pin;
+    // PQ-аутентификация издателя: постоянная ML-DSA-65 идентичность (seed 600 на томе, обязательство
+    // — в ссылку). Даёт то, чего pin дать не может: доказательство ВЛАДЕНИЯ ключом, устойчивое к
+    // CRQC (приватный ключ Ed25519-серта тот восстановит из pub и пройдёт пиннинг «легально»).
+    let pq = Arc::new(citadel_token::pqid::IssuerPqIdentity::load_or_generate(&dir)?);
+    eprintln!(
+        "[issuer] PQ-идентичность (ML-DSA-65): обязательство {} → {dir}/{} (кладётся в ссылку)",
+        hex::encode(pq.commitment()),
+        citadel_token::pqid::ISSUER_COMMITMENT_FILE
+    );
     // S2.1/A1-остаток: obfs-обёртка issuer-канала (probe-resistance). При заданном PSK и token-, и
     // admin-канал молчат на не-obfs пробу и на проводе неотличимы от туннеля (тот же PSK из ссылки).
     let obfs_psk = obfs_psk_from_env();
@@ -333,21 +353,25 @@ fn run_issuer() -> Result<()> {
     if let Ok(admin_listen) = std::env::var("Citadel_ADMIN_LISTEN") {
         let scfg = scfg.clone();
         let dir = dir.clone();
+        let pq = pq.clone();
         std::thread::spawn(move || {
             let listener = match TcpListener::bind(&admin_listen) {
                 Ok(l) => l,
                 Err(e) => return eprintln!("[issuer] admin-канал: bind {admin_listen}: {e}"),
             };
-            eprintln!("[issuer] admin-канал на {admin_listen} (PQ-TLS+pin, Ed25519 домен+EKM)");
+            eprintln!(
+                "[issuer] admin-канал на {admin_listen} (PQ-TLS+pin, гибрид Ed25519+ML-DSA домен+EKM)"
+            );
             for conn in listener.incoming() {
                 match conn {
                     Ok(tcp) => {
                         let scfg = scfg.clone();
                         let dir = dir.clone();
+                        let pq = pq.clone();
                         std::thread::spawn(move || {
                             let srv = citadel_token::admin::AdminServer { dir };
                             let r = citadel_token::pqtls::accept_tls(tcp, scfg, obfs_psk)
-                                .and_then(|tls| srv.serve_conn(tls));
+                                .and_then(|tls| srv.serve_conn(tls, &pq, &cert_pin));
                             if let Err(e) = r {
                                 citadel_token::dlog!("[issuer] admin-соединение завершено: {e}");
                             }
@@ -410,7 +434,10 @@ fn run_issuer() -> Result<()> {
 
     let listen = std::env::var("Citadel_TOKEN_LISTEN").unwrap_or_else(|_| "0.0.0.0:7000".into());
     let listener = TcpListener::bind(&listen).with_context(|| format!("bind {listen}"))?;
-    eprintln!("[issuer] слепое подписание на {listen} (blind RSA-{bits}, epoch-scoped, PQ-TLS+pin)");
+    eprintln!(
+        "[issuer] слепое подписание на {listen} (blind RSA-{bits}, epoch-scoped, PQ-TLS+pin, \
+         гибридная PQ-аутентификация сторон)"
+    );
     for conn in listener.incoming() {
         match conn {
             Ok(stream) => {
@@ -419,10 +446,11 @@ fn run_issuer() -> Result<()> {
                 let scfg = scfg.clone();
                 let quota = quota.clone();
                 let lease = lease.clone();
+                let pq = pq.clone();
                 std::thread::spawn(move || {
                     if let Err(e) = serve_client(
-                        stream, scfg, &state, &dir, &quota, max_per_epoch, &lease, lease_secs,
-                        obfs_psk,
+                        stream, scfg, &pq, &cert_pin, &state, &dir, &quota, max_per_epoch, &lease,
+                        lease_secs, obfs_psk,
                     ) {
                         citadel_token::dlog!("[issuer] соединение завершено: {e}");
                     }
@@ -477,6 +505,8 @@ fn lease_grant(map: &mut LeaseMap, client_id: [u8; 32], now: u64, lease_secs: u6
 fn serve_client(
     tcp: TcpStream,
     scfg: Arc<rustls::ServerConfig>,
+    pq: &citadel_token::pqid::IssuerPqIdentity,
+    cert_pin: &[u8; 32],
     state: &Mutex<EpochKey>,
     dir: &str,
     quota: &Mutex<QuotaMap>,
@@ -489,23 +519,40 @@ fn serve_client(
     // S2.1/A1: поднять PQ-TLS поверх TCP ДО любого обмена — Layer-1 и слепая выдача идут в шифре
     // с целостностью; клиент уже спиннил серт (MITM не подставит свои blind_msg, client_id скрыт).
     let mut conn = citadel_token::pqtls::accept_tls(tcp, scfg, obfs_psk)?;
-    // C5.2 Layer-1: challenge-response ДО слепой подписи (аутентификация «абонента»).
+    // PQ-аутентификация: экспортер этой сессии нужен ОБЕИМ сторонам как channel binding, поэтому
+    // хендшейк доводится явно, до первого прикладного кадра.
+    let ekm = citadel_token::pqtls::handshake_server(&mut conn)?;
+    // Издатель представляется ПЕРВЫМ: ML-DSA-подпись `домен‖челлендж‖cert_pin‖EKM`. Иначе клиент
+    // отдавал бы `client_id` стороне, подлинность которой держится на одном лишь Ed25519-серте
+    // (его квантовый противник восстанавливает из pub и проходит pin) — то есть деанон подписки.
     let challenge: [u8; 32] = rand::random();
-    write_frame(&mut conn, &challenge)?;
-    let auth = read_frame(&mut conn)?; // ожидаем pub(32) ‖ sig(64)
-    if auth.len() != 96 {
-        anyhow::bail!("Layer-1: плохой auth-кадр ({} б, ожидалось 96)", auth.len());
-    }
-    let (pk, sig) = (&auth[..32], &auth[32..]);
-    if !citadel_token::ed25519_verify(pk, &challenge, sig) {
-        anyhow::bail!("Layer-1: подпись челленджа неверна");
-    }
-    if !registry_allows(dir, pk, now_unix()) {
+    write_frame(&mut conn, &pq.hello(&challenge, cert_pin, &ekm)?)?;
+    // Первый кадр клиента типизирован: абонент аутентифицируется, exit-узел просит ключ эпохи.
+    let frame = read_frame(&mut conn)?;
+    let auth = match citadel_token::pqid::parse_client_frame(&frame)? {
+        citadel_token::pqid::ClientFrame::EpochPub => {
+            // Раздельный деплой: exit на другой машине подтягивает публичный ключ эпохи (общего
+            // тома /shared у него нет). Ключ публичен; личность спрашивать не за чем, а канал уже
+            // отфильтрован obfs-PSK и PQ-TLS с пиннингом. Отдаём и закрываем.
+            let cur_pub = state.lock().unwrap().1.clone();
+            write_frame(&mut conn, &cur_pub)?;
+            citadel_token::dlog!("[issuer] отдан публичный ключ эпохи (pubsync exit-узла)");
+            return Ok(());
+        }
+        citadel_token::pqid::ClientFrame::Auth(a) => a,
+    };
+    let client_id = citadel_token::pqid::verify_hybrid(
+        auth,
+        citadel_token::pqid::DOMAIN_CLIENT,
+        &challenge,
+        &ekm,
+    )
+    .context("Layer-1: аутентификация абонента")?;
+    if !registry_allows(dir, &client_id, now_unix()) {
         anyhow::bail!("Layer-1: client_id не активен/истёк/отозван — отказ");
     }
-    let client_id: [u8; 32] = pk.try_into().expect("pk = auth[..32], ровно 32 байта");
     // no-logs: связка client_id↔время — только при явном Citadel_DEBUG_LOG (см. citadel_token::debug_logs)
-    citadel_token::dlog!("[issuer] Layer-1 ✔ абонент {}… авторизован", &hex::encode(pk)[..12]);
+    citadel_token::dlog!("[issuer] Layer-1 ✔ абонент {}… авторизован", &hex::encode(client_id)[..12]);
     // Задача 4/B (мягкий single-session): аренда client_id ещё активна → отклоняем новую выдачу
     // (второе устройство с той же ссылки / слишком частый реконнект). Клиент получит 0 токенов →
     // establish без токена → exit откажет → клиент подождёт истечения аренды и переподключится.
@@ -562,6 +609,13 @@ fn run_client_fetch() -> Result<()> {
         .and_then(|s| hex::decode(s.trim()).ok())
         .and_then(|v| v.try_into().ok())
         .context("Citadel_ISSUER_PIN (32 байта hex) обязателен для PQ-TLS канала к издателю")?;
+    // PQ-аутентификация издателя: обязательство ML-DSA из ссылки — обязательно (fail-closed: без
+    // него канал защищён лишь классической подписью серта, а её квантовый противник обходит).
+    let issuer_mldsa: [u8; 32] = std::env::var("Citadel_ISSUER_MLDSA")
+        .ok()
+        .and_then(|s| hex::decode(s.trim()).ok())
+        .and_then(|v| v.try_into().ok())
+        .context("Citadel_ISSUER_MLDSA (32 байта hex) обязателен: PQ-обязательство издателя")?;
     let count = token_count();
     let dir = token_dir();
     // S2.1/A1-остаток: obfs-обёртка канала (probe-resistance) — PSK из env, обязан совпасть с issuer.
@@ -569,7 +623,8 @@ fn run_client_fetch() -> Result<()> {
     eprintln!("[client] Layer-1 issuance у издателя {issuer} ({count} токенов, PQ-TLS+pin{}, blind epoch-scoped)…",
         if obfs_psk.is_some() { "+obfs" } else { "" });
     // C5.3: весь протокол (Layer-1 auth + получение текущего epoch-pub + слепая выдача) — в citadel_token.
-    let tokens = citadel_token::fetch_tokens(&issuer, &issuer_pin, &seed, count, 20, obfs_psk)?;
+    let tokens =
+        citadel_token::fetch_tokens(&issuer, &issuer_pin, &issuer_mldsa, &seed, count, 20, obfs_psk)?;
 
     let mut f = std::fs::File::create(format!("{dir}/tokens")).context("запись tokens")?;
     for t in &tokens {
@@ -587,8 +642,70 @@ fn run_pubkey() -> Result<()> {
         .and_then(|s| hex::decode(s.trim()).ok())
         .and_then(|v| v.try_into().ok())
         .context("Citadel_CLIENT_SEED (32 байта hex)")?;
-    println!("{}", hex::encode(citadel_token::ed25519_pub_from_seed(&seed)?));
+    println!("{}", hex::encode(citadel_token::pqid::id_from_seed(&seed)?));
     Ok(())
+}
+
+/// **pubsync** — синхронизация публичного ключа эпохи для exit-узла на ОТДЕЛЬНОЙ машине (P1).
+///
+/// Когда exit и издатель стоят на одном сервере, exit читает `issuer-<epoch>.pub` с общего тома.
+/// При раздельном деплое общего тома нет, а ключ ротируется каждую эпоху — этот режим и закрывает
+/// разрыв: раз в интервал подтягивает текущий ключ у издателя (obfs + PQ-TLS с пиннингом +
+/// проверка ML-DSA-идентичности издателя) и кладёт его туда, откуда exit читает.
+///
+/// Живёт рядом с exit'ом (отдельный контейнер того же compose), а не внутри exit-процесса: у того
+/// сброшены привилегии и он намеренно ничего не тянет из сети сам.
+///
+/// Env: `Citadel_TOKEN_ISSUER` (host:port), `Citadel_ISSUER_PIN`, `Citadel_ISSUER_MLDSA`,
+///      `Citadel_TOKEN_DIR` (куда писать), `Citadel_EPOCH_SECS` (та же длина эпохи, что у издателя),
+///      `Citadel_OBFS_PSK`, `Citadel_PUBSYNC_INTERVAL` (сек; по умолчанию — восьмая часть эпохи,
+///      но не реже минуты и не чаще раза в 15 с).
+fn run_pubsync() -> Result<()> {
+    let issuer = std::env::var("Citadel_TOKEN_ISSUER").context("Citadel_TOKEN_ISSUER не задан")?;
+    let issuer_pin = parse_hex32(
+        std::env::var("Citadel_ISSUER_PIN").ok().as_ref(),
+        "Citadel_ISSUER_PIN (TLS-pin издателя, 64 hex)",
+    )?;
+    let issuer_mldsa = parse_hex32(
+        std::env::var("Citadel_ISSUER_MLDSA").ok().as_ref(),
+        "Citadel_ISSUER_MLDSA (обязательство PQ-идентичности издателя, 64 hex)",
+    )?;
+    let dir = token_dir();
+    let epoch_secs: u64 =
+        std::env::var("Citadel_EPOCH_SECS").ok().and_then(|s| s.parse().ok()).unwrap_or(3600);
+    let interval = std::env::var("Citadel_PUBSYNC_INTERVAL")
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+        .unwrap_or_else(|| (epoch_secs / 8).clamp(15, 60));
+    let obfs_psk = obfs_psk_from_env();
+    eprintln!(
+        "[pubsync] издатель {issuer}, каталог {dir}, эпоха {epoch_secs}с, опрос раз в {interval}с{}",
+        if obfs_psk.is_some() { " (obfs)" } else { "" }
+    );
+
+    let mut last: Option<(u64, Vec<u8>)> = None;
+    loop {
+        let epoch = citadel_token::current_epoch(epoch_secs);
+        // Уже есть ключ ЭТОЙ эпохи — не дёргаем издателя лишний раз (сеть + его accept-петля).
+        let need = !matches!(&last, Some((e, _)) if *e == epoch);
+        if need {
+            match citadel_token::fetch_epoch_pub(&issuer, &issuer_pin, &issuer_mldsa, 3, obfs_psk) {
+                Ok(pk) => {
+                    if let Err(e) = publish_epoch_pub(&dir, epoch, &pk) {
+                        eprintln!("[pubsync] ключ эпохи {epoch} получен, но не записан: {e:#}");
+                    } else {
+                        eprintln!("[pubsync] ключ эпохи {epoch} обновлён ({} Б)", pk.len());
+                        last = Some((epoch, pk));
+                    }
+                }
+                // Издатель недоступен — не фатально: exit продолжает работать на ключе прошлой
+                // эпохи (grace current±prev), а мы повторим через интервал. Валиться нельзя:
+                // рестарт-петля контейнера ничего не чинит, а логи забивает.
+                Err(e) => eprintln!("[pubsync] не удалось получить ключ эпохи {epoch}: {e:#}"),
+            }
+        }
+        std::thread::sleep(std::time::Duration::from_secs(interval.max(5)));
+    }
 }
 
 /// Legacy: выпуск пачки токенов в одном процессе → файлы (локальное демо/тесты, без сети).

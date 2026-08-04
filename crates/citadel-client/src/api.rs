@@ -100,6 +100,7 @@ mod tests {
             issuer: Some("issuer.example:7000".into()),
             issuer_pub: Some(vec![4u8; 270]),
             issuer_pin: Some([5u8; 32]),
+            issuer_mldsa: Some([9u8; 32]),
             client_seed: None,
             admin_seed: None,
             admin_port: None,

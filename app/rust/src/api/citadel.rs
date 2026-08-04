@@ -519,6 +519,13 @@ pub fn vault_is_unlocked() -> bool {
 }
 
 /// Заблокировать (забыть ключ из памяти).
+///
+/// **Замок хранилища не имеет отношения к туннелю и обязан его не трогать.** Живой сессии vault не
+/// нужен: ссылка разобрана в [`spawn_controller`] при старте, свежий Layer-1 токен на каждый
+/// establish добывает собственный refresher (у него своя копия issuer+seed), а `update_last_exit`
+/// под замком просто пропускается. Инвариант закреплён тестом `vault_lock_does_not_touch_session`:
+/// раньше «Заблокировать хранилище» на поднятом туннеле обрывало связь (Dart звал `disconnect()`),
+/// хотя пользователь просил ровно обратное — убрать профили с глаз, а не выйти из VPN.
 #[frb(sync)]
 pub fn vault_lock() {
     *VAULT.lock().unwrap() = None;
@@ -855,10 +862,11 @@ fn spawn_controller(
     }
     let controller = Arc::new(VpnController::new());
     *ACTIVE.lock().unwrap() = Some(controller.clone());
-    // S2.1/A1: Layer-1 фетч требует issuer + issuer_pin (PQ-TLS канал) + client_seed. Без pin
-    // refresher не ставим (token-less путь; exit откажет, если требует токен — misconfig виден).
-    if let (Some(iss), Some(pin), Some(seed)) =
-        (link.issuer.clone(), link.issuer_pin, link.client_seed)
+    // S2.1/A1 + PQ: Layer-1 фетч требует issuer + issuer_pin (PQ-TLS канал) + issuer_mldsa
+    // (PQ-обязательство издателя) + client_seed. Чего-то нет → refresher не ставим (token-less
+    // путь; exit откажет, если требует токен — misconfig виден).
+    if let (Some(iss), Some(pin), Some(mldsa), Some(seed)) =
+        (link.issuer.clone(), link.issuer_pin, link.issuer_mldsa, link.client_seed)
     {
         // S2.1/A1-остаток: issuer-канал оборачиваем в obfs тем же PSK, что и туннель (probe-resistance;
         // None для ссылок без obfs → голый TLS). Обязан совпадать с серверной обёрткой.
@@ -869,8 +877,10 @@ fn spawn_controller(
                 // Ошибку добычи НЕ проглатываем (раньше `.ok()` терял причину → в логе лишь «токен не
                 // задан»): логируем полную цепочку — issuer недоступен? pin? obfs? заблокирован
                 // осиротевшим kill-switch'ем? Виден в лог-панели ядра (нужен диагноз auth-failed).
-                match citadel_client::token_agent::fetch_tokens(&iss, &pin, &seed, 1, 3, obfs_psk)
-                    .await
+                match citadel_client::token_agent::fetch_tokens(
+                    &iss, &pin, &mldsa, &seed, 1, 3, obfs_psk,
+                )
+                .await
                 {
                     Ok(mut v) => v.pop(),
                     Err(e) => {
@@ -1168,6 +1178,7 @@ pub fn run_diagnostics(
     let admin = citadel_client::admin_probe_dst(&uri);
     let issuer = dlink.issuer.clone();
     let issuer_pin = dlink.issuer_pin; // S2.1/A1: pin PQ-TLS канала к издателю
+    let issuer_mldsa = dlink.issuer_mldsa; // PQ: обязательство к ML-DSA-идентичности издателя
     let client_seed = dlink.client_seed;
     rt().spawn(async move {
         // Диагностика идёт тем же путём, что реальный коннект: если креды несут Layer-1
@@ -1178,6 +1189,7 @@ pub fn run_diagnostics(
                 cfg.clone(),
                 issuer.as_deref(),
                 issuer_pin.as_ref(),
+                issuer_mldsa.as_ref(),
                 client_seed.as_ref(),
             )
             .await
@@ -1209,4 +1221,43 @@ pub fn run_diagnostics(
         // sink закроется при дропе (функция вернулась) → Dart увидит конец стрима
     });
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Замок хранилища и жизнь туннеля — независимые вещи, и это должно оставаться правдой на
+    /// ВСЕХ клиентах (общий Dart-слой + это ядро): «Заблокировать хранилище» убирает профили с
+    /// глаз, а не выходит из VPN. Регрессия ловится здесь, а не на устройстве: раньше
+    /// `AppState.lockVault()` первым делом звал `disconnect()`, и на живом туннеле замок рвал связь.
+    #[test]
+    fn vault_lock_does_not_touch_session() {
+        let ctrl = Arc::new(VpnController::new());
+        ctrl.begin();
+        *ACTIVE.lock().unwrap() = Some(ctrl.clone());
+
+        vault_lock();
+
+        assert!(ACTIVE.lock().unwrap().is_some(), "замок не должен снимать активную сессию");
+        assert!(!ctrl.is_stopped(), "замок не должен глушить контроллер (авто-реконнект жив)");
+        assert_eq!(ctrl.state(), VpnState::Connecting, "фаза сессии замком не меняется");
+
+        // Не оставляем сессию в статике: следующие тесты в этом процессе видят чистое состояние.
+        *ACTIVE.lock().unwrap() = None;
+    }
+
+    /// Обратная сторона того же инварианта: `vpn_disconnect` — единственная дверь, через которую
+    /// UI гасит сессию (её зовут «Отключить» на главном экране, в трее и на экране разблокировки).
+    #[test]
+    fn vpn_disconnect_stops_session() {
+        let ctrl = Arc::new(VpnController::new());
+        ctrl.begin();
+        *ACTIVE.lock().unwrap() = Some(ctrl.clone());
+
+        vpn_disconnect();
+
+        assert!(ACTIVE.lock().unwrap().is_none(), "disconnect снимает сессию со статика");
+        assert!(ctrl.is_stopped(), "disconnect глушит авто-реконнект");
+    }
 }

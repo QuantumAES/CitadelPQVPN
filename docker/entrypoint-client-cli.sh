@@ -23,27 +23,32 @@ PASSWD=testpassword123
 SEED=$(printf 'c5%.0s' $(seq 1 32))   # тот же seed, что issuer регистрирует в реестре (Layer-1)
 
 echo "[client-cli] жду артефакты exit/issuer в /shared…"
-for f in /shared/exit.pin /shared/obfs.psk /shared/issuer.pub /shared/issuer-tls.pin /shared/exit.mldsa; do
+for f in /shared/exit.pin /shared/obfs.psk /shared/issuer.pub /shared/issuer-tls.pin /shared/issuer-mldsa.pin /shared/exit.mldsa; do
     for _ in $(seq 1 90); do [ -s "$f" ] && break; sleep 1; done
     [ -s "$f" ] || echo "  [!] нет $f — часть тестов упадёт"
 done
 
+# Порты стенда (п.2): нестандартные значения приходят из compose — клиент обязан взять их
+# из ССЫЛКИ и нигде не подставлять 4433/7000 сам.
+UDP_PORT=${CITADEL_UDP_PORT:-4433}
+ISSUER_PORT=${CITADEL_ISSUER_PORT:-7000}
 EXIT_IP=$(getent hosts exit 2>/dev/null | awk '{print $1; exit}')
 ISSUER_IP=$(getent hosts issuer 2>/dev/null | awk '{print $1; exit}')
-echo "[client-cli] exit=$EXIT_IP issuer=$ISSUER_IP"
+echo "[client-cli] exit=$EXIT_IP:$UDP_PORT issuer=$ISSUER_IP:$ISSUER_PORT"
 
 # Ссылка строится по IP (не по имени): именно так и должно быть при включённом kill-switch —
 # резолвер закрыт, а адрес в ссылке работает всегда.
 LINK=$(citadel-linkgen \
-    --servers "$EXIT_IP:4433" \
+    --servers "$EXIT_IP:$UDP_PORT" \
     --server-name Citadel.exit \
     --psk "$(cat /shared/obfs.psk)" \
     --pin "$(cat /shared/exit.pin)" \
     --mldsa-pub /shared/exit.mldsa \
     --routes "1.1.1.1/32 10.99.0.1/32" \
     --dns 1.1.1.1 \
-    --issuer "$ISSUER_IP:7000" \
+    --issuer "$ISSUER_IP:$ISSUER_PORT" \
     --issuer-pin "$(cat /shared/issuer-tls.pin)" \
+    --issuer-mldsa "$(cat /shared/issuer-mldsa.pin)" \
     --client-seed "$SEED" 2>/dev/null | grep -m1 '^citadel://')
 [ -n "$LINK" ] || { echo "[client-cli] ФАТАЛЬНО: не удалось построить ссылку"; sleep infinity; }
 echo "[client-cli] ссылка построена (${#LINK} символов)"
@@ -220,15 +225,16 @@ LAN=$(ip -o -4 route show scope link | awk '/eth0/{print $1; exit}')
 LAN_GW=$(getent hosts exit | awk '{print $1; exit}')   # сосед по мосту (проверка обхода)
 echo "  локальная подсеть (обход): ${LAN:-нет} ; сосед: $LAN_GW"
 LINK_FULL=$(citadel-linkgen \
-    --servers "$EXIT_IP:4433" \
+    --servers "$EXIT_IP:$UDP_PORT" \
     --server-name Citadel.exit \
     --psk "$(cat /shared/obfs.psk)" \
     --pin "$(cat /shared/exit.pin)" \
     --mldsa-pub /shared/exit.mldsa \
     --routes "0.0.0.0/0" \
     --dns 1.1.1.1 \
-    --issuer "$ISSUER_IP:7000" \
+    --issuer "$ISSUER_IP:$ISSUER_PORT" \
     --issuer-pin "$(cat /shared/issuer-tls.pin)" \
+    --issuer-mldsa "$(cat /shared/issuer-mldsa.pin)" \
     --client-seed "$SEED" 2>/dev/null | grep -m1 '^citadel://')
 printf '%s\n%s\n' "$LINK_FULL" "$PASSWD" | citadel-cli add --name full --stdin 2>&1 | tail -1
 [ -n "$LAN" ] && citadel-cli split exclude "$LAN" >/dev/null

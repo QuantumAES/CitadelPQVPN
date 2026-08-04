@@ -138,6 +138,35 @@ pub fn connect_tls(tcp: TcpStream, pin: [u8; 32], obfs_psk: Option<[u8; 32]>) ->
     Ok(StreamOwned::new(conn, ObfsMaybe::wrap(tcp, obfs_psk)))
 }
 
+/// Метка TLS keying-material exporter'а (RFC 5705) — channel binding PQ-подписей обоих каналов
+/// (выдача токенов и admin). Одна на обе стороны; назначение подписи разделяют домены
+/// [`crate::pqid`], а не метка.
+pub const EKM_LABEL: &[u8] = b"EXPORTER-CitadelPQVPN/pqid/v1";
+/// Длина выводимого экспортера.
+pub const EKM_LEN: usize = 32;
+
+/// Довести хендшейк до конца и вернуть EKM сессии.
+///
+/// Явно, а не «само собой на первом кадре»: экспортер доступен ТОЛЬКО после завершённого
+/// хендшейка, а издатель обязан подписать его в САМОМ ПЕРВОМ прикладном кадре (hello) — иначе
+/// клиент отдал бы свой `client_id` непроверенной стороне. `complete_io` прокачивает хендшейк в
+/// обе стороны, не добавляя round-trip к протоколу.
+pub fn handshake_client(tls: &mut ClientTlsStream) -> Result<[u8; EKM_LEN]> {
+    tls.conn.complete_io(&mut tls.sock).context("TLS-хендшейк с издателем (pin/obfs не совпал?)")?;
+    ekm(&tls.conn)
+}
+
+/// Серверная сторона [`handshake_client`].
+pub fn handshake_server(tls: &mut IssuerTlsStream) -> Result<[u8; EKM_LEN]> {
+    tls.conn.complete_io(&mut tls.sock).context("TLS-хендшейк с клиентом")?;
+    ekm(&tls.conn)
+}
+
+fn ekm<D>(conn: &rustls::ConnectionCommon<D>) -> Result<[u8; EKM_LEN]> {
+    conn.export_keying_material([0u8; EKM_LEN], EKM_LABEL, None)
+        .map_err(|e| anyhow!("EKM (хендшейк не завершён?): {e}"))
+}
+
 /// Верификатор с пиннингом: сверяет pin серта И проверяет подпись хендшейка штатными алгоритмами
 /// (без последнего pin публичного ключа не защищал бы от MITM). Копия `citadel_quic::PinnedServerCert`
 /// (крейт citadel-token не может зависеть от citadel-quic — обратная зависимость в графе).

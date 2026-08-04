@@ -30,8 +30,8 @@ set -euo pipefail
 # ─── ВШИТЫЙ публичный ключ релиза (см. packaging/release/citadel-release.pub) ───
 RELEASE_PUBKEY="RWSErwVVdH0bhg9dQViFezkqCQPfWpZt18rK0irjOOpNfUW3G4hkoNp4"
 
-# ─── параметры (env или $1=version) ───
-VERSION="${1:-${CITADEL_VERSION:-}}"
+# ─── параметры (env, флаги или $1=version) ───
+VERSION="${CITADEL_VERSION:-}"
 REPO="${CITADEL_REPO:-QuantumAES/CitadelPQVPN}"
 BASE_URL="${CITADEL_BASE_URL:-https://github.com/$REPO/releases/download}"
 SERVER_HOST="${CITADEL_SERVER_HOST:-}"       # публичный host/IP для ссылки; пусто → автодетект
@@ -55,6 +55,152 @@ LEASE_SECS="${CITADEL_LEASE_SECS:-0}"        # задача 4/B: single-session 
 log()  { printf '\033[1;36m[citadel]\033[0m %s\n' "$*"; }
 warn() { printf '\033[1;33m[citadel] ⚠ %s\033[0m\n' "$*" >&2; }
 die()  { printf '\033[1;31m[citadel] ОШИБКА: %s\033[0m\n' "$*" >&2; exit 1; }
+
+usage() {
+  cat <<'USAGE'
+CitadelPQVPN — установщик exit-сервера (запускать на сервере от root).
+
+  install-citadel-server.sh [vX.Y.Z] [флаги]
+
+Порты (значение по умолчанию в скобках; каждый флаг дублируется env-переменной):
+  --udp-port    N   (4433)  QUIC/UDP туннеля            [CITADEL_UDP_PORT]
+  --tcp-port    N   (443)   obfs-over-TCP fallback      [CITADEL_TCP_PORT]
+  --issuer-port N   (7000)  издатель токенов (публичный)[CITADEL_ISSUER_PORT]
+  --admin-port  N   (7001)  admin-канал, НАРУЖУ НЕ ОТКРЫТ — только из туннеля [CITADEL_ADMIN_PORT]
+
+Порты по умолчанию узнаваемы (4433/7000 — «подпись» Citadel). На сети, где это важно,
+задавай свои: клиент берёт их из ссылки, менять на нём ничего не нужно. Единственный порт,
+который стоит оставить как есть, — TCP 443: obfs-fallback маскируется под HTTPS.
+
+Роль установки (P1 — разнести exit и издателя по разным машинам):
+  --role all        (умолчание) exit и издатель на ОДНОМ сервере
+  --role issuer     только издатель: реестр абонентов + выдача токенов + admin-канал
+  --role exit       только exit-узел; параметры издателя берутся из его bundle
+  --issuer-bundle F файл `KEY=VALUE`, напечатанный установкой издателя (для --role exit)
+
+Одна кража диска не должна давать обе идентичности сразу, поэтому на серьёзной установке
+издателя выносят на отдельную машину. Порядок: сначала `--role issuer` (он напечатает bundle),
+затем на другой машине `--role exit --issuer-bundle …`. Публичный ключ эпохи exit подтягивает
+сам (контейнер `citadel-pubsync`), общий том между машинами не нужен.
+
+Прочее:
+  --host HOST       публичный адрес для ссылки (по умолчанию — автодетект)  [CITADEL_SERVER_HOST]
+  --routes "CIDR…"  что гнать в туннель (0.0.0.0/0)                          [CITADEL_ROUTES]
+  --dns IP          DNS, проталкиваемый клиенту (1.1.1.1)                    [CITADEL_DNS]
+  --dir PATH        каталог установки (/opt/citadel)                         [CITADEL_DIR]
+  --no-issuer       token-less exit без издателя (по умолчанию издатель включён) [CITADEL_ISSUER=0]
+  --keep-keys       не ротировать идентичность при повторном запуске         [CITADEL_KEEP_KEYS=1]
+  -h, --help        эта справка
+USAGE
+}
+
+# Разбор флагов. Позиционный аргумент (версия релиза) поддержан как раньше.
+while (($#)); do
+  case "$1" in
+    --role)           CITADEL_ROLE="${2:-}";          shift 2 ;;
+    --issuer-bundle)  CITADEL_ISSUER_BUNDLE="${2:-}"; shift 2 ;;
+    --issuer-addr)    CITADEL_ISSUER_ADDR="${2:-}";   shift 2 ;;
+    --issuer-pin)     CITADEL_ISSUER_PIN="${2:-}";    shift 2 ;;
+    --issuer-mldsa)   CITADEL_ISSUER_MLDSA="${2:-}";  shift 2 ;;
+    --obfs-psk)       CITADEL_OBFS_PSK="${2:-}";      shift 2 ;;
+    --client-seed)    CITADEL_CLIENT_SEED="${2:-}";   shift 2 ;;
+    --admin-seed)     CITADEL_ADMIN_SEED="${2:-}";    shift 2 ;;
+    --udp-port)     CITADEL_UDP_PORT="${2:-}";     shift 2 ;;
+    --tcp-port)     CITADEL_TCP_PORT="${2:-}";     shift 2 ;;
+    --issuer-port)  CITADEL_ISSUER_PORT="${2:-}";  shift 2 ;;
+    --admin-port)   CITADEL_ADMIN_PORT="${2:-}";   shift 2 ;;
+    --host)         CITADEL_SERVER_HOST="${2:-}";  shift 2 ;;
+    --routes)       CITADEL_ROUTES="${2:-}";       shift 2 ;;
+    --dns)          CITADEL_DNS="${2:-}";          shift 2 ;;
+    --dir)          CITADEL_DIR="${2:-}";          shift 2 ;;
+    --no-issuer)    CITADEL_ISSUER=0;              shift ;;
+    --keep-keys)    CITADEL_KEEP_KEYS=1;           shift ;;
+    -h|--help)      usage; exit 0 ;;
+    -*)             die "неизвестный флаг: $1 (см. --help)" ;;
+    *)              VERSION="$1";                  shift ;;
+  esac
+done
+# Флаги выставляют те же переменные, что и env, поэтому значения перечитываем ПОСЛЕ разбора.
+SERVER_HOST="${CITADEL_SERVER_HOST:-$SERVER_HOST}"
+UDP_PORT="${CITADEL_UDP_PORT:-$UDP_PORT}"
+TCP_PORT="${CITADEL_TCP_PORT:-$TCP_PORT}"
+ISSUER_PORT="${CITADEL_ISSUER_PORT:-$ISSUER_PORT}"
+ADMIN_PORT="${CITADEL_ADMIN_PORT:-$ADMIN_PORT}"
+ROUTES="${CITADEL_ROUTES:-$ROUTES}"
+DNS="${CITADEL_DNS:-$DNS}"
+DIR="${CITADEL_DIR:-$DIR}"
+ISSUER_ON="${CITADEL_ISSUER:-$ISSUER_ON}"
+ROLE="${CITADEL_ROLE:-all}"
+
+# ─── 0a-bis. роль установки (P1: exit и издатель на разных машинах) ───
+case "$ROLE" in
+  all|issuer|exit) ;;
+  *) die "--role: '$ROLE' — допустимо all | issuer | exit" ;;
+esac
+# Файл-bundle от установки издателя: те же имена, что и env-переменные (KEY=VALUE, без экспорта).
+if [[ -n "${CITADEL_ISSUER_BUNDLE:-}" ]]; then
+  [[ -r "$CITADEL_ISSUER_BUNDLE" ]] || die "--issuer-bundle: файл не читается: $CITADEL_ISSUER_BUNDLE"
+  # Только известные ключи и только hex/host:port — файл приходит с другой машины, доверять ему
+  # как shell-скрипту («source») нельзя: одна строка `rm -rf /` выполнилась бы от root.
+  while IFS='=' read -r k v; do
+    k="${k%%[[:space:]]*}"; v="${v%%[[:space:]]*}"
+    [[ -z "$k" || "$k" == \#* ]] && continue
+    case "$k" in
+      CITADEL_ISSUER_ADDR|CITADEL_ISSUER_PIN|CITADEL_ISSUER_MLDSA|CITADEL_OBFS_PSK|\
+      CITADEL_CLIENT_SEED|CITADEL_ADMIN_SEED|CITADEL_ADMIN_PORT|CITADEL_EPOCH_SECS|CITADEL_ISSUER_PORT)
+        # уже заданный флаг/env приоритетнее файла (позволяет точечно переопределить)
+        [[ -n "${!k:-}" ]] || printf -v "$k" '%s' "$v" ;;
+      *) warn "issuer-bundle: неизвестный ключ '$k' пропущен" ;;
+    esac
+  done < "$CITADEL_ISSUER_BUNDLE"
+  ADMIN_PORT="${CITADEL_ADMIN_PORT:-$ADMIN_PORT}"
+  ISSUER_PORT="${CITADEL_ISSUER_PORT:-$ISSUER_PORT}"
+  EPOCH_SECS="${CITADEL_EPOCH_SECS:-$EPOCH_SECS}"
+fi
+ISSUER_ADDR="${CITADEL_ISSUER_ADDR:-}"     # host:port издателя (только --role exit)
+ISSUER_PIN_IN="${CITADEL_ISSUER_PIN:-}"    # его TLS-pin
+ISSUER_MLDSA_IN="${CITADEL_ISSUER_MLDSA:-}" # обязательство его PQ-идентичности
+PSK_IN="${CITADEL_OBFS_PSK:-}"             # общий obfs-PSK (генерит установка издателя)
+CLIENT_SEED_IN="${CITADEL_CLIENT_SEED:-}"  # seed абонента (ссылку минтит exit-машина)
+ADMIN_SEED_IN="${CITADEL_ADMIN_SEED:-}"    # seed админа (мастер-ссылка)
+if [[ "$ROLE" == exit && "$ISSUER_ON" == 1 ]]; then
+  hex64() { [[ "$1" =~ ^[0-9a-fA-F]{64}$ ]]; }
+  [[ -n "$ISSUER_ADDR" ]] || die "--role exit: нужен --issuer-addr host:port (или --issuer-bundle)"
+  [[ "$ISSUER_ADDR" == *:* ]] || die "--issuer-addr: ожидается host:port, получено '$ISSUER_ADDR'"
+  for spec in "ISSUER_PIN_IN:--issuer-pin" "ISSUER_MLDSA_IN:--issuer-mldsa" "PSK_IN:--obfs-psk" \
+              "CLIENT_SEED_IN:--client-seed" "ADMIN_SEED_IN:--admin-seed"; do
+    var="${spec%%:*}"; flag="${spec##*:}"
+    [[ -n "${!var}" ]] || die "--role exit: нужен $flag (или --issuer-bundle с ним)"
+    hex64 "${!var}" || die "$flag: ожидается 64 hex-символа"
+  done
+fi
+
+# ─── 0a. валидация портов ───
+# Кривой порт обязан отвалиться ЗДЕСЬ, а не через 5 минут установки в невнятной ошибке docker/netsh:
+# `ports: "70000:4433/udp"` compose примет за строку и упадёт уже на `up`, а занятый порт даст
+# «address already in use» после сборки образа.
+valid_port() { [[ "$1" =~ ^[0-9]+$ ]] && (($1 >= 1 && $1 <= 65535)); }
+for spec in "UDP_PORT:--udp-port" "TCP_PORT:--tcp-port" "ISSUER_PORT:--issuer-port" "ADMIN_PORT:--admin-port"; do
+  var="${spec%%:*}"; flag="${spec##*:}"
+  valid_port "${!var}" || die "$flag: '${!var}' — порт должен быть числом 1..65535"
+done
+# Публичные порты не должны совпадать между собой (иначе docker молча возьмёт последний биндинг),
+# а admin-порт — не совпадать с портом издателя: они слушаются ОДНИМ процессом.
+[[ "$UDP_PORT" != "$TCP_PORT" ]] || die "--udp-port и --tcp-port совпадают ($UDP_PORT): это разные протоколы, но публикуются разными правилами — задай разные значения"
+if [[ "$ISSUER_ON" == 1 ]]; then
+  [[ "$ISSUER_PORT" != "$TCP_PORT" ]] || die "--issuer-port и --tcp-port совпадают ($TCP_PORT) — оба TCP на одном хосте не поднимутся"
+  [[ "$ISSUER_PORT" != "$ADMIN_PORT" ]] || die "--issuer-port и --admin-port совпадают ($ISSUER_PORT) — издатель слушает оба, bind не пройдёт"
+fi
+# Занятость порта на хосте (docker publish упадёт на bind). Проверяем только публикуемые порты:
+# admin-порт живёт внутри compose-сети и наружу не публикуется.
+if command -v ss >/dev/null; then
+  busy() { ss -Hln"$1" "sport = :$2" 2>/dev/null | grep -q . ; }
+  busy u "$UDP_PORT" && warn "UDP-порт $UDP_PORT уже кем-то занят на хосте — publish может не пройти"
+  busy t "$TCP_PORT" && warn "TCP-порт $TCP_PORT уже кем-то занят на хосте — publish может не пройти"
+  [[ "$ISSUER_ON" == 1 ]] && busy t "$ISSUER_PORT" && warn "TCP-порт издателя $ISSUER_PORT уже кем-то занят на хосте"
+fi
+# 443 у obfs-fallback — не «просто дефолт», а маскировка под HTTPS: смена ломает камуфляж.
+[[ "$TCP_PORT" == "443" ]] || warn "obfs-fallback переехал на TCP $TCP_PORT: маскировка под HTTPS работает именно на 443 — менять его стоит только осознанно"
 
 # ─── 0. преконды ───
 [[ "$(id -u)" == "0" ]] || die "запусти от root (sudo)"
@@ -166,6 +312,7 @@ if [[ -f "$DIR/keys/obfs.psk" && "${CITADEL_KEEP_KEYS:-0}" != 1 ]]; then
   # остановить контейнеры, держащие старые ключи в RAM — при up перечитают свежие из тома
   [[ -f "$DIR/etc/compose.yml" ]] && docker compose -f "$DIR/etc/compose.yml" down >/dev/null 2>&1 || true
   rm -f "$DIR/keys/"obfs.psk "$DIR/keys/"client.seed "$DIR/keys/"admin.seed \
+        "$DIR/keys/"issuer-mldsa.seed "$DIR/keys/"issuer-mldsa.pin \
         "$DIR/keys/"admin_id "$DIR/keys/"admin.client_id "$DIR/keys/"registry "$DIR/keys/"tokens \
         "$DIR/keys/"exit.pin "$DIR/keys/"exit-cert.der "$DIR/keys/"exit-key.der \
         "$DIR/keys/"exit-mldsa.seed "$DIR/keys/"exit.mldsa "$DIR/keys/"exit2.pin "$DIR/keys/"exit2.mldsa \
@@ -174,8 +321,13 @@ if [[ -f "$DIR/keys/obfs.psk" && "${CITADEL_KEEP_KEYS:-0}" != 1 ]]; then
 fi
 
 # ─── 4. keygen на сервере: obfs PSK + (issuer) client_seed «абонента» ───
+# PSK общий для туннеля и каналов издателя, поэтому при раздельном деплое его генерит установка
+# ИЗДАТЕЛЯ и передаёт exit-машине bundle'ом — иначе обфускация у сторон не сойдётся.
 PSK_FILE="$DIR/keys/obfs.psk"
-if [[ ! -f "$PSK_FILE" ]]; then
+if [[ "$ROLE" == exit && -n "$PSK_IN" ]]; then
+  printf '%s' "$PSK_IN" > "$PSK_FILE"
+  chmod 600 "$PSK_FILE"
+elif [[ ! -f "$PSK_FILE" ]]; then
   head -c 32 /dev/urandom | od -An -tx1 | tr -d ' \n' > "$PSK_FILE"
   chmod 600 "$PSK_FILE"
 fi
@@ -183,7 +335,16 @@ PSK="$(cat "$PSK_FILE")"
 
 CLIENT_SEED=""; CLIENT_PUB=""
 ADMIN_SEED=""; ADMIN_PUB=""
-if [[ "$ISSUER_ON" == 1 ]]; then
+if [[ "$ROLE" == exit && "$ISSUER_ON" == 1 ]]; then
+  # Раздельный деплой: seed'ы сгенерированы на машине ИЗДАТЕЛЯ (там же они зарегистрированы в
+  # реестре и в admin_id). Здесь они нужны ровно для одного — собрать ссылки, потому что только у
+  # exit-машины есть его cert-pin и ML-DSA pub. Сразу после печати стираются (§8).
+  CLIENT_SEED="$CLIENT_SEED_IN"
+  ADMIN_SEED="$ADMIN_SEED_IN"
+  CLIENT_PUB="$(Citadel_CLIENT_SEED="$CLIENT_SEED" "$DIR/bin/citadel-token" pubkey)" \
+    || die "не удалось вывести client_id абонента (citadel-token pubkey)"
+  log "Layer-1 абонент из bundle издателя: client_id=${CLIENT_PUB:0:16}…"
+elif [[ "$ISSUER_ON" == 1 ]]; then
   # client_seed = приватный Ed25519 «абонента» (Layer-1); хранится ТОЛЬКО у админа (в ссылке).
   SEED_FILE="$DIR/keys/client.seed"
   if [[ ! -f "$SEED_FILE" ]]; then
@@ -191,12 +352,14 @@ if [[ "$ISSUER_ON" == 1 ]]; then
     chmod 600 "$SEED_FILE"
   fi
   CLIENT_SEED="$(cat "$SEED_FILE")"
-  # В реестр издателя пишем PUB (client_id), а НЕ seed → издатель не знает секрет абонента.
+  # В реестр издателя пишем client_id (публичный идентификатор гибридной Ed25519+ML-DSA
+  # идентичности абонента), а НЕ seed → издатель не знает секрет абонента.
   CLIENT_PUB="$(Citadel_CLIENT_SEED="$CLIENT_SEED" "$DIR/bin/citadel-token" pubkey)" \
     || die "не удалось вывести client_id абонента (citadel-token pubkey)"
   log "Layer-1 абонент: client_id=${CLIENT_PUB:0:16}… (seed остаётся только в ссылке)"
 
-  # C7.2 admin-плоскость: ОТДЕЛЬНЫЙ Ed25519 админа (не равен client.seed — домен-разделение auth).
+  # C7.2 admin-плоскость: ОТДЕЛЬНЫЙ seed админа (не равен client.seed — домен-разделение auth);
+  # из него выводится та же гибридная пара Ed25519+ML-DSA, что и у абонента.
   # admin.seed уходит ТОЛЬКО в мастер-ссылку; на сервере (том issuer) остаётся лишь pub (admin_id).
   ADMIN_SEED_FILE="$DIR/keys/admin.seed"
   if [[ ! -f "$ADMIN_SEED_FILE" ]]; then
@@ -215,6 +378,15 @@ if [[ "$ISSUER_ON" == 1 ]]; then
 fi
 
 # ─── 5. образ (Dockerfile) + entrypoints + compose ───
+# Где exit ищет издателя: в общей установке — по docker-DNS имени сервиса, при раздельной — по
+# хосту из bundle (DNAT работает по адресу, поэтому имя резолвится в entrypoint при старте).
+if [[ "$ROLE" == exit ]]; then
+  ISSUER_DNS_NAME="${ISSUER_ADDR%%:*}"
+  ISSUER_TOKEN_PORT="${ISSUER_ADDR##*:}"
+else
+  ISSUER_DNS_NAME="issuer"
+  ISSUER_TOKEN_PORT="$ISSUER_PORT"
+fi
 cat > "$DIR/etc/Dockerfile" <<'EOF'
 # S1.5: digest-pin базового образа (OCI index, мульти-арч) — supply-chain/воспроизводимость
 FROM debian:trixie-slim@sha256:28de0877c2189802884ccd20f15ee41c203573bd87bb6b883f5f46362d24c5c2
@@ -225,8 +397,10 @@ COPY bin/citadel-m1 /usr/local/bin/citadel-m1
 COPY bin/citadel-token /usr/local/bin/citadel-token
 COPY etc/entrypoint-exit.sh /usr/local/bin/entrypoint-exit.sh
 COPY etc/entrypoint-issuer.sh /usr/local/bin/entrypoint-issuer.sh
+COPY etc/entrypoint-pubsync.sh /usr/local/bin/entrypoint-pubsync.sh
 RUN chmod +x /usr/local/bin/citadel-m1 /usr/local/bin/citadel-token \
-        /usr/local/bin/entrypoint-exit.sh /usr/local/bin/entrypoint-issuer.sh
+        /usr/local/bin/entrypoint-exit.sh /usr/local/bin/entrypoint-issuer.sh \
+        /usr/local/bin/entrypoint-pubsync.sh
 EOF
 
 # entrypoint exit-узла. При ISSUER_ON — требует epoch-токен и включает ML-DSA (M7).
@@ -261,7 +435,13 @@ rm -f /shared/exit.mldsa
 # Резолвим issuer по docker-DNS в IP (iptables DNAT принимает адрес, не имя).
 export Citadel_ADMIN_VIP=$ADMIN_VIP
 export Citadel_ADMIN_PORT=$ADMIN_PORT
-ISSUER_IP="\$(getent hosts issuer | awk '{print \$1}' | head -n1)"
+# Издатель может быть задан именем (docker-DNS в общей установке) ИЛИ голым IP (bundle при
+# раздельной). getent hosts на адрес без обратной DNS-записи возвращает ПУСТО — поэтому
+# литеральный IPv4 берём как есть и резолвим только имена.
+ISSUER_IP="$ISSUER_DNS_NAME"
+case "\$ISSUER_IP" in
+  *[!0-9.]*) ISSUER_IP="\$(getent hosts $ISSUER_DNS_NAME | awk '{print \$1}' | head -n1)" ;;
+esac
 if [ -n "\$ISSUER_IP" ]; then
   export Citadel_ADMIN_DNAT="\$ISSUER_IP:$ADMIN_PORT"
   echo "[citadel-exit] admin-plane: DNAT $ADMIN_VIP:$ADMIN_PORT -> \$ISSUER_IP:$ADMIN_PORT (только из туннеля)"
@@ -276,6 +456,23 @@ EOF
   echo 'exec citadel-m1'
 } > "$DIR/etc/entrypoint-exit.sh"
 chmod +x "$DIR/etc/entrypoint-exit.sh"
+
+# entrypoint pubsync-сайдкара (P1, раздельный деплой): держит публичный ключ ТЕКУЩЕЙ эпохи в томе
+# exit'а. При установке «всё на одном сервере» не задействуется — там ключ пишет сам издатель.
+cat > "$DIR/etc/entrypoint-pubsync.sh" <<EOF
+#!/usr/bin/env bash
+set -e
+export Citadel_TOKEN_ROLE=pubsync
+export Citadel_TOKEN_DIR=/shared
+export Citadel_TOKEN_ISSUER=$ISSUER_ADDR
+export Citadel_ISSUER_PIN=$ISSUER_PIN_IN
+export Citadel_ISSUER_MLDSA=$ISSUER_MLDSA_IN
+export Citadel_EPOCH_SECS=$EPOCH_SECS
+export Citadel_OBFS_PSK=\$(cat /shared/obfs.psk)
+echo "[citadel-pubsync] слежу за ключом эпохи у издателя $ISSUER_ADDR (эпоха ${EPOCH_SECS}с)…"
+exec citadel-token
+EOF
+chmod +x "$DIR/etc/entrypoint-pubsync.sh"
 
 # entrypoint издателя (генерируется всегда; задействуется только при ISSUER_ON).
 # Реестр (/shared/registry) НЕ удаляем — admin-revoke переживает рестарт (bootstrap лишь досевает).
@@ -304,7 +501,7 @@ cat <<EOF
 name: citadel
 services:
 EOF
-if [[ "$ISSUER_ON" == 1 ]]; then
+if [[ "$ISSUER_ON" == 1 && "$ROLE" != exit ]]; then
 cat <<EOF
   issuer:
     image: citadel-exit:$VERSION
@@ -317,7 +514,8 @@ cat <<EOF
     environment:
       Citadel_OBFS_PSK: "$PSK"         # S2.1/A1-остаток: obfs-обёртка token-/admin-каналов (probe-resistance)
     ports:
-      - "$ISSUER_PORT:7000/tcp"        # клиент фетчит epoch-токены сюда (Layer-1)
+      - "$ISSUER_PORT:7000/tcp"        # клиент фетчит epoch-токены сюда (Layer-1)$(
+      if [[ "$ROLE" == issuer ]]; then printf '\n      - "%s:%s/tcp"   # admin-канал: НУЖЕН только exit-машине — закрой его firewall\x27ом для всех остальных' "$ADMIN_PORT" "$ADMIN_PORT"; fi)
     volumes:
       - "$DIR/keys:/shared"
     healthcheck:                       # готов, когда RSA-ключ эпохи сгенерирован и issuer.pub опубликован
@@ -328,6 +526,7 @@ cat <<EOF
       start_period: 3s
 EOF
 fi
+if [[ "$ROLE" != issuer ]]; then
 cat <<EOF
   exit:
     image: citadel-exit:$VERSION
@@ -348,11 +547,28 @@ cat <<EOF
     volumes:
       - "$DIR/keys:/shared"
 EOF
-if [[ "$ISSUER_ON" == 1 ]]; then
+if [[ "$ISSUER_ON" == 1 && "$ROLE" == all ]]; then
 cat <<EOF
     depends_on:
       issuer: { condition: service_healthy }   # нужен issuer.pub для верификации токенов
 EOF
+fi
+# P1: при раздельном деплое ключ эпохи на exit-машину приносит сайдкар (общего тома с издателем
+# нет, а ключ ротируется каждую эпоху).
+if [[ "$ISSUER_ON" == 1 && "$ROLE" == exit ]]; then
+cat <<EOF
+  pubsync:
+    image: citadel-exit:$VERSION
+    container_name: citadel-pubsync
+    entrypoint: ["/usr/local/bin/entrypoint-pubsync.sh"]
+    read_only: true
+    tmpfs: ["/tmp"]
+    security_opt: ["no-new-privileges:true"]
+    restart: unless-stopped
+    volumes:
+      - "$DIR/keys:/shared"
+EOF
+fi
 fi
 } > "$DIR/etc/compose.yml"
 
@@ -363,24 +579,47 @@ docker build -t "citadel-exit:$VERSION" -f "$DIR/etc/Dockerfile" "$DIR"
 log "поднимаю контейнер(ы) (docker compose up)…"
 docker compose -f "$DIR/etc/compose.yml" up -d
 
-log "жду готовности exit (cert/pin)…"
-for _ in $(seq 1 90); do [[ -s "$DIR/keys/exit.pin" ]] && break; sleep 1; done
-[[ -s "$DIR/keys/exit.pin" ]] || {
-  docker compose -f "$DIR/etc/compose.yml" logs --tail 40 || true
-  die "exit не поднялся за 90с (см. лог выше)"
-}
-PIN="$(cat "$DIR/keys/exit.pin")"
+PIN=""
+if [[ "$ROLE" != issuer ]]; then
+  log "жду готовности exit (cert/pin)…"
+  for _ in $(seq 1 90); do [[ -s "$DIR/keys/exit.pin" ]] && break; sleep 1; done
+  [[ -s "$DIR/keys/exit.pin" ]] || {
+    docker compose -f "$DIR/etc/compose.yml" logs --tail 40 || true
+    die "exit не поднялся за 90с (см. лог выше)"
+  }
+  PIN="$(cat "$DIR/keys/exit.pin")"
+fi
 
 MLDSA_ARGS=()
 ISSUER_TLS_PIN=""
-if [[ "$ISSUER_ON" == 1 ]]; then
-  log "жду издателя (issuer.pub, issuer-tls.pin) и ML-DSA pub exit'а…"
-  for _ in $(seq 1 90); do [[ -s "$DIR/keys/issuer.pub" && -s "$DIR/keys/issuer-tls.pin" && -s "$DIR/keys/exit.mldsa" ]] && break; sleep 1; done
+if [[ "$ISSUER_ON" == 1 && "$ROLE" == exit ]]; then
+  # Раздельный деплой: TLS-pin и PQ-обязательство издателя пришли bundle'ом, а ключ эпохи должен
+  # ПРИЙТИ ПО СЕТИ — это и есть проверка, что связка exit↔издатель собрана верно (порт открыт,
+  # PSK совпал, pin/обязательство те самые). Без неё установка «прошла бы успешно», а туннель
+  # молча отвергал бы все токены.
+  ISSUER_TLS_PIN="$ISSUER_PIN_IN"
+  ISSUER_MLDSA="$ISSUER_MLDSA_IN"
+  log "жду ML-DSA pub exit'а и первую синхронизацию ключа эпохи с издателем $ISSUER_ADDR…"
+  for _ in $(seq 1 90); do [[ -s "$DIR/keys/exit.mldsa" && -s "$DIR/keys/issuer.pub" ]] && break; sleep 1; done
+  [[ -s "$DIR/keys/exit.mldsa" ]] || die "exit не опубликовал ML-DSA pub (exit.mldsa) за 90с"
+  [[ -s "$DIR/keys/issuer.pub" ]] || {
+    docker compose -f "$DIR/etc/compose.yml" logs --tail 30 pubsync || true
+    die "не удалось получить ключ эпохи у издателя $ISSUER_ADDR за 90с — проверь: порт $ISSUER_TOKEN_PORT открыт с этой машины, obfs-PSK/pin/обязательство из bundle те самые (лог выше)"
+  }
+  MLDSA_ARGS=(--mldsa-pub "$DIR/keys/exit.mldsa")
+  log "ключ эпохи получен от издателя ✓ (дальше сайдкар citadel-pubsync держит его свежим)"
+elif [[ "$ISSUER_ON" == 1 ]]; then
+  log "жду издателя (issuer.pub, issuer-tls.pin, issuer-mldsa.pin) и ML-DSA pub exit'а…"
+  for _ in $(seq 1 90); do [[ -s "$DIR/keys/issuer.pub" && -s "$DIR/keys/issuer-tls.pin" && -s "$DIR/keys/issuer-mldsa.pin" && -s "$DIR/keys/exit.mldsa" ]] && break; sleep 1; done
   [[ -s "$DIR/keys/issuer.pub" ]] || { docker compose -f "$DIR/etc/compose.yml" logs --tail 40 issuer || true; die "издатель не опубликовал issuer.pub за 90с"; }
   [[ -s "$DIR/keys/issuer-tls.pin" ]] || die "издатель не опубликовал issuer-tls.pin (PQ-TLS канал, A1) за 90с"
+  [[ -s "$DIR/keys/issuer-mldsa.pin" ]] || die "издатель не опубликовал issuer-mldsa.pin (PQ-аутентификация издателя) за 90с"
   [[ -s "$DIR/keys/exit.mldsa" ]] || die "exit не опубликовал ML-DSA pub (exit.mldsa) за 90с"
   MLDSA_ARGS=(--mldsa-pub "$DIR/keys/exit.mldsa")
   ISSUER_TLS_PIN="$(cat "$DIR/keys/issuer-tls.pin")"   # S2.1/A1: pin PQ-TLS канала издателя → в ссылку
+  # PQ: обязательство к ML-DSA-идентичности издателя. Без него клиент откажется и фетчить токены,
+  # и открывать admin-канал: pin серта — классическая привязка, против CRQC она не держит.
+  ISSUER_MLDSA="$(cat "$DIR/keys/issuer-mldsa.pin")"
 fi
 
 # ─── 7. публичный адрес + citadel:// (секрет) ───
@@ -389,12 +628,72 @@ if [[ -z "$SERVER_HOST" ]]; then
 fi
 [[ -n "$SERVER_HOST" ]] || die "не удалось определить публичный IP — задай CITADEL_SERVER_HOST=<ip/host>"
 
+# ── роль issuer: ссылок здесь нет (у машины нет exit-идентичности) — печатаем bundle для exit'а ──
+if [[ "$ROLE" == issuer ]]; then
+  BUNDLE="$(mktemp)"
+  cat > "$BUNDLE" <<EOF
+CITADEL_ISSUER_ADDR=$SERVER_HOST:$ISSUER_PORT
+CITADEL_ISSUER_PIN=$ISSUER_TLS_PIN
+CITADEL_ISSUER_MLDSA=$ISSUER_MLDSA
+CITADEL_OBFS_PSK=$PSK
+CITADEL_CLIENT_SEED=$CLIENT_SEED
+CITADEL_ADMIN_SEED=$ADMIN_SEED
+CITADEL_ADMIN_PORT=$ADMIN_PORT
+CITADEL_EPOCH_SECS=$EPOCH_SECS
+EOF
+  cat <<EOF
+
+╔══════════════════════════════════════════════════════════════════╗
+║  CitadelPQVPN ИЗДАТЕЛЬ развёрнут ✓   ($SERVER_HOST:$ISSUER_PORT tcp)
+╚══════════════════════════════════════════════════════════════════╝
+
+Это половина установки: exit-узел ставится ОТДЕЛЬНОЙ командой на другой машине. Ссылок здесь нет
+и быть не может — их собирает exit-машина (только у неё есть cert-pin и ML-DSA-ключ туннеля).
+
+Порты этой машины:
+  • $ISSUER_PORT/tcp  — выдача токенов          → ОТКРЫТЬ для клиентов
+  • $ADMIN_PORT/tcp  — admin-канал            → открыть ТОЛЬКО для адреса exit-машины, например:
+      ufw allow from <IP_EXIT> to any port $ADMIN_PORT proto tcp
+    (канал и сам защищён PQ-TLS+pin и подписью админа, но лишней публичности ему не нужно)
+
+────────────────── СЕКРЕТ: bundle для установки exit-узла ──────────────────
+Скопируй в файл на exit-машине (например issuer.env) и поставь exit так:
+
+  ./install-citadel-server.sh $VERSION --role exit --issuer-bundle issuer.env
+
+$(cat "$BUNDLE")
+─────────────────────────────────────────────────────────────────────────────
+Bundle содержит seed'ы абонента и админа — это секрет уровня «доступ к сервису». Передавай его
+на exit-машину защищённым каналом (scp), не через мессенджер, и удали файл после установки.
+
+Реестр Layer-1 и admin_id остаются ЗДЕСЬ: абонентов выдаёт и отзывает эта машина.
+Управление: docker compose -f $DIR/etc/compose.yml {ps,logs,down}
+
+ЕСЛИ ЭТА МАШИНА СКОМПРОМЕТИРОВАНА: переустанови издателя этим же скриптом (сменится его
+TLS-идентичность и PQ-идентичность) и следом переустанови exit с новым bundle — прежние ссылки
+станут нерабочими, раздай новые. Смысл раздельного деплоя в том, что кража ЭТОЙ машины не даёт
+идентичность туннеля (она на exit-узле) — и наоборот. Подробнее: docs/SERVER-KEY-PROTECTION.md.
+EOF
+  rm -f "$BUNDLE"
+  # Seed'ы напечатаны — на диске издателя их не оставляем (Q2/Q4, как в общей установке).
+  for sfile in "$DIR/keys/admin.seed" "$DIR/keys/client.seed"; do
+    [[ -f "$sfile" ]] || continue
+    shred -u "$sfile" 2>/dev/null || rm -f "$sfile"
+  done
+  log "seed'ы абонента и админа стёрты с машины издателя (они уехали в bundle)"
+  exit 0
+fi
+
 LINKARGS=(--servers "$SERVER_HOST:$UDP_PORT" --psk "$PSK" --pin "$PIN"
           --kx pq --tcp-port "$TCP_PORT" --routes "$ROUTES" --dns "$DNS" "${MLDSA_ARGS[@]}")
 if [[ "$ISSUER_ON" == 1 ]]; then
   # Layer-1: клиент авто-фетчит epoch-токен у издателя перед коннектом (issuer host:port + seed).
   # S2.1/A1: --issuer-pin → клиент пиннит PQ-TLS канал фетча (анти-MITM + скрытие client_id).
-  LINKARGS+=(--issuer "$SERVER_HOST:$ISSUER_PORT" --issuer-pin "$ISSUER_TLS_PIN" --client-seed "$CLIENT_SEED")
+  # При раздельном деплое издатель живёт на ДРУГОЙ машине — в ссылку идёт его адрес из bundle.
+  LINK_ISSUER="$SERVER_HOST:$ISSUER_PORT"
+  [[ "$ROLE" == exit ]] && LINK_ISSUER="$ISSUER_ADDR"
+  LINKARGS+=(--issuer "$LINK_ISSUER" --issuer-pin "$ISSUER_TLS_PIN" \
+             --issuer-mldsa "$ISSUER_MLDSA" --client-seed "$CLIENT_SEED")
 fi
 # Клиентская ссылка (для раздачи абонентам) — БЕЗ admin-seed. Генерим ДО добавления admin-полей.
 # $LINKGEN — во временном каталоге (на бокс не кладётся, Q4).
@@ -418,6 +717,21 @@ cat <<EOF
 ║  CitadelPQVPN exit развёрнут ✓   ($SERVER_HOST:$UDP_PORT udp / $TCP_PORT tcp)
 ╚══════════════════════════════════════════════════════════════════╝
 
+Порты (клиент берёт их из ссылки — на устройствах ничего настраивать не нужно):
+  • $UDP_PORT/udp  — основной туннель (PQ-QUIC)          → ОТКРЫТЬ в firewall/security-group
+  • $TCP_PORT/tcp  — obfs-fallback, когда UDP режут      → ОТКРЫТЬ
+$(if [[ "$ROLE" == exit ]]; then cat <<PORTS
+  • издатель — на ОТДЕЛЬНОЙ машине ($ISSUER_ADDR): порт открывается там, здесь не нужен.
+    Ключ эпохи подтягивает сайдкар citadel-pubsync (исходящее соединение к издателю).
+  • admin-канал ($ADMIN_PORT/tcp) слушает издатель; этой машине его открывать не нужно.
+PORTS
+else cat <<PORTS
+  • $ISSUER_PORT/tcp  — издатель токенов                    → ОТКРЫТЬ (при выключенном издателе не нужен)
+  • $ADMIN_PORT/tcp  — admin-канал                        → НЕ открывать: доступен только из туннеля
+PORTS
+fi)
+  Свои значения: ./install-citadel-server.sh --udp-port N --tcp-port N --issuer-port N (см. --help).
+
 ⚠ Ссылки печатаются ЗДЕСЬ и НИГДЕ не сохраняются. Скопируй их СЕЙЧАС. Забыл / потерял →
   запусти скрипт снова: он ротирует идентичность и выдаст НОВЫЕ ссылки (прежние, розданные до
   этого, всё равно уже недействительны — obfs/pin/Layer-1 сменились). docker-рестарт/ребут VPS
@@ -428,6 +742,14 @@ cat <<EOF
 $LINK
 
 НЕ раздавать абонентам. Управление: docker compose -f $DIR/etc/compose.yml {ps,logs,down}
+
+ЕСЛИ СЕРВЕР СКОМПРОМЕТИРОВАН (или есть подозрение). Узел спроектирован расходным: восстановление
+— это переустановка, а не «чистка». Запусти этот же скрипт заново — он сменит ВСЮ идентичность
+(obfs-PSK, cert-pin, ML-DSA, ключи издателя), после чего прежние ссылки мертвы, и раздай новые.
+Перехваченный ранее трафик расшифровать нельзя: сессионные ключи эфемерны (forward secrecy), а
+ключ подписи токенов живёт только в памяти издателя и меняется каждую эпоху (${EPOCH_SECS}s).
+Что даёт злоумышленнику украденный диск и почему шифрование каталога ключей помогает не от всего
+— docs/SERVER-KEY-PROTECTION.md.
 EOF
 
 if [[ "$ISSUER_ON" == 1 ]]; then

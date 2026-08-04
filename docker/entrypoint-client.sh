@@ -25,8 +25,11 @@ ISSUER_IP=${ISSUER_IP:-issuer}
 echo "[client] issuer резолвится в $ISSUER_IP"
 
 # S2.1/A1: pin TLS-серта издателя для PQ-TLS канала фетча токенов (издатель пишет его в /shared).
-for _ in $(seq 1 30); do [ -s /shared/issuer-tls.pin ] && break; sleep 1; done
+for _ in $(seq 1 30); do [ -s /shared/issuer-tls.pin ] && [ -s /shared/issuer-mldsa.pin ] && break; sleep 1; done
 ISSUER_PIN=$(cat /shared/issuer-tls.pin 2>/dev/null || echo "")
+# PQ: обязательство к ML-DSA-идентичности издателя (клиент требует его и для токенов, и для admin)
+ISSUER_MLDSA=$(cat /shared/issuer-mldsa.pin 2>/dev/null || echo "")
+[ -n "$ISSUER_MLDSA" ] || echo "[client] WARN: нет issuer-mldsa.pin — PQ-аутентификация издателя не пройдёт"
 [ -n "$ISSUER_PIN" ] && echo "[client] issuer TLS-pin: ${ISSUER_PIN:0:16}… (PQ-TLS+pin канал, A1)" \
     || echo "[client] WARN: нет issuer-tls.pin — фетч токенов не пройдёт (A1 fail-closed)"
 
@@ -34,7 +37,7 @@ ISSUER_PIN=$(cat /shared/issuer-tls.pin 2>/dev/null || echo "")
 # Издатель подписывает вслепую, токен в файл; издатель не видит токен → unlinkable от сессии на exit.
 # S2.1/A1: канал к издателю — PQ-TLS с пиннингом (Citadel_ISSUER_PIN).
 echo "[client] получаю токены от издателя (M5 issuer↔exit split, PQ-TLS+pin)…"
-Citadel_TOKEN_ROLE=client Citadel_TOKEN_ISSUER=issuer:7000 Citadel_ISSUER_PIN=$ISSUER_PIN Citadel_TOKEN_DIR=/shared Citadel_TOKEN_COUNT=10 \
+Citadel_TOKEN_ROLE=client Citadel_TOKEN_ISSUER=issuer:7000 Citadel_ISSUER_PIN=$ISSUER_PIN Citadel_ISSUER_MLDSA=$ISSUER_MLDSA Citadel_TOKEN_DIR=/shared Citadel_TOKEN_COUNT=10 \
     Citadel_CLIENT_SEED=$(printf 'c5%.0s' {1..32}) \
     citadel-token || echo "[client] WARN: не удалось получить токены от издателя"
 
@@ -45,7 +48,7 @@ echo "===================================================================="
 echo "  ТЕСТ 17 (C5.2 Layer-1) — НЕзарегистрированный абонент не получает токены (M5)"
 echo "===================================================================="
 rm -rf /tmp/t17; mkdir -p /tmp/t17
-Citadel_TOKEN_ROLE=client Citadel_TOKEN_ISSUER=issuer:7000 Citadel_ISSUER_PIN=$ISSUER_PIN Citadel_TOKEN_DIR=/tmp/t17 Citadel_TOKEN_COUNT=1 \
+Citadel_TOKEN_ROLE=client Citadel_TOKEN_ISSUER=issuer:7000 Citadel_ISSUER_PIN=$ISSUER_PIN Citadel_ISSUER_MLDSA=$ISSUER_MLDSA Citadel_TOKEN_DIR=/tmp/t17 Citadel_TOKEN_COUNT=1 \
     Citadel_CLIENT_SEED=deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef \
     timeout 15 citadel-token >/tmp/t17/out 2>&1 || true
 if [ ! -s /tmp/t17/tokens ]; then
@@ -62,12 +65,12 @@ SEED_C=$(printf 'ab%.0s' {1..32})
 PUB_C=$(Citadel_CLIENT_SEED=$SEED_C citadel-token pubkey 2>/dev/null)
 echo "$PUB_C 99999999999 active" >> /shared/registry   # добавить активного абонента в реестр
 rm -rf /tmp/t18; mkdir -p /tmp/t18
-Citadel_TOKEN_ROLE=client Citadel_TOKEN_ISSUER=issuer:7000 Citadel_ISSUER_PIN=$ISSUER_PIN Citadel_TOKEN_DIR=/tmp/t18 Citadel_TOKEN_COUNT=1 \
+Citadel_TOKEN_ROLE=client Citadel_TOKEN_ISSUER=issuer:7000 Citadel_ISSUER_PIN=$ISSUER_PIN Citadel_ISSUER_MLDSA=$ISSUER_MLDSA Citadel_TOKEN_DIR=/tmp/t18 Citadel_TOKEN_COUNT=1 \
     Citadel_CLIENT_SEED=$SEED_C timeout 15 citadel-token >/tmp/t18/o1 2>&1 || true
 GOT1=$([ -s /tmp/t18/tokens ] && echo yes || echo no)
 sed -i "s#^$PUB_C .*#$PUB_C 99999999999 revoked#" /shared/registry   # ОТЗЫВ (issuer перечитывает реестр)
 rm -f /tmp/t18/tokens
-Citadel_TOKEN_ROLE=client Citadel_TOKEN_ISSUER=issuer:7000 Citadel_ISSUER_PIN=$ISSUER_PIN Citadel_TOKEN_DIR=/tmp/t18 Citadel_TOKEN_COUNT=1 \
+Citadel_TOKEN_ROLE=client Citadel_TOKEN_ISSUER=issuer:7000 Citadel_ISSUER_PIN=$ISSUER_PIN Citadel_ISSUER_MLDSA=$ISSUER_MLDSA Citadel_TOKEN_DIR=/tmp/t18 Citadel_TOKEN_COUNT=1 \
     Citadel_CLIENT_SEED=$SEED_C timeout 15 citadel-token >/tmp/t18/o2 2>&1 || true
 GOT2=$([ -s /tmp/t18/tokens ] && echo yes || echo no)
 if [ "$GOT1" = yes ] && [ "$GOT2" = no ]; then
@@ -367,7 +370,7 @@ ADMIN_SEED=$(printf 'ad%.0s' {1..32})
 export Citadel_ADMIN_ADDR=10.7.0.1:7001
 # 20a: list по каналу — демо-абонент (c5) виден в реестре
 DEMO_PUB=$(Citadel_CLIENT_SEED=$(printf 'c5%.0s' {1..32}) citadel-token pubkey)
-if Citadel_ISSUER_PIN=$ISSUER_PIN Citadel_ADMIN_SEED=$ADMIN_SEED timeout 20 citadel-token admin list 2>/dev/null | grep -q "^$DEMO_PUB .* active"; then
+if Citadel_ISSUER_PIN=$ISSUER_PIN Citadel_ISSUER_MLDSA=$ISSUER_MLDSA Citadel_ADMIN_SEED=$ADMIN_SEED timeout 20 citadel-token admin list 2>/dev/null | grep -q "^$DEMO_PUB .* active"; then
     echo "  OK ✔ list по туннелю: реестр читается, демо-абонент active"
 else
     echo "  [!] list по admin-каналу не прошёл ✗"
@@ -376,10 +379,10 @@ fi
 # новый seed получает epoch-токены у issuer = пропуск на exit (токены универсальны per-epoch)
 NEW_SEED=$(head -c 32 /dev/urandom | od -An -tx1 | tr -d ' \n')
 NEW_PUB=$(Citadel_CLIENT_SEED=$NEW_SEED citadel-token pubkey)
-Citadel_ISSUER_PIN=$ISSUER_PIN Citadel_ADMIN_SEED=$ADMIN_SEED timeout 20 citadel-token admin add "$NEW_PUB" 2>/dev/null \
+Citadel_ISSUER_PIN=$ISSUER_PIN Citadel_ISSUER_MLDSA=$ISSUER_MLDSA Citadel_ADMIN_SEED=$ADMIN_SEED timeout 20 citadel-token admin add "$NEW_PUB" 2>/dev/null \
     && echo "  add ${NEW_PUB:0:12}… по каналу: OK" || echo "  [!] add по каналу не прошёл ✗"
 rm -rf /tmp/t20; mkdir -p /tmp/t20
-Citadel_TOKEN_ROLE=client Citadel_TOKEN_ISSUER=$ISSUER_IP:7000 Citadel_ISSUER_PIN=$ISSUER_PIN Citadel_TOKEN_DIR=/tmp/t20 Citadel_TOKEN_COUNT=1 \
+Citadel_TOKEN_ROLE=client Citadel_TOKEN_ISSUER=$ISSUER_IP:7000 Citadel_ISSUER_PIN=$ISSUER_PIN Citadel_ISSUER_MLDSA=$ISSUER_MLDSA Citadel_TOKEN_DIR=/tmp/t20 Citadel_TOKEN_COUNT=1 \
     Citadel_CLIENT_SEED=$NEW_SEED timeout 15 citadel-token >/tmp/t20/o1 2>&1 || true
 if [ -s /tmp/t20/tokens ]; then
     echo "  OK ✔ добавленный по туннелю абонент получил epoch-токен (допущен к exit)"
@@ -387,9 +390,9 @@ else
     echo "  [!] новый абонент НЕ получил токены после add ✗"
 fi
 # 20c: revoke по каналу → отказ в выдаче (действует ≤ длины эпохи)
-Citadel_ISSUER_PIN=$ISSUER_PIN Citadel_ADMIN_SEED=$ADMIN_SEED timeout 20 citadel-token admin revoke "$NEW_PUB" 2>/dev/null || true
+Citadel_ISSUER_PIN=$ISSUER_PIN Citadel_ISSUER_MLDSA=$ISSUER_MLDSA Citadel_ADMIN_SEED=$ADMIN_SEED timeout 20 citadel-token admin revoke "$NEW_PUB" 2>/dev/null || true
 rm -f /tmp/t20/tokens
-Citadel_TOKEN_ROLE=client Citadel_TOKEN_ISSUER=$ISSUER_IP:7000 Citadel_ISSUER_PIN=$ISSUER_PIN Citadel_TOKEN_DIR=/tmp/t20 Citadel_TOKEN_COUNT=1 \
+Citadel_TOKEN_ROLE=client Citadel_TOKEN_ISSUER=$ISSUER_IP:7000 Citadel_ISSUER_PIN=$ISSUER_PIN Citadel_ISSUER_MLDSA=$ISSUER_MLDSA Citadel_TOKEN_DIR=/tmp/t20 Citadel_TOKEN_COUNT=1 \
     Citadel_CLIENT_SEED=$NEW_SEED timeout 15 citadel-token >/tmp/t20/o2 2>&1 || true
 if [ ! -s /tmp/t20/tokens ]; then
     echo "  OK ✔ после revoke по туннелю — отказ в токенах (отзыв ≤ длины эпохи)"
@@ -403,13 +406,13 @@ echo "  ТЕСТ 21 (C7 негатив) — чужой ключ в admin-кад�
 echo "===================================================================="
 # клиентский Layer-1 seed (c5 — валидный АБОНЕНТ) в роли admin-ключа: домен-разделение auth —
 # подписка не даёт админских прав; issuer рвёт канал без ack (не оракул)
-if Citadel_ISSUER_PIN=$ISSUER_PIN Citadel_ADMIN_SEED=$(printf 'c5%.0s' {1..32}) timeout 20 citadel-token admin list >/dev/null 2>&1; then
+if Citadel_ISSUER_PIN=$ISSUER_PIN Citadel_ISSUER_MLDSA=$ISSUER_MLDSA Citadel_ADMIN_SEED=$(printf 'c5%.0s' {1..32}) timeout 20 citadel-token admin list >/dev/null 2>&1; then
     echo "  [!] КЛИЕНТСКИЙ ключ прошёл в admin-канал ✗"
 else
     echo "  OK ✔ клиентский (не-admin) ключ отвергнут admin-каналом"
 fi
 # R6: отзыв Layer-1 client_id САМОГО админа настоящим админом → сервер отклоняет (анти-self-lockout)
-if Citadel_ISSUER_PIN=$ISSUER_PIN Citadel_ADMIN_SEED=$ADMIN_SEED timeout 20 citadel-token admin revoke "$DEMO_PUB" >/dev/null 2>&1; then
+if Citadel_ISSUER_PIN=$ISSUER_PIN Citadel_ISSUER_MLDSA=$ISSUER_MLDSA Citadel_ADMIN_SEED=$ADMIN_SEED timeout 20 citadel-token admin revoke "$DEMO_PUB" >/dev/null 2>&1; then
     echo "  [!] self-revoke client_id админа ПРОШЁЛ ✗"
 else
     echo "  OK ✔ self-revoke отклонён сервером (R6 — админ не может запереть сам себя)"
@@ -430,8 +433,38 @@ fi
 
 echo
 echo "===================================================================="
+echo "  ТЕСТ 23 (P1) — раздельный деплой: exit-узел получает ключ эпохи ПО СЕТИ (pubsync)"
+echo "===================================================================="
+# Когда издатель стоит на другой машине, общего тома нет, а ключ эпохи ротируется каждый час —
+# exit подтягивает его сам, по тому же obfs+PQ-TLS каналу с проверкой PQ-идентичности издателя.
+# Здесь это гоняется «как на отдельной машине»: свой пустой каталог, только сетевой путь.
+SYNCDIR=/tmp/pubsync; rm -rf "$SYNCDIR"; mkdir -p "$SYNCDIR"
+Citadel_TOKEN_ROLE=pubsync Citadel_TOKEN_DIR="$SYNCDIR" Citadel_TOKEN_ISSUER="$ISSUER_IP:7000" \
+  Citadel_ISSUER_PIN=$ISSUER_PIN Citadel_ISSUER_MLDSA=$ISSUER_MLDSA Citadel_OBFS_PSK=$(cat /shared/obfs.psk) \
+  Citadel_EPOCH_SECS=3600 Citadel_PUBSYNC_INTERVAL=5 timeout 20 citadel-token >/tmp/pubsync.log 2>&1 || true
+if [ -s "$SYNCDIR/issuer.pub" ] && cmp -s "$SYNCDIR/issuer.pub" /shared/issuer.pub; then
+    echo "  OK ✔ ключ эпохи получен по сети и совпал с ключом издателя (exit может стоять отдельно)"
+else
+    echo "  [!] pubsync не принёс ключ эпохи ✗"; tail -3 /tmp/pubsync.log
+fi
+# Негатив: чужое обязательство PQ-идентичности издателя → синхронизация обязана отказать,
+# иначе подставной издатель навязал бы exit'у свой ключ и тот верил бы чужим токенам.
+rm -rf "$SYNCDIR"; mkdir -p "$SYNCDIR"
+Citadel_TOKEN_ROLE=pubsync Citadel_TOKEN_DIR="$SYNCDIR" Citadel_TOKEN_ISSUER="$ISSUER_IP:7000" \
+  Citadel_ISSUER_PIN=$ISSUER_PIN Citadel_ISSUER_MLDSA=$(printf 'ab%.0s' {1..32}) \
+  Citadel_OBFS_PSK=$(cat /shared/obfs.psk) Citadel_EPOCH_SECS=3600 Citadel_PUBSYNC_INTERVAL=5 \
+  timeout 15 citadel-token >/tmp/pubsync-mitm.log 2>&1 || true
+if [ -s "$SYNCDIR/issuer.pub" ]; then
+    echo "  [!] ключ принят от «издателя» с чужой PQ-идентичностью ✗"
+else
+    echo "  OK ✔ чужая PQ-идентичность издателя отклонена — ключ на диск не попал"
+fi
+
+echo
+echo "===================================================================="
 echo "  Готово. M1-M7 + STRIDE F1-F7: pinning, egress, obfs L1, drop-priv, DNS-leak, rate-limit,"
 echo "  миграция, TCP-fallback, split-issuance, multi-server, crypto-agility, PQ-auth, commitment-fetch,"
-echo "  admin-plane по туннелю (C7: add/revoke, домен-auth, порт снаружи закрыт)."
+echo "  admin-plane по туннелю (C7: add/revoke, домен-auth, порт снаружи закрыт),"
+echo "  синхронизация ключа эпохи по сети (P1: exit и издатель на разных машинах)."
 echo "===================================================================="
 wait "$M1E" 2>/dev/null || true

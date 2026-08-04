@@ -11,7 +11,7 @@
 //! По сети ходят лишь `blind_msg` и `blind_sig`. `issue_batch` (всё в одном процессе) оставлен
 //! для тестов/локального демо.
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use blind_rsa_signatures::{
     BlindSignature, KeyPair, MessageRandomizer, Options, PublicKey, Secret, SecretKey, Signature,
 };
@@ -41,7 +41,8 @@ macro_rules! dlog {
     };
 }
 
-pub mod admin; // C7.1: admin-плоскость (реестр по PQ-TLS: domain-sep Ed25519 + EKM channel binding)
+pub mod admin; // C7.1: admin-плоскость (реестр по PQ-TLS: гибридная подпись + EKM channel binding)
+pub mod pqid; // PQ-удостоверение сторон: гибрид Ed25519 + ML-DSA-65 из одного seed (анти-CRQC auth)
 pub mod pqtls; // S2.1/A1: PQ-TLS + pin канал к издателю (анти-MITM, анти-деанон client_id)
 pub mod obfs_stream; // S2.1/A1 (остаток): синхронная obfs-обёртка issuer-канала (probe-resistance, анти-DPI)
 
@@ -117,22 +118,19 @@ pub fn read_frame(r: &mut impl Read) -> io::Result<Vec<u8>> {
     Ok(buf)
 }
 
-/// C5.3: клиентская сторона issuance по сети (sync). Проходит Layer-1 (`seed` доказывает владение
-/// «абонементом»), получает ТЕКУЩИЙ epoch-pub издателя, добывает `count` токенов
-/// (blind→sign→finalize). Издатель токены НЕ видит (unlinkable). `retries` — попытки коннекта
-/// (издатель мог ещё генерить RSA-ключ). Протокол: challenge → pub‖sig → issuer_pub → {blind→sig}×N.
+/// Поднять канал к издателю и проверить ЕГО подлинность: TCP (с ретраями) → obfs → PQ-TLS с
+/// пиннингом → `IssuerHello` с ML-DSA-подписью привязки. Возвращает поток, EKM сессии и челлендж.
 ///
-/// S2.1/A1: весь обмен идёт по **PQ-TLS с пиннингом** серта издателя (`issuer_pin`). Это закрывает
-/// (a) MITM-кражу токенов (подстановку чужих `blind_msg`), (b) деанон `client_id` в открытом виде,
-/// (c) импёрсонацию издателя. Несовпадение pin → отказ на TLS-хендшейке (fail-closed).
-pub fn fetch_tokens(
+/// Общая часть для всех потребителей канала (выдача токенов, синхронизация epoch-ключа), чтобы
+/// проверка издателя не разъехалась между ними: пропустить её где-то одном — значит открыть там
+/// PQ-MITM.
+fn connect_authenticated_issuer(
     issuer_addr: &str,
     issuer_pin: &[u8; 32],
-    seed: &[u8; 32],
-    count: usize,
+    issuer_mldsa: &[u8; 32],
     retries: u32,
     obfs_psk: Option<[u8; 32]>,
-) -> Result<Vec<Vec<u8>>> {
+) -> Result<(pqtls::ClientTlsStream, [u8; pqtls::EKM_LEN], Vec<u8>)> {
     let mut tcp = None;
     for _ in 0..retries.max(1) {
         match TcpStream::connect(issuer_addr) {
@@ -148,14 +146,68 @@ pub fn fetch_tokens(
     // S2.1/A1-остаток: при заданном obfs_psk — под TLS obfs-слой (probe-resistance: issuer-порт
     // молчит на не-obfs пробу, трафик неотличим от туннеля). psk обязан совпасть с серверным.
     let mut conn = pqtls::connect_tls(tcp, *issuer_pin, obfs_psk)?;
+    let ekm = pqtls::handshake_client(&mut conn)?;
+    // Издатель доказывает подлинность PQ-подписью, привязанной к ЭТОЙ сессии (fail-closed:
+    // не сошлось обязательство/подпись — рвём соединение, НЕ показав ничего своего).
+    let hello = read_frame(&mut conn).context("издатель не прислал hello (порт/obfs/pin?)")?;
+    let challenge = pqid::verify_hello(&hello, issuer_mldsa, issuer_pin, &ekm)
+        .context("PQ-аутентификация издателя не прошла")?;
+    Ok((conn, ekm, challenge))
+}
 
-    // Layer-1: челлендж → pub(32)‖sig(64)
-    let challenge = read_frame(&mut conn)?;
-    let pk = ed25519_pub_from_seed(seed)?;
-    let sig = ed25519_sign(seed, &challenge)?;
-    let mut auth = Vec::with_capacity(96);
-    auth.extend_from_slice(&pk);
-    auth.extend_from_slice(&sig);
+/// Публичный ключ ТЕКУЩЕЙ эпохи у издателя — для exit-узла, стоящего на ОТДЕЛЬНОЙ машине.
+///
+/// Когда exit и издатель живут на одном сервере, exit читает `issuer-<epoch>.pub` прямо с общего
+/// тома. При раздельном деплое общего тома нет, а ключ ротируется каждую эпоху — поэтому exit
+/// подтягивает его сам (`citadel-token pubsync`). Аутентификация exit'а здесь не нужна: ключ
+/// публичен (издатель отдаёт его каждому авторизованному абоненту), а до этого кадра доходит
+/// только тот, кто знает obfs-PSK и прошёл PQ-TLS с пиннингом. Подлинность ИЗДАТЕЛЯ проверяется
+/// полностью — иначе exit принял бы ключ подставного и стал бы верить чужим токенам.
+pub fn fetch_epoch_pub(
+    issuer_addr: &str,
+    issuer_pin: &[u8; 32],
+    issuer_mldsa: &[u8; 32],
+    retries: u32,
+    obfs_psk: Option<[u8; 32]>,
+) -> Result<Vec<u8>> {
+    let (mut conn, _ekm, _challenge) =
+        connect_authenticated_issuer(issuer_addr, issuer_pin, issuer_mldsa, retries, obfs_psk)?;
+    write_frame(&mut conn, &pqid::build_epoch_pub_request()?)?;
+    let pk = read_frame(&mut conn).context("издатель не отдал ключ эпохи")?;
+    if pk.is_empty() {
+        bail!("издатель вернул пустой ключ эпохи");
+    }
+    Ok(pk)
+}
+
+/// C5.3: клиентская сторона issuance по сети (sync). Проходит Layer-1 (`seed` доказывает владение
+/// «абонементом»), получает ТЕКУЩИЙ epoch-pub издателя, добывает `count` токенов
+/// (blind→sign→finalize). Издатель токены НЕ видит (unlinkable). `retries` — попытки коннекта
+/// (издатель мог ещё генерить RSA-ключ). Протокол: challenge → pub‖sig → issuer_pub → {blind→sig}×N.
+///
+/// S2.1/A1: весь обмен идёт по **PQ-TLS с пиннингом** серта издателя (`issuer_pin`). Это закрывает
+/// (a) MITM-кражу токенов (подстановку чужих `blind_msg`), (b) деанон `client_id` в открытом виде,
+/// (c) импёрсонацию издателя. Несовпадение pin → отказ на TLS-хендшейке (fail-closed).
+///
+/// PQ-аутентификация (см. [`pqid`]): pin один защиты не даёт против квантового противника (ключ
+/// Ed25519-серта восстанавливается из pub, лежащего в самом серте). Поэтому издатель ПЕРВЫМ кадром
+/// доказывает подлинность ML-DSA-подписью, привязанной к этой TLS-сессии, а клиент сверяет её с
+/// 32-байтным обязательством `issuer_mldsa` из ссылки — и только потом предъявляет свою
+/// идентичность. Абонент, в свою очередь, подписывает челлендж ГИБРИДНО (Ed25519 + ML-DSA-65).
+pub fn fetch_tokens(
+    issuer_addr: &str,
+    issuer_pin: &[u8; 32],
+    issuer_mldsa: &[u8; 32],
+    seed: &[u8; 32],
+    count: usize,
+    retries: u32,
+    obfs_psk: Option<[u8; 32]>,
+) -> Result<Vec<Vec<u8>>> {
+    let (mut conn, ekm, challenge) =
+        connect_authenticated_issuer(issuer_addr, issuer_pin, issuer_mldsa, retries, obfs_psk)?;
+
+    // Layer-1: гибридная подпись челленджа (Ed25519 + ML-DSA-65, привязка к сессии через EKM).
+    let auth = pqid::build_auth(seed, pqid::DOMAIN_CLIENT, &challenge, &ekm)?;
     write_frame(&mut conn, &auth)?;
 
     // Текущий (epoch) pub издателя для ослепления. Если Layer-1 не прошёл, издатель закрыл
@@ -318,22 +370,27 @@ mod tests {
         assert!(verify_token_multi(&[], tok).is_none());
     }
 
-    /// C5.3 + S2.1/A1: полный клиентский протокол `fetch_tokens` против in-process issuer поверх
-    /// PQ-TLS (Layer-1 auth + выдача epoch-pub + слепая подпись). Проверяет, что добытые токены
-    /// валидны под issuer pub И что канал идёт через пиннящийся TLS (fetch_tokens требует pin).
+    /// C5.3 + S2.1/A1 + PQ: полный клиентский протокол `fetch_tokens` против in-process issuer
+    /// поверх PQ-TLS. Проверяет, что (а) издатель доказывает подлинность ML-DSA-подписью привязки,
+    /// (б) абонент авторизуется ГИБРИДНОЙ подписью и опознаётся по `BLAKE3(ed_pub‖mldsa_pub)`,
+    /// (в) добытые токены валидны под issuer pub.
     #[test]
     fn fetch_tokens_layer1_roundtrip() {
         use std::net::TcpListener;
         let seed = [0x33u8; 32];
-        let pk_ed = ed25519_pub_from_seed(&seed).unwrap();
+        let client_id = pqid::id_from_seed(&seed).unwrap();
         let (issuer_pk, issuer_sk) = issuer_keypair(2048).unwrap();
 
         // S2.1/A1: издатель поднимает постоянный TLS-серт; клиент пиннит его pin.
         let dir = std::env::temp_dir().join(format!("citadel-fetch-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
-        let identity = pqtls::IssuerIdentity::load_or_generate(dir.to_str().unwrap()).unwrap();
+        let dir = dir.to_str().unwrap();
+        let identity = pqtls::IssuerIdentity::load_or_generate(dir).unwrap();
         let issuer_pin = identity.pin;
         let scfg = identity.server_config().unwrap();
+        // PQ-идентичность издателя: обязательство уходит «в ссылку» (здесь — прямо клиенту).
+        let pq = pqid::IssuerPqIdentity::load_or_generate(dir).unwrap();
+        let issuer_mldsa = pq.commitment();
 
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap().to_string();
@@ -341,25 +398,135 @@ mod tests {
         let srv = std::thread::spawn(move || {
             let (tcp, _) = listener.accept().unwrap();
             let mut conn = pqtls::accept_tls(tcp, scfg, None).unwrap();
+            let ekm = pqtls::handshake_server(&mut conn).unwrap();
             let challenge = [0x77u8; 32];
-            write_frame(&mut conn, &challenge).unwrap();
-            let auth = read_frame(&mut conn).unwrap(); // pub(32)‖sig(64)
-            assert_eq!(auth.len(), 96);
-            assert!(ed25519_verify(&auth[..32], &challenge, &auth[32..])); // подпись челленджа
-            assert_eq!(&auth[..32], &pk_ed[..]); // зарегистрированный абонент
+            write_frame(&mut conn, &pq.hello(&challenge, &issuer_pin, &ekm).unwrap()).unwrap();
+            let auth = read_frame(&mut conn).unwrap();
+            let got = pqid::verify_auth(&auth, pqid::DOMAIN_CLIENT, &challenge, &ekm).unwrap();
+            assert_eq!(got, client_id, "зарегистрированный абонент");
             write_frame(&mut conn, &issuer_pk_srv).unwrap(); // текущий epoch-pub
             while let Ok(blind_msg) = read_frame(&mut conn) {
                 let sig = issuer_blind_sign(&issuer_sk, &blind_msg).unwrap();
                 write_frame(&mut conn, &sig).unwrap();
             }
         });
-        let tokens = fetch_tokens(&addr, &issuer_pin, &seed, 3, 3, None).unwrap();
+        let tokens = fetch_tokens(&addr, &issuer_pin, &issuer_mldsa, &seed, 3, 3, None).unwrap();
         assert_eq!(tokens.len(), 3);
         for t in &tokens {
             assert!(verify_token(&issuer_pk, t).is_some(), "токен валиден под issuer pub");
         }
         srv.join().unwrap();
-        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// P1 (раздельный деплой): exit-узел на ДРУГОЙ машине забирает публичный ключ эпохи без
+    /// собственной идентичности — и получает ровно тот ключ, под которым потом сходятся токены.
+    #[test]
+    fn fetch_epoch_pub_serves_exit_on_separate_host() {
+        use std::net::TcpListener;
+        let dir = std::env::temp_dir().join(format!("citadel-pubsync-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let dir = dir.to_str().unwrap();
+        let identity = pqtls::IssuerIdentity::load_or_generate(dir).unwrap();
+        let issuer_pin = identity.pin;
+        let scfg = identity.server_config().unwrap();
+        let pq = pqid::IssuerPqIdentity::load_or_generate(dir).unwrap();
+        let issuer_mldsa = pq.commitment();
+        let (issuer_pk, issuer_sk) = issuer_keypair(2048).unwrap();
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        let pk_srv = issuer_pk.clone();
+        let srv = std::thread::spawn(move || {
+            let (tcp, _) = listener.accept().unwrap();
+            let mut conn = pqtls::accept_tls(tcp, scfg, None).unwrap();
+            let ekm = pqtls::handshake_server(&mut conn).unwrap();
+            let challenge = [0x31u8; 32];
+            write_frame(&mut conn, &pq.hello(&challenge, &issuer_pin, &ekm).unwrap()).unwrap();
+            let frame = read_frame(&mut conn).unwrap();
+            assert_eq!(pqid::parse_client_frame(&frame).unwrap(), pqid::ClientFrame::EpochPub);
+            write_frame(&mut conn, &pk_srv).unwrap();
+        });
+
+        let got = fetch_epoch_pub(&addr, &issuer_pin, &issuer_mldsa, 3, None).unwrap();
+        assert_eq!(got, issuer_pk, "exit получил ключ ТЕКУЩЕЙ эпохи");
+        // и он действительно проверяет токены этой эпохи
+        let (bm, st) = client_blind(&got).unwrap();
+        let bs = issuer_blind_sign(&issuer_sk, &bm).unwrap();
+        let token = client_finalize(&got, &bs, &st).unwrap();
+        assert!(verify_token(&got, &token).is_some());
+        srv.join().unwrap();
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// Подставной издатель не снабдит exit ключом: обязательство из конфига не сойдётся, и
+    /// синхронизация упадёт ДО того, как ключ попадёт на диск (иначе exit верил бы чужим токенам).
+    #[test]
+    fn fetch_epoch_pub_rejects_foreign_issuer_identity() {
+        use std::net::TcpListener;
+        let dir = std::env::temp_dir().join(format!("citadel-pubsync-mitm-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let dir = dir.to_str().unwrap();
+        let identity = pqtls::IssuerIdentity::load_or_generate(dir).unwrap();
+        let issuer_pin = identity.pin;
+        let scfg = identity.server_config().unwrap();
+        let pq = pqid::IssuerPqIdentity::load_or_generate(dir).unwrap();
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        let srv = std::thread::spawn(move || {
+            let (tcp, _) = listener.accept().unwrap();
+            let Ok(mut conn) = pqtls::accept_tls(tcp, scfg, None) else { return };
+            let Ok(ekm) = pqtls::handshake_server(&mut conn) else { return };
+            let _ = write_frame(&mut conn, &pq.hello(&[0x41u8; 32], &issuer_pin, &ekm).unwrap());
+        });
+        let foreign = pqid::issuer_commitment(&pqid::mldsa_pub_from_seed(&[0x99u8; 32]).unwrap());
+        let err = fetch_epoch_pub(&addr, &issuer_pin, &foreign, 1, None).unwrap_err();
+        assert!(format!("{err:#}").contains("PQ-аутентификация издателя"), "err: {err:#}");
+        srv.join().unwrap();
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// Издатель-самозванец: TLS-серт свой (клиент пиннит ЕГО — то есть pin сходится, ровно как
+    /// при квантовой подделке классической подписи), но PQ-обязательство из ссылки не то. Клиент
+    /// обязан оборвать сессию ДО отправки `client_id` — иначе PQ-MITM собирал бы идентификаторы
+    /// абонентов (деанон подписки).
+    #[test]
+    fn fetch_tokens_rejects_foreign_issuer_identity() {
+        use std::net::TcpListener;
+        let dir = std::env::temp_dir().join(format!("citadel-fetch-mitm-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let dir = dir.to_str().unwrap();
+        let identity = pqtls::IssuerIdentity::load_or_generate(dir).unwrap();
+        let issuer_pin = identity.pin;
+        let scfg = identity.server_config().unwrap();
+        let pq = pqid::IssuerPqIdentity::load_or_generate(dir).unwrap();
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        let got_client_frame = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let flag = got_client_frame.clone();
+        let srv = std::thread::spawn(move || {
+            let (tcp, _) = listener.accept().unwrap();
+            let Ok(mut conn) = pqtls::accept_tls(tcp, scfg, None) else { return };
+            let Ok(ekm) = pqtls::handshake_server(&mut conn) else { return };
+            let challenge = [0x11u8; 32];
+            let _ = write_frame(&mut conn, &pq.hello(&challenge, &issuer_pin, &ekm).unwrap());
+            if read_frame(&mut conn).is_ok() {
+                flag.store(true, std::sync::atomic::Ordering::SeqCst);
+            }
+        });
+
+        // «Другой» издатель в ссылке (обязательство не совпадает с предъявленным ML-DSA pub)
+        let foreign = pqid::issuer_commitment(&pqid::mldsa_pub_from_seed(&[0xABu8; 32]).unwrap());
+        let err = fetch_tokens(&addr, &issuer_pin, &foreign, &[0x44u8; 32], 1, 1, None).unwrap_err();
+        assert!(format!("{err:#}").contains("PQ-аутентификация издателя"), "err: {err:#}");
+        srv.join().unwrap();
+        assert!(
+            !got_client_frame.load(std::sync::atomic::Ordering::SeqCst),
+            "client_id не должен был уйти самозванцу"
+        );
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]

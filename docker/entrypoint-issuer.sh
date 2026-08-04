@@ -20,14 +20,14 @@ export Citadel_TOKEN_ROLE=issuer
 # серверные роли по умолчанию молчат о клиентах и их трафике (no-logs, citadel_quic::debug_logs).
 export Citadel_DEBUG_LOG=1
 export Citadel_TOKEN_DIR=/shared
-export Citadel_TOKEN_LISTEN=0.0.0.0:7000
+export Citadel_TOKEN_LISTEN=0.0.0.0:${CITADEL_ISSUER_PORT:-7000}
 export Citadel_EPOCH_SECS=3600   # C5.1: длина эпохи (ДОЛЖНА совпадать с exit) — токены epoch-scoped
 # C5.2 Layer-1: регистрируем демо-абонента (в проде реестром управляет админ, C5.5).
 export Citadel_REGISTER_SEEDS=$(printf 'c5%.0s' {1..32})   # 32×c5 = ровно 64 hex = 32-байтный seed
 # C7: admin-плоскость — отдельный listener (реестр по туннелю; exit DNAT'ит ADMIN_VIP:7001 сюда).
 # admin_id = pub демо-admin-seed'а ('ad'×32; в проде seed генерит installer и кладёт в мастер-ссылку);
 # secure default: без файла admin_id канал никого не пускает.
-export Citadel_ADMIN_LISTEN=0.0.0.0:7001
+export Citadel_ADMIN_LISTEN=0.0.0.0:${CITADEL_ADMIN_PORT:-7001}
 ADMIN_SEED=$(printf 'ad%.0s' {1..32})
 # NB: Citadel_TOKEN_ROLE=issuer уже экспортирован, а env-роль приоритетнее arg[1] → для pubkey
 # роль переопределяем явно (иначе вызов запустил бы второй issuer и завис).
@@ -35,6 +35,6 @@ Citadel_TOKEN_ROLE=pubkey Citadel_CLIENT_SEED=$ADMIN_SEED citadel-token > /share
 # admin.client_id — Layer-1 client_id самого админа (= демо-абонент 'c5'): его отзыв по каналу
 # issuer отклоняет (анти-self-lockout, R6) — негатив проверяется в ТЕСТ 21.
 Citadel_TOKEN_ROLE=pubkey Citadel_CLIENT_SEED=$Citadel_REGISTER_SEEDS citadel-token > /shared/admin.client_id
-echo "[issuer] admin-плоскость: admin_id=$(cut -c1-16 /shared/admin_id)… (канал :7001, только из туннеля)"
-echo "[issuer] старт слепого подписания (генерация RSA-ключа, затем TCP :7000)…"
+echo "[issuer] admin-плоскость: admin_id=$(cut -c1-16 /shared/admin_id)… (канал :${CITADEL_ADMIN_PORT:-7001}, только из туннеля)"
+echo "[issuer] старт слепого подписания (генерация RSA-ключа, затем TCP :${CITADEL_ISSUER_PORT:-7000})…"
 exec citadel-token

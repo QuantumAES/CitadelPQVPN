@@ -8,6 +8,7 @@ import 'package:app/app_state.dart';
 import 'package:app/errors.dart';
 import 'package:app/format.dart';
 import 'package:app/home_page.dart';
+import 'package:app/locked_session_banner.dart';
 import 'package:app/windows_tray.dart';
 import 'package:app/src/rust/api/citadel.dart';
 import 'package:app/src/rust/api/diag.dart';
@@ -309,7 +310,12 @@ class _UnlockScreenState extends State<UnlockScreen> {
                         ?.copyWith(color: cs.outline)),
                 // Замок хранилища туннель не рвёт — значит, экран пароля обязан показать, что
                 // сессия жива, и дать её отключить (иначе работающий VPN становится невидимым).
-                _LockedSessionBanner(state: widget.state),
+                LockedSessionBanner(
+                  busy: widget.state.isBusy,
+                  up: widget.state.phase == VpnPhase.up,
+                  exit: widget.state.exit,
+                  onDisconnect: widget.state.disconnect,
+                ),
                 const SizedBox(height: 28),
                 TextField(
                   controller: _pw,
@@ -340,80 +346,6 @@ class _UnlockScreenState extends State<UnlockScreen> {
             ),
           ),
         ),
-      ),
-    );
-  }
-}
-
-/// Плашка живой сессии на экране разблокировки.
-///
-/// Блокировка хранилища и закрытие окна туннель не останавливают: сессию держит движок, а на
-/// Android — ещё и foreground-сервис, переживающий Activity. Но экран пароля закрывает собой всё
-/// остальное, и без этой плашки работающий VPN оказывался невидимым и неуправляемым — со стороны
-/// это выглядело ровно как «туннель отвалился». Показываем состояние и даём отключить, не требуя
-/// сперва ввести мастер-пароль: отключение сессии секретов не касается.
-class _LockedSessionBanner extends StatelessWidget {
-  const _LockedSessionBanner({required this.state});
-  final AppState state;
-
-  @override
-  Widget build(BuildContext context) {
-    if (!state.isBusy) return const SizedBox.shrink();
-    final dark = Theme.of(context).brightness == Brightness.dark;
-    final up = state.phase == VpnPhase.up;
-    final bg = up
-        ? (dark ? Colors.green.shade900 : Colors.green.shade50)
-        : (dark ? Colors.amber.shade900 : Colors.amber.shade50);
-    final fg = up
-        ? (dark ? Colors.green.shade200 : Colors.green.shade800)
-        : (dark ? Colors.amber.shade200 : Colors.amber.shade900);
-    // Узел выхода — без порта, как и на главном экране (см. format.dart).
-    final where = state.exit.isEmpty ? '' : hostOnly(state.exit);
-
-    return Container(
-      margin: const EdgeInsets.only(top: 20),
-      padding: const EdgeInsets.all(14),
-      decoration: BoxDecoration(color: bg, borderRadius: BorderRadius.circular(16)),
-      child: Column(
-        crossAxisAlignment: CrossAxisAlignment.stretch,
-        children: [
-          Row(
-            children: [
-              if (up)
-                Icon(Icons.shield, color: fg, size: 22)
-              else
-                SizedBox(
-                  height: 20,
-                  width: 20,
-                  child: CircularProgressIndicator(strokeWidth: 2.2, color: fg),
-                ),
-              const SizedBox(width: 10),
-              Expanded(
-                child: Text(
-                  up ? 'Туннель активен' : 'Подключение…',
-                  style: Theme.of(context)
-                      .textTheme
-                      .titleSmall
-                      ?.copyWith(color: fg, fontWeight: FontWeight.w600),
-                ),
-              ),
-            ],
-          ),
-          if (where.isNotEmpty) ...[
-            const SizedBox(height: 4),
-            Text(where,
-                style: Theme.of(context)
-                    .textTheme
-                    .bodySmall
-                    ?.copyWith(color: fg.withValues(alpha: 0.9))),
-          ],
-          const SizedBox(height: 10),
-          FilledButton.tonalIcon(
-            onPressed: state.disconnect,
-            icon: const Icon(Icons.power_settings_new, size: 18),
-            label: const Text('Отключить'),
-          ),
-        ],
       ),
     );
   }

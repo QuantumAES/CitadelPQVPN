@@ -603,6 +603,8 @@ dependencies = [
  "rcgen",
  "rustls",
  "serde",
+ "serde_bytes",
+ "zeroize",
 ]
 
 [[package]]

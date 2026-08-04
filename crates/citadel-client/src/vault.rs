@@ -659,6 +659,7 @@ mod tests {
             issuer: None,
             issuer_pub: None,
             issuer_pin: None,
+            issuer_mldsa: Some([9u8; 32]),
             client_seed: None,
             admin_seed: None,
             admin_port: None,

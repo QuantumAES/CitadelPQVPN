@@ -2,6 +2,15 @@
 # из демо-стека и клиент, собранный по новой модели (citadel-vpnd + citadel-engine + citadel-cli).
 name: citadel-pq-cli
 
+# П.2 «порты первым классом»: стенд намеренно поднят на НЕСТАНДАРТНЫХ портах (не 4433/443/7000/7001).
+# Все 48 e2e-проверок ходят через них, поэтому любая захардкоженная «подпись Citadel» на пути
+# клиента (ссылка, фетч токенов, obfs-fallback, admin-канал по туннелю) ломает прогон сразу.
+x-ports: &ports
+  CITADEL_UDP_PORT: "5443"
+  CITADEL_TCP_PORT: "8443"
+  CITADEL_ISSUER_PORT: "7300"
+  CITADEL_ADMIN_PORT: "7301"
+
 services:
   issuer:
     build:
@@ -10,6 +19,7 @@ services:
     image: citadel-pq:latest
     container_name: citadel-cli-issuer
     entrypoint: ["/usr/local/bin/entrypoint-issuer.sh"]
+    environment: *ports
     volumes: ["clishare:/shared"]
     networks: ["clinet"]
     restart: unless-stopped
@@ -26,6 +36,7 @@ services:
     depends_on:
       issuer: { condition: service_healthy }
     entrypoint: ["/usr/local/bin/entrypoint-exit.sh"]
+    environment: *ports
     cap_add: ["NET_ADMIN"]
     devices: ["/dev/net/tun:/dev/net/tun"]
     sysctls: ["net.ipv4.ip_forward=1"]
@@ -43,6 +54,7 @@ services:
     depends_on:
       issuer: { condition: service_healthy }
     entrypoint: ["/usr/local/bin/entrypoint-client-cli.sh"]
+    environment: *ports
     cap_add: ["NET_ADMIN"]
     devices: ["/dev/net/tun:/dev/net/tun"]
     volumes: ["clishare:/shared"]

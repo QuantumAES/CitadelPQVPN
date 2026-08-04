@@ -1,11 +1,17 @@
 //! C7.1 — admin-плоскость issuer'а: управление Layer-1 реестром по PQ-TLS каналу.
 //!
-//! Заменяет SSH-путь GUI (см. SECURITY-ROADMAP §C7): admin аутентифицируется отдельным
-//! Ed25519-ключом (`admin_seed` из мастер-ссылки; на сервере — только pub `admin_id`),
-//! подпись **domain-separated** (`AUTH_DOMAIN`) и **привязана к TLS-сессии** через EKM
+//! Заменяет SSH-путь GUI (см. SECURITY-ROADMAP §C7): admin аутентифицируется отдельным ключом
+//! (`admin_seed` из мастер-ссылки; на сервере — только его идентификатор `admin_id`), подпись
+//! **domain-separated** ([`pqid::DOMAIN_ADMIN`]) и **привязана к TLS-сессии** через EKM
 //! (TLS-exporter) — кросс-протокольный replay Layer-1-подписи и релей между сессиями
 //! невозможны. Команды после auth — CBOR-кадры [`AdminRequest`]/[`AdminResponse`] поверх
 //! того же фрейминга `u32(len BE) ‖ payload`.
+//!
+//! PQ-трек: подпись админа **гибридная** (Ed25519 + ML-DSA-65 из того же seed), а издатель ПЕРВЫМ
+//! кадром доказывает свою подлинность ML-DSA-подписью привязки (см. [`crate::pqid`]). До этого
+//! обе стороны опирались на классическую подпись и pin серта, то есть квантовый противник,
+//! располагая лишь публичными данными (`admin_id` на сервере, серт издателя на проводе), мог и
+//! выдать себя за админа, и подставить себя вместо издателя.
 //!
 //! Транспортная приватность (недостижимость admin-порта извне туннеля) обеспечивается
 //! деплоем (C7.2: DNAT с `-i Citadel0`, порт наружу не публикуется) — этот модуль даёт
@@ -17,8 +23,9 @@ use std::time::Duration;
 use anyhow::{anyhow, bail, Context, Result};
 use serde::{Deserialize, Serialize};
 
-use crate::pqtls::{ClientTlsStream, IssuerTlsStream};
-use crate::{ed25519_pub_from_seed, ed25519_sign, ed25519_verify, read_frame, write_frame};
+use crate::pqtls::{self, ClientTlsStream, IssuerTlsStream};
+use crate::pqid::{self, IssuerPqIdentity};
+use crate::{read_frame, write_frame};
 
 /// C7.2: admin-VIP — адрес, на который клиент-админ адресует admin-канал ИЗ ТУННЕЛЯ (шлюз туннеля).
 /// Совпадает с гейтвеем `Citadel_TUN_ADDR` exit'а (installer: `10.7.0.1/16`). Exit пропускает TCP
@@ -26,17 +33,9 @@ use crate::{ed25519_pub_from_seed, ed25519_sign, ed25519_verify, read_frame, wri
 /// Инвариант деплоя: при смене `Citadel_TUN_ADDR` синхронизировать это значение (и наоборот).
 pub const ADMIN_VIP: &str = "10.7.0.1";
 
-/// Домен admin-подписи. Layer-1 подписывает СЫРОЙ challenge — admin-подпись живёт в другом
-/// домене, поэтому issuer никогда не примет одну вместо другой (даже при совпадении ключей).
-pub const AUTH_DOMAIN: &[u8] = b"citadel-admin/v1";
-/// Метка TLS-exporter'а (EKM) для channel binding admin-подписи.
-pub const EKM_LABEL: &[u8] = b"EXPORTER-citadel-admin/v1";
-/// Длина EKM (байт).
-pub const EKM_LEN: usize = 32;
-/// Префикс-байт auth-кадра админа: кадр = `0x01 ‖ pub(32) ‖ sig(64)` (97 Б; Layer-1 кадр — 96 Б).
-pub const AUTH_PREFIX: u8 = 0x01;
-/// Длина auth-кадра админа.
-pub const AUTH_FRAME_LEN: usize = 97;
+/// Домен admin-подписи — [`pqid::DOMAIN_ADMIN`]. Абонент подписывает челлендж в СВОЁМ домене,
+/// поэтому issuer никогда не примет одну подпись вместо другой (даже при совпадении ключей).
+pub use crate::pqid::DOMAIN_ADMIN as AUTH_DOMAIN;
 
 /// Запись Layer-1 реестра (`<pub_hex> <valid_until_unix> <status>`) — общая для issuer'а,
 /// admin-клиента и CLI.
@@ -136,76 +135,48 @@ pub fn registry_apply_revoke(existing: &str, pk: &[u8; 32]) -> Result<String> {
 }
 
 /// Атомарная запись файла реестра: temp в том же каталоге + rename (POSIX-атомарно на одной ФС).
+///
+/// P1 (сужение поверхности): права `0600` ставятся на temp ДО rename — реестр читает только сам
+/// издатель, а лежит он на общем томе рядом с публичными артефактами, которые exit читает из-под
+/// `nobody`. Список `client_id` со сроками — приватные данные абонентской базы, и раздавать их
+/// всем, кто может войти в каталог, незачем.
 pub fn atomic_write(path: &str, content: &str) -> Result<()> {
     let tmp = format!("{path}.tmp.{}", std::process::id());
     std::fs::write(&tmp, content).with_context(|| format!("запись {tmp}"))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600))
+            .with_context(|| format!("права 600 на {tmp}"))?;
+    }
     std::fs::rename(&tmp, path).with_context(|| format!("rename {tmp} → {path}"))?;
     Ok(())
 }
 
-// ─────────────────────────── auth: подпись домен‖challenge‖EKM ───────────────────────────
+// ─────────────────────────── auth: гибридная подпись домен‖challenge‖EKM ───────────────────────────
 
-/// Сообщение admin-подписи: `AUTH_DOMAIN ‖ challenge ‖ EKM`.
-fn auth_msg(challenge: &[u8], ekm: &[u8; EKM_LEN]) -> Vec<u8> {
-    let mut m = Vec::with_capacity(AUTH_DOMAIN.len() + challenge.len() + EKM_LEN);
-    m.extend_from_slice(AUTH_DOMAIN);
-    m.extend_from_slice(challenge);
-    m.extend_from_slice(ekm);
-    m
-}
-
-/// Собрать auth-кадр админа: `0x01 ‖ pub(32) ‖ sig(64)`.
+/// Собрать auth-кадр админа (гибрид Ed25519 + ML-DSA-65, привязка к сессии через EKM).
 pub fn build_auth_frame(
     admin_seed: &[u8; 32],
     challenge: &[u8],
-    ekm: &[u8; EKM_LEN],
+    ekm: &[u8; pqtls::EKM_LEN],
 ) -> Result<Vec<u8>> {
-    let pk = ed25519_pub_from_seed(admin_seed)?;
-    let sig = ed25519_sign(admin_seed, &auth_msg(challenge, ekm))?;
-    let mut f = Vec::with_capacity(AUTH_FRAME_LEN);
-    f.push(AUTH_PREFIX);
-    f.extend_from_slice(&pk);
-    f.extend_from_slice(&sig);
-    Ok(f)
+    pqid::build_auth(admin_seed, AUTH_DOMAIN, challenge, ekm)
 }
 
-/// Проверить auth-кадр админа: формат, совпадение pub с `admin_id` и подпись (домен+EKM).
-/// Возвращает pub при успехе.
+/// Проверить auth-кадр админа: обе подписи (домен+EKM) и совпадение идентичности с `admin_id`.
+/// Возвращает `admin_id` при успехе.
 pub fn verify_auth_frame(
     frame: &[u8],
     challenge: &[u8],
-    ekm: &[u8; EKM_LEN],
+    ekm: &[u8; pqtls::EKM_LEN],
     admin_id: &[u8; 32],
 ) -> Result<[u8; 32]> {
-    if frame.len() != AUTH_FRAME_LEN || frame[0] != AUTH_PREFIX {
-        bail!("admin-auth: плохой кадр ({} Б; ожидалось {AUTH_FRAME_LEN})", frame.len());
-    }
-    let pk: [u8; 32] = frame[1..33].try_into().expect("frame[1..33] = 32 байта");
-    if &pk != admin_id {
+    let id = pqid::verify_auth(frame, AUTH_DOMAIN, challenge, ekm)?;
+    if &id != admin_id {
         bail!("admin-auth: ключ не является admin_id — отказ");
     }
-    if !ed25519_verify(&pk, &auth_msg(challenge, ekm), &frame[33..]) {
-        bail!("admin-auth: подпись неверна (нет домена/EKM или подделка)");
-    }
-    Ok(pk)
-}
-
-/// EKM (TLS-exporter) сессии — channel binding admin-подписи. Требует ЗАВЕРШЁННОГО хендшейка:
-/// вызывать после первого прочитанного кадра (клиент) / после чтения auth-кадра (сервер) —
-/// к этому моменту Finished обеих сторон обработаны и экспортёр совпадает у сторон.
-fn ekm_from<D>(conn: &rustls::ConnectionCommon<D>) -> Result<[u8; EKM_LEN]> {
-    conn.export_keying_material([0u8; EKM_LEN], EKM_LABEL, None)
-        .map_err(|e| anyhow!("EKM (хендшейк не завершён?): {e}"))
-}
-
-/// EKM клиентской стороны admin-канала.
-pub fn ekm_client(tls: &ClientTlsStream) -> Result<[u8; EKM_LEN]> {
-    ekm_from(&tls.conn)
-}
-
-/// EKM серверной стороны admin-канала.
-pub fn ekm_server(tls: &IssuerTlsStream) -> Result<[u8; EKM_LEN]> {
-    ekm_from(&tls.conn)
+    Ok(id)
 }
 
 // ─────────────────────────── сервер ───────────────────────────
@@ -246,15 +217,20 @@ impl AdminServer {
         format!("{}/registry", self.dir)
     }
 
-    /// Обслужить admin-соединение: challenge → auth-кадр (домен+EKM, сверка `admin_id`) →
-    /// цикл CBOR-команд до закрытия клиентом. Провал auth → пауза 1с (анти-brute, R5) + разрыв
-    /// БЕЗ ack (клиент не отличает «нет admin_id» от «чужой ключ» — не оракул).
-    pub fn serve_conn(&self, mut tls: IssuerTlsStream) -> Result<()> {
+    /// Обслужить admin-соединение: hello издателя (челлендж + PQ-доказательство подлинности) →
+    /// гибридный auth-кадр админа (домен+EKM, сверка `admin_id`) → цикл CBOR-команд до закрытия
+    /// клиентом. Провал auth → пауза 1с (анти-brute, R5) + разрыв БЕЗ ack (клиент не отличает
+    /// «нет admin_id» от «чужой ключ» — не оракул).
+    pub fn serve_conn(
+        &self,
+        mut tls: IssuerTlsStream,
+        pq: &IssuerPqIdentity,
+        cert_pin: &[u8; 32],
+    ) -> Result<()> {
+        let ekm = pqtls::handshake_server(&mut tls)?;
         let challenge: [u8; 32] = rand::random();
-        write_frame(&mut tls, &challenge)?;
+        write_frame(&mut tls, &pq.hello(&challenge, cert_pin, &ekm)?)?;
         let frame = read_frame(&mut tls)?;
-        // EKM после первого прочитанного кадра — хендшейк точно завершён (см. ekm_from).
-        let ekm = ekm_server(&tls)?;
         let verified = self
             .admin_id()
             .ok_or_else(|| anyhow!("admin-канал: admin_id не задан — отказ (secure default)"))
@@ -338,6 +314,7 @@ impl AdminClient {
     pub fn connect(
         addr: &str,
         issuer_pin: &[u8; 32],
+        issuer_mldsa: &[u8; 32],
         admin_seed: &[u8; 32],
         obfs_psk: Option<[u8; 32]>,
     ) -> Result<Self> {
@@ -350,9 +327,14 @@ impl AdminClient {
             .with_context(|| format!("admin-канал {addr} недоступен (туннель поднят?)"))?;
         tcp.set_read_timeout(Some(Self::IO_TIMEOUT)).context("set_read_timeout")?;
         tcp.set_write_timeout(Some(Self::IO_TIMEOUT)).context("set_write_timeout")?;
-        let mut tls = crate::pqtls::connect_tls(tcp, *issuer_pin, obfs_psk)?;
-        let challenge = read_frame(&mut tls).context("admin-канал: нет challenge (pin mismatch?)")?;
-        let ekm = ekm_client(&tls)?;
+        let mut tls = pqtls::connect_tls(tcp, *issuer_pin, obfs_psk)?;
+        let ekm = pqtls::handshake_client(&mut tls)?;
+        // Издатель обязан представиться ПЕРВЫМ: admin-канал управляет реестром абонентов, и отдавать
+        // admin-идентичность (пусть даже подписью) стороне, подлинность которой держится на одном
+        // классическом серте, нельзя. Не сошлось — рвём до отправки чего-либо своего.
+        let hello = read_frame(&mut tls).context("admin-канал: нет hello (pin/obfs/порт?)")?;
+        let challenge = pqid::verify_hello(&hello, issuer_mldsa, issuer_pin, &ekm)
+            .context("admin-канал: PQ-аутентификация издателя не прошла")?;
         let frame = build_auth_frame(admin_seed, &challenge, &ekm)?;
         write_frame(&mut tls, &frame)?;
         let ack = read_frame(&mut tls).context("admin-auth отклонён сервером (не admin_id?)")?;
@@ -451,47 +433,29 @@ mod tests {
 
     // ── auth: чистые негативы без TLS ──
 
-    /// verify_auth_frame: happy + все негативы формата/ключа/подписи/домена/EKM.
+    /// verify_auth_frame: happy + негативы ключа/подписи/домена/EKM. Формат кадра и обе подписи
+    /// проверяются в [`crate::pqid`]; здесь — то, что добавляет admin-слой: сверка с `admin_id`.
     #[test]
     fn auth_frame_verify_matrix() {
         let seed = [0x42u8; 32];
-        let admin_id = ed25519_pub_from_seed(&seed).unwrap();
+        let admin_id = pqid::id_from_seed(&seed).unwrap();
         let challenge = [0x11u8; 32];
-        let ekm = [0x22u8; EKM_LEN];
+        let ekm = [0x22u8; pqtls::EKM_LEN];
         let frame = build_auth_frame(&seed, &challenge, &ekm).unwrap();
-        assert_eq!(frame.len(), AUTH_FRAME_LEN);
         // happy
         assert_eq!(verify_auth_frame(&frame, &challenge, &ekm, &admin_id).unwrap(), admin_id);
         // чужой admin_id → отказ (ключ не админский)
-        let foreign = ed25519_pub_from_seed(&[0x43u8; 32]).unwrap();
+        let foreign = pqid::id_from_seed(&[0x43u8; 32]).unwrap();
         assert!(verify_auth_frame(&frame, &challenge, &ekm, &foreign).is_err());
-        // Layer-1-стиль (96 Б, без префикса) → отказ по формату
-        assert!(verify_auth_frame(&frame[1..], &challenge, &ekm, &admin_id).is_err());
-        // неверный префикс → отказ
-        let mut bad = frame.clone();
-        bad[0] = 0x02;
-        assert!(verify_auth_frame(&bad, &challenge, &ekm, &admin_id).is_err());
-        // подпись без домена/EKM (сырой challenge, как Layer-1) → отказ (domain separation)
-        let sig_raw = ed25519_sign(&seed, &challenge).unwrap();
-        let mut f96 = vec![AUTH_PREFIX];
-        f96.extend_from_slice(&admin_id);
-        f96.extend_from_slice(&sig_raw);
-        assert!(verify_auth_frame(&f96, &challenge, &ekm, &admin_id).is_err());
-        // подпись домен‖challenge, но БЕЗ EKM → отказ (channel binding обязателен)
-        let mut no_ekm = AUTH_DOMAIN.to_vec();
-        no_ekm.extend_from_slice(&challenge);
-        let sig_no_ekm = ed25519_sign(&seed, &no_ekm).unwrap();
-        let mut f_no_ekm = vec![AUTH_PREFIX];
-        f_no_ekm.extend_from_slice(&admin_id);
-        f_no_ekm.extend_from_slice(&sig_no_ekm);
-        assert!(verify_auth_frame(&f_no_ekm, &challenge, &ekm, &admin_id).is_err());
+        // подпись абонента (домен Layer-1) в admin-канале → отказ (domain separation)
+        let l1 = pqid::build_auth(&seed, pqid::DOMAIN_CLIENT, &challenge, &ekm).unwrap();
+        assert!(verify_auth_frame(&l1, &challenge, &ekm, &admin_id).is_err());
         // чужая сессия (другой EKM) → отказ (анти-релей между TLS-сессиями)
-        assert!(verify_auth_frame(&frame, &challenge, &[0x99u8; EKM_LEN], &admin_id).is_err());
-        // повреждённая подпись → отказ
-        let mut tampered = frame;
-        let last = tampered.len() - 1;
-        tampered[last] ^= 1;
-        assert!(verify_auth_frame(&tampered, &challenge, &ekm, &admin_id).is_err());
+        assert!(verify_auth_frame(&frame, &challenge, &[0x99u8; pqtls::EKM_LEN], &admin_id).is_err());
+        // чужой челлендж → отказ (анти-replay)
+        assert!(verify_auth_frame(&frame, &[0x12u8; 32], &ekm, &admin_id).is_err());
+        // мусор вместо кадра → отказ, без паники
+        assert!(verify_auth_frame(b"not-cbor", &challenge, &ekm, &admin_id).is_err());
     }
 
     /// CBOR wire-формат команд/ответов: roundtrip без потерь.
@@ -528,13 +492,16 @@ mod tests {
     // ── e2e поверх PQ-TLS: in-process issuer admin-канал ──
 
     /// Поднять admin-сервер на `conns` последовательных соединений. Возвращает (addr, pin, handle).
+    /// Возвращает (addr, cert_pin, обязательство PQ-идентичности издателя, handle).
     fn spawn_admin_server(
         dir: &str,
         conns: usize,
-    ) -> (String, [u8; 32], std::thread::JoinHandle<()>) {
+    ) -> (String, [u8; 32], [u8; 32], std::thread::JoinHandle<()>) {
         let identity = pqtls::IssuerIdentity::load_or_generate(dir).unwrap();
         let pin = identity.pin;
         let scfg = identity.server_config().unwrap();
+        let pq = std::sync::Arc::new(IssuerPqIdentity::load_or_generate(dir).unwrap());
+        let commitment = pq.commitment();
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap().to_string();
         let dir = dir.to_string();
@@ -544,11 +511,11 @@ mod tests {
                 let srv = AdminServer { dir: dir.clone() };
                 // провал auth — ожидаемый исход негативных тестов, не паника сервера
                 if let Ok(tls) = pqtls::accept_tls(tcp, scfg.clone(), None) {
-                    let _ = srv.serve_conn(tls);
+                    let _ = srv.serve_conn(tls, &pq, &pin);
                 }
             }
         });
-        (addr, pin, h)
+        (addr, pin, commitment, h)
     }
 
     fn tmp_dir(tag: &str) -> String {
@@ -563,21 +530,21 @@ mod tests {
     fn admin_e2e_list_add_revoke_and_lockout_guard() {
         let dir = tmp_dir("e2e");
         let admin_seed = [0x51u8; 32];
-        let admin_id = ed25519_pub_from_seed(&admin_seed).unwrap();
+        let admin_id = pqid::id_from_seed(&admin_seed).unwrap();
         std::fs::write(format!("{dir}/admin_id"), hex::encode(admin_id)).unwrap();
         // Layer-1 client_id самого админа (guard R6)
-        let admin_cid = ed25519_pub_from_seed(&[0x52u8; 32]).unwrap();
+        let admin_cid = pqid::id_from_seed(&[0x52u8; 32]).unwrap();
         std::fs::write(format!("{dir}/admin.client_id"), hex::encode(admin_cid)).unwrap();
         std::fs::write(format!("{dir}/registry"), format!("{} 9999999999 active\n", hex::encode(admin_cid))).unwrap();
 
-        let (addr, pin, h) = spawn_admin_server(&dir, 1);
-        let mut c = AdminClient::connect(&addr, &pin, &admin_seed, None).unwrap();
+        let (addr, pin, mldsa, h) = spawn_admin_server(&dir, 1);
+        let mut c = AdminClient::connect(&addr, &pin, &mldsa, &admin_seed, None).unwrap();
 
         // list: только запись админа
         let start = c.list().unwrap();
         assert_eq!(start.len(), 1);
         // add с дефолтным сроком (0 → +365d)
-        let subscriber = ed25519_pub_from_seed(&[0x53u8; 32]).unwrap();
+        let subscriber = pqid::id_from_seed(&[0x53u8; 32]).unwrap();
         c.add(subscriber, 0).unwrap();
         let after_add = c.list().unwrap();
         let e = after_add.iter().find(|e| e.client_id == subscriber).expect("абонент в реестре");
@@ -607,11 +574,11 @@ mod tests {
     #[test]
     fn admin_auth_rejects_foreign_key() {
         let dir = tmp_dir("foreign");
-        let admin_id = ed25519_pub_from_seed(&[0x61u8; 32]).unwrap();
+        let admin_id = pqid::id_from_seed(&[0x61u8; 32]).unwrap();
         std::fs::write(format!("{dir}/admin_id"), hex::encode(admin_id)).unwrap();
-        let (addr, pin, h) = spawn_admin_server(&dir, 1);
-        // валидная по формату подпись, но чужим seed'ом
-        assert!(AdminClient::connect(&addr, &pin, &[0x62u8; 32], None).is_err());
+        let (addr, pin, mldsa, h) = spawn_admin_server(&dir, 1);
+        // валидные по формату подписи, но чужим seed'ом
+        assert!(AdminClient::connect(&addr, &pin, &mldsa, &[0x62u8; 32], None).is_err());
         h.join().unwrap();
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -620,34 +587,56 @@ mod tests {
     #[test]
     fn admin_auth_rejects_without_admin_id_file() {
         let dir = tmp_dir("noid");
-        let (addr, pin, h) = spawn_admin_server(&dir, 1);
-        assert!(AdminClient::connect(&addr, &pin, &[0x63u8; 32], None).is_err());
+        let (addr, pin, mldsa, h) = spawn_admin_server(&dir, 1);
+        assert!(AdminClient::connect(&addr, &pin, &mldsa, &[0x63u8; 32], None).is_err());
         h.join().unwrap();
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// Layer-1-стилевой кадр (96 Б `pub‖sig(challenge)`, как у fetch_tokens) на admin-канале —
-    /// отказ: кросс-протокольный доступ абонентским ключом невозможен, даже если этот ключ
-    /// записан как admin_id (домен+EKM обязательны).
+    /// Кадр абонента (домен Layer-1, как у `fetch_tokens`) на admin-канале — отказ:
+    /// кросс-протокольный доступ абонентским ключом невозможен, даже если этот ключ записан как
+    /// `admin_id` (домен+EKM обязательны).
     #[test]
     fn admin_auth_rejects_layer1_frame() {
         let dir = tmp_dir("layer1");
         let seed = [0x71u8; 32];
-        let pk = ed25519_pub_from_seed(&seed).unwrap();
+        let id = pqid::id_from_seed(&seed).unwrap();
         // намеренно worst case: этот же ключ объявлен admin_id
-        std::fs::write(format!("{dir}/admin_id"), hex::encode(pk)).unwrap();
-        let (addr, pin, h) = spawn_admin_server(&dir, 1);
+        std::fs::write(format!("{dir}/admin_id"), hex::encode(id)).unwrap();
+        let (addr, pin, mldsa, h) = spawn_admin_server(&dir, 1);
 
         let tcp = TcpStream::connect(&addr).unwrap();
         let mut tls = pqtls::connect_tls(tcp, pin, None).unwrap();
-        let challenge = read_frame(&mut tls).unwrap();
-        // ровно то, что шлёт Layer-1 клиент: pub(32) ‖ Ed25519(seed, сырой challenge)
-        let sig = ed25519_sign(&seed, &challenge).unwrap();
-        let mut auth = Vec::with_capacity(96);
-        auth.extend_from_slice(&pk);
-        auth.extend_from_slice(&sig);
+        let ekm = pqtls::handshake_client(&mut tls).unwrap();
+        let hello = read_frame(&mut tls).unwrap();
+        let challenge = pqid::verify_hello(&hello, &mldsa, &pin, &ekm).unwrap();
+        // ровно то, что шлёт абонент на :7000 — тот же ключ, тот же EKM, но ДРУГОЙ домен
+        let auth = pqid::build_auth(&seed, pqid::DOMAIN_CLIENT, &challenge, &ekm).unwrap();
         write_frame(&mut tls, &auth).unwrap();
         assert!(read_frame(&mut tls).is_err(), "ack не должен прийти — соединение разорвано");
+        h.join().unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Издатель-самозванец (свой TLS-серт и своя PQ-идентичность) не проходит: клиент сверяет
+    /// обязательство из ссылки и рвёт соединение ДО отправки admin-подписи.
+    #[test]
+    fn admin_client_rejects_foreign_issuer() {
+        let dir = tmp_dir("fakeissuer");
+        let admin_seed = [0x81u8; 32];
+        std::fs::write(
+            format!("{dir}/admin_id"),
+            hex::encode(pqid::id_from_seed(&admin_seed).unwrap()),
+        )
+        .unwrap();
+        let (addr, pin, _mldsa, h) = spawn_admin_server(&dir, 1);
+        // обязательство «другого» издателя — ровно то, что увидит клиент при подмене сервера
+        let foreign = pqid::issuer_commitment(&pqid::mldsa_pub_from_seed(&[0x82u8; 32]).unwrap());
+        let err = match AdminClient::connect(&addr, &pin, &foreign, &admin_seed, None) {
+            Ok(_) => panic!("самозванец не должен пройти"),
+            Err(e) => e,
+        };
+        assert!(format!("{err:#}").contains("PQ-аутентификация издателя"), "err: {err:#}");
         h.join().unwrap();
         let _ = std::fs::remove_dir_all(&dir);
     }

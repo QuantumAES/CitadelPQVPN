@@ -14,9 +14,12 @@ use citadel_quic::config::ClientConfig;
 /// Добыть `count` epoch-токенов у `issuer` (host:port), авторизуясь `client_seed`'ом (Layer-1).
 /// `retries` — попытки коннекта (издатель мог ещё генерить RSA-ключ). Издатель токены НЕ видит.
 /// S2.1/A1: канал к issuer'у — PQ-TLS с пиннингом (`issuer_pin`) → анти-MITM + скрытие client_id.
+/// PQ: `issuer_mldsa` — обязательство к ML-DSA-идентичности издателя из ссылки; издатель обязан
+/// доказать владение ею подписью привязки к сессии, иначе канал рвётся до отправки `client_id`.
 pub async fn fetch_tokens(
     issuer: &str,
     issuer_pin: &[u8; 32],
+    issuer_mldsa: &[u8; 32],
     client_seed: &[u8; 32],
     count: usize,
     retries: u32,
@@ -24,9 +27,10 @@ pub async fn fetch_tokens(
 ) -> Result<Vec<Vec<u8>>> {
     let issuer = issuer.to_string();
     let pin = *issuer_pin;
+    let mldsa = *issuer_mldsa;
     let seed = *client_seed;
     tokio::task::spawn_blocking(move || {
-        citadel_token::fetch_tokens(&issuer, &pin, &seed, count, retries, obfs_psk)
+        citadel_token::fetch_tokens(&issuer, &pin, &mldsa, &seed, count, retries, obfs_psk)
     })
     .await
     .context("token-fetch задача паникнула")?
@@ -40,17 +44,25 @@ pub async fn with_token(
     mut config: ClientConfig,
     issuer: Option<&str>,
     issuer_pin: Option<&[u8; 32]>,
+    issuer_mldsa: Option<&[u8; 32]>,
     client_seed: Option<&[u8; 32]>,
 ) -> Result<ClientConfig> {
-    // нет issuer/seed → без токена (passthrough); есть issuer — pin обязателен (fail-closed).
+    // нет issuer/seed → без токена (passthrough); есть issuer — pin и PQ-обязательство обязательны
+    // (fail-closed).
     if let (Some(issuer), Some(seed)) = (issuer, client_seed) {
         let pin = issuer_pin.ok_or_else(|| {
             anyhow::anyhow!("issuer задан без issuer_pin — небезопасный канал (A1); ссылка устарела?")
         })?;
+        let mldsa = issuer_mldsa.ok_or_else(|| {
+            anyhow::anyhow!(
+                "в ссылке нет PQ-обязательства издателя — канал держался бы на классической \
+                 подписи серта; перевыпустите ссылку у администратора"
+            )
+        })?;
         // S2.1/A1-остаток: obfs-обёртка issuer-канала берётся из того же ClientConfig.obfs_psk,
         // что и туннель (probe-resistance; None → голый TLS для ссылок без obfs).
         let obfs_psk = config.obfs_psk;
-        let mut tokens = fetch_tokens(issuer, pin, seed, 1, 20, obfs_psk).await?;
+        let mut tokens = fetch_tokens(issuer, pin, mldsa, seed, 1, 20, obfs_psk).await?;
         if let Some(t) = tokens.pop() {
             config.token = t;
         }
@@ -63,7 +75,9 @@ mod tests {
     /// Недоступный issuer → Err (обёртка не паникует и не виснет); 1 попытка → быстро.
     #[tokio::test]
     async fn unreachable_issuer_errs() {
-        assert!(super::fetch_tokens("127.0.0.1:9", &[0u8; 32], &[7u8; 32], 1, 1, None).await.is_err());
+        assert!(super::fetch_tokens("127.0.0.1:9", &[0u8; 32], &[1u8; 32], &[7u8; 32], 1, 1, None)
+            .await
+            .is_err());
     }
 
     /// C5.4: без issuer/seed `with_token` возвращает config без токена (passthrough, не виснет).
@@ -81,6 +95,7 @@ mod tests {
             issuer: None,
             issuer_pub: None,
             issuer_pin: None,
+            issuer_mldsa: Some([9u8; 32]),
             client_seed: None,
             admin_seed: None,
             admin_port: None,
@@ -88,14 +103,15 @@ mod tests {
             dns: None,
         }
         .to_client_config();
-        let out = super::with_token(cfg, None, None, None).await.unwrap();
+        let out = super::with_token(cfg, None, None, None, None).await.unwrap();
         assert!(out.token.is_empty());
     }
 
-    /// S2.1/A1 fail-closed: issuer задан, но pin отсутствует → `with_token` — ошибка (не молчаливый
-    /// небезопасный фетч).
+    /// Fail-closed на границе доверия к издателю: issuer задан, но нет pin (S2.1/A1) ЛИБО нет
+    /// PQ-обязательства (`issuer_mldsa`) → `with_token` возвращает ошибку, а не молча идёт в
+    /// небезопасный фетч.
     #[tokio::test]
-    async fn with_token_requires_pin_when_issuer_set() {
+    async fn with_token_requires_pin_and_pq_commitment_when_issuer_set() {
         let cfg = crate::creds::CredentialBundle {
             version: crate::creds::BUNDLE_VERSION,
             servers: vec!["exit:4433".into()],
@@ -108,6 +124,7 @@ mod tests {
             issuer: Some("issuer:7000".into()),
             issuer_pub: None,
             issuer_pin: None,
+            issuer_mldsa: Some([9u8; 32]),
             client_seed: None,
             admin_seed: None,
             admin_port: None,
@@ -116,6 +133,13 @@ mod tests {
         }
         .to_client_config();
         let seed = [9u8; 32];
-        assert!(super::with_token(cfg, Some("issuer:7000"), None, Some(&seed)).await.is_err());
+        // issuer без pin — отказ (A1)
+        assert!(super::with_token(cfg.clone(), Some("issuer:7000"), None, Some(&[1u8; 32]), Some(&seed))
+            .await
+            .is_err());
+        // issuer с pin, но БЕЗ PQ-обязательства издателя — тоже отказ (fail-closed, PQ-трек)
+        assert!(super::with_token(cfg, Some("issuer:7000"), Some(&[2u8; 32]), None, Some(&seed))
+            .await
+            .is_err());
     }
 }

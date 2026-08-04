@@ -16,17 +16,36 @@ use serde::{Deserialize, Serialize};
 /// v2 (S2.1/A1): добавлен `issuer_pin` — pin TLS-серта издателя (PQ-TLS канал к issuer'у).
 /// v3 (C7.2): добавлены `admin_seed`/`admin_port` (admin-плоскость, только мастер-ссылка);
 /// оба поля `#[serde(default)]` → v2-ссылки/бандлы читаются без изменений (см. `MIN_READ_VERSION`).
-pub const BUNDLE_VERSION: u8 = 3;
+/// v4 (PQ-трек): добавлено `issuer_mldsa` — обязательство к ML-DSA-идентичности издателя, без
+/// которого канал выдачи токенов и admin-канал не поднимаются (fail-closed). Одновременно сменился
+/// способ вычисления `client_id` (гибрид Ed25519+ML-DSA, `citadel_token::pqid`), поэтому v3-ссылки
+/// НЕ совместимы с обновлённым сервером ни в какой части — их читать бессмысленно (см.
+/// `MIN_READ_VERSION`): человеку нужен понятный отказ «перевыпустите ссылку», а не отказ Layer-1
+/// «client_id не активен» на живом сервере.
+pub const BUNDLE_VERSION: u8 = 4;
 
 /// Минимальная версия формата, которую ещё разбираем. NB (задача 2, уточнено 2026-07-20): это НЕ
 /// канал совместимости кред между поколениями сервера — инвалидация «старых ссылок при обновлении
 /// сервера» держится на КРИПТО-ротации (новые obfs_psk/cert-pin/issuer-pin/seed'ы у обновлённого
 /// сервера ⇒ старая ссылка не проходит obfs/pin/Layer-1), а не на version-гейте. Диапазон
-/// `MIN..=BUNDLE_VERSION` нужен лишь чтобы не падать на переходных v2/v3-ссылках одного поколения.
-const MIN_READ_VERSION: u8 = 2;
+/// `MIN..=BUNDLE_VERSION` нужен лишь чтобы не падать на переходных ссылках одного поколения.
+/// PQ-трек поднял планку до 4: у ссылок v2/v3 идентичность абонента классическая, и сервер,
+/// перешедший на гибридную, их всё равно не авторизует.
+const MIN_READ_VERSION: u8 = 4;
 
 /// Дефолтный порт admin-канала (за туннелем), если в ссылке `admin_port` не задан.
 pub const DEFAULT_ADMIN_PORT: &str = "7001";
+
+/// Что человеку делать с несовместимой версией. Номер формата сам по себе не говорит ничего:
+/// «слишком старая» лечится перевыпуском ссылки у администратора, «слишком новая» — обновлением
+/// приложения. Разные действия — значит, и текст должен быть разный.
+fn version_hint(got: u8) -> &'static str {
+    if got < MIN_READ_VERSION {
+        "Ссылка выпущена до перехода на пост-квантовую аутентификацию — запросите новую у администратора."
+    } else {
+        "Ссылка новее этой версии приложения — обновите приложение."
+    }
+}
 
 /// Полный набор кред для подключения к exit'ам — всё инлайн.
 ///
@@ -62,6 +81,11 @@ pub struct CredentialBundle {
     /// issuer / legacy. Без него клиент НЕ может безопасно фетчить (fail-closed в `token_agent`).
     #[serde(with = "serde_bytes")]
     pub issuer_pin: Option<[u8; 32]>,
+    /// v4 (PQ): обязательство к ML-DSA-идентичности издателя = `BLAKE3(mldsa_pub)`. Клиент требует
+    /// его И на канале выдачи токенов, И на admin-канале: pin серта — классическая привязка, и
+    /// против CRQC она не держит (приватный ключ Ed25519-серта выводится из его же pub).
+    #[serde(default, with = "serde_bytes")]
+    pub issuer_mldsa: Option<[u8; 32]>,
     /// Ed25519 client-seed (Layer-1 «абонемент», C5); `None` → анонимный режим без идентичности.
     #[serde(with = "serde_bytes")]
     pub client_seed: Option<[u8; 32]>,
@@ -108,8 +132,10 @@ impl CredentialBundle {
         let b: CredentialBundle = ciborium::from_reader(bytes).context("CBOR-разбор бандла")?;
         if b.version < MIN_READ_VERSION || b.version > BUNDLE_VERSION {
             anyhow::bail!(
-                "несовместимая версия бандла: {} (поддерживается {MIN_READ_VERSION}..={BUNDLE_VERSION})",
-                b.version
+                "несовместимая версия бандла: {} (поддерживается {MIN_READ_VERSION}..={BUNDLE_VERSION}). \
+                 {}",
+                b.version,
+                version_hint(b.version)
             );
         }
         // S1.2/M1: dns/routes уходят в root-контекст (resolv.conf/ip route) — отклоняем инъекции.
@@ -210,6 +236,10 @@ pub struct CredentialLink {
     /// S2.1/A1: pin TLS-серта издателя (BLAKE3 DER) — клиент пиннит PQ-TLS канал фетча токенов.
     #[serde(with = "serde_bytes")]
     pub issuer_pin: Option<[u8; 32]>,
+    /// v4 (PQ): обязательство к ML-DSA-идентичности издателя (`BLAKE3(mldsa_pub)`) — уже хэш,
+    /// поэтому в компактной ссылке идёт как есть.
+    #[serde(default, with = "serde_bytes")]
+    pub issuer_mldsa: Option<[u8; 32]>,
     /// Ed25519 client-seed (секрет Layer-1 — инлайн).
     #[serde(with = "serde_bytes")]
     pub client_seed: Option<[u8; 32]>,
@@ -254,6 +284,7 @@ impl CredentialLink {
             issuer: b.issuer.clone(),
             issuer_commit: b.issuer_pub.as_deref().map(sha256),
             issuer_pin: b.issuer_pin,
+            issuer_mldsa: b.issuer_mldsa,
             client_seed: b.client_seed,
             admin_seed: b.admin_seed,
             admin_port: b.admin_port.clone(),
@@ -287,8 +318,10 @@ impl CredentialLink {
             ciborium::from_reader(&cbor[..]).context("CBOR-разбор ссылки")?;
         if link.version < MIN_READ_VERSION || link.version > BUNDLE_VERSION {
             anyhow::bail!(
-                "несовместимая версия ссылки: {} (поддерживается {MIN_READ_VERSION}..={BUNDLE_VERSION})",
-                link.version
+                "несовместимая версия ссылки: {} (поддерживается {MIN_READ_VERSION}..={BUNDLE_VERSION}). \
+                 {}",
+                link.version,
+                version_hint(link.version)
             );
         }
         // S1.2/M1: dns/routes уходят в root-контекст (resolv.conf/ip route) — отклоняем инъекции.
@@ -386,6 +419,7 @@ mod tests {
             issuer: Some("issuer.example:7000".into()),
             issuer_pub: Some(vec![0x44; 270]),
             issuer_pin: Some([0x66; 32]),
+            issuer_mldsa: Some([9u8; 32]),
             client_seed: Some([0x55; 32]),
             admin_seed: Some([0x77; 32]),
             admin_port: Some("7001".into()),
@@ -416,6 +450,7 @@ mod tests {
             issuer: None,
             issuer_pub: None,
             issuer_pin: None,
+            issuer_mldsa: Some([9u8; 32]),
             client_seed: None,
             admin_seed: None,
             admin_port: None,
@@ -471,13 +506,16 @@ mod tests {
         assert_eq!(client.admin_port(), DEFAULT_ADMIN_PORT); // дефолт при отсутствии
     }
 
-    /// C7.2 совместимость: ссылка СТАРОГО формата v2 (без admin-полей, version=2) читается новым
-    /// кодом (admin=None). Эмулируем реальные v2-байты структурой без admin-полей — если бы
-    /// ciborium кодировал позиционным массивом, а не map'ом по именам, разбор бы упал.
+    /// PQ-трек: ссылка ДОквантового формата (v3 и старше) отвергается с ПОНЯТНОЙ причиной.
+    ///
+    /// Раньше здесь проверялась обратная совместимость (v2 читается новым кодом). Теперь она
+    /// вредна: у таких ссылок идентичность абонента классическая, `client_id` считается иначе, и
+    /// сервер их всё равно не авторизует — человек получил бы «client_id не активен» на исправном
+    /// сервере и пошёл бы чинить не то. Отказ на разборе называет настоящую причину.
     #[test]
-    fn v2_link_parses_under_v3() {
+    fn pre_pq_link_rejected_with_version_reason() {
         use base64::Engine;
-        // точная форма CredentialLink ДО C7.2 (v3): те же поля минус admin_seed/admin_port.
+        // точная форма CredentialLink ДО PQ-трека (v3): те же поля минус issuer_mldsa.
         #[derive(Serialize)]
         struct LegacyLink {
             version: u8,
@@ -502,7 +540,7 @@ mod tests {
             dns: Option<String>,
         }
         let legacy = LegacyLink {
-            version: 2, // старая версия
+            version: 3,
             servers: vec!["exit.example:4433".into()],
             server_name: "citadel.exit".into(),
             kx_suite: "pq".into(),
@@ -523,11 +561,9 @@ mod tests {
             "{URI_PREFIX}{}",
             base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(&cbor)
         );
-        let parsed = CredentialLink::from_uri(&uri).expect("v2-ссылка читается новым кодом");
-        assert_eq!(parsed.version, 2);
-        assert_eq!(parsed.client_seed, Some([4; 32]));
-        assert!(!parsed.is_admin(), "v2 не несёт admin — не мастер");
-        assert_eq!(parsed.admin_seed, None);
+        let err = CredentialLink::from_uri(&uri).expect_err("доквантовая ссылка не принимается");
+        let msg = format!("{err:#}");
+        assert!(msg.contains("версия"), "причина должна называть версию: {msg}");
     }
 
     #[test]

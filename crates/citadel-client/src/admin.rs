@@ -18,7 +18,6 @@ use anyhow::{anyhow, Context, Result};
 use zeroize::Zeroize;
 
 use citadel_token::admin::{AdminClient, RegistryEntry, ADMIN_VIP};
-use citadel_token::ed25519_pub_from_seed;
 
 use crate::creds::CredentialLink;
 
@@ -58,11 +57,12 @@ fn random_seed() -> Result<[u8; 32]> {
     Ok(s)
 }
 
-/// Параметры аутентификации admin-канала: `(issuer_pin, admin_seed, obfs_psk)`.
-type AdminAuth = ([u8; 32], [u8; 32], Option<[u8; 32]>);
+/// Параметры аутентификации admin-канала: `(issuer_pin, issuer_mldsa, admin_seed, obfs_psk)`.
+type AdminAuth = ([u8; 32], [u8; 32], [u8; 32], Option<[u8; 32]>);
 
-/// `(pin, admin_seed, obfs_psk)` из мастер-ссылки. Ошибка, если ссылка не мастер (нет admin-seed) или
-/// в ней нет issuer_pin (без него PQ-TLS канал к admin-плоскости был бы MITM-открыт — fail-closed).
+/// `(pin, issuer_mldsa, admin_seed, obfs_psk)` из мастер-ссылки. Ошибка, если ссылка не мастер (нет
+/// admin-seed), в ней нет issuer_pin (без него PQ-TLS канал был бы MITM-открыт) или нет
+/// PQ-обязательства издателя (без него подлинность сервера держалась бы на классической подписи).
 /// `obfs_psk` (S2.1/A1-остаток) — тот же, что у туннеля/token-fetch: `Some` → admin-канал обёрнут в
 /// obfs (probe-resistance), совпадает с серверной обёрткой; `None` (ссылка без obfs) → голый TLS.
 fn admin_auth(master_uri: &str) -> Result<AdminAuth> {
@@ -73,7 +73,10 @@ fn admin_auth(master_uri: &str) -> Result<AdminAuth> {
     let pin = link.issuer_pin.ok_or_else(|| {
         anyhow!("в ссылке нет issuer_pin — небезопасный канал к admin-плоскости (A1)")
     })?;
-    Ok((pin, seed, link.obfs_psk))
+    let mldsa = link.issuer_mldsa.ok_or_else(|| {
+        anyhow!("в ссылке нет PQ-обязательства издателя — перевыпустите мастер-ссылку")
+    })?;
+    Ok((pin, mldsa, seed, link.obfs_psk))
 }
 
 /// Адрес admin-канала (host:port) для мастер-ссылки: хост фиксирован [`ADMIN_VIP`] (доступ только
@@ -141,11 +144,12 @@ pub fn build_subscriber_link(master_uri: &str, client_seed: &[u8; 32]) -> Result
 async fn list_at(
     addr: String,
     pin: [u8; 32],
+    mldsa: [u8; 32],
     seed: [u8; 32],
     obfs_psk: Option<[u8; 32]>,
 ) -> Result<Vec<SubscriberEntry>> {
     tokio::task::spawn_blocking(move || -> Result<Vec<SubscriberEntry>> {
-        let mut c = AdminClient::connect(&addr, &pin, &seed, obfs_psk)?;
+        let mut c = AdminClient::connect(&addr, &pin, &mldsa, &seed, obfs_psk)?;
         Ok(c.list()?.into_iter().map(SubscriberEntry::from).collect())
     })
     .await
@@ -155,13 +159,14 @@ async fn list_at(
 async fn add_at(
     addr: String,
     pin: [u8; 32],
+    mldsa: [u8; 32],
     seed: [u8; 32],
     obfs_psk: Option<[u8; 32]>,
     client_id: [u8; 32],
     valid_until: u64,
 ) -> Result<()> {
     tokio::task::spawn_blocking(move || -> Result<()> {
-        let mut c = AdminClient::connect(&addr, &pin, &seed, obfs_psk)?;
+        let mut c = AdminClient::connect(&addr, &pin, &mldsa, &seed, obfs_psk)?;
         c.add(client_id, valid_until)
     })
     .await
@@ -171,12 +176,13 @@ async fn add_at(
 async fn revoke_at(
     addr: String,
     pin: [u8; 32],
+    mldsa: [u8; 32],
     seed: [u8; 32],
     obfs_psk: Option<[u8; 32]>,
     client_id: [u8; 32],
 ) -> Result<()> {
     tokio::task::spawn_blocking(move || -> Result<()> {
-        let mut c = AdminClient::connect(&addr, &pin, &seed, obfs_psk)?;
+        let mut c = AdminClient::connect(&addr, &pin, &mldsa, &seed, obfs_psk)?;
         c.revoke(client_id)
     })
     .await
@@ -185,15 +191,15 @@ async fn revoke_at(
 
 /// Список абонентов реестра (по admin-каналу через туннель).
 pub async fn admin_list(master_uri: String) -> Result<Vec<SubscriberEntry>> {
-    let (pin, seed, obfs_psk) = admin_auth(&master_uri)?;
-    list_at(admin_addr(&master_uri)?, pin, seed, obfs_psk).await
+    let (pin, mldsa, seed, obfs_psk) = admin_auth(&master_uri)?;
+    list_at(admin_addr(&master_uri)?, pin, mldsa, seed, obfs_psk).await
 }
 
 /// Отозвать абонента по client_id (hex). Отзыв админом собственного client_id сервер отклонит (R6).
 pub async fn admin_revoke(master_uri: String, client_id_hex: String) -> Result<()> {
-    let (pin, seed, obfs_psk) = admin_auth(&master_uri)?;
+    let (pin, mldsa, seed, obfs_psk) = admin_auth(&master_uri)?;
     let cid = parse_client_id(&client_id_hex)?;
-    revoke_at(admin_addr(&master_uri)?, pin, seed, obfs_psk, cid).await
+    revoke_at(admin_addr(&master_uri)?, pin, mldsa, seed, obfs_psk, cid).await
 }
 
 /// Выдать доступ новому абоненту: свежий seed → регистрация pub по admin-каналу → клиентская ссылка
@@ -201,14 +207,16 @@ pub async fn admin_revoke(master_uri: String, client_id_hex: String) -> Result<(
 /// Ссылка строится ДО регистрации (валидация мастер-ссылки) — при ошибке сборки в реестр ничего
 /// не пишем.
 pub async fn admin_issue(master_uri: String, valid_until: u64) -> Result<IssuedLink> {
-    let (pin, seed, obfs_psk) = admin_auth(&master_uri)?;
+    let (pin, mldsa, seed, obfs_psk) = admin_auth(&master_uri)?;
     let addr = admin_addr(&master_uri)?;
     let mut client_seed = random_seed()?;
-    let client_id = ed25519_pub_from_seed(&client_seed)?;
+    // PQ: client_id — идентификатор ГИБРИДНОЙ идентичности (BLAKE3(ed_pub‖mldsa_pub)), тот же,
+    // что выведет издатель из auth-кадра абонента. Регистрируем именно его.
+    let client_id = citadel_token::pqid::id_from_seed(&client_seed)?;
     let uri = build_subscriber_link(&master_uri, &client_seed);
     client_seed.zeroize(); // seed уже в ссылке; локальную копию затираем
     let uri = uri?;
-    add_at(addr, pin, seed, obfs_psk, client_id, valid_until).await?;
+    add_at(addr, pin, mldsa, seed, obfs_psk, client_id, valid_until).await?;
     Ok(IssuedLink { client_id_hex: hex::encode(client_id), uri })
 }
 
@@ -234,6 +242,7 @@ mod tests {
             issuer: Some("exit.example:7000".into()),
             issuer_pub: Some(vec![4u8; 270]),
             issuer_pin: Some([5u8; 32]),
+            issuer_mldsa: Some([9u8; 32]),
             client_seed: Some([6u8; 32]),
             admin_seed: Some(admin_seed),
             admin_port: Some("7001".into()),
@@ -270,7 +279,7 @@ mod tests {
     fn conn_params_derived_and_reject_non_master() {
         let uri = master_uri([0x51; 32]);
         assert_eq!(admin_addr(&uri).unwrap(), format!("{ADMIN_VIP}:7001"));
-        let (pin, seed, obfs) = admin_auth(&uri).unwrap();
+        let (pin, _mldsa, seed, obfs) = admin_auth(&uri).unwrap();
         assert_eq!(pin, [5u8; 32]);
         assert_eq!(seed, [0x51; 32]);
         assert_eq!(obfs, Some([3u8; 32]), "obfs_psk наследуется из мастер-ссылки (A1-остаток)");
@@ -291,10 +300,18 @@ mod tests {
 
     // ── e2e против in-process issuer admin-сервера (тот же путь, что реальный, минус туннель) ──
 
-    fn spawn_admin(dir: &str, conns: usize) -> (String, [u8; 32], std::thread::JoinHandle<()>) {
+    /// Возвращает (addr, cert_pin, обязательство PQ-идентичности издателя, handle).
+    fn spawn_admin(
+        dir: &str,
+        conns: usize,
+    ) -> (String, [u8; 32], [u8; 32], std::thread::JoinHandle<()>) {
         let id = pqtls::IssuerIdentity::load_or_generate(dir).unwrap();
         let pin = id.pin;
         let scfg = id.server_config().unwrap();
+        let pq = std::sync::Arc::new(
+            citadel_token::pqid::IssuerPqIdentity::load_or_generate(dir).unwrap(),
+        );
+        let commitment = pq.commitment();
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap().to_string();
         let dir = dir.to_string();
@@ -303,11 +320,11 @@ mod tests {
                 let (tcp, _) = listener.accept().unwrap();
                 let srv = AdminServer { dir: dir.clone() };
                 if let Ok(tls) = pqtls::accept_tls(tcp, scfg.clone(), None) {
-                    let _ = srv.serve_conn(tls);
+                    let _ = srv.serve_conn(tls, &pq, &pin);
                 }
             }
         });
-        (addr, pin, h)
+        (addr, pin, commitment, h)
     }
 
     fn tmp_dir(tag: &str) -> String {
@@ -323,29 +340,29 @@ mod tests {
     async fn e2e_issue_list_revoke_via_admin_channel() {
         let dir = tmp_dir("e2e");
         let admin_seed = [0x33u8; 32];
-        let admin_id = ed25519_pub_from_seed(&admin_seed).unwrap();
+        let admin_id = citadel_token::pqid::id_from_seed(&admin_seed).unwrap();
         std::fs::write(format!("{dir}/admin_id"), hex::encode(admin_id)).unwrap();
         std::fs::write(format!("{dir}/registry"), "").unwrap();
-        let (addr, pin, h) = spawn_admin(&dir, 4); // add + list + revoke + list = 4 коннекта
+        let (addr, pin, mldsa, h) = spawn_admin(&dir, 4); // add + list + revoke + list = 4 коннекта
 
         let uri = master_uri(admin_seed);
         // issue: сгенерить seed, собрать ссылку, зарегистрировать client_id
         let mut client_seed = random_seed().unwrap();
-        let client_id = ed25519_pub_from_seed(&client_seed).unwrap();
+        let client_id = citadel_token::pqid::id_from_seed(&client_seed).unwrap();
         let client_uri = build_subscriber_link(&uri, &client_seed).unwrap();
         client_seed.zeroize();
-        add_at(addr.clone(), pin, admin_seed, None, client_id, 0).await.unwrap();
+        add_at(addr.clone(), pin, mldsa, admin_seed, None, client_id, 0).await.unwrap();
         assert!(CredentialLink::from_uri(&client_uri).unwrap().client_seed.is_some());
 
         // list: абонент active с дефолтным сроком (+365д)
-        let list = list_at(addr.clone(), pin, admin_seed, None).await.unwrap();
+        let list = list_at(addr.clone(), pin, mldsa, admin_seed, None).await.unwrap();
         let e = list.iter().find(|e| e.client_id_hex == hex::encode(client_id)).expect("в реестре");
         assert!(e.active && e.status == "active");
         assert!(e.valid_until_unix > 0);
 
         // revoke → status revoked
-        revoke_at(addr.clone(), pin, admin_seed, None, client_id).await.unwrap();
-        let after = list_at(addr, pin, admin_seed, None).await.unwrap();
+        revoke_at(addr.clone(), pin, mldsa, admin_seed, None, client_id).await.unwrap();
+        let after = list_at(addr, pin, mldsa, admin_seed, None).await.unwrap();
         assert_eq!(
             after.iter().find(|e| e.client_id_hex == hex::encode(client_id)).unwrap().status,
             "revoked"
@@ -358,12 +375,12 @@ mod tests {
     #[tokio::test]
     async fn admin_channel_rejects_wrong_seed() {
         let dir = tmp_dir("wrong");
-        let real_admin = ed25519_pub_from_seed(&[0x40u8; 32]).unwrap();
+        let real_admin = citadel_token::pqid::id_from_seed(&[0x40u8; 32]).unwrap();
         std::fs::write(format!("{dir}/admin_id"), hex::encode(real_admin)).unwrap();
         std::fs::write(format!("{dir}/registry"), "").unwrap();
-        let (addr, pin, h) = spawn_admin(&dir, 1);
+        let (addr, pin, mldsa, h) = spawn_admin(&dir, 1);
         // клиент подписывает ДРУГИМ seed → сервер не пускает
-        assert!(list_at(addr, pin, [0x41u8; 32], None).await.is_err());
+        assert!(list_at(addr, pin, mldsa, [0x41u8; 32], None).await.is_err());
         h.join().unwrap();
         let _ = std::fs::remove_dir_all(&dir);
     }

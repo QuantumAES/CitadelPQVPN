@@ -6,8 +6,8 @@
 //! citadel-linkgen --servers "1.2.3.4:4433" --psk <hex64|passphrase> --pin <hex64> \
 //!   [--kx all] [--tcp-port 443] [--routes "1.1.1.1/32 1.0.0.1/32"] \
 //!   [--dns 1.1.1.1] [--server-name citadel.exit] [--qr link.svg] \
-//!   [--issuer host:7000] [--issuer-pin <hex64>] [--client-seed <hex64>] [--mldsa-pub exit.mldsa] \
-//!   [--admin-seed <hex64>] [--admin-port 7001]
+//!   [--issuer host:7000] [--issuer-pin <hex64>] [--issuer-mldsa <hex64>] [--client-seed <hex64>] \
+//!   [--mldsa-pub exit.mldsa] [--admin-seed <hex64>] [--admin-port 7001]
 //! ```
 //! C7.2 admin-плоскость: `--admin-seed` (hex64, отдельный Ed25519 админа — НЕ равен client-seed) +
 //! опц. `--admin-port` (дефолт 7001) делают ссылку МАСТЕР-ссылкой (управление реестром абонентов по
@@ -67,6 +67,8 @@ fn main() {
         issuer_pub: None, // клиент дотягивает issuer_pub по каналу при фетче (не нужен в ссылке)
         // S2.1/A1: pin TLS-серта издателя (из issuer-tls.pin) — клиент пиннит PQ-TLS канал фетча.
         issuer_pin: get("--issuer-pin").as_deref().and_then(parse_pin),
+        // PQ: обязательство к ML-DSA-идентичности издателя (из issuer-mldsa.pin).
+        issuer_mldsa: get("--issuer-mldsa").as_deref().and_then(parse_pin),
         client_seed: get("--client-seed").as_deref().and_then(parse_pin),
         // C7.2: admin-плоскость — только для МАСТЕР-ссылки. `--admin-seed` (hex64, отдельный Ed25519,
         // не равен client-seed) + опц. `--admin-port` (дефолт 7001). Клиентские ссылки эти флаги НЕ несут.
@@ -82,6 +84,13 @@ fn main() {
     if bundle.issuer.is_some() && bundle.issuer_pin.is_none() {
         eprintln!("[linkgen] ⚠ --issuer задан БЕЗ --issuer-pin — клиент не сможет безопасно фетчить токен (A1)");
     }
+    if bundle.issuer.is_some() && bundle.issuer_mldsa.is_none() {
+        eprintln!(
+            "[linkgen] ⚠ --issuer задан БЕЗ --issuer-mldsa — клиент ОТКАЖЕТСЯ фетчить токены и \
+             открывать admin-канал (PQ-аутентификация издателя обязательна). Возьми hex из \
+             issuer-mldsa.pin на томе издателя."
+        );
+    }
     if bundle.admin_seed.is_some() {
         eprintln!(
             "[linkgen] ⚠ МАСТЕР-ссылка (несёт admin-seed): даёт управление реестром абонентов — \
@@ -89,13 +98,14 @@ fn main() {
         );
     }
     eprintln!(
-        "[linkgen] servers={:?} pin={} psk={} mldsa={} issuer={} issuer-pin={} layer1-seed={} admin={} routes={:?}",
+        "[linkgen] servers={:?} pin={} psk={} mldsa={} issuer={} issuer-pin={} issuer-mldsa={} layer1-seed={} admin={} routes={:?}",
         bundle.servers,
         if bundle.cert_pin.is_some() { "да" } else { "НЕТ (no-pin, PoC)" },
         if bundle.obfs_psk.is_some() { "да" } else { "НЕТ" },
         if bundle.mldsa_pub.is_some() { "H(pub) в ссылке" } else { "НЕТ" },
         bundle.issuer.as_deref().unwrap_or("НЕТ (token-less)"),
         if bundle.issuer_pin.is_some() { "да" } else { "НЕТ" },
+        if bundle.issuer_mldsa.is_some() { "да" } else { "НЕТ" },
         if bundle.client_seed.is_some() { "да" } else { "НЕТ" },
         if bundle.admin_seed.is_some() { format!("МАСТЕР (порт {})", bundle.admin_port.as_deref().unwrap_or("7001")) } else { "нет".into() },
         bundle.routes,

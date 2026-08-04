@@ -10,7 +10,7 @@ anyhow = "1"
 rand = "0.8"
 blind-rsa-signatures = "=0.15.0"   # =0.15.0: 0.15.1+ ломается (derive_more glob → PartialEq ambiguous, E0659)
 hex = "0.4"
-aws-lc-rs = "1.17"                 # C5.2 Layer-1: Ed25519 (тот же крипто-бэкенд, что в движке)
+aws-lc-rs = { version = "1.17", features = ["unstable"] }  # Layer-1: Ed25519 + ML-DSA-65 (FIPS 204, unstable API) — тот же крипто-бэкенд, что в движке
 citadel-obfs = { path = "../citadel-obfs" }   # S2.1/A1 (остаток): obfs-обёртка issuer-канала (анти-DPI)
 # S2.1/A1: защищённый (PQ-TLS + pin) канал к издателю. rustls/rcgen/blake3 — те же версии, что в движке.
 rustls = { version = "0.23", default-features = false, features = ["aws_lc_rs", "std"] }
@@ -18,6 +18,8 @@ rcgen = "0.13"
 blake3 = "1"
 # C7.1 admin-плоскость: CBOR-кадры команд (те же версии, что в citadel-client)
 serde = { version = "1", features = ["derive"] }
+zeroize = "1"                      # S1.3: затирание seed PQ-идентичности издателя в памяти
+serde_bytes = "0.11"               # PQ-кадры: byte-string вместо массива int (pub 1952 Б, подпись 3309 Б)
 ciborium = "0.2"
 
 [dev-dependencies]
