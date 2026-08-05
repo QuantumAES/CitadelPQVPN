@@ -4,6 +4,7 @@ import 'package:flutter/material.dart';
 
 import 'package:app/android_vpn.dart';
 import 'package:app/errors.dart';
+import 'package:app/l10n/strings.dart';
 import 'package:app/src/rust/api/citadel.dart';
 
 /// C8.3 split-tunneling. Две независимые оси:
@@ -57,7 +58,7 @@ class _SplitTunnelPageState extends State<SplitTunnelPage> {
     );
     if (!mounted) return;
     ScaffoldMessenger.of(context).showSnackBar(
-      const SnackBar(content: Text('Сохранено · применится со следующего подключения')),
+      SnackBar(content: Text(Strings.of(context)('split_saved'))),
     );
     Navigator.of(context).pop();
   }
@@ -94,7 +95,7 @@ class _SplitTunnelPageState extends State<SplitTunnelPage> {
     if (!mounted) return;
     if (subnets.isEmpty) {
       ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(content: Text('Локальная подсеть не определена')),
+        SnackBar(content: Text(Strings.of(context)('split_local_subnet_none'))),
       );
       return;
     }
@@ -116,11 +117,12 @@ class _SplitTunnelPageState extends State<SplitTunnelPage> {
 
   @override
   Widget build(BuildContext context) {
+    final t = Strings.of(context);
     return Scaffold(
       appBar: AppBar(
-        title: const Text('Split-туннель'),
+        title: Text(t('split_title')),
         actions: [
-          TextButton(onPressed: _save, child: const Text('Сохранить')),
+          TextButton(onPressed: _save, child: Text(t('save'))),
         ],
       ),
       body: ListView(
@@ -129,13 +131,13 @@ class _SplitTunnelPageState extends State<SplitTunnelPage> {
           // Ось приложений — только Android (нативный VpnService per-app). На Linux per-app
           // (cgroup2+fwmark) пока не реализован — показываем лишь ось назначений.
           if (Platform.isAndroid) ...[
-            _sectionHeader(context, Icons.apps, 'Приложения'),
-            _modeSelector(_appMode, (m) => setState(() => _appMode = m)),
+            _sectionHeader(context, Icons.apps, t('split_apps')),
+            _modeSelector(t, _appMode, (m) => setState(() => _appMode = m)),
             if (_appMode != _modeOff) ...[
               ListTile(
                 leading: const Icon(Icons.checklist),
-                title: Text('Выбрано приложений: ${_apps.length}'),
-                subtitle: const Text('Нажми, чтобы выбрать из установленных'),
+                title: Text(t('split_apps_selected', {'n': '${_apps.length}'})),
+                subtitle: Text(t('split_apps_pick')),
                 trailing: const Icon(Icons.chevron_right),
                 onTap: _pickApps,
               ),
@@ -156,8 +158,8 @@ class _SplitTunnelPageState extends State<SplitTunnelPage> {
             ],
             const Divider(height: 24),
           ],
-          _sectionHeader(context, Icons.lan_outlined, 'Адреса назначения'),
-          _modeSelector(_destMode, (m) => setState(() => _destMode = m)),
+          _sectionHeader(context, Icons.lan_outlined, t('split_dests')),
+          _modeSelector(t, _destMode, (m) => setState(() => _destMode = m)),
           if (_destMode != _modeOff) ...[
             Padding(
               padding: const EdgeInsets.fromLTRB(16, 4, 16, 4),
@@ -166,8 +168,8 @@ class _SplitTunnelPageState extends State<SplitTunnelPage> {
                   Expanded(
                     child: TextField(
                       controller: _destCtrl,
-                      decoration: const InputDecoration(
-                        labelText: 'домен / IP / CIDR',
+                      decoration: InputDecoration(
+                        labelText: t('split_dest_label'),
                         hintText: 'example.com · 1.2.3.4 · 192.168.0.0/16',
                         isDense: true,
                       ),
@@ -184,7 +186,7 @@ class _SplitTunnelPageState extends State<SplitTunnelPage> {
                 alignment: Alignment.centerLeft,
                 child: TextButton.icon(
                   icon: const Icon(Icons.wifi),
-                  label: const Text('Добавить локальную подсеть'),
+                  label: Text(t('split_add_local_subnet')),
                   onPressed: _addLocalSubnet,
                 ),
               ),
@@ -204,16 +206,13 @@ class _SplitTunnelPageState extends State<SplitTunnelPage> {
           Padding(
             padding: const EdgeInsets.all(16),
             child: Text(
-              'Внимание: приложения/адреса «в обход» идут напрямую и раскрывают ваш реальный IP. '
-              'Домены резолвятся при подключении; у CDN с меняющимися IP правило может «протекать» '
-              'между переподключениями.'
-              '${Platform.isAndroid ? ' Исключение назначений требует Android 13+.' : ''}'
-              // Ось приложений есть только на Android, и DNS там делится ровно по ней: система
-              // выбирает резолвер по приложению, а не по адресу. Это неочевидно и важно.
-              '${Platform.isAndroid ? '\n\nDNS: приложения в туннеле резолвят через резолвер '
-                  'туннеля, остальные — через DNS вашей сети (Wi-Fi/оператор), и он видит их '
-                  'домены. Если в системе включён «Личный DNS» (DNS-over-TLS), Android применит '
-                  'его и внутри туннеля.' : ''}',
+              [
+                t('split_warn'),
+                // Ось приложений есть только на Android, и DNS там делится ровно по ней: система
+                // выбирает резолвер по приложению, а не по адресу. Это неочевидно и важно.
+                if (Platform.isAndroid) t('split_warn_android13'),
+                if (Platform.isAndroid) '\n${t('split_warn_dns')}',
+              ].join(' '),
               style: const TextStyle(fontSize: 12, color: Colors.grey),
             ),
           ),
@@ -233,13 +232,13 @@ class _SplitTunnelPageState extends State<SplitTunnelPage> {
         ),
       );
 
-  Widget _modeSelector(String value, ValueChanged<String> onChanged) => Padding(
+  Widget _modeSelector(Strings t, String value, ValueChanged<String> onChanged) => Padding(
         padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 4),
         child: SegmentedButton<String>(
-          segments: const [
-            ButtonSegment(value: _modeOff, label: Text('Выкл')),
-            ButtonSegment(value: _modeInclude, label: Text('Через туннель')),
-            ButtonSegment(value: _modeExclude, label: Text('В обход')),
+          segments: [
+            ButtonSegment(value: _modeOff, label: Text(t('split_mode_off'))),
+            ButtonSegment(value: _modeInclude, label: Text(t('split_mode_include'))),
+            ButtonSegment(value: _modeExclude, label: Text(t('split_mode_exclude'))),
           ],
           selected: {value},
           showSelectedIcon: false,
@@ -274,12 +273,13 @@ class _AppPickerPageState extends State<_AppPickerPage> {
       final apps = await AndroidVpn.listInstalledApps();
       if (mounted) setState(() => _all = apps);
     } catch (e) {
-      if (mounted) setState(() => _error = humanError(e));
+      if (mounted) setState(() => _error = humanError(e, Strings.of(context)));
     }
   }
 
   @override
   Widget build(BuildContext context) {
+    final t = Strings.of(context);
     final all = _all;
     final filtered = all == null
         ? const <({String package, String label})>[]
@@ -291,11 +291,11 @@ class _AppPickerPageState extends State<_AppPickerPage> {
             .toList();
     return Scaffold(
       appBar: AppBar(
-        title: const Text('Выбор приложений'),
+        title: Text(t('split_apps_title')),
         actions: [
           TextButton(
             onPressed: () => Navigator.of(context).pop(_selected),
-            child: Text('Готово (${_selected.length})'),
+            child: Text(t('split_apps_done', {'n': '${_selected.length}'})),
           ),
         ],
       ),
@@ -304,9 +304,9 @@ class _AppPickerPageState extends State<_AppPickerPage> {
           Padding(
             padding: const EdgeInsets.all(12),
             child: TextField(
-              decoration: const InputDecoration(
-                prefixIcon: Icon(Icons.search),
-                labelText: 'Поиск',
+              decoration: InputDecoration(
+                prefixIcon: const Icon(Icons.search),
+                labelText: t('search'),
                 isDense: true,
               ),
               onChanged: (v) => setState(() => _filter = v.trim().toLowerCase()),
@@ -315,7 +315,7 @@ class _AppPickerPageState extends State<_AppPickerPage> {
           if (_error != null)
             Padding(
               padding: const EdgeInsets.all(16),
-              child: Text('Не удалось получить список приложений: $_error'),
+              child: Text(t('split_apps_failed', {'error': '$_error'})),
             )
           else if (all == null)
             const Expanded(child: Center(child: CircularProgressIndicator()))

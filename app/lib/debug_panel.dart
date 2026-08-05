@@ -3,6 +3,7 @@ import 'dart:async';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 
+import 'package:app/l10n/strings.dart';
 import 'package:app/src/rust/api/diag.dart';
 
 /// Живой журнал ядра (stderr движка захвачен в Rust — см. api::diag). Приминг снимком +
@@ -42,7 +43,7 @@ class _DebugLogPanelState extends State<DebugLogPanel> {
   @override
   Widget build(BuildContext context) {
     return MonoLogView(
-      title: 'Журнал ядра',
+      title: Strings.of(context)('log_core_title'),
       icon: Icons.terminal,
       lines: _lines,
       onClear: () {
@@ -127,6 +128,7 @@ class _MonoLogViewState extends State<MonoLogView> {
   @override
   Widget build(BuildContext context) {
     final cs = Theme.of(context).colorScheme;
+    final t = Strings.of(context);
     _scheduleJump();
     return Container(
       decoration: BoxDecoration(
@@ -151,7 +153,7 @@ class _MonoLogViewState extends State<MonoLogView> {
                 if (widget.trailing != null) widget.trailing!,
                 IconButton(
                   visualDensity: VisualDensity.compact,
-                  tooltip: _autoscroll ? 'Автоскролл: вкл' : 'Автоскролл: выкл',
+                  tooltip: t(_autoscroll ? 'log_autoscroll_on' : 'log_autoscroll_off'),
                   icon: Icon(_autoscroll
                       ? Icons.vertical_align_bottom
                       : Icons.pause_circle_outline),
@@ -159,20 +161,20 @@ class _MonoLogViewState extends State<MonoLogView> {
                 ),
                 IconButton(
                   visualDensity: VisualDensity.compact,
-                  tooltip: 'Копировать',
+                  tooltip: t('log_copy'),
                   icon: const Icon(Icons.copy_all_outlined),
                   onPressed: () {
                     Clipboard.setData(
                         ClipboardData(text: widget.lines.join('\n')));
                     ScaffoldMessenger.of(context).showSnackBar(
-                      const SnackBar(content: Text('Лог скопирован')),
+                      SnackBar(content: Text(t('log_copied'))),
                     );
                   },
                 ),
                 if (widget.onClear != null)
                   IconButton(
                     visualDensity: VisualDensity.compact,
-                    tooltip: 'Очистить',
+                    tooltip: t('log_clear'),
                     icon: const Icon(Icons.delete_outline),
                     onPressed: widget.onClear,
                   ),
@@ -184,7 +186,7 @@ class _MonoLogViewState extends State<MonoLogView> {
             height: widget.height,
             child: widget.lines.isEmpty
                 ? Center(
-                    child: Text('пусто',
+                    child: Text(t('log_empty'),
                         style: TextStyle(color: cs.outline)),
                   )
                 : Scrollbar(

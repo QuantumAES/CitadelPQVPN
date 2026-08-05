@@ -1,6 +1,8 @@
 import 'package:flutter/material.dart';
 import 'package:mobile_scanner/mobile_scanner.dart';
 
+import 'package:app/l10n/strings.dart';
+
 /// #0.2 — экран сканирования QR-ссылки камерой (Android/iOS/macOS). Возвращает через `Navigator.pop`
 /// первую распознанную непустую строку QR (обычно `citadel://…`) — вызывающий валидирует её как
 /// ссылку. Разрешение на камеру запрашивает `mobile_scanner` при старте; отказ/ошибка → `errorBuilder`.
@@ -36,12 +38,13 @@ class _QrScanPageState extends State<QrScanPage> {
 
   @override
   Widget build(BuildContext context) {
+    final t = Strings.of(context);
     return Scaffold(
       appBar: AppBar(
-        title: const Text('Сканировать QR'),
+        title: Text(t('scan_qr')),
         actions: [
           IconButton(
-            tooltip: 'Фонарик',
+            tooltip: t('torch'),
             icon: const Icon(Icons.flashlight_on_outlined),
             onPressed: () => _controller.toggleTorch(),
           ),
@@ -71,7 +74,7 @@ class _QrScanPageState extends State<QrScanPage> {
             left: 24,
             right: 24,
             child: Text(
-              'Наведите камеру на QR-код citadel://-ссылки',
+              t('scan_hint'),
               textAlign: TextAlign.center,
               style: const TextStyle(
                 color: Colors.white,
@@ -91,6 +94,7 @@ class _CameraError extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
+    final t = Strings.of(context);
     final denied = error.errorCode == MobileScannerErrorCode.permissionDenied;
     return Center(
       child: Padding(
@@ -103,10 +107,10 @@ class _CameraError extends StatelessWidget {
             const SizedBox(height: 12),
             Text(
               denied
-                  ? 'Нет доступа к камере. Разрешите камеру в настройках приложения или вставьте '
-                      'ссылку вручную.'
-                  : 'Камера недоступна: ${error.errorDetails?.message ?? error.errorCode.name}. '
-                      'Вставьте ссылку вручную.',
+                  ? t('camera_denied')
+                  : t('camera_unavailable', {
+                      'error': error.errorDetails?.message ?? error.errorCode.name,
+                    }),
               textAlign: TextAlign.center,
             ),
           ],

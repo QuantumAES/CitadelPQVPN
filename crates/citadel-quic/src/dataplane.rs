@@ -183,6 +183,29 @@ impl Inbound {
     }
 }
 
+// ─────────────────────────── счётчики трафика туннеля (индикация скорости в UI) ───────────────
+// Монотонные (за время жизни процесса) счётчики inner-байтов, прошедших через туннель НА КЛИЕНТЕ.
+// UI показывает по ним текущую скорость — то есть дельту между двумя опросами, делённую на время;
+// именно поэтому счётчики не сбрасываются ни на реконнекте, ни на смене профиля: сброс дал бы
+// отрицательную дельту и скачок в индикаторе. Итогов за сессию/сутки здесь нет намеренно — это уже
+// история пользовательского трафика, которую клиенту незачем накапливать.
+//
+// Считаем полезную нагрузку (inner IP-пакеты), без QUIC/AEAD/obfs-оверхеда: человек сравнивает
+// цифру со скоростью своей загрузки, а не с расходом канала.
+//
+// На EXIT (`egress = Some`) счётчики НЕ ведутся: там это был бы учёт чужого трафика в общей на
+// процесс переменной — против no-logs (см. `citadel_quic::debug_logs`) и бессмысленно при N клиентах.
+
+static TRAFFIC_RX: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static TRAFFIC_TX: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Снимок счётчиков трафика туннеля: `(принято, отправлено)` в байтах полезной нагрузки.
+/// Монотонны за время жизни процесса — вызывающий считает скорость по дельте двух снимков.
+pub fn traffic_bytes() -> (u64, u64) {
+    use std::sync::atomic::Ordering::Relaxed;
+    (TRAFFIC_RX.load(Relaxed), TRAFFIC_TX.load(Relaxed))
+}
+
 /// Окно pump-watchdog и минимум отправленных датаграмм в окне, при котором «0 принятых»
 /// трактуется как мёртвый путь. Окно > keep-alive-интервала (5с), чтобы здоровый простой и
 /// одиночные потери не срабатывали; порог tx отсекает простой (мало шлём — путь не трогаем).
@@ -297,6 +320,8 @@ pub async fn pump(
     // no-logs (`Citadel_DEBUG_LOG`), на клиенте — печатается всегда (это устройство пользователя,
     // лог нужен ему самому и панели диагностики).
     let is_exit = egress.is_some();
+    // Счётчики скорости — только на клиенте (см. TRAFFIC_RX/TRAFFIC_TX).
+    let count_traffic = !is_exit;
     macro_rules! pump_log {
         ($($t:tt)*) => {
             if !is_exit || crate::debug_logs() {
@@ -340,6 +365,9 @@ pub async fn pump(
             match send_conn.send_datagram(bytes::Bytes::from(dg)) {
                 Ok(()) => {
                     send_tx.fetch_add(1, Ordering::Relaxed);
+                    if count_traffic {
+                        TRAFFIC_TX.fetch_add(pkt.len() as u64, Ordering::Relaxed);
+                    }
                 }
                 Err(e) => pump_log!("[pump] датаграмма отброшена ({} б): {e}", pkt.len()),
             }
@@ -356,8 +384,13 @@ pub async fn pump(
                     // любой принятый датаграм = обратный путь жив (для watchdog); фильтр — дальше
                     recv_rx.fetch_add(1, Ordering::Relaxed);
                     if let Some((datagram::CTX_RAW_IP, pkt)) = datagram::decode(&dg) {
-                        if inb.accept(pkt) && net_to_tun_tx.send(pkt.to_vec()).await.is_err() {
-                            break;
+                        if inb.accept(pkt) {
+                            if count_traffic {
+                                TRAFFIC_RX.fetch_add(pkt.len() as u64, Ordering::Relaxed);
+                            }
+                            if net_to_tun_tx.send(pkt.to_vec()).await.is_err() {
+                                break;
+                            }
                         }
                     }
                 }

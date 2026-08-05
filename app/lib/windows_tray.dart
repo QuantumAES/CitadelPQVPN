@@ -2,6 +2,8 @@ import 'dart:io' show Platform;
 
 import 'package:flutter/services.dart';
 
+import 'package:app/l10n/strings.dart';
+
 /// #5.5 — системный трей **только для Windows**, реализован НАТИВНО в C++-runner'е
 /// (`windows/runner/flutter_window.cpp`, Shell_NotifyIcon) через method-channel `citadel/tray`.
 ///
@@ -26,6 +28,7 @@ class WindowsTray {
     required void Function() onOpen,
     required void Function() onDisconnect,
     required void Function() onExit,
+    required Strings t,
   }) async {
     if (!supported) return;
     _ch.setMethodCallHandler((call) async {
@@ -39,11 +42,18 @@ class WindowsTray {
       }
       return null;
     });
+    await setMenuLabels(t);
+  }
+
+  /// Подписи меню трея на языке приложения. Отдельным вызовом, потому что язык меняется на лету:
+  /// нативное меню строится из этих строк и должно пережить смену без перезапуска приложения.
+  static Future<void> setMenuLabels(Strings t) async {
+    if (!supported) return;
     await _ch.invokeMethod('init', <String, String>{
       'tooltip': 'CitadelPQVPN',
-      'open': 'Открыть CitadelPQVPN',
-      'disconnect': 'Отключить туннель',
-      'exit': 'Выход',
+      'open': t('tray_open'),
+      'disconnect': t('tray_disconnect'),
+      'exit': t('tray_exit'),
     });
   }
 

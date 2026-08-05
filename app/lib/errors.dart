@@ -2,6 +2,8 @@ import 'package:flutter/material.dart';
 import 'package:flutter_rust_bridge/flutter_rust_bridge.dart'
     show AnyhowException, PanicException;
 
+import 'package:app/l10n/strings.dart';
+
 /// Технические хвосты, которых человеку в сообщении об отказе видеть не нужно. Текст режется по
 /// ПЕРВОМУ встреченному маркеру — всё, что дальше, уходит только в журнал отладки.
 ///
@@ -39,14 +41,16 @@ const _limit = 300;
 /// Функция — ЕДИНСТВЕННЫЙ путь текста ошибки на экран: любой `catch (e)`, показывающий что-то
 /// пользователю, обязан идти через неё, а не через `'$e'` (тот ещё и обернёт всё в
 /// `AnyhowException(...)`).
-String humanError(Object e) {
+/// `t` (строки текущего языка) нужен только для случая «текста нет вовсе»: сами сообщения приходят
+/// из ядра и переводу здесь не подлежат — оно формулирует их само (пока по-русски).
+String humanError(Object e, [Strings? t]) {
   var head = _rawMessage(e);
   for (final marker in _cutMarkers) {
     final i = head.indexOf(marker);
     if (i >= 0) head = head.substring(0, i);
   }
   head = head.trim();
-  if (head.isEmpty) return 'Неизвестная ошибка';
+  if (head.isEmpty) return t?.call('unknown_error') ?? 'Неизвестная ошибка';
   return head.length > _limit ? '${head.substring(0, _limit - 1)}…' : head;
 }
 

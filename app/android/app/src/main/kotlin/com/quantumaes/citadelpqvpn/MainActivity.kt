@@ -64,6 +64,18 @@ class MainActivity : FlutterActivity() {
                     CitadelVpnService.instance?.stopTun()
                     result.success(true)
                 }
+                // Язык интерфейса выбирает пользователь в приложении, а постоянная нотификация —
+                // часть того же интерфейса (и единственное, что видно о VPN при закрытом окне).
+                // Поэтому её тексты присылает Dart, а не берутся из системной локали.
+                "setNotifStrings" -> {
+                    CitadelVpnService.setNotifStrings(
+                        call.argument<String>("up") ?: CitadelVpnService.STATUS_UP,
+                        call.argument<String>("connecting") ?: CitadelVpnService.STATUS_CONNECTING,
+                        call.argument<String>("reconnecting") ?: CitadelVpnService.STATUS_RECONNECTING,
+                        call.argument<String>("down") ?: CitadelVpnService.STATUS_DOWN,
+                    )
+                    result.success(true)
+                }
                 "setSecureFlag" -> {
                     // C8.5: включить/снять FLAG_SECURE (запрет скриншотов). Dart зовёт на старте
                     // (из сохранённой настройки) и по тумблеру. Флаги окна — только с UI-потока.

@@ -38,7 +38,7 @@ flutter_rust_bridge::frb_generated_boilerplate!(
     default_rust_auto_opaque = RustAutoOpaqueMoi,
 );
 pub(crate) const FLUTTER_RUST_BRIDGE_CODEGEN_VERSION: &str = "2.12.0";
-pub(crate) const FLUTTER_RUST_BRIDGE_CODEGEN_CONTENT_HASH: i32 = -1849053047;
+pub(crate) const FLUTTER_RUST_BRIDGE_CODEGEN_CONTENT_HASH: i32 = 528982392;
 
 // Section: executor
 
@@ -657,6 +657,35 @@ fn wire__crate__api__citadel__killswitch_enabled_impl(
         },
     )
 }
+fn wire__crate__api__citadel__language_impl(
+    ptr_: flutter_rust_bridge::for_generated::PlatformGeneralizedUint8ListPtr,
+    rust_vec_len_: i32,
+    data_len_: i32,
+) -> flutter_rust_bridge::for_generated::WireSyncRust2DartSse {
+    FLUTTER_RUST_BRIDGE_HANDLER.wrap_sync::<flutter_rust_bridge::for_generated::SseCodec, _>(
+        flutter_rust_bridge::for_generated::TaskInfo {
+            debug_name: "language",
+            port: None,
+            mode: flutter_rust_bridge::for_generated::FfiCallMode::Sync,
+        },
+        move || {
+            let message = unsafe {
+                flutter_rust_bridge::for_generated::Dart2RustMessageSse::from_wire(
+                    ptr_,
+                    rust_vec_len_,
+                    data_len_,
+                )
+            };
+            let mut deserializer =
+                flutter_rust_bridge::for_generated::SseDeserializer::new(message);
+            deserializer.end();
+            transform_result_sse::<_, ()>((move || {
+                let output_ok = Result::<_, ()>::Ok(crate::api::citadel::language())?;
+                Ok(output_ok)
+            })())
+        },
+    )
+}
 fn wire__crate__api__citadel__link_qr_impl(
     ptr_: flutter_rust_bridge::for_generated::PlatformGeneralizedUint8ListPtr,
     rust_vec_len_: i32,
@@ -926,6 +955,38 @@ fn wire__crate__api__citadel__set_killswitch_impl(
         },
     )
 }
+fn wire__crate__api__citadel__set_language_impl(
+    ptr_: flutter_rust_bridge::for_generated::PlatformGeneralizedUint8ListPtr,
+    rust_vec_len_: i32,
+    data_len_: i32,
+) -> flutter_rust_bridge::for_generated::WireSyncRust2DartSse {
+    FLUTTER_RUST_BRIDGE_HANDLER.wrap_sync::<flutter_rust_bridge::for_generated::SseCodec, _>(
+        flutter_rust_bridge::for_generated::TaskInfo {
+            debug_name: "set_language",
+            port: None,
+            mode: flutter_rust_bridge::for_generated::FfiCallMode::Sync,
+        },
+        move || {
+            let message = unsafe {
+                flutter_rust_bridge::for_generated::Dart2RustMessageSse::from_wire(
+                    ptr_,
+                    rust_vec_len_,
+                    data_len_,
+                )
+            };
+            let mut deserializer =
+                flutter_rust_bridge::for_generated::SseDeserializer::new(message);
+            let api_code = <String>::sse_decode(&mut deserializer);
+            deserializer.end();
+            transform_result_sse::<_, ()>((move || {
+                let output_ok = Result::<_, ()>::Ok({
+                    crate::api::citadel::set_language(api_code);
+                })?;
+                Ok(output_ok)
+            })())
+        },
+    )
+}
 fn wire__crate__api__diag__set_log_file_impl(
     ptr_: flutter_rust_bridge::for_generated::PlatformGeneralizedUint8ListPtr,
     rust_vec_len_: i32,
@@ -1022,6 +1083,38 @@ fn wire__crate__api__citadel__set_split_config_impl(
         },
     )
 }
+fn wire__crate__api__citadel__set_traffic_meter_impl(
+    ptr_: flutter_rust_bridge::for_generated::PlatformGeneralizedUint8ListPtr,
+    rust_vec_len_: i32,
+    data_len_: i32,
+) -> flutter_rust_bridge::for_generated::WireSyncRust2DartSse {
+    FLUTTER_RUST_BRIDGE_HANDLER.wrap_sync::<flutter_rust_bridge::for_generated::SseCodec, _>(
+        flutter_rust_bridge::for_generated::TaskInfo {
+            debug_name: "set_traffic_meter",
+            port: None,
+            mode: flutter_rust_bridge::for_generated::FfiCallMode::Sync,
+        },
+        move || {
+            let message = unsafe {
+                flutter_rust_bridge::for_generated::Dart2RustMessageSse::from_wire(
+                    ptr_,
+                    rust_vec_len_,
+                    data_len_,
+                )
+            };
+            let mut deserializer =
+                flutter_rust_bridge::for_generated::SseDeserializer::new(message);
+            let api_on = <bool>::sse_decode(&mut deserializer);
+            deserializer.end();
+            transform_result_sse::<_, ()>((move || {
+                let output_ok = Result::<_, ()>::Ok({
+                    crate::api::citadel::set_traffic_meter(api_on);
+                })?;
+                Ok(output_ok)
+            })())
+        },
+    )
+}
 fn wire__crate__api__citadel__split_config_impl(
     ptr_: flutter_rust_bridge::for_generated::PlatformGeneralizedUint8ListPtr,
     rust_vec_len_: i32,
@@ -1077,6 +1170,64 @@ fn wire__crate__api__diag__start_log_capture_impl(
                 let output_ok = Result::<_, ()>::Ok({
                     crate::api::diag::start_log_capture();
                 })?;
+                Ok(output_ok)
+            })())
+        },
+    )
+}
+fn wire__crate__api__citadel__traffic_counters_impl(
+    ptr_: flutter_rust_bridge::for_generated::PlatformGeneralizedUint8ListPtr,
+    rust_vec_len_: i32,
+    data_len_: i32,
+) -> flutter_rust_bridge::for_generated::WireSyncRust2DartSse {
+    FLUTTER_RUST_BRIDGE_HANDLER.wrap_sync::<flutter_rust_bridge::for_generated::SseCodec, _>(
+        flutter_rust_bridge::for_generated::TaskInfo {
+            debug_name: "traffic_counters",
+            port: None,
+            mode: flutter_rust_bridge::for_generated::FfiCallMode::Sync,
+        },
+        move || {
+            let message = unsafe {
+                flutter_rust_bridge::for_generated::Dart2RustMessageSse::from_wire(
+                    ptr_,
+                    rust_vec_len_,
+                    data_len_,
+                )
+            };
+            let mut deserializer =
+                flutter_rust_bridge::for_generated::SseDeserializer::new(message);
+            deserializer.end();
+            transform_result_sse::<_, ()>((move || {
+                let output_ok = Result::<_, ()>::Ok(crate::api::citadel::traffic_counters())?;
+                Ok(output_ok)
+            })())
+        },
+    )
+}
+fn wire__crate__api__citadel__traffic_meter_enabled_impl(
+    ptr_: flutter_rust_bridge::for_generated::PlatformGeneralizedUint8ListPtr,
+    rust_vec_len_: i32,
+    data_len_: i32,
+) -> flutter_rust_bridge::for_generated::WireSyncRust2DartSse {
+    FLUTTER_RUST_BRIDGE_HANDLER.wrap_sync::<flutter_rust_bridge::for_generated::SseCodec, _>(
+        flutter_rust_bridge::for_generated::TaskInfo {
+            debug_name: "traffic_meter_enabled",
+            port: None,
+            mode: flutter_rust_bridge::for_generated::FfiCallMode::Sync,
+        },
+        move || {
+            let message = unsafe {
+                flutter_rust_bridge::for_generated::Dart2RustMessageSse::from_wire(
+                    ptr_,
+                    rust_vec_len_,
+                    data_len_,
+                )
+            };
+            let mut deserializer =
+                flutter_rust_bridge::for_generated::SseDeserializer::new(message);
+            deserializer.end();
+            transform_result_sse::<_, ()>((move || {
+                let output_ok = Result::<_, ()>::Ok(crate::api::citadel::traffic_meter_enabled())?;
                 Ok(output_ok)
             })())
         },
@@ -1397,14 +1548,14 @@ fn wire__crate__api__citadel__vault_min_password_len_impl(
         },
     )
 }
-fn wire__crate__api__citadel__vault_move_impl(
+fn wire__crate__api__citadel__vault_move_to_impl(
     ptr_: flutter_rust_bridge::for_generated::PlatformGeneralizedUint8ListPtr,
     rust_vec_len_: i32,
     data_len_: i32,
 ) -> flutter_rust_bridge::for_generated::WireSyncRust2DartSse {
     FLUTTER_RUST_BRIDGE_HANDLER.wrap_sync::<flutter_rust_bridge::for_generated::SseCodec, _>(
         flutter_rust_bridge::for_generated::TaskInfo {
-            debug_name: "vault_move",
+            debug_name: "vault_move_to",
             port: None,
             mode: flutter_rust_bridge::for_generated::FfiCallMode::Sync,
         },
@@ -1419,11 +1570,11 @@ fn wire__crate__api__citadel__vault_move_impl(
             let mut deserializer =
                 flutter_rust_bridge::for_generated::SseDeserializer::new(message);
             let api_id = <String>::sse_decode(&mut deserializer);
-            let api_up = <bool>::sse_decode(&mut deserializer);
+            let api_index = <u32>::sse_decode(&mut deserializer);
             deserializer.end();
             transform_result_sse::<_, flutter_rust_bridge::for_generated::anyhow::Error>(
                 (move || {
-                    let output_ok = crate::api::citadel::vault_move(api_id, api_up)?;
+                    let output_ok = crate::api::citadel::vault_move_to(api_id, api_index)?;
                     Ok(output_ok)
                 })(),
             )
@@ -1897,6 +2048,18 @@ impl SseDecode for crate::api::admin::SubscriberDto {
     }
 }
 
+impl SseDecode for crate::api::citadel::TrafficDto {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    fn sse_decode(deserializer: &mut flutter_rust_bridge::for_generated::SseDeserializer) -> Self {
+        let mut var_rxBytes = <i64>::sse_decode(deserializer);
+        let mut var_txBytes = <i64>::sse_decode(deserializer);
+        return crate::api::citadel::TrafficDto {
+            rx_bytes: var_rxBytes,
+            tx_bytes: var_txBytes,
+        };
+    }
+}
+
 impl SseDecode for u32 {
     // Codec=Sse (Serialization based), see doc to use other codecs
     fn sse_decode(deserializer: &mut flutter_rust_bridge::for_generated::SseDeserializer) -> Self {
@@ -1973,22 +2136,22 @@ fn pde_ffi_dispatcher_primary_impl(
         ),
         13 => wire__crate__api__diag__debug_log_stream_impl(port, ptr, rust_vec_len, data_len),
         17 => wire__crate__api__simple__init_app_impl(port, ptr, rust_vec_len, data_len),
-        20 => wire__crate__api__citadel__link_summary_dto_default_impl(
+        21 => wire__crate__api__citadel__link_summary_dto_default_impl(
             port,
             ptr,
             rust_vec_len,
             data_len,
         ),
-        21 => wire__crate__api__citadel__parse_link_summary_impl(port, ptr, rust_vec_len, data_len),
-        22 => wire__crate__api__citadel__run_diagnostics_impl(port, ptr, rust_vec_len, data_len),
-        32 => wire__crate__api__citadel__vault_add_impl(port, ptr, rust_vec_len, data_len),
-        33 => {
+        22 => wire__crate__api__citadel__parse_link_summary_impl(port, ptr, rust_vec_len, data_len),
+        23 => wire__crate__api__citadel__run_diagnostics_impl(port, ptr, rust_vec_len, data_len),
+        37 => wire__crate__api__citadel__vault_add_impl(port, ptr, rust_vec_len, data_len),
+        38 => {
             wire__crate__api__citadel__vault_change_password_impl(port, ptr, rust_vec_len, data_len)
         }
-        34 => wire__crate__api__citadel__vault_create_impl(port, ptr, rust_vec_len, data_len),
-        45 => wire__crate__api__citadel__vault_unlock_impl(port, ptr, rust_vec_len, data_len),
-        46 => wire__crate__api__citadel__vpn_connect_impl(port, ptr, rust_vec_len, data_len),
-        47 => {
+        39 => wire__crate__api__citadel__vault_create_impl(port, ptr, rust_vec_len, data_len),
+        50 => wire__crate__api__citadel__vault_unlock_impl(port, ptr, rust_vec_len, data_len),
+        51 => wire__crate__api__citadel__vpn_connect_impl(port, ptr, rust_vec_len, data_len),
+        52 => {
             wire__crate__api__citadel__vpn_connect_profile_impl(port, ptr, rust_vec_len, data_len)
         }
         _ => unreachable!(),
@@ -2013,27 +2176,32 @@ fn pde_ffi_dispatcher_sync_impl(
         15 => wire__crate__api__citadel__desktop_service_quit_impl(ptr, rust_vec_len, data_len),
         16 => wire__crate__api__simple__greet_impl(ptr, rust_vec_len, data_len),
         18 => wire__crate__api__citadel__killswitch_enabled_impl(ptr, rust_vec_len, data_len),
-        19 => wire__crate__api__citadel__link_qr_impl(ptr, rust_vec_len, data_len),
-        23 => wire__crate__api__citadel__screenshot_block_enabled_impl(ptr, rust_vec_len, data_len),
-        24 => wire__crate__api__citadel__set_data_dir_impl(ptr, rust_vec_len, data_len),
-        25 => wire__crate__api__citadel__set_debug_enabled_impl(ptr, rust_vec_len, data_len),
-        26 => wire__crate__api__citadel__set_killswitch_impl(ptr, rust_vec_len, data_len),
-        27 => wire__crate__api__diag__set_log_file_impl(ptr, rust_vec_len, data_len),
-        28 => wire__crate__api__citadel__set_screenshot_block_impl(ptr, rust_vec_len, data_len),
-        29 => wire__crate__api__citadel__set_split_config_impl(ptr, rust_vec_len, data_len),
-        30 => wire__crate__api__citadel__split_config_impl(ptr, rust_vec_len, data_len),
-        31 => wire__crate__api__diag__start_log_capture_impl(ptr, rust_vec_len, data_len),
-        35 => wire__crate__api__citadel__vault_exists_impl(ptr, rust_vec_len, data_len),
-        36 => wire__crate__api__citadel__vault_is_unlocked_impl(ptr, rust_vec_len, data_len),
-        37 => wire__crate__api__citadel__vault_list_impl(ptr, rust_vec_len, data_len),
-        38 => wire__crate__api__citadel__vault_location_impl(ptr, rust_vec_len, data_len),
-        39 => wire__crate__api__citadel__vault_lock_impl(ptr, rust_vec_len, data_len),
-        40 => wire__crate__api__citadel__vault_max_name_len_impl(ptr, rust_vec_len, data_len),
-        41 => wire__crate__api__citadel__vault_min_password_len_impl(ptr, rust_vec_len, data_len),
-        42 => wire__crate__api__citadel__vault_move_impl(ptr, rust_vec_len, data_len),
-        43 => wire__crate__api__citadel__vault_remove_impl(ptr, rust_vec_len, data_len),
-        44 => wire__crate__api__citadel__vault_rename_impl(ptr, rust_vec_len, data_len),
-        48 => wire__crate__api__citadel__vpn_disconnect_impl(ptr, rust_vec_len, data_len),
+        19 => wire__crate__api__citadel__language_impl(ptr, rust_vec_len, data_len),
+        20 => wire__crate__api__citadel__link_qr_impl(ptr, rust_vec_len, data_len),
+        24 => wire__crate__api__citadel__screenshot_block_enabled_impl(ptr, rust_vec_len, data_len),
+        25 => wire__crate__api__citadel__set_data_dir_impl(ptr, rust_vec_len, data_len),
+        26 => wire__crate__api__citadel__set_debug_enabled_impl(ptr, rust_vec_len, data_len),
+        27 => wire__crate__api__citadel__set_killswitch_impl(ptr, rust_vec_len, data_len),
+        28 => wire__crate__api__citadel__set_language_impl(ptr, rust_vec_len, data_len),
+        29 => wire__crate__api__diag__set_log_file_impl(ptr, rust_vec_len, data_len),
+        30 => wire__crate__api__citadel__set_screenshot_block_impl(ptr, rust_vec_len, data_len),
+        31 => wire__crate__api__citadel__set_split_config_impl(ptr, rust_vec_len, data_len),
+        32 => wire__crate__api__citadel__set_traffic_meter_impl(ptr, rust_vec_len, data_len),
+        33 => wire__crate__api__citadel__split_config_impl(ptr, rust_vec_len, data_len),
+        34 => wire__crate__api__diag__start_log_capture_impl(ptr, rust_vec_len, data_len),
+        35 => wire__crate__api__citadel__traffic_counters_impl(ptr, rust_vec_len, data_len),
+        36 => wire__crate__api__citadel__traffic_meter_enabled_impl(ptr, rust_vec_len, data_len),
+        40 => wire__crate__api__citadel__vault_exists_impl(ptr, rust_vec_len, data_len),
+        41 => wire__crate__api__citadel__vault_is_unlocked_impl(ptr, rust_vec_len, data_len),
+        42 => wire__crate__api__citadel__vault_list_impl(ptr, rust_vec_len, data_len),
+        43 => wire__crate__api__citadel__vault_location_impl(ptr, rust_vec_len, data_len),
+        44 => wire__crate__api__citadel__vault_lock_impl(ptr, rust_vec_len, data_len),
+        45 => wire__crate__api__citadel__vault_max_name_len_impl(ptr, rust_vec_len, data_len),
+        46 => wire__crate__api__citadel__vault_min_password_len_impl(ptr, rust_vec_len, data_len),
+        47 => wire__crate__api__citadel__vault_move_to_impl(ptr, rust_vec_len, data_len),
+        48 => wire__crate__api__citadel__vault_remove_impl(ptr, rust_vec_len, data_len),
+        49 => wire__crate__api__citadel__vault_rename_impl(ptr, rust_vec_len, data_len),
+        53 => wire__crate__api__citadel__vpn_disconnect_impl(ptr, rust_vec_len, data_len),
         _ => unreachable!(),
     }
 }
@@ -2221,6 +2389,27 @@ impl flutter_rust_bridge::IntoIntoDart<crate::api::admin::SubscriberDto>
     for crate::api::admin::SubscriberDto
 {
     fn into_into_dart(self) -> crate::api::admin::SubscriberDto {
+        self
+    }
+}
+// Codec=Dco (DartCObject based), see doc to use other codecs
+impl flutter_rust_bridge::IntoDart for crate::api::citadel::TrafficDto {
+    fn into_dart(self) -> flutter_rust_bridge::for_generated::DartAbi {
+        [
+            self.rx_bytes.into_into_dart().into_dart(),
+            self.tx_bytes.into_into_dart().into_dart(),
+        ]
+        .into_dart()
+    }
+}
+impl flutter_rust_bridge::for_generated::IntoDartExceptPrimitive
+    for crate::api::citadel::TrafficDto
+{
+}
+impl flutter_rust_bridge::IntoIntoDart<crate::api::citadel::TrafficDto>
+    for crate::api::citadel::TrafficDto
+{
+    fn into_into_dart(self) -> crate::api::citadel::TrafficDto {
         self
     }
 }
@@ -2435,6 +2624,14 @@ impl SseEncode for crate::api::admin::SubscriberDto {
         <String>::sse_encode(self.status, serializer);
         <bool>::sse_encode(self.active, serializer);
         <String>::sse_encode(self.label, serializer);
+    }
+}
+
+impl SseEncode for crate::api::citadel::TrafficDto {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    fn sse_encode(self, serializer: &mut flutter_rust_bridge::for_generated::SseSerializer) {
+        <i64>::sse_encode(self.rx_bytes, serializer);
+        <i64>::sse_encode(self.tx_bytes, serializer);
     }
 }
 

@@ -1,0 +1,223 @@
+/// Français. Набор ключей обязан совпадать с `lang_ru.dart` (проверяется тестом l10n_test.dart).
+library;
+
+const Map<String, String> langFr = {
+  'cancel': 'Annuler',
+  'close': 'Fermer',
+  'save': 'Enregistrer',
+  'delete': 'Supprimer',
+  'connect': 'Connecter',
+  'disconnect': 'Déconnecter',
+  'rename': 'Renommer',
+  'unknown_error': 'Erreur inconnue',
+
+  'add_profile': 'Ajouter un profil',
+  'lock_vault': 'Verrouiller le coffre',
+  'settings': 'Paramètres',
+  'profiles': 'Profils',
+  'no_profiles': 'Aucun profil',
+  'no_profiles_hint': 'Ajoutez un lien citadel://\npour vous connecter à un serveur',
+  'profile_fallback_name': 'profil',
+  'new_profile_fallback': 'nouveau profil',
+
+  'status_protected': 'Protégé',
+  'status_connecting': 'Connexion…',
+  'status_unprotected': 'Non protégé',
+  'status_profile_named': 'profil « {name} »',
+  'traffic_rx': 'réception',
+  'traffic_tx': 'envoi',
+  'rate_units': 'o/s,Ko/s,Mo/s,Go/s,To/s',
+  'decimal_sep': ',',
+
+  'err_server_unreachable': 'Serveur injoignable',
+  'err_service_not_started': 'Le service CitadelPQVPN n’est pas démarré',
+  'err_service_not_started_hint': 'redémarrez l’ordinateur ou réinstallez l’application',
+  'err_service_unavailable': 'Le service CitadelPQVPN est indisponible',
+  'err_service_unavailable_hint': 'vérifiez qu’il est installé et démarré',
+  'err_no_vpn_permission': 'Autorisation VPN refusée',
+  'err_no_vpn_permission_hint': 'autorisez la connexion dans la boîte de dialogue du système',
+
+  'switch_title': 'Changer de connexion ?',
+  'switch_body': '« {current} » est actuellement connecté. Le déconnecter et se connecter à « {name} » ?',
+  'switch_confirm': 'Changer',
+
+  'unlock_vault': 'Déverrouiller le coffre',
+  'unlock': 'Déverrouiller',
+  'create_vault': 'Créer le coffre',
+  'create': 'Créer',
+  'vault_create_hint':
+      'Les profils sont chiffrés avec ce mot de passe principal (AES-256-GCM). Sans lui, ils sont irrécupérables.',
+  'vault_locked': 'Le coffre de profils est verrouillé',
+  'master_password': 'Mot de passe principal',
+  'password': 'Mot de passe',
+  'password_repeat': 'Confirmez le mot de passe',
+  'password_min': 'au moins {n} caractères',
+  'password_empty': 'Le mot de passe ne peut pas être vide',
+  'password_too_short': 'Mot de passe trop court : au moins {n} caractères',
+  'passwords_mismatch': 'Les mots de passe ne correspondent pas',
+  'change_password': 'Changer le mot de passe principal',
+  'current_password': 'Mot de passe actuel',
+  'new_password': 'Nouveau mot de passe',
+  'new_password_repeat': 'Confirmez le nouveau mot de passe',
+  'enter_current_password': 'Saisissez le mot de passe actuel',
+  'new_password_too_short': 'Nouveau mot de passe trop court : au moins {n} caractères',
+  'new_passwords_mismatch': 'Les nouveaux mots de passe ne correspondent pas',
+  'change': 'Changer',
+  'password_changed': 'Mot de passe principal modifié',
+
+  'delete_profile_title': 'Supprimer le profil ?',
+  'delete_profile_body': 'Le profil « {name} » sera supprimé du coffre. Cette action est irréversible.',
+  'rename_profile': 'Renommer le profil',
+  'profile_name': 'Nom du profil',
+  'profile_renamed': 'Profil renommé',
+  'subscribers': 'Abonnés',
+  'reorder_hint': 'Ordre : appuyez longuement sur un profil, puis faites-le glisser',
+
+  'traffic_meter_title': 'Afficher le débit',
+  'traffic_meter_sub': 'Débit actuel en réception et en envoi sur la carte de connexion',
+  'debug_title': 'Mode débogage',
+  'debug_sub': 'Journal du cœur et diagnostic de connexion',
+  'screenshot_title': 'Bloquer les captures d’écran',
+  'screenshot_sub': 'Bloquer les captures et l’enregistrement de l’écran de l’application',
+  'killswitch_title': 'Kill switch',
+  'killswitch_sub': 'Bloquer le trafic hors tunnel (fail-closed) ; dès la prochaine session',
+  'killswitch_android_title': 'Kill switch (always-on)',
+  'killswitch_android_sub': 'À configurer dans les paramètres VPN du système',
+  'split_title': 'Tunnel scindé',
+  'split_sub_android': 'Par applications et adresses : via le tunnel / hors tunnel',
+  'split_sub_desktop': 'Par adresses de destination : via le tunnel / hors tunnel',
+  'vault_location_title': 'Coffre de profils',
+  'vault_path_copied': 'Chemin du coffre copié',
+  'language_title': 'Langue de l’application',
+  'about_title': 'À propos',
+  'about_sub': 'CitadelPQVPN · version {version}',
+
+  'about_body': 'VPN post-quantique.\n\n'
+      'La session est protégée par un échange de clés hybride X25519 + ML-KEM-768 et une signature '
+      'serveur ML-DSA-65 : le trafic intercepté aujourd’hui restera indéchiffrable même pour '
+      'l’ordinateur quantique de demain.\n\n'
+      'Le trafic est déguisé en flux de données ordinaire, les profils et les clés sont conservés '
+      'dans un coffre chiffré sur l’appareil, et le serveur ne tient aucun journal de connexions.',
+  'about_version': 'Version',
+  'about_app_version': 'Application : {version}',
+  'about_core_version': 'Cœur : v{version}',
+  'copy_version': 'Copier la version',
+  'version_copied': 'Version copiée',
+
+  'alwayson_body': 'Sous Android, c’est le système, et non l’application, qui bloque le trafic hors VPN.\n\n'
+      'Dans les paramètres VPN du système, activez pour CitadelPQVPN :\n'
+      '• VPN permanent (Always-on VPN)\n'
+      '• Bloquer les connexions sans VPN',
+  'open_settings': 'Ouvrir les paramètres',
+
+  'new_profile': 'Nouveau profil',
+  'link_label': 'lien citadel://',
+  'link_hint_scan': 'collez un lien ou scannez un QR code',
+  'link_hint_paste': 'collez un lien ou des données QR',
+  'paste_from_clipboard': 'Coller depuis le presse-papiers',
+  'scan_qr_camera': 'Scanner un QR code avec la caméra',
+  'checking_link': 'Vérification du lien…',
+  'link_invalid': 'Lien non reconnu',
+  'link_admin_warn': 'Lien maître : il donne la gestion des abonnés. Ne le transmettez à personne.',
+  'profile_name_optional': 'Nom du profil (facultatif)',
+  'profile_name_hint': 'ex. exit-nl',
+  'connect_and_save': 'Connecter et enregistrer',
+  'add_profile_note':
+      'Le profil sera enregistré dans le coffre chiffré après la première connexion réussie.',
+  'feat_admin_master': 'admin (maître)',
+  'feat_obfs_full': 'obfuscation',
+
+  'diag_run': 'Diagnostic de connexion',
+  'diag_running': 'Vérification…',
+  'diag_title': 'Diagnostic',
+  'diag_no_profile': 'Aucun profil à diagnostiquer',
+  'diag_start': 'Connexion d’essai pour le diagnostic (session distincte, pas le tunnel principal)…',
+  'diag_aborted': 'Diagnostic interrompu : {error}',
+  'log_core_title': 'Journal du cœur',
+  'log_autoscroll_on': 'Défilement auto : activé',
+  'log_autoscroll_off': 'Défilement auto : désactivé',
+  'log_copy': 'Copier',
+  'log_copied': 'Journal copié',
+  'log_clear': 'Effacer',
+  'log_empty': 'vide',
+
+  'tunnel_active': 'Le tunnel est actif',
+  'close_window_body': 'Le VPN est connecté. Que faire à la fermeture de la fenêtre ?\n\n'
+      '• Garder en arrière-plan — la fenêtre est réduite, la connexion continue.\n'
+      '• Déconnecter et quitter — fermer le tunnel et l’application.',
+  'close_background': 'Garder en arrière-plan',
+  'close_quit': 'Déconnecter et quitter',
+
+  'tray_up': 'CitadelPQVPN — tunnel actif',
+  'tray_up_at': 'CitadelPQVPN — tunnel actif ({exit})',
+  'tray_connecting': 'CitadelPQVPN — connexion…',
+  'tray_off': 'CitadelPQVPN — tunnel désactivé',
+  'tray_error': 'CitadelPQVPN — {reason}',
+
+  'tray_open': 'Ouvrir CitadelPQVPN',
+  'tray_disconnect': 'Déconnecter le tunnel',
+  'tray_exit': 'Quitter',
+
+  'notif_up': 'Tunnel post-quantique actif',
+  'notif_connecting': 'Connexion…',
+  'notif_reconnecting': 'Pas de connexion — rétablissement',
+  'notif_down': 'Tunnel inactif',
+
+  'split_saved': 'Enregistré · s’appliquera à la prochaine connexion',
+  'split_apps': 'Applications',
+  'split_dests': 'Adresses de destination',
+  'split_apps_selected': 'Applications sélectionnées : {n}',
+  'split_apps_pick': 'Touchez pour choisir parmi les applications installées',
+  'split_dest_label': 'domaine / IP / CIDR',
+  'split_add_local_subnet': 'Ajouter le sous-réseau local',
+  'split_local_subnet_none': 'Sous-réseau local non détecté',
+  'split_mode_off': 'Désactivé',
+  'split_mode_include': 'Via le tunnel',
+  'split_mode_exclude': 'Hors tunnel',
+  'split_warn': 'Attention : les applications/adresses « hors tunnel » passent en direct et révèlent '
+      'votre IP réelle. Les domaines sont résolus à la connexion ; avec les CDN dont les IP changent, '
+      'la règle peut « fuir » entre deux reconnexions.',
+  'split_warn_android13': 'L’exclusion de destinations nécessite Android 13+.',
+  'split_warn_dns': 'DNS : les applications dans le tunnel résolvent via le résolveur du tunnel, '
+      'les autres via le DNS de votre réseau (Wi-Fi/opérateur), qui voit leurs domaines. Si le '
+      '« DNS privé » (DNS-over-TLS) est activé dans le système, Android l’applique aussi dans le tunnel.',
+  'split_apps_title': 'Choisir les applications',
+  'split_apps_done': 'Terminé ({n})',
+  'search': 'Recherche',
+  'split_apps_failed': 'Impossible d’obtenir la liste des applications : {error}',
+
+  'subscribers_title': 'Abonnés · {name}',
+  'issue_access': 'Délivrer un accès',
+  'refresh': 'Actualiser',
+  'issue_label': 'Étiquette (pour qui)',
+  'issue_label_hint': 'ex. « téléphone d’Ali »',
+  'issue_label_helper': 'conservée uniquement sur cet appareil',
+  'issue_valid_until': 'Validité (facultatif)',
+  'issue_valid_until_hint': '+30d · +12h · unix · vide = +365d',
+  'issue': 'Délivrer',
+  'issued_title': 'Accès délivré',
+  'issued_title_named': 'Accès délivré : {label}',
+  'copy_link': 'Copier le lien',
+  'link_copied': 'Lien copié',
+  'issued_note': 'Transmettez le lien à l’abonné maintenant (QR code ou canal sécurisé). '
+      'Il est impossible de le récupérer ensuite : le secret de l’abonné n’est pas conservé sur cet appareil.',
+  'revoke_title': 'Révoquer l’accès ?',
+  'revoke_body': 'L’accès {who} sera révoqué (status=revoked). '
+      'Effectif à la prochaine connexion, au plus tard à la fin de l’époque en cours.',
+  'revoke': 'Révoquer',
+  'need_session': 'Une session active est nécessaire',
+  'need_session_body': 'La gestion des abonnés passe par le canal admin à l’intérieur du tunnel. '
+      'Connectez-vous à « {name} » pour continuer.',
+  'registry_loading': 'Chargement du registre…',
+  'registry_empty': 'Le registre est vide — délivrez le premier accès.',
+  'entry_expired': 'expiré',
+  'entry_until': 'jusqu’au {date}',
+  'client_id_copied': 'client_id copié',
+
+  'scan_qr': 'Scanner un QR code',
+  'torch': 'Lampe',
+  'scan_hint': 'Pointez la caméra vers le QR code d’un lien citadel://',
+  'camera_denied': 'Pas d’accès à la caméra. Autorisez la caméra dans les paramètres de '
+      'l’application ou collez le lien manuellement.',
+  'camera_unavailable': 'Caméra indisponible : {error}. Collez le lien manuellement.',
+};

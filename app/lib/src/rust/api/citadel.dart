@@ -6,7 +6,7 @@
 import '../frb_generated.dart';
 import 'package:flutter_rust_bridge/flutter_rust_bridge_for_generated.dart';
 
-// These functions are ignored because they are not marked as `pub`: `android_start`, `debug_flag_file`, `dto_to_split`, `first_line`, `guarded_parse_link`, `idle`, `io_kind_in_chain`, `is_not_found`, `is_permission_denied`, `killswitch_file`, `link_from`, `load_split_config`, `off`, `parse_split`, `profile_to_dto`, `profile_uri`, `read_error`, `rt`, `screenshot_block_file`, `serialize_split`, `spawn_controller`, `split_file`, `start_connect`, `state_dto`, `to_dto`, `update_android_status`, `update_last_exit`, `vault_error`, `vault_path`, `vpn_state_str`, `with_vault`, `write_error`, `xdg_store_path`
+// These functions are ignored because they are not marked as `pub`: `android_start`, `debug_flag_file`, `dto_to_split`, `first_line`, `guarded_parse_link`, `idle`, `io_kind_in_chain`, `is_not_found`, `is_permission_denied`, `killswitch_file`, `language_file`, `link_from`, `load_split_config`, `off`, `parse_split`, `profile_to_dto`, `profile_uri`, `read_error`, `rt`, `screenshot_block_file`, `serialize_split`, `spawn_controller`, `split_file`, `start_connect`, `state_dto`, `to_dto`, `traffic_meter_file`, `update_android_status`, `update_last_exit`, `valid_lang`, `vault_error`, `vault_path`, `vpn_state_str`, `with_vault`, `write_error`, `xdg_store_path`
 // These types are ignored because they are neither used by any `pub` functions nor (for structs and enums) marked `#[frb(unignore)]`: `AndroidStatus`, `AndroidTunProvider`
 // These function are ignored because they are on traits that is not defined in current crate (put an empty `#[frb]` on it to unignore): `clone`, `configure`
 
@@ -42,6 +42,28 @@ void setScreenshotBlock({required bool on_}) =>
 bool screenshotBlockEnabled() =>
     RustLib.instance.api.crateApiCitadelScreenshotBlockEnabled();
 
+/// Сохранить выбранный язык интерфейса (код вида `ru`, `en`, …) — переживает рестарт.
+void setLanguage({required String code}) =>
+    RustLib.instance.api.crateApiCitadelSetLanguage(code: code);
+
+/// Сохранённый язык интерфейса; файла нет или содержимое непохоже на код языка → `ru`.
+String language() => RustLib.instance.api.crateApiCitadelLanguage();
+
+/// Сохранить настройку индикации трафика (GUI-тумблер) — переживает рестарт.
+void setTrafficMeter({required bool on_}) =>
+    RustLib.instance.api.crateApiCitadelSetTrafficMeter(on_: on_);
+
+/// Сохранённое состояние индикации трафика (инициализация тумблера). Ленивая подгрузка; файла нет
+/// → **дефолт false** (выключено).
+bool trafficMeterEnabled() =>
+    RustLib.instance.api.crateApiCitadelTrafficMeterEnabled();
+
+/// Снимок счётчиков трафика туннеля (монотонных за время жизни процесса) для расчёта СКОРОСТИ:
+/// UI делит дельту между двумя опросами на прошедшее время. Итогов за сессию тут нет намеренно —
+/// накапливать историю пользовательского трафика клиенту незачем.
+TrafficDto trafficCounters() =>
+    RustLib.instance.api.crateApiCitadelTrafficCounters();
+
 /// Сохранить split-настройку (GUI). Применяется со СЛЕДУЮЩЕГО подключения; переживает рестарт.
 void setSplitConfig({required SplitTunnelDto cfg}) =>
     RustLib.instance.api.crateApiCitadelSetSplitConfig(cfg: cfg);
@@ -63,6 +85,13 @@ bool vaultExists() => RustLib.instance.api.crateApiCitadelVaultExists();
 bool vaultIsUnlocked() => RustLib.instance.api.crateApiCitadelVaultIsUnlocked();
 
 /// Заблокировать (забыть ключ из памяти).
+///
+/// **Замок хранилища не имеет отношения к туннелю и обязан его не трогать.** Живой сессии vault не
+/// нужен: ссылка разобрана в [`spawn_controller`] при старте, свежий Layer-1 токен на каждый
+/// establish добывает собственный refresher (у него своя копия issuer+seed), а `update_last_exit`
+/// под замком просто пропускается. Инвариант закреплён тестом `vault_lock_does_not_touch_session`:
+/// раньше «Заблокировать хранилище» на поднятом туннеле обрывало связь (Dart звал `disconnect()`),
+/// хотя пользователь просил ровно обратное — убрать профили с глаз, а не выйти из VPN.
 void vaultLock() => RustLib.instance.api.crateApiCitadelVaultLock();
 
 /// Где лежит файл хранилища (диагностика в UI: «нет доступа» без пути — бесполезное сообщение).
@@ -110,10 +139,11 @@ void vaultRemove({required String id}) =>
 void vaultRename({required String id, required String name}) =>
     RustLib.instance.api.crateApiCitadelVaultRename(id: id, name: name);
 
-/// Переместить профиль на одну позицию вверх (`up=true`) или вниз в списке. Порядок хранится в
-/// самом vault, поэтому переживает перезапуск и переносится вместе с хранилищем.
-void vaultMove({required String id, required bool up}) =>
-    RustLib.instance.api.crateApiCitadelVaultMove(id: id, up: up);
+/// Переставить профиль на позицию `index` (перетаскивание в списке профилей). Порядок хранится в
+/// самом vault, поэтому переживает перезапуск и переносится вместе с хранилищем. Индекс за границей
+/// списка ядро прижимает к последней позиции.
+void vaultMoveTo({required String id, required int index}) =>
+    RustLib.instance.api.crateApiCitadelVaultMoveTo(id: id, index: index);
 
 /// Предел длины имени профиля из ядра — чтобы поле ввода в UI ограничивало ровно тем же числом,
 /// а не «своим» (иначе человек набирает имя, которое молча обрежется).
@@ -414,6 +444,30 @@ class SplitTunnelDto {
           apps == other.apps &&
           destMode == other.destMode &&
           dests == other.dests;
+}
+
+/// Счётчики трафика туннеля в байтах полезной нагрузки, монотонные за время жизни процесса
+/// (см. [`traffic_counters`]). UI считает по ним текущую скорость приёма/передачи.
+///
+/// Тип `i64`, а не `u64`: на Dart-стороне `u64` превращается в `BigInt` (арифметика дельт стала бы
+/// неоправданно громоздкой), тогда как `i64` — обычное целое. Переполнения не будет: 2^63 байт —
+/// это 9 эксабайт трафика за один запуск приложения.
+class TrafficDto {
+  final PlatformInt64 rxBytes;
+  final PlatformInt64 txBytes;
+
+  const TrafficDto({required this.rxBytes, required this.txBytes});
+
+  @override
+  int get hashCode => rxBytes.hashCode ^ txBytes.hashCode;
+
+  @override
+  bool operator ==(Object other) =>
+      identical(this, other) ||
+      other is TrafficDto &&
+          runtimeType == other.runtimeType &&
+          rxBytes == other.rxBytes &&
+          txBytes == other.txBytes;
 }
 
 /// Событие VPN-сессии для UI. `kind`: `state` | `connected` | `error`.

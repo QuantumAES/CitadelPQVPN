@@ -9,6 +9,7 @@ import 'package:app/app_state.dart';
 import 'package:app/debug_panel.dart';
 import 'package:app/errors.dart';
 import 'package:app/format.dart';
+import 'package:app/l10n/strings.dart';
 import 'package:app/qr_scan_page.dart';
 import 'package:app/src/rust/api/citadel.dart';
 import 'package:app/split_tunnel_page.dart';
@@ -30,13 +31,50 @@ class HomePage extends StatefulWidget {
 class _HomePageState extends State<HomePage> {
   Timer? _tick;
 
+  /// Индикация трафика: текущая скорость (байт/с), посчитанная по дельте монотонных счётчиков ядра
+  /// между двумя тиками. Итогов за сессию не ведём — их и не просили, а хранить историю трафика
+  /// пользователя на устройстве незачем.
+  double _rxRate = 0, _txRate = 0;
+  int? _rxPrev, _txPrev;
+  DateTime? _sampledAt;
+
   @override
   void initState() {
     super.initState();
     // обновляем счётчик времени сессии раз в секунду, пока подключены
     _tick = Timer.periodic(const Duration(seconds: 1), (_) {
-      if (widget.state.phase == VpnPhase.up && mounted) setState(() {});
+      if (widget.state.phase == VpnPhase.up && mounted) {
+        _sampleTraffic();
+        setState(() {});
+      }
     });
+  }
+
+  /// Снять счётчики ядра и пересчитать скорость. Дельта делится на ФАКТИЧЕСКИ прошедшее время, а не
+  /// на «одну секунду»: таймер в фоне/под нагрузкой отстаёт, и деление на константу завышало бы
+  /// скорость. Отрицательная дельта (движок перезапущен, счётчики с нуля) → показываем ноль.
+  void _sampleTraffic() {
+    if (!s.trafficMeter) {
+      _rxPrev = _txPrev = null;
+      _rxRate = _txRate = 0;
+      return;
+    }
+    final now = DateTime.now();
+    final c = trafficCounters();
+    final rx = c.rxBytes.toInt(), tx = c.txBytes.toInt();
+    final prevAt = _sampledAt;
+    if (_rxPrev != null && prevAt != null) {
+      final dt = now.difference(prevAt).inMicroseconds / 1e6;
+      // Длинная пауза между снимками (окно было свёрнуто, сессия падала и поднималась) — это не
+      // «медленная секунда», а разрыв ряда: берём её только как новую точку отсчёта.
+      if (dt > 0 && dt < 5) {
+        _rxRate = ((rx - _rxPrev!) / dt).clamp(0, double.maxFinite);
+        _txRate = ((tx - _txPrev!) / dt).clamp(0, double.maxFinite);
+      }
+    }
+    _rxPrev = rx;
+    _txPrev = tx;
+    _sampledAt = now;
   }
 
   @override
@@ -47,6 +85,9 @@ class _HomePageState extends State<HomePage> {
 
   AppState get s => widget.state;
 
+  /// Строки текущего языка (см. `lib/l10n/strings.dart`).
+  Strings get t => Strings.of(context);
+
   // ─────────────────────────── подключение ───────────────────────────
 
   Future<void> _tapProfile(ProfileDto p) async {
@@ -54,9 +95,9 @@ class _HomePageState extends State<HomePage> {
     if (s.isBusy && s.activeProfileId != p.id) {
       final cur = _activeName();
       final ok = await _confirm(
-        'Переключить подключение?',
-        'Сейчас активно подключение «$cur». Отключить его и подключиться к «${p.name}»?',
-        confirmLabel: 'Переключить',
+        t('switch_title'),
+        t('switch_body', {'current': cur, 'name': p.name}),
+        confirmLabel: t('switch_confirm'),
       );
       if (ok != true) return;
       s.disconnect();
@@ -67,7 +108,7 @@ class _HomePageState extends State<HomePage> {
 
   String _activeName() {
     final id = s.activeProfileId;
-    if (id == null) return 'новый профиль';
+    if (id == null) return t('new_profile_fallback');
     return s.profiles
         .firstWhere((x) => x.id == id, orElse: () => _ghost(id))
         .name;
@@ -75,7 +116,7 @@ class _HomePageState extends State<HomePage> {
 
   ProfileDto _ghost(String id) => ProfileDto(
         id: id,
-        name: 'профиль',
+        name: t('profile_fallback_name'),
         servers: '',
         hasPin: false,
         hasPqAuth: false,
@@ -103,15 +144,15 @@ class _HomePageState extends State<HomePage> {
     if (vaultExists()) {
       if (vaultIsUnlocked()) return true;
       return await _passwordDialog(
-        title: 'Разблокировать хранилище',
-        action: 'Разблокировать',
+        title: t('unlock_vault'),
+        action: t('unlock'),
         onSubmit: (pw) => s.unlock(pw),
       );
     }
     return await _passwordDialog(
-      title: 'Создать хранилище',
-      hint: 'Профили шифруются этим мастер-паролем (AES-256-GCM). Без него их не восстановить.',
-      action: 'Создать',
+      title: t('create_vault'),
+      hint: t('vault_create_hint'),
+      action: t('create'),
       confirm: true,
       onSubmit: (pw) => s.createVault(pw),
     );
@@ -125,16 +166,30 @@ class _HomePageState extends State<HomePage> {
       appBar: AppBar(
         title: const Text('CitadelPQVPN'),
         actions: [
+          // Замок хранилища — на главном экране, а не только в настройках: это действие «на
+          // выход из-за стола», и лезть за ним в меню в такой момент неудобно. Сессию замок не
+          // рвёт (см. AppState.lockVault) — прячет профили и требует пароль. Кнопка живёт в
+          // AnimatedBuilder: у закрытого хранилища её быть не должно, а состояние меняется на лету.
+          AnimatedBuilder(
+            animation: s,
+            builder: (_, _) => s.unlocked
+                ? IconButton(
+                    icon: const Icon(Icons.lock_outline),
+                    tooltip: t('lock_vault'),
+                    onPressed: s.lockVault,
+                  )
+                : const SizedBox.shrink(),
+          ),
           // #0.3: «Добавить профиль» — в AppBar, а не FAB: плавающая кнопка перекрывала
           // popup-меню (три точки) нижних плиток профилей.
           IconButton(
             icon: const Icon(Icons.add),
-            tooltip: 'Добавить профиль',
+            tooltip: t('add_profile'),
             onPressed: _addProfile,
           ),
           IconButton(
             icon: const Icon(Icons.settings_outlined),
-            tooltip: 'Настройки',
+            tooltip: t('settings'),
             onPressed: _openSettings,
           ),
         ],
@@ -142,26 +197,78 @@ class _HomePageState extends State<HomePage> {
       body: AnimatedBuilder(
         animation: s,
         builder: (context, _) {
-          return ListView(
-            padding: const EdgeInsets.fromLTRB(16, 16, 16, 24),
+          // Шапка (статус + отладка + заголовок списка) — не часть перетаскиваемого списка:
+          // ReorderableListView отдаёт под неё отдельный слот `header`, поэтому вложенных
+          // прокруток нет и автопрокрутка при перетаскивании к краю экрана работает штатно.
+          final header = Column(
+            crossAxisAlignment: CrossAxisAlignment.stretch,
             children: [
-              _StatusCard(state: s, onDisconnect: s.disconnect),
+              _StatusCard(
+                state: s,
+                onDisconnect: s.disconnect,
+                rxRate: _rxRate,
+                txRate: _txRate,
+              ),
               if (s.debugEnabled) ...[
                 const SizedBox(height: 16),
                 _DebugSection(state: s),
               ],
               const SizedBox(height: 20),
-              if (s.profiles.isEmpty)
-                _EmptyProfiles(onAdd: _addProfile)
-              else ...[
+              if (s.profiles.isNotEmpty) ...[
                 Padding(
                   padding: const EdgeInsets.symmetric(horizontal: 4),
-                  child: Text('Профили',
-                      style: Theme.of(context).textTheme.titleSmall),
+                  child: Row(
+                    children: [
+                      Expanded(
+                        child: Text(t('profiles'),
+                            style: Theme.of(context).textTheme.titleSmall),
+                      ),
+                      // Перетаскивание — жест невидимый: без подсказки о нём узнают случайно.
+                      // Показываем её только когда переставлять есть что (профилей больше одного).
+                      if (s.profiles.length > 1)
+                        Flexible(
+                          child: Text(
+                            t('reorder_hint'),
+                            textAlign: TextAlign.right,
+                            style: Theme.of(context).textTheme.labelSmall?.copyWith(
+                                  color: Theme.of(context).colorScheme.outline,
+                                ),
+                          ),
+                        ),
+                    ],
+                  ),
                 ),
                 const SizedBox(height: 8),
-                for (final (i, p) in s.profiles.indexed)
-                  _ProfileTile(
+              ],
+            ],
+          );
+
+          if (s.profiles.isEmpty) {
+            return ListView(
+              padding: const EdgeInsets.fromLTRB(16, 16, 16, 24),
+              children: [header, _EmptyProfiles(onAdd: _addProfile)],
+            );
+          }
+
+          // Порядок профилей меняется перетаскиванием (долгое нажатие на плитке). Кнопок
+          // «выше/ниже» больше нет: на списке из нескольких профилей они требовали по нажатию
+          // на позицию, а порядок всё равно хранится в vault и переживает перезапуск.
+          return ReorderableListView(
+            padding: const EdgeInsets.fromLTRB(16, 16, 16, 24),
+            header: header,
+            // Свои «ручки»: дефолтные на desktop рисуют иконку-хват поверх плитки (там уже меню
+            // «три точки»), а тащить начинают с первого же движения мыши — по случайному сдвигу
+            // при попытке нажать. Нам нужен один и тот же жест везде: долгое нажатие.
+            buildDefaultDragHandles: false,
+            onReorderStart: (_) => HapticFeedback.mediumImpact(),
+            proxyDecorator: _dragProxy,
+            onReorderItem: _onReorder,
+            children: [
+              for (final (i, p) in s.profiles.indexed)
+                ReorderableDelayedDragStartListener(
+                  key: ValueKey(p.id),
+                  index: i,
+                  child: _ProfileTile(
                     profile: p,
                     active: s.activeProfileId == p.id,
                     phase: s.phase,
@@ -169,13 +276,10 @@ class _HomePageState extends State<HomePage> {
                     onDelete: () => _deleteProfile(p),
                     onDisconnect: s.disconnect,
                     onRename: () => _renameProfile(p),
-                    onMove: ({required bool up}) => _moveProfile(p, up: up),
-                    canMoveUp: i > 0,
-                    canMoveDown: i < s.profiles.length - 1,
                     onSubscribers:
                         p.isAdmin ? () => _openSubscribers(p) : null,
                   ),
-              ],
+                ),
             ],
           );
         },
@@ -193,9 +297,9 @@ class _HomePageState extends State<HomePage> {
 
   Future<void> _deleteProfile(ProfileDto p) async {
     final ok = await _confirm(
-      'Удалить профиль?',
-      'Профиль «${p.name}» будет удалён из хранилища. Это действие необратимо.',
-      confirmLabel: 'Удалить',
+      t('delete_profile_title'),
+      t('delete_profile_body', {'name': p.name}),
+      confirmLabel: t('delete'),
       destructive: true,
     );
     if (ok == true) s.removeProfile(p.id);
@@ -221,7 +325,7 @@ class _HomePageState extends State<HomePage> {
           }
 
           return AlertDialog(
-            title: const Text('Переименовать профиль'),
+            title: Text(t('rename_profile')),
             content: SingleChildScrollView(
               child: Column(
                 mainAxisSize: MainAxisSize.min,
@@ -232,9 +336,9 @@ class _HomePageState extends State<HomePage> {
                     autofocus: true,
                     maxLength: maxLen,
                     onSubmitted: (_) => submit(),
-                    decoration: const InputDecoration(
-                      labelText: 'Имя профиля',
-                      border: OutlineInputBorder(),
+                    decoration: InputDecoration(
+                      labelText: t('profile_name'),
+                      border: const OutlineInputBorder(),
                     ),
                   ),
                   if (err != null) ...[
@@ -247,24 +351,51 @@ class _HomePageState extends State<HomePage> {
             actions: [
               TextButton(
                   onPressed: () => Navigator.pop(dctx, false),
-                  child: const Text('Отмена')),
-              FilledButton(onPressed: submit, child: const Text('Сохранить')),
+                  child: Text(t('cancel'))),
+              FilledButton(onPressed: submit, child: Text(t('save'))),
             ],
           );
         });
       },
     );
     ctrl.dispose();
-    if (done == true) _toast('Профиль переименован');
+    if (done == true) _toast(t('profile_renamed'));
   }
 
-  /// Переставить профиль в списке. Порядок хранится в vault — переживает перезапуск.
-  void _moveProfile(ProfileDto p, {required bool up}) {
+  /// Перетаскивание профиля завершено (`onReorderItem` уже привёл `newIndex` к координатам списка
+  /// ПОСЛЕ изъятия перетаскиваемого элемента — поправка на «съехавший» индекс не нужна).
+  /// Порядок хранится в vault, поэтому переживает перезапуск.
+  void _onReorder(int oldIndex, int newIndex) {
+    if (oldIndex == newIndex) return;
+    final p = s.profiles[oldIndex];
     try {
-      s.moveProfile(p.id, up: up);
+      s.moveProfileTo(p.id, newIndex);
     } catch (e) {
       _toast(humanError(e));
     }
+  }
+
+  /// Вид «оторванной» плитки под пальцем: чуть приподнята и увеличена. Мини-анимация нужна не для
+  /// красоты — она отвечает на вопрос «режим перетаскивания включился или я просто держу палец»,
+  /// который иначе решается только пробным движением. Дефолтный декоратор поднимает только тень.
+  Widget _dragProxy(Widget child, int index, Animation<double> animation) {
+    return AnimatedBuilder(
+      animation: animation,
+      builder: (context, c) {
+        final k = Curves.easeOut.transform(animation.value);
+        return Transform.scale(
+          scale: 1 + 0.04 * k,
+          child: Material(
+            color: Colors.transparent,
+            elevation: 8 * k,
+            shadowColor: Theme.of(context).colorScheme.shadow,
+            borderRadius: BorderRadius.circular(12),
+            child: c,
+          ),
+        );
+      },
+      child: child,
+    );
   }
 
   // ─────────────────────────── настройки ───────────────────────────
@@ -282,7 +413,7 @@ class _HomePageState extends State<HomePage> {
             if (s.unlocked) ...[
               ListTile(
                 leading: const Icon(Icons.password_outlined),
-                title: const Text('Сменить мастер-пароль'),
+                title: Text(t('change_password')),
                 onTap: () {
                   Navigator.pop(sheetCtx);
                   _changePassword();
@@ -290,17 +421,29 @@ class _HomePageState extends State<HomePage> {
               ),
               ListTile(
                 leading: const Icon(Icons.lock_outline),
-                title: const Text('Заблокировать хранилище'),
+                title: Text(t('lock_vault')),
                 onTap: () {
                   Navigator.pop(sheetCtx);
                   s.lockVault();
                 },
               ),
             ],
+            // Индикация трафика: только текущая скорость на плашке подключения, без итогов.
+            // По умолчанию выключена — лишняя строка на главном экране нужна не всем.
+            SwitchListTile(
+              secondary: const Icon(Icons.speed_outlined),
+              title: Text(t('traffic_meter_title')),
+              subtitle: Text(t('traffic_meter_sub')),
+              value: s.trafficMeter,
+              onChanged: (_) {
+                s.toggleTrafficMeter();
+                Navigator.pop(sheetCtx);
+              },
+            ),
             SwitchListTile(
               secondary: const Icon(Icons.bug_report_outlined),
-              title: const Text('Режим отладки'),
-              subtitle: const Text('Журнал ядра и диагностика подключения'),
+              title: Text(t('debug_title')),
+              subtitle: Text(t('debug_sub')),
               value: s.debugEnabled,
               onChanged: (_) {
                 s.toggleDebug();
@@ -311,8 +454,8 @@ class _HomePageState extends State<HomePage> {
             if (Platform.isAndroid)
               SwitchListTile(
                 secondary: const Icon(Icons.screenshot_monitor_outlined),
-                title: const Text('Запрет скриншотов'),
-                subtitle: const Text('Блокировать снимки и запись экрана приложения'),
+                title: Text(t('screenshot_title')),
+                subtitle: Text(t('screenshot_sub')),
                 value: s.screenshotBlock,
                 onChanged: (_) {
                   s.toggleScreenshotBlock();
@@ -324,8 +467,8 @@ class _HomePageState extends State<HomePage> {
             if (!Platform.isAndroid && !Platform.isIOS)
               SwitchListTile(
                 secondary: const Icon(Icons.shield_outlined),
-                title: const Text('Kill-switch'),
-                subtitle: const Text('Блокировать трафик вне туннеля (fail-closed); с новой сессии'),
+                title: Text(t('killswitch_title')),
+                subtitle: Text(t('killswitch_sub')),
                 value: s.killswitch,
                 onChanged: (_) {
                   s.toggleKillswitch();
@@ -335,8 +478,8 @@ class _HomePageState extends State<HomePage> {
             if (Platform.isAndroid)
               ListTile(
                 leading: const Icon(Icons.shield_outlined),
-                title: const Text('Kill-switch (always-on)'),
-                subtitle: const Text('Настроить в системных настройках VPN'),
+                title: Text(t('killswitch_android_title')),
+                subtitle: Text(t('killswitch_android_sub')),
                 onTap: () {
                   Navigator.pop(sheetCtx);
                   _showAlwaysOnGuide();
@@ -347,10 +490,10 @@ class _HomePageState extends State<HomePage> {
             if (Platform.isAndroid || Platform.isLinux || Platform.isWindows)
               ListTile(
                 leading: const Icon(Icons.alt_route),
-                title: const Text('Split-туннель'),
+                title: Text(t('split_title')),
                 subtitle: Text(Platform.isAndroid
-                    ? 'По приложениям и адресам: через туннель / в обход'
-                    : 'По адресам назначения: через туннель / в обход'),
+                    ? t('split_sub_android')
+                    : t('split_sub_desktop')),
                 onTap: () {
                   Navigator.pop(sheetCtx);
                   Navigator.of(context).push(
@@ -365,18 +508,29 @@ class _HomePageState extends State<HomePage> {
             // Тап — копирует путь (в поддержку/для проверки прав на папку).
             ListTile(
               leading: const Icon(Icons.folder_outlined),
-              title: const Text('Хранилище профилей'),
+              title: Text(t('vault_location_title')),
               subtitle: Text(vaultLocation(), style: const TextStyle(fontSize: 11)),
               onTap: () async {
                 await Clipboard.setData(ClipboardData(text: vaultLocation()));
                 if (sheetCtx.mounted) Navigator.pop(sheetCtx);
-                _toast('Путь хранилища скопирован');
+                _toast(t('vault_path_copied'));
+              },
+            ),
+            // Язык интерфейса. Выбор пользователя, а не системная локаль: клиент часто ставят на
+            // чужом или рабочем устройстве, где локаль не та, на которой человек читает.
+            ListTile(
+              leading: const Icon(Icons.language),
+              title: Text(t('language_title')),
+              subtitle: Text(kLangNames[s.lang] ?? kLangNames[kDefaultLang]!),
+              onTap: () {
+                Navigator.pop(sheetCtx);
+                _pickLanguage();
               },
             ),
             ListTile(
               leading: const Icon(Icons.info_outline),
-              title: const Text('О приложении'),
-              subtitle: Text('CitadelPQVPN · версия $appVersion'),
+              title: Text(t('about_title')),
+              subtitle: Text(t('about_sub', {'version': appVersion})),
               onTap: () {
                 Navigator.pop(sheetCtx);
                 _showAbout();
@@ -389,12 +543,39 @@ class _HomePageState extends State<HomePage> {
     );
   }
 
+  /// Выбор языка интерфейса. Языки перечислены на самих себе («Deutsch», «हिन्दी») — человек ищет
+  /// в списке свой язык, а не перевод его названия на текущий. Выбор применяется сразу (весь
+  /// MaterialApp перестраивается) и сохраняется ядром рядом с хранилищем.
+  Future<void> _pickLanguage() async {
+    final picked = await showDialog<String>(
+      context: context,
+      builder: (dctx) => RadioGroup<String>(
+        groupValue: s.lang,
+        onChanged: (v) => Navigator.pop(dctx, v),
+        child: SimpleDialog(
+          title: Text(Strings.of(dctx)('language_title')),
+          children: [
+            for (final code in kSupportedLocales.map((l) => l.languageCode))
+              RadioListTile<String>(
+                value: code,
+                title: Text(kLangNames[code] ?? code),
+              ),
+          ],
+        ),
+      ),
+    );
+    if (picked != null) s.setLang(picked);
+  }
+
   /// «О приложении»: что это, чем отличается, какая версия. Версии — двумя строками и с
   /// возможностью скопировать: при разборе жалобы первым делом спрашивают именно их, а сборка
   /// приложения и версия ядра расходятся (ядро обновляется отдельно от оболочки).
   Future<void> _showAbout() async {
     final core = coreVersion();
-    final versions = 'CitadelPQVPN $appVersion · ядро v$core';
+    // Строка «для поддержки»: её копируют в переписку, поэтому собираем её из тех же
+    // локализованных кусков, что показаны в диалоге, — чтобы человек прислал ровно то, что видит.
+    final versions =
+        'CitadelPQVPN $appVersion · ${t('about_core_version', {'version': core})}';
     await showDialog<void>(
       context: context,
       builder: (dctx) {
@@ -413,20 +594,15 @@ class _HomePageState extends State<HomePage> {
               crossAxisAlignment: CrossAxisAlignment.start,
               children: [
                 Text(
-                  'Постквантовый VPN.\n\n'
-                  'Сессия защищена гибридным обменом ключами X25519 + ML-KEM-768 и '
-                  'подписью сервера ML-DSA-65: перехваченный сегодня трафик не расшифровать '
-                  'и завтрашним квантовым компьютером.\n\n'
-                  'Трафик маскируется под обычный поток данных, профили и ключи лежат в '
-                  'зашифрованном хранилище на устройстве, сервер не ведёт журналов подключений.',
+                  t('about_body'),
                   style: Theme.of(dctx).textTheme.bodyMedium,
                 ),
                 const SizedBox(height: 16),
-                Text('Версия', style: Theme.of(dctx).textTheme.labelLarge),
+                Text(t('about_version'), style: Theme.of(dctx).textTheme.labelLarge),
                 const SizedBox(height: 4),
-                Text('Приложение: $appVersion',
+                Text(t('about_app_version', {'version': appVersion}),
                     style: Theme.of(dctx).textTheme.bodySmall?.copyWith(color: cs.outline)),
-                Text('Ядро: v$core',
+                Text(t('about_core_version', {'version': core}),
                     style: Theme.of(dctx).textTheme.bodySmall?.copyWith(color: cs.outline)),
               ],
             ),
@@ -436,12 +612,12 @@ class _HomePageState extends State<HomePage> {
               onPressed: () async {
                 await Clipboard.setData(ClipboardData(text: versions));
                 if (dctx.mounted) Navigator.pop(dctx);
-                _toast('Версия скопирована');
+                _toast(t('version_copied'));
               },
-              child: const Text('Скопировать версию'),
+              child: Text(t('copy_version')),
             ),
             FilledButton(
-                onPressed: () => Navigator.pop(dctx), child: const Text('Закрыть')),
+                onPressed: () => Navigator.pop(dctx), child: Text(t('close'))),
           ],
         );
       },
@@ -453,18 +629,13 @@ class _HomePageState extends State<HomePage> {
     final ok = await showDialog<bool>(
       context: context,
       builder: (dctx) => AlertDialog(
-        title: const Text('Kill-switch (always-on)'),
-        content: const Text(
-          'На Android блокировку трафика мимо VPN включает система, не приложение.\n\n'
-          'В системных настройках VPN включи для CitadelPQVPN:\n'
-          '• Постоянный VPN (Always-on VPN)\n'
-          '• Блокировать соединения без VPN',
-        ),
+        title: Text(t('killswitch_android_title')),
+        content: Text(t('alwayson_body')),
         actions: [
-          TextButton(onPressed: () => Navigator.pop(dctx, false), child: const Text('Закрыть')),
+          TextButton(onPressed: () => Navigator.pop(dctx, false), child: Text(t('close'))),
           FilledButton(
             onPressed: () => Navigator.pop(dctx, true),
-            child: const Text('Открыть настройки'),
+            child: Text(t('open_settings')),
           ),
         ],
       ),
@@ -490,15 +661,15 @@ class _HomePageState extends State<HomePage> {
         return StatefulBuilder(builder: (dctx, setLocal) {
           Future<void> submit() async {
             if (oldC.text.isEmpty) {
-              setLocal(() => err = 'Введите текущий пароль');
+              setLocal(() => err = t('enter_current_password'));
               return;
             }
             if (newC.text.characters.length < minLen) {
-              setLocal(() => err = 'Новый пароль слишком короткий: минимум $minLen символов');
+              setLocal(() => err = t('new_password_too_short', {'n': '$minLen'}));
               return;
             }
             if (newC.text != new2C.text) {
-              setLocal(() => err = 'Новые пароли не совпадают');
+              setLocal(() => err = t('new_passwords_mismatch'));
               return;
             }
             setLocal(() {
@@ -511,13 +682,13 @@ class _HomePageState extends State<HomePage> {
             } catch (e) {
               setLocal(() {
                 busy = false;
-                err = humanError(e);
+                err = humanError(e, t);
               });
             }
           }
 
           return AlertDialog(
-            title: const Text('Сменить мастер-пароль'),
+            title: Text(t('change_password')),
             content: SingleChildScrollView(
               child: Column(
                 mainAxisSize: MainAxisSize.min,
@@ -528,7 +699,7 @@ class _HomePageState extends State<HomePage> {
                     autofocus: true,
                     obscureText: true,
                     enabled: !busy,
-                    decoration: const InputDecoration(labelText: 'Текущий пароль'),
+                    decoration: InputDecoration(labelText: t('current_password')),
                   ),
                   const SizedBox(height: 12),
                   TextField(
@@ -536,8 +707,8 @@ class _HomePageState extends State<HomePage> {
                     obscureText: true,
                     enabled: !busy,
                     decoration: InputDecoration(
-                      labelText: 'Новый пароль',
-                      helperText: 'минимум $minLen символов',
+                      labelText: t('new_password'),
+                      helperText: t('password_min', {'n': '$minLen'}),
                     ),
                   ),
                   const SizedBox(height: 12),
@@ -546,7 +717,7 @@ class _HomePageState extends State<HomePage> {
                     obscureText: true,
                     enabled: !busy,
                     onSubmitted: busy ? null : (_) => submit(),
-                    decoration: const InputDecoration(labelText: 'Повторите новый пароль'),
+                    decoration: InputDecoration(labelText: t('new_password_repeat')),
                   ),
                   if (err != null) ...[
                     const SizedBox(height: 12),
@@ -558,21 +729,21 @@ class _HomePageState extends State<HomePage> {
             actions: [
               TextButton(
                 onPressed: busy ? null : () => Navigator.pop(dctx, false),
-                child: const Text('Отмена'),
+                child: Text(t('cancel')),
               ),
               FilledButton(
                 onPressed: busy ? null : submit,
                 child: busy
                     ? const SizedBox(
                         height: 18, width: 18, child: CircularProgressIndicator(strokeWidth: 2))
-                    : const Text('Сменить'),
+                    : Text(t('change')),
               ),
             ],
           );
         });
       },
     );
-    if (done == true) _toast('Мастер-пароль изменён');
+    if (done == true) _toast(t('password_changed'));
     oldC.dispose();
     newC.dispose();
     new2C.dispose();
@@ -582,6 +753,7 @@ class _HomePageState extends State<HomePage> {
 
   Future<bool?> _confirm(String title, String body,
       {String confirmLabel = 'OK', bool destructive = false}) {
+    final t = this.t;
     return showDialog<bool>(
       context: context,
       builder: (dctx) => AlertDialog(
@@ -590,7 +762,7 @@ class _HomePageState extends State<HomePage> {
         actions: [
           TextButton(
               onPressed: () => Navigator.pop(dctx, false),
-              child: const Text('Отмена')),
+              child: Text(t('cancel'))),
           FilledButton(
             style: destructive
                 ? FilledButton.styleFrom(
@@ -628,18 +800,18 @@ class _HomePageState extends State<HomePage> {
         return StatefulBuilder(builder: (dctx, setLocal) {
           Future<void> submit() async {
             if (pw.text.isEmpty) {
-              setLocal(() => err = 'Пароль не может быть пустым');
+              setLocal(() => err = t('password_empty'));
               return;
             }
             // Политику длины проверяем здесь же: то же число, что enforce'ит ядро (оно и отдаёт
             // его через FFI), но человек узнаёт о ней сразу, а не после Argon2-derive. Только при
             // создании: у существующего хранилища пароль мог быть задан прежней политикой.
             if (confirm && pw.text.characters.length < minLen) {
-              setLocal(() => err = 'Пароль слишком короткий: минимум $minLen символов');
+              setLocal(() => err = t('password_too_short', {'n': '$minLen'}));
               return;
             }
             if (confirm && pw.text != pw2.text) {
-              setLocal(() => err = 'Пароли не совпадают');
+              setLocal(() => err = t('passwords_mismatch'));
               return;
             }
             setLocal(() {
@@ -652,7 +824,7 @@ class _HomePageState extends State<HomePage> {
             } catch (e) {
               setLocal(() {
                 busy = false;
-                err = humanError(e);
+                err = humanError(e, t);
               });
             }
           }
@@ -676,8 +848,8 @@ class _HomePageState extends State<HomePage> {
                     obscureText: true,
                     enabled: !busy,
                     decoration: InputDecoration(
-                      labelText: 'Пароль',
-                      helperText: confirm ? 'минимум $minLen символов' : null,
+                      labelText: t('password'),
+                      helperText: confirm ? t('password_min', {'n': '$minLen'}) : null,
                     ),
                     onSubmitted: confirm || busy ? null : (_) => submit(),
                   ),
@@ -688,7 +860,7 @@ class _HomePageState extends State<HomePage> {
                       obscureText: true,
                       enabled: !busy,
                       decoration:
-                          const InputDecoration(labelText: 'Повторите пароль'),
+                          InputDecoration(labelText: t('password_repeat')),
                       onSubmitted: busy ? null : (_) => submit(),
                     ),
                   ],
@@ -702,7 +874,7 @@ class _HomePageState extends State<HomePage> {
             actions: [
               TextButton(
                   onPressed: busy ? null : () => Navigator.pop(dctx, false),
-                  child: const Text('Отмена')),
+                  child: Text(t('cancel'))),
               FilledButton(
                 onPressed: busy ? null : submit,
                 child: busy
@@ -744,6 +916,9 @@ class _DebugSectionState extends State<_DebugSection> {
 
   AppState get s => widget.state;
 
+  /// Строки текущего языка.
+  Strings get t => Strings.of(context);
+
   /// Профиль для диагностики: активный, иначе первый в списке.
   String? get _targetId =>
       s.activeProfileId ?? (s.profiles.isNotEmpty ? s.profiles.first.id : null);
@@ -752,7 +927,7 @@ class _DebugSectionState extends State<_DebugSection> {
     final id = _targetId;
     if (id == null) {
       ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(content: Text('Нет профиля для диагностики')),
+        SnackBar(content: Text(t('diag_no_profile'))),
       );
       return;
     }
@@ -760,7 +935,7 @@ class _DebugSectionState extends State<_DebugSection> {
     setState(() {
       _diag
         ..clear()
-        ..add('▶ Пробное подключение для диагностики (отдельная сессия, не основной туннель)…');
+        ..add('▶ ${t('diag_start')}');
       _running = true;
     });
     _sub = runDiagnostics(profileId: id).listen(
@@ -775,7 +950,7 @@ class _DebugSectionState extends State<_DebugSection> {
         if (mounted) {
           setState(() {
             _running = false;
-            _diag.add('✗ Диагностика прервана: $e');
+            _diag.add('✗ ${t('diag_aborted', {'error': '$e'})}');
           });
         }
       },
@@ -805,7 +980,7 @@ class _DebugSectionState extends State<_DebugSection> {
                         child: CircularProgressIndicator(strokeWidth: 2),
                       )
                     : const Icon(Icons.fact_check_outlined),
-                label: Text(_running ? 'Проверка…' : 'Диагностика подключения'),
+                label: Text(_running ? t('diag_running') : t('diag_run')),
               ),
             ),
           ],
@@ -813,7 +988,7 @@ class _DebugSectionState extends State<_DebugSection> {
         if (_diag.isNotEmpty) ...[
           const SizedBox(height: 12),
           MonoLogView(
-            title: 'Диагностика',
+            title: t('diag_title'),
             icon: Icons.checklist_rtl,
             lines: _diag,
             height: 200,
@@ -830,13 +1005,22 @@ class _DebugSectionState extends State<_DebugSection> {
 // ═══════════════════════════ карточка статуса ═══════════════════════════
 
 class _StatusCard extends StatelessWidget {
-  const _StatusCard({required this.state, required this.onDisconnect});
+  const _StatusCard({
+    required this.state,
+    required this.onDisconnect,
+    this.rxRate = 0,
+    this.txRate = 0,
+  });
   final AppState state;
   final VoidCallback onDisconnect;
+
+  /// Текущая скорость приёма/передачи, байт/с (0, если индикация выключена или сессии нет).
+  final double rxRate, txRate;
 
   @override
   Widget build(BuildContext context) {
     final cs = Theme.of(context).colorScheme;
+    final t = Strings.of(context);
     final dark = Theme.of(context).brightness == Brightness.dark;
 
     late Color bg, fg;
@@ -849,12 +1033,12 @@ class _StatusCard extends StatelessWidget {
         bg = (dark ? Colors.green.shade900 : Colors.green.shade50);
         fg = (dark ? Colors.green.shade200 : Colors.green.shade800);
         icon = Icons.shield;
-        label = 'Защищено';
+        label = t('status_protected');
       case VpnPhase.connecting:
         bg = (dark ? Colors.amber.shade900 : Colors.amber.shade50);
         fg = (dark ? Colors.amber.shade200 : Colors.amber.shade900);
         icon = Icons.shield_outlined;
-        label = 'Подключение…';
+        label = t('status_connecting');
         lead = SizedBox(
           height: 22,
           width: 22,
@@ -866,12 +1050,14 @@ class _StatusCard extends StatelessWidget {
         icon = Icons.gpp_bad_outlined;
         // Человеку — что произошло, а не текст ошибки движка: подробности (полная цепочка
         // причин) остаются в журнале отладки, кому надо — посмотрит там.
-        label = state.errorTitle.isEmpty ? 'Сервер недоступен' : state.errorTitle;
+        // errorTitle — КЛЮЧ строки (см. AppState._classify): переводим при отрисовке, поэтому
+        // смена языка меняет и уже показанный отказ.
+        label = t(state.errorTitle.isEmpty ? 'err_server_unreachable' : state.errorTitle);
       case VpnPhase.off:
         bg = cs.surfaceContainerHighest;
         fg = cs.onSurfaceVariant;
         icon = Icons.lock_open_outlined;
-        label = 'Не защищено';
+        label = t('status_unprotected');
     }
 
     // Что показываем о живой сессии: узел выхода и транспорт. Ни номера порта, ни назначенного
@@ -887,8 +1073,8 @@ class _StatusCard extends StatelessWidget {
     // отказа — сам текст ошибки ядра здесь не показываем (он в журнале отладки).
     final name = state.activeProfileName;
     final failure = <String>[
-      if (name.isNotEmpty) 'профиль «$name»',
-      if (state.errorHint.isNotEmpty) state.errorHint,
+      if (name.isNotEmpty) t('status_profile_named', {'name': name}),
+      if (state.errorHint.isNotEmpty) t(state.errorHint),
     ].join('  ·  ');
 
     return Container(
@@ -924,16 +1110,26 @@ class _StatusCard extends StatelessWidget {
           ),
           if (details.isNotEmpty || state.phase == VpnPhase.error) ...[
             const SizedBox(height: 6),
-            Align(
-              alignment: Alignment.centerLeft,
+            // По центру: строка «узел · транспорт» относится ко всей плашке, а не к иконке слева,
+            // и в узком портретном окне выключка по левому краю смотрелась обрывком.
+            SizedBox(
+              width: double.infinity,
               child: Text(
                 state.phase == VpnPhase.error ? failure : details,
+                textAlign: TextAlign.center,
                 style: Theme.of(context)
                     .textTheme
                     .bodyMedium
                     ?.copyWith(color: fg.withValues(alpha: 0.9)),
               ),
             ),
+          ],
+          // Индикация трафика (настройка «Показывать индикацию трафика», по умолчанию выключена):
+          // только текущая скорость, без итогов за сессию. Показываем на поднятом туннеле —
+          // на «подключении» цифры были бы нулями, а место на плашке уже занято.
+          if (state.trafficMeter && state.phase == VpnPhase.up) ...[
+            const SizedBox(height: 10),
+            _TrafficRow(rxRate: rxRate, txRate: txRate, fg: fg, t: t),
           ],
           if (state.isBusy) ...[
             const SizedBox(height: 16),
@@ -942,12 +1138,51 @@ class _StatusCard extends StatelessWidget {
               child: FilledButton.tonalIcon(
                 onPressed: onDisconnect,
                 icon: const Icon(Icons.power_settings_new),
-                label: const Text('Отключить'),
+                label: Text(t('disconnect')),
               ),
             ),
           ],
         ],
       ),
+    );
+  }
+}
+
+/// Строка скорости на плашке подключения: «↓ 1,4 МБ/с   ↑ 320 КБ/с». Моноширинные цифры
+/// (`tabularFigures`) — иначе строка дёргается по ширине на каждом обновлении раз в секунду.
+class _TrafficRow extends StatelessWidget {
+  const _TrafficRow({
+    required this.rxRate,
+    required this.txRate,
+    required this.fg,
+    required this.t,
+  });
+  final double rxRate, txRate;
+  final Color fg;
+  final Strings t;
+
+  @override
+  Widget build(BuildContext context) {
+    final style = Theme.of(context).textTheme.bodyMedium?.copyWith(
+          color: fg.withValues(alpha: 0.9),
+          fontFeatures: const [FontFeature.tabularFigures()],
+        );
+    Widget item(IconData icon, String label, String value) => Row(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            Icon(icon, size: 16, color: fg.withValues(alpha: 0.9)),
+            const SizedBox(width: 4),
+            // Подпись для доступности (скринридер прочитает «приём»/«отправка», а не стрелку).
+            Semantics(label: label, child: Text(value, style: style)),
+          ],
+        );
+    return Row(
+      mainAxisAlignment: MainAxisAlignment.center,
+      children: [
+        item(Icons.arrow_downward, t('traffic_rx'), fmtRate(rxRate, t)),
+        const SizedBox(width: 20),
+        item(Icons.arrow_upward, t('traffic_tx'), fmtRate(txRate, t)),
+      ],
     );
   }
 }
@@ -963,9 +1198,6 @@ class _ProfileTile extends StatelessWidget {
     required this.onDelete,
     required this.onDisconnect,
     required this.onRename,
-    required this.onMove,
-    required this.canMoveUp,
-    required this.canMoveDown,
     this.onSubscribers,
   });
   final ProfileDto profile;
@@ -975,16 +1207,13 @@ class _ProfileTile extends StatelessWidget {
   final VoidCallback onDelete;
   final VoidCallback onDisconnect;
   final VoidCallback onRename;
-  /// Переместить профиль в списке: `up=true` — выше, иначе ниже.
-  final void Function({required bool up}) onMove;
-  final bool canMoveUp;
-  final bool canMoveDown;
   /// C7.4: открыть экран абонентов (не null только у admin-профиля).
   final VoidCallback? onSubscribers;
 
   @override
   Widget build(BuildContext context) {
     final cs = Theme.of(context).colorScheme;
+    final t = Strings.of(context);
     Color dot;
     if (active && phase == VpnPhase.up) {
       dot = Colors.green;
@@ -1000,6 +1229,7 @@ class _ProfileTile extends StatelessWidget {
       if (profile.hasPqAuth)
         _featChip(context, Icons.verified_user_outlined, 'PQ-auth'),
       if (profile.hasObfs) _featChip(context, Icons.blur_on, 'obfs'),
+      // (admin/PQ-auth/obfs/pin — короткие технические метки, одинаковые на всех языках)
       if (profile.hasPin) _featChip(context, Icons.push_pin_outlined, 'pin'),
     ];
 
@@ -1040,27 +1270,19 @@ class _ProfileTile extends StatelessWidget {
                 onSubscribers?.call();
               case 'rename':
                 onRename();
-              case 'up':
-                onMove(up: true);
-              case 'down':
-                onMove(up: false);
             }
           },
           itemBuilder: (_) => [
             if (active && (phase == VpnPhase.up || phase == VpnPhase.connecting))
-              const PopupMenuItem(value: 'disconnect', child: Text('Отключить'))
+              PopupMenuItem(value: 'disconnect', child: Text(t('disconnect')))
             else
-              const PopupMenuItem(value: 'connect', child: Text('Подключить')),
+              PopupMenuItem(value: 'connect', child: Text(t('connect'))),
             if (onSubscribers != null)
-              const PopupMenuItem(value: 'subscribers', child: Text('Абоненты')),
-            const PopupMenuItem(value: 'rename', child: Text('Переименовать')),
-            // Пункты перемещения показываем только там, где им есть куда двигать: неактивный
-            // пункт меню человек всё равно нажмёт и решит, что функция сломана.
-            if (canMoveUp)
-              const PopupMenuItem(value: 'up', child: Text('Переместить выше')),
-            if (canMoveDown)
-              const PopupMenuItem(value: 'down', child: Text('Переместить ниже')),
-            const PopupMenuItem(value: 'delete', child: Text('Удалить')),
+              PopupMenuItem(value: 'subscribers', child: Text(t('subscribers'))),
+            PopupMenuItem(value: 'rename', child: Text(t('rename'))),
+            // Порядок списка меняется перетаскиванием (долгое нажатие на плитке) — пунктов
+            // «переместить выше/ниже» здесь больше нет.
+            PopupMenuItem(value: 'delete', child: Text(t('delete'))),
           ],
         ),
       ),
@@ -1089,16 +1311,17 @@ class _EmptyProfiles extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final cs = Theme.of(context).colorScheme;
+    final t = Strings.of(context);
     return Padding(
       padding: const EdgeInsets.only(top: 48),
       child: Column(
         children: [
           Icon(Icons.vpn_key_outlined, size: 56, color: cs.outline),
           const SizedBox(height: 16),
-          Text('Нет профилей',
+          Text(t('no_profiles'),
               style: Theme.of(context).textTheme.titleMedium),
           const SizedBox(height: 4),
-          Text('Добавьте citadel://-ссылку,\nчтобы подключиться к серверу',
+          Text(t('no_profiles_hint'),
               textAlign: TextAlign.center,
               style: Theme.of(context)
                   .textTheme
@@ -1108,7 +1331,7 @@ class _EmptyProfiles extends StatelessWidget {
           FilledButton.icon(
             onPressed: onAdd,
             icon: const Icon(Icons.add),
-            label: const Text('Добавить профиль'),
+            label: Text(t('add_profile')),
           ),
         ],
       ),
@@ -1210,6 +1433,7 @@ class _AddProfileSheetState extends State<AddProfileSheet> {
 
   @override
   Widget build(BuildContext context) {
+    final t = Strings.of(context);
     final valid = _summary?.valid ?? false;
     return Padding(
       padding: EdgeInsets.only(
@@ -1222,7 +1446,7 @@ class _AddProfileSheetState extends State<AddProfileSheet> {
         mainAxisSize: MainAxisSize.min,
         crossAxisAlignment: CrossAxisAlignment.stretch,
         children: [
-          Text('Новый профиль',
+          Text(t('new_profile'),
               style: Theme.of(context).textTheme.titleLarge),
           const SizedBox(height: 16),
           TextField(
@@ -1231,12 +1455,12 @@ class _AddProfileSheetState extends State<AddProfileSheet> {
             minLines: 1,
             maxLines: 3,
             decoration: InputDecoration(
-              labelText: 'citadel://-ссылка',
-              hintText: _canScan ? 'вставьте ссылку или отсканируйте QR' : 'вставьте ссылку или QR-данные',
+              labelText: t('link_label'),
+              hintText: _canScan ? t('link_hint_scan') : t('link_hint_paste'),
               border: const OutlineInputBorder(),
               suffixIcon: IconButton(
                 icon: const Icon(Icons.content_paste),
-                tooltip: 'Вставить из буфера',
+                tooltip: t('paste_from_clipboard'),
                 onPressed: _paste,
               ),
             ),
@@ -1247,7 +1471,7 @@ class _AddProfileSheetState extends State<AddProfileSheet> {
             OutlinedButton.icon(
               onPressed: _scanQr,
               icon: const Icon(Icons.qr_code_scanner),
-              label: const Text('Сканировать QR камерой'),
+              label: Text(t('scan_qr_camera')),
             ),
           ],
           if (_busy) ...[
@@ -1257,7 +1481,7 @@ class _AddProfileSheetState extends State<AddProfileSheet> {
                 const SizedBox(
                     height: 16, width: 16, child: CircularProgressIndicator(strokeWidth: 2)),
                 const SizedBox(width: 10),
-                Text('Проверяем ссылку…',
+                Text(t('checking_link'),
                     style: Theme.of(context).textTheme.bodyMedium),
               ],
             ),
@@ -1269,10 +1493,10 @@ class _AddProfileSheetState extends State<AddProfileSheet> {
             const SizedBox(height: 12),
             TextField(
               controller: _name,
-              decoration: const InputDecoration(
-                labelText: 'Имя профиля (необязательно)',
-                hintText: 'напр. exit-nl',
-                border: OutlineInputBorder(),
+              decoration: InputDecoration(
+                labelText: t('profile_name_optional'),
+                hintText: t('profile_name_hint'),
+                border: const OutlineInputBorder(),
               ),
             ),
           ],
@@ -1280,11 +1504,11 @@ class _AddProfileSheetState extends State<AddProfileSheet> {
           FilledButton.icon(
             onPressed: valid ? _submit : null,
             icon: const Icon(Icons.shield_outlined),
-            label: const Text('Подключить и сохранить'),
+            label: Text(t('connect_and_save')),
           ),
           const SizedBox(height: 4),
           Text(
-            'Профиль сохранится в зашифрованное хранилище после первого успешного подключения.',
+            t('add_profile_note'),
             style: Theme.of(context).textTheme.bodySmall,
             textAlign: TextAlign.center,
           ),
@@ -1301,20 +1525,20 @@ class _LinkPreview extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final cs = Theme.of(context).colorScheme;
+    final t = Strings.of(context);
     if (!summary.valid) {
       return Row(
         children: [
           Icon(Icons.error_outline, size: 18, color: cs.error),
           const SizedBox(width: 8),
-          Text('Ссылка не распознана',
-              style: TextStyle(color: cs.error)),
+          Text(t('link_invalid'), style: TextStyle(color: cs.error)),
         ],
       );
     }
     final feats = <String>[
-      if (summary.isAdmin) 'admin (мастер)',
+      if (summary.isAdmin) t('feat_admin_master'),
       if (summary.hasPqAuth) 'PQ-auth',
-      if (summary.hasObfs) 'обфускация',
+      if (summary.hasObfs) t('feat_obfs_full'),
       if (summary.hasPin) 'cert-pin',
       if (summary.kxSuite.isNotEmpty) 'KX: ${summary.kxSuite}',
     ];
@@ -1365,7 +1589,7 @@ class _LinkPreview extends StatelessWidget {
                   const SizedBox(width: 6),
                   Expanded(
                     child: Text(
-                      'Мастер-ссылка: даёт управление абонентами. Не передавайте её никому.',
+                      t('link_admin_warn'),
                       style: Theme.of(context)
                           .textTheme
                           .bodySmall

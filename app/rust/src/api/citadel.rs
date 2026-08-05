@@ -82,6 +82,17 @@ pub struct QrDto {
     pub cells: Vec<u8>,
 }
 
+/// Счётчики трафика туннеля в байтах полезной нагрузки, монотонные за время жизни процесса
+/// (см. [`traffic_counters`]). UI считает по ним текущую скорость приёма/передачи.
+///
+/// Тип `i64`, а не `u64`: на Dart-стороне `u64` превращается в `BigInt` (арифметика дельт стала бы
+/// неоправданно громоздкой), тогда как `i64` — обычное целое. Переполнения не будет: 2^63 байт —
+/// это 9 эксабайт трафика за один запуск приложения.
+pub struct TrafficDto {
+    pub rx_bytes: i64,
+    pub tx_bytes: i64,
+}
+
 /// Снимок статуса живой Android-сессии для UI при перезапуске (нюанс 2: натив переживает смерть
 /// Activity, Dart — нет). `state`: `idle`|`connecting`|`up`|`migrating`|`down`; `profile_id` — ""
 /// если коннект по сырой ссылке.
@@ -249,6 +260,93 @@ pub fn screenshot_block_enabled() -> bool {
         }
     }
     SCREENSHOT_BLOCK.load(Relaxed)
+}
+
+// ─────────────────────────── язык интерфейса ───────────────────────────
+// Выбор пользователя хранится там же, где остальные настройки клиента (файл рядом с vault): язык
+// нужен ДО открытия хранилища (экран разблокировки уже говорит с человеком), поэтому класть его
+// внутрь зашифрованного vault нельзя. Сами строки живут в Dart (`app/lib/l10n`), ядро хранит только
+// код языка. Дефолт — русский.
+
+/// Код языка ограничиваем по форме (2–8 символов ASCII-букв/дефис): значение приходит из UI, но
+/// пишется в файл и потом читается обратно — принимать оттуда произвольную строку незачем.
+fn valid_lang(code: &str) -> bool {
+    let n = code.len();
+    (2..=8).contains(&n)
+        && code.chars().all(|c| c.is_ascii_alphabetic() || c == '-')
+}
+
+fn language_file() -> PathBuf {
+    vault_path().with_file_name("language")
+}
+
+/// Сохранить выбранный язык интерфейса (код вида `ru`, `en`, …) — переживает рестарт.
+#[frb(sync)]
+pub fn set_language(code: String) {
+    if !valid_lang(&code) {
+        return;
+    }
+    let f = language_file();
+    if let Some(d) = f.parent() {
+        let _ = std::fs::create_dir_all(d);
+    }
+    let _ = std::fs::write(f, &code);
+}
+
+/// Сохранённый язык интерфейса; файла нет или содержимое непохоже на код языка → `ru`.
+#[frb(sync)]
+pub fn language() -> String {
+    match std::fs::read_to_string(language_file()) {
+        Ok(s) if valid_lang(s.trim()) => s.trim().to_string(),
+        _ => "ru".to_string(),
+    }
+}
+
+// ─────────────────────────── индикация трафика (скорость на плашке подключения) ───────────────
+// Тумблер «Показывать индикацию трафика» + снимок счётчиков туннеля. Персист рядом с vault (как
+// debug/screenshot_block); **дефолт ВЫКЛЮЧЕН** — цифры скорости на главном экране нужны не всем, а
+// лишний опрос раз в секунду и лишняя строка на скриншоте по умолчанию ни к чему.
+
+static TRAFFIC_METER: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static TRAFFIC_METER_LOADED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+fn traffic_meter_file() -> PathBuf {
+    vault_path().with_file_name("traffic_meter")
+}
+
+/// Сохранить настройку индикации трафика (GUI-тумблер) — переживает рестарт.
+#[frb(sync)]
+pub fn set_traffic_meter(on: bool) {
+    use std::sync::atomic::Ordering::Relaxed;
+    TRAFFIC_METER.store(on, Relaxed);
+    TRAFFIC_METER_LOADED.store(true, Relaxed);
+    let f = traffic_meter_file();
+    if let Some(d) = f.parent() {
+        let _ = std::fs::create_dir_all(d);
+    }
+    let _ = std::fs::write(f, if on { "1" } else { "0" });
+}
+
+/// Сохранённое состояние индикации трафика (инициализация тумблера). Ленивая подгрузка; файла нет
+/// → **дефолт false** (выключено).
+#[frb(sync)]
+pub fn traffic_meter_enabled() -> bool {
+    use std::sync::atomic::Ordering::Relaxed;
+    if !TRAFFIC_METER_LOADED.swap(true, Relaxed) {
+        if let Ok(s) = std::fs::read_to_string(traffic_meter_file()) {
+            TRAFFIC_METER.store(s.trim() == "1", Relaxed);
+        }
+    }
+    TRAFFIC_METER.load(Relaxed)
+}
+
+/// Снимок счётчиков трафика туннеля (монотонных за время жизни процесса) для расчёта СКОРОСТИ:
+/// UI делит дельту между двумя опросами на прошедшее время. Итогов за сессию тут нет намеренно —
+/// накапливать историю пользовательского трафика клиенту незачем.
+#[frb(sync)]
+pub fn traffic_counters() -> TrafficDto {
+    let (rx, tx) = citadel_client::traffic_bytes();
+    TrafficDto { rx_bytes: rx as i64, tx_bytes: tx as i64 }
 }
 
 // ─────────────────────────── C8.3 split-tunneling (Android) ───────────────────────────
@@ -665,12 +763,13 @@ pub fn vault_rename(id: String, name: String) -> Result<()> {
     g.as_mut().ok_or_else(|| anyhow!("Хранилище заблокировано"))?.rename(&id, &name)
 }
 
-/// Переместить профиль на одну позицию вверх (`up=true`) или вниз в списке. Порядок хранится в
-/// самом vault, поэтому переживает перезапуск и переносится вместе с хранилищем.
+/// Переставить профиль на позицию `index` (перетаскивание в списке профилей). Порядок хранится в
+/// самом vault, поэтому переживает перезапуск и переносится вместе с хранилищем. Индекс за границей
+/// списка ядро прижимает к последней позиции.
 #[frb(sync)]
-pub fn vault_move(id: String, up: bool) -> Result<()> {
+pub fn vault_move_to(id: String, index: u32) -> Result<()> {
     let mut g = VAULT.lock().unwrap();
-    g.as_mut().ok_or_else(|| anyhow!("Хранилище заблокировано"))?.move_profile(&id, up)
+    g.as_mut().ok_or_else(|| anyhow!("Хранилище заблокировано"))?.move_to(&id, index as usize)
 }
 
 /// Предел длины имени профиля из ядра — чтобы поле ввода в UI ограничивало ровно тем же числом,
@@ -1226,6 +1325,19 @@ pub fn run_diagnostics(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Код языка приходит из UI, но попадает в файл настроек и читается обратно — поэтому форма
+    /// проверяется на входе. Пропускаем только то, что бывает кодом языка; всё остальное (пути,
+    /// переводы строки, кириллица, пустое) отвергаем, а чтение непонятного файла даёт русский.
+    #[test]
+    fn language_code_shape_is_validated() {
+        for ok in ["ru", "en", "pt-BR", "zh"] {
+            assert!(valid_lang(ok), "{ok} — допустимый код языка");
+        }
+        for bad in ["", "r", "../etc/passwd", "ru\n", "ру", "en_US", "toolongcode"] {
+            assert!(!valid_lang(bad), "{bad:?} не должен приниматься как код языка");
+        }
+    }
 
     /// Замок хранилища и жизнь туннеля — независимые вещи, и это должно оставаться правдой на
     /// ВСЕХ клиентах (общий Dart-слой + это ядро): «Заблокировать хранилище» убирает профили с

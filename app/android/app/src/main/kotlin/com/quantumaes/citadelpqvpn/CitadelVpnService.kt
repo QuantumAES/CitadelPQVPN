@@ -42,10 +42,29 @@ class CitadelVpnService : VpnService() {
         // Тексты постоянной нотификации по состоянию сессии. Она — единственное, что видно о VPN
         // при закрытом окне, поэтому «туннель активен» в ней должно означать ровно то, что сказано:
         // при пропаже сети движок уходит в переподключение, и нотификация обязана это показать.
-        const val STATUS_UP = "Постквантовый туннель активен"
-        const val STATUS_CONNECTING = "Подключение…"
-        const val STATUS_RECONNECTING = "Нет соединения — восстанавливаю"
-        const val STATUS_DOWN = "Туннель не активен"
+        //
+        // Язык берём из ПРИЛОЖЕНИЯ, а не из системной локали: язык интерфейса выбирает пользователь
+        // (настройка хранится ядром), и нотификация — часть того же интерфейса; ресурсы `values-xx`
+        // здесь дали бы расхождение «в приложении один язык, в шторке другой». Dart присылает
+        // переводы через MethodChannel (`setNotifStrings`) при старте и при смене языка; значения по
+        // умолчанию — русские, они же используются, если сервис поднялся раньше Dart.
+        @Volatile
+        var STATUS_UP = "Постквантовый туннель активен"
+        @Volatile
+        var STATUS_CONNECTING = "Подключение…"
+        @Volatile
+        var STATUS_RECONNECTING = "Нет соединения — восстанавливаю"
+        @Volatile
+        var STATUS_DOWN = "Туннель не активен"
+
+        /** Обновить тексты нотификации (Dart → MethodChannel) и перерисовать её, если сервис жив. */
+        fun setNotifStrings(up: String, connecting: String, reconnecting: String, down: String) {
+            STATUS_UP = up
+            STATUS_CONNECTING = connecting
+            STATUS_RECONNECTING = reconnecting
+            STATUS_DOWN = down
+            instance?.refreshNotif()
+        }
 
         init {
             // та же .so, что грузит Flutter/frb; нужна, чтобы резолвились JNI-методы native*
@@ -80,6 +99,9 @@ class CitadelVpnService : VpnService() {
     // Текст последней foreground-нотификации — чтобы не дёргать NotificationManager вхолостую.
     @Volatile
     private var statusText: String = STATUS_CONNECTING
+    // Последнее состояние движка (не текст): по нему пересобираем нотификацию при смене языка.
+    @Volatile
+    private var lastState: String = "connecting"
 
     override fun onCreate() {
         super.onCreate()
@@ -441,6 +463,7 @@ class CitadelVpnService : VpnService() {
      * NotificationManager потокобезопасен, поэтому вызов из tokio-потока движка допустим.
      */
     fun setStatus(state: String) {
+        lastState = state
         val text = when (state) {
             "up" -> STATUS_UP
             "connecting" -> STATUS_CONNECTING
@@ -454,5 +477,14 @@ class CitadelVpnService : VpnService() {
         } catch (e: Exception) {
             android.util.Log.w("CitadelVpn", "не обновить нотификацию: ${e.message}")
         }
+    }
+
+    /**
+     * Перерисовать нотификацию тем же состоянием, но новыми текстами (смена языка приложения).
+     * Состояние помним отдельно от текста: иначе после смены языка в шторке остался бы прежний.
+     */
+    fun refreshNotif() {
+        statusText = "" // сбросить дедупликацию: текст изменился, состояние — нет
+        setStatus(lastState)
     }
 }

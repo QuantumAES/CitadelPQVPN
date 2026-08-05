@@ -29,6 +29,21 @@ class AndroidVpn {
   static Future<void> setSecureFlag(bool on) =>
       _ch.invokeMethod('setSecureFlag', {'on': on});
 
+  /// Тексты постоянной нотификации VPN на языке ПРИЛОЖЕНИЯ (нотификация — тот же интерфейс, а
+  /// системная локаль устройства может быть другой). Зовётся на старте и при смене языка.
+  static Future<void> setNotifStrings({
+    required String up,
+    required String connecting,
+    required String reconnecting,
+    required String down,
+  }) =>
+      _ch.invokeMethod('setNotifStrings', {
+        'up': up,
+        'connecting': connecting,
+        'reconnecting': reconnecting,
+        'down': down,
+      });
+
   /// C8.3: список запускаемых приложений для split-tunnel picker'а. Каждый элемент — `(package, label)`.
   static Future<List<({String package, String label})>> listInstalledApps() async {
     final raw = await _ch.invokeMethod<List<dynamic>>('listInstalledApps') ?? const [];

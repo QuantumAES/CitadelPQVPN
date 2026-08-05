@@ -376,23 +376,27 @@ impl Vault {
         self.save()
     }
 
-    /// Переместить профиль на одну позицию вверх/вниз. Порядок профилей в файле — и есть порядок
-    /// списка в UI (отдельного поля сортировки нет: список короткий, а ручной порядок должен
-    /// переживать перезапуск и смену устройства вместе с хранилищем). На краю списка — no-op.
-    pub fn move_profile(&mut self, id: &str, up: bool) -> Result<()> {
-        let i = self
+    /// Переставить профиль на позицию `to` (индекс в списке после перемещения). Порядок профилей в
+    /// файле — и есть порядок списка в UI (отдельного поля сортировки нет: список короткий, а ручной
+    /// порядок должен переживать перезапуск и смену устройства вместе с хранилищем).
+    ///
+    /// Перенос, а не обмен соседей: интерфейс переставляет профиль перетаскиванием сразу на нужное
+    /// место, и промежуточные состояния (N записей файла на один жест) хранилищу не нужны. Индекс
+    /// за границей списка прижимается к последней позиции — так UI не обязан знать длину списка;
+    /// перемещение «на своё же место» — no-op без перезаписи файла.
+    pub fn move_to(&mut self, id: &str, to: usize) -> Result<()> {
+        let from = self
             .data
             .profiles
             .iter()
             .position(|p| p.id == id)
             .ok_or_else(|| anyhow!("профиль не найден: {id}"))?;
-        let j = if up {
-            i.checked_sub(1)
-        } else {
-            (i + 1 < self.data.profiles.len()).then_some(i + 1)
-        };
-        let Some(j) = j else { return Ok(()) };
-        self.data.profiles.swap(i, j);
+        let to = to.min(self.data.profiles.len().saturating_sub(1));
+        if from == to {
+            return Ok(());
+        }
+        let p = self.data.profiles.remove(from);
+        self.data.profiles.insert(to, p);
         self.save()
     }
 
@@ -939,10 +943,11 @@ mod tests {
         std::fs::remove_file(&path).ok();
     }
 
-    /// Порядок профилей = порядок в файле: перемещение вверх/вниз переживает переоткрытие,
-    /// на краях списка — молчаливый no-op (кнопка в UI просто не даёт эффекта, а не ломается).
+    /// Порядок профилей = порядок в файле: перенос на произвольную позицию (перетаскивание в UI)
+    /// переживает переоткрытие, индекс за границей прижимается к концу, перенос на своё же место —
+    /// молчаливый no-op (жест, не сдвинувший профиль, не должен переписывать хранилище).
     #[test]
-    fn move_profile_reorders_and_persists() {
+    fn move_to_reorders_and_persists() {
         let path = tmp_path("reorder");
         let uri = sample_uri();
         let (a, b, c) = {
@@ -950,14 +955,18 @@ mod tests {
             let a = v.add("a", &uri).unwrap().id;
             let b = v.add("b", &uri).unwrap().id;
             let c = v.add("c", &uri).unwrap().id;
-            v.move_profile(&c, true).unwrap(); // c вверх → a, c, b
+            v.move_to(&c, 1).unwrap(); // c на 2-е место → a, c, b
             assert_eq!(names(&v), vec!["a", "c", "b"]);
-            v.move_profile(&a, false).unwrap(); // a вниз → c, a, b
+            v.move_to(&a, 1).unwrap(); // a на 2-е место → c, a, b
             assert_eq!(names(&v), vec!["c", "a", "b"]);
-            v.move_profile(&c, true).unwrap(); // уже первый — no-op
-            v.move_profile(&b, false).unwrap(); // уже последний — no-op
+            v.move_to(&c, 0).unwrap(); // уже первый — no-op
+            v.move_to(&b, 99).unwrap(); // за границей → прижать к последней позиции (уже там)
             assert_eq!(names(&v), vec!["c", "a", "b"]);
-            assert!(v.move_profile("нет-такого", true).is_err());
+            v.move_to(&b, 0).unwrap(); // с конца в начало через весь список → b, c, a
+            assert_eq!(names(&v), vec!["b", "c", "a"]);
+            v.move_to(&b, 2).unwrap(); // обратно в конец → c, a, b
+            assert_eq!(names(&v), vec!["c", "a", "b"]);
+            assert!(v.move_to("нет-такого", 0).is_err());
             (a, b, c)
         };
         let v = Vault::open(&path, "reorderpass1").unwrap();

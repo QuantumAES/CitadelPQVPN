@@ -89,6 +89,9 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   SubscriberDto dco_decode_subscriber_dto(dynamic raw);
 
   @protected
+  TrafficDto dco_decode_traffic_dto(dynamic raw);
+
+  @protected
   int dco_decode_u_32(dynamic raw);
 
   @protected
@@ -172,6 +175,9 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
 
   @protected
   SubscriberDto sse_decode_subscriber_dto(SseDeserializer deserializer);
+
+  @protected
+  TrafficDto sse_decode_traffic_dto(SseDeserializer deserializer);
 
   @protected
   int sse_decode_u_32(SseDeserializer deserializer);
@@ -283,6 +289,9 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
 
   @protected
   void sse_encode_subscriber_dto(SubscriberDto self, SseSerializer serializer);
+
+  @protected
+  void sse_encode_traffic_dto(TrafficDto self, SseSerializer serializer);
 
   @protected
   void sse_encode_u_32(int self, SseSerializer serializer);

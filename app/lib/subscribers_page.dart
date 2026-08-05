@@ -3,6 +3,7 @@ import 'package:flutter/services.dart';
 
 import 'package:app/app_state.dart';
 import 'package:app/errors.dart';
+import 'package:app/l10n/strings.dart';
 import 'package:app/src/rust/api/admin.dart';
 import 'package:app/src/rust/api/citadel.dart';
 
@@ -25,6 +26,9 @@ class _SubscribersPageState extends State<SubscribersPage> {
   String? _error;
 
   AppState get s => widget.state;
+
+  /// Строки текущего языка.
+  Strings get t => Strings.of(context);
 
   /// Туннель этого профиля поднят (admin-канал достижим).
   bool get _sessionUp =>
@@ -69,7 +73,7 @@ class _SubscribersPageState extends State<SubscribersPage> {
           return await op();
         } catch (e) {
           if (attempt >= retries || !mounted) {
-            if (mounted) setState(() => _error = _short(humanError(e)));
+            if (mounted) setState(() => _error = _short(humanError(e, t)));
             return null;
           }
           await Future.delayed(delay); // admin-путь после туннеля мог ещё не подняться
@@ -104,25 +108,25 @@ class _SubscribersPageState extends State<SubscribersPage> {
     final ok = await showDialog<bool>(
       context: context,
       builder: (dctx) => AlertDialog(
-        title: const Text('Выдать доступ'),
+        title: Text(t('issue_access')),
         content: Column(
           mainAxisSize: MainAxisSize.min,
           children: [
             TextField(
               controller: labelC,
               autofocus: true,
-              decoration: const InputDecoration(
-                labelText: 'Метка (кому)',
-                hintText: 'напр. «телефон Али»',
-                helperText: 'хранится только на этом устройстве',
+              decoration: InputDecoration(
+                labelText: t('issue_label'),
+                hintText: t('issue_label_hint'),
+                helperText: t('issue_label_helper'),
               ),
             ),
             const SizedBox(height: 12),
             TextField(
               controller: vuC,
-              decoration: const InputDecoration(
-                labelText: 'Срок (необязательно)',
-                hintText: '+30d · +12h · unix · пусто = +365d',
+              decoration: InputDecoration(
+                labelText: t('issue_valid_until'),
+                hintText: t('issue_valid_until_hint'),
               ),
             ),
           ],
@@ -130,10 +134,10 @@ class _SubscribersPageState extends State<SubscribersPage> {
         actions: [
           TextButton(
               onPressed: () => Navigator.pop(dctx, false),
-              child: const Text('Отмена')),
+              child: Text(t('cancel'))),
           FilledButton(
               onPressed: () => Navigator.pop(dctx, true),
-              child: const Text('Выдать')),
+              child: Text(t('issue'))),
         ],
       ),
     );
@@ -177,7 +181,9 @@ class _SubscribersPageState extends State<SubscribersPage> {
             crossAxisAlignment: CrossAxisAlignment.stretch,
             children: [
               Text(
-                label.isEmpty ? 'Доступ выдан' : 'Доступ выдан: $label',
+                label.isEmpty
+                    ? t('issued_title')
+                    : t('issued_title_named', {'label': label}),
                 style: Theme.of(sheetCtx).textTheme.titleLarge,
                 textAlign: TextAlign.center,
               ),
@@ -199,15 +205,14 @@ class _SubscribersPageState extends State<SubscribersPage> {
                 onPressed: () {
                   Clipboard.setData(ClipboardData(text: issued.uri));
                   ScaffoldMessenger.of(sheetCtx).showSnackBar(
-                      const SnackBar(content: Text('Ссылка скопирована')));
+                      SnackBar(content: Text(t('link_copied'))));
                 },
                 icon: const Icon(Icons.copy),
-                label: const Text('Скопировать ссылку'),
+                label: Text(t('copy_link')),
               ),
               const SizedBox(height: 8),
               Text(
-                'Передайте ссылку абоненту сейчас (QR или защищённый канал). '
-                'Повторно получить её нельзя: секрет абонента на этом устройстве не хранится.',
+                t('issued_note'),
                 style: Theme.of(sheetCtx).textTheme.bodySmall,
                 textAlign: TextAlign.center,
               ),
@@ -225,18 +230,17 @@ class _SubscribersPageState extends State<SubscribersPage> {
     final ok = await showDialog<bool>(
       context: context,
       builder: (dctx) => AlertDialog(
-        title: const Text('Отозвать доступ?'),
-        content: Text('Доступ $who будет отозван (status=revoked). '
-            'Действует со следующего подключения, ≤ длины эпохи.'),
+        title: Text(t('revoke_title')),
+        content: Text(t('revoke_body', {'who': who})),
         actions: [
           TextButton(
               onPressed: () => Navigator.pop(dctx, false),
-              child: const Text('Отмена')),
+              child: Text(t('cancel'))),
           FilledButton(
             style: FilledButton.styleFrom(
                 backgroundColor: Theme.of(dctx).colorScheme.error),
             onPressed: () => Navigator.pop(dctx, true),
-            child: const Text('Отозвать'),
+            child: Text(t('revoke')),
           ),
         ],
       ),
@@ -253,16 +257,16 @@ class _SubscribersPageState extends State<SubscribersPage> {
   Widget build(BuildContext context) {
     return Scaffold(
       appBar: AppBar(
-        title: Text('Абоненты · ${widget.profile.name}'),
+        title: Text(t('subscribers_title', {'name': widget.profile.name})),
         actions: [
           // #5.4: «Выдать доступ» — в AppBar (как «Добавить профиль» на главном), не плавающей кнопкой.
           IconButton(
-            tooltip: 'Выдать доступ',
+            tooltip: t('issue_access'),
             onPressed: _busy || !_sessionUp ? null : _issueDialog,
             icon: const Icon(Icons.person_add_alt),
           ),
           IconButton(
-            tooltip: 'Обновить',
+            tooltip: t('refresh'),
             onPressed: _busy || !_sessionUp ? null : _refresh,
             icon: const Icon(Icons.refresh),
           ),
@@ -304,12 +308,11 @@ class _SubscribersPageState extends State<SubscribersPage> {
           children: [
             Icon(Icons.vpn_lock, size: 56, color: cs.outline),
             const SizedBox(height: 16),
-            Text('Нужна активная сессия',
+            Text(t('need_session'),
                 style: Theme.of(context).textTheme.titleMedium),
             const SizedBox(height: 4),
             Text(
-              'Управление абонентами идёт по admin-каналу внутри туннеля. '
-              'Подключитесь к «${widget.profile.name}», чтобы продолжить.',
+              t('need_session_body', {'name': widget.profile.name}),
               textAlign: TextAlign.center,
               style: Theme.of(context)
                   .textTheme
@@ -326,7 +329,7 @@ class _SubscribersPageState extends State<SubscribersPage> {
                       height: 16,
                       child: CircularProgressIndicator(strokeWidth: 2))
                   : const Icon(Icons.shield_outlined),
-              label: Text(connecting ? 'Подключение…' : 'Подключить'),
+              label: Text(connecting ? t('status_connecting') : t('connect')),
             ),
           ],
         ),
@@ -336,16 +339,15 @@ class _SubscribersPageState extends State<SubscribersPage> {
 
   Widget _list() {
     if (_entries == null) {
-      return const Center(
+      return Center(
         child: Padding(
-          padding: EdgeInsets.all(24),
-          child: Text('Загрузка реестра…', textAlign: TextAlign.center),
+          padding: const EdgeInsets.all(24),
+          child: Text(t('registry_loading'), textAlign: TextAlign.center),
         ),
       );
     }
     if (_entries!.isEmpty) {
-      return const Center(
-          child: Text('Реестр пуст — выдайте первый доступ.'));
+      return Center(child: Text(t('registry_empty')));
     }
     return ListView.separated(
       itemCount: _entries!.length,
@@ -366,12 +368,12 @@ class _SubscribersPageState extends State<SubscribersPage> {
               : Text(e.label, maxLines: 1, overflow: TextOverflow.ellipsis),
           subtitle: Text(
             '${e.label.isEmpty ? '' : '${_shortId(e.clientIdHex)} · '}'
-            '${e.status}${expired ? ' · истёк' : ''}'
-            ' · до ${_fmtDate(e.validUntilUnix.toInt())}',
+            '${e.status}${expired ? ' · ${t('entry_expired')}' : ''}'
+            ' · ${t('entry_until', {'date': _fmtDate(e.validUntilUnix.toInt())})}',
           ),
           trailing: e.active
               ? IconButton(
-                  tooltip: 'Отозвать',
+                  tooltip: t('revoke'),
                   icon: const Icon(Icons.block),
                   onPressed: _busy ? null : () => _revoke(e),
                 )
@@ -379,7 +381,7 @@ class _SubscribersPageState extends State<SubscribersPage> {
           onTap: () {
             Clipboard.setData(ClipboardData(text: e.clientIdHex));
             ScaffoldMessenger.of(context).showSnackBar(
-                const SnackBar(content: Text('client_id скопирован')));
+                SnackBar(content: Text(t('client_id_copied'))));
           },
         );
       },

@@ -1,6 +1,7 @@
 import 'dart:io' show Platform;
 
 import 'package:flutter/material.dart';
+import 'package:flutter_localizations/flutter_localizations.dart';
 import 'package:path_provider/path_provider.dart';
 import 'package:window_manager/window_manager.dart';
 
@@ -8,6 +9,7 @@ import 'package:app/app_state.dart';
 import 'package:app/errors.dart';
 import 'package:app/format.dart';
 import 'package:app/home_page.dart';
+import 'package:app/l10n/strings.dart';
 import 'package:app/locked_session_banner.dart';
 import 'package:app/windows_tray.dart';
 import 'package:app/src/rust/api/citadel.dart';
@@ -92,6 +94,10 @@ class _CitadelAppState extends State<CitadelApp> with WindowListener {
   final AppState state = AppState();
   final GlobalKey<NavigatorState> _navKey = GlobalKey<NavigatorState>();
 
+  /// Язык, на котором сейчас построено меню трея (нативное меню живёт вне дерева виджетов и само
+  /// на смену языка не перестроится).
+  String? _trayLang;
+
   @override
   void initState() {
     super.initState();
@@ -104,6 +110,7 @@ class _CitadelAppState extends State<CitadelApp> with WindowListener {
           onOpen: _showFromTray,
           onDisconnect: state.disconnect,
           onExit: _quitApp,
+          t: Strings.forCode(state.lang),
         );
         state.addListener(_syncTray);
         _syncTray();
@@ -126,18 +133,37 @@ class _CitadelAppState extends State<CitadelApp> with WindowListener {
   /// Отразить состояние туннеля в трее: цвет точки-бейджа на значке + tooltip + видимость пункта
   /// «Отключить». Так состояние читается у свёрнутого приложения, без его открытия.
   void _syncTray() {
+    // Строки трея берём без BuildContext: этот State живёт НАД MaterialApp, `Localizations` здесь
+    // ещё нет — язык спрашиваем у состояния приложения напрямую.
+    final t = Strings.forCode(state.lang);
+    // Язык мог смениться — тогда пересобираем и подписи меню (тултип обновится ниже вместе с фазой).
+    if (state.lang != _trayLang) {
+      _trayLang = state.lang;
+      WindowsTray.setMenuLabels(t);
+    }
     final (phase, tip) = switch (state.phase) {
       // Узел выхода — без порта, как и на главном экране (см. format.dart).
-      VpnPhase.up => ('up', 'CitadelPQVPN — туннель активен${state.exit.isEmpty ? '' : ' (${hostOnly(state.exit)})'}'),
-      VpnPhase.connecting => ('connecting', 'CitadelPQVPN — подключение…'),
+      VpnPhase.up => (
+          'up',
+          state.exit.isEmpty
+              ? t('tray_up')
+              : t('tray_up_at', {'exit': hostOnly(state.exit)})
+        ),
+      VpnPhase.connecting => ('connecting', t('tray_connecting')),
       VpnPhase.error => (
           'error',
           [
-            'CitadelPQVPN — ${state.errorTitle.isEmpty ? 'сервер недоступен' : state.errorTitle.toLowerCase()}',
+            // errorTitle — КЛЮЧ строки (AppState._classify), а не готовый текст: переводим здесь.
+            t('tray_error', {
+              'reason': t(state.errorTitle.isEmpty
+                      ? 'err_server_unreachable'
+                      : state.errorTitle)
+                  .toLowerCase(),
+            }),
             if (state.activeProfileName.isNotEmpty) '(${state.activeProfileName})',
           ].join(' ')
         ),
-      VpnPhase.off => ('off', 'CitadelPQVPN — туннель выключен'),
+      VpnPhase.off => ('off', t('tray_off')),
     };
     WindowsTray.setPhase(phase, tooltip: tip);
   }
@@ -193,19 +219,19 @@ class _CitadelAppState extends State<CitadelApp> with WindowListener {
       return;
     }
     // Сюда попадают только платформы без трея (Linux/macOS): «в фоне» = свернуть в панель задач.
+    final t = Strings.of(ctx);
     final choice = await showDialog<String>(
       context: ctx,
       builder: (d) => AlertDialog(
-        title: const Text('Туннель активен'),
-        content: const Text(
-          'VPN подключён. Что сделать при закрытии окна?\n\n'
-          '• Оставить в фоне — окно свернётся, соединение продолжит работать.\n'
-          '• Отключить и выйти — разорвать туннель и закрыть приложение.',
-        ),
+        title: Text(t('tunnel_active')),
+        content: Text(t('close_window_body')),
         actions: [
-          TextButton(onPressed: () => Navigator.pop(d, 'cancel'), child: const Text('Отмена')),
-          TextButton(onPressed: () => Navigator.pop(d, 'background'), child: const Text('Оставить в фоне')),
-          FilledButton(onPressed: () => Navigator.pop(d, 'quit'), child: const Text('Отключить и выйти')),
+          TextButton(onPressed: () => Navigator.pop(d, 'cancel'), child: Text(t('cancel'))),
+          TextButton(
+              onPressed: () => Navigator.pop(d, 'background'),
+              child: Text(t('close_background'))),
+          FilledButton(
+              onPressed: () => Navigator.pop(d, 'quit'), child: Text(t('close_quit'))),
         ],
       ),
     );
@@ -221,22 +247,31 @@ class _CitadelAppState extends State<CitadelApp> with WindowListener {
 
   @override
   Widget build(BuildContext context) {
-    return MaterialApp(
-      navigatorKey: _navKey,
-      title: 'CitadelPQVPN',
-      debugShowCheckedModeBanner: false,
-      theme: _theme(Brightness.light),
-      darkTheme: _theme(Brightness.dark),
-      themeMode: ThemeMode.system,
-      home: AnimatedBuilder(
-        animation: state,
-        builder: (context, _) {
-          // Gate: если хранилище есть, но не разблокировано — экран ввода пароля.
-          if (state.hasVault && !state.unlocked) {
-            return UnlockScreen(state: state);
-          }
-          return HomePage(state: state);
-        },
+    // AnimatedBuilder обнимает ВЕСЬ MaterialApp, а не только `home`: смена языка меняет `locale`
+    // самого приложения (и переводы Material-виджетов), а не только наши строки.
+    return AnimatedBuilder(
+      animation: state,
+      builder: (context, _) => MaterialApp(
+        navigatorKey: _navKey,
+        title: 'CitadelPQVPN',
+        debugShowCheckedModeBanner: false,
+        theme: _theme(Brightness.light),
+        darkTheme: _theme(Brightness.dark),
+        themeMode: ThemeMode.system,
+        // Язык выбирает пользователь (настройка хранится ядром), а не система: VPN-клиент часто
+        // ставят на чужом/рабочем устройстве с непонятной локалью, и «как в системе» там не помощь.
+        locale: Locale(state.lang),
+        supportedLocales: kSupportedLocales,
+        localizationsDelegates: const [
+          StringsDelegate(),
+          GlobalMaterialLocalizations.delegate,
+          GlobalWidgetsLocalizations.delegate,
+          GlobalCupertinoLocalizations.delegate,
+        ],
+        // Gate: если хранилище есть, но не разблокировано — экран ввода пароля.
+        home: state.hasVault && !state.unlocked
+            ? UnlockScreen(state: state)
+            : HomePage(state: state),
       ),
     );
   }
@@ -283,6 +318,7 @@ class _UnlockScreenState extends State<UnlockScreen> {
   @override
   Widget build(BuildContext context) {
     final cs = Theme.of(context).colorScheme;
+    final t = Strings.of(context);
     return Scaffold(
       body: Center(
         child: ConstrainedBox(
@@ -302,7 +338,7 @@ class _UnlockScreenState extends State<UnlockScreen> {
                     textAlign: TextAlign.center,
                     style: Theme.of(context).textTheme.headlineSmall),
                 const SizedBox(height: 4),
-                Text('Хранилище профилей заблокировано',
+                Text(t('vault_locked'),
                     textAlign: TextAlign.center,
                     style: Theme.of(context)
                         .textTheme
@@ -322,10 +358,10 @@ class _UnlockScreenState extends State<UnlockScreen> {
                   autofocus: true,
                   obscureText: true,
                   onSubmitted: (_) => _submit(),
-                  decoration: const InputDecoration(
-                    labelText: 'Мастер-пароль',
-                    prefixIcon: Icon(Icons.key_outlined),
-                    border: OutlineInputBorder(),
+                  decoration: InputDecoration(
+                    labelText: t('master_password'),
+                    prefixIcon: const Icon(Icons.key_outlined),
+                    border: const OutlineInputBorder(),
                   ),
                 ),
                 if (_error != null) ...[
@@ -340,7 +376,7 @@ class _UnlockScreenState extends State<UnlockScreen> {
                           height: 20,
                           width: 20,
                           child: CircularProgressIndicator(strokeWidth: 2))
-                      : const Text('Разблокировать'),
+                      : Text(t('unlock')),
                 ),
               ],
             ),

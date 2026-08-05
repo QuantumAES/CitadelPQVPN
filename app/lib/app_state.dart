@@ -4,6 +4,7 @@ import 'dart:io';
 import 'package:flutter/foundation.dart';
 
 import 'package:app/android_vpn.dart';
+import 'package:app/l10n/strings.dart';
 import 'package:app/src/rust/api/citadel.dart';
 
 /// Человекочитаемая фаза подключения (UI ветвится по ней, не по сырым строкам ядра).
@@ -42,6 +43,42 @@ class AppState extends ChangeNotifier {
     notifyListeners();
   }
 
+  /// Язык интерфейса (код `ru`, `en`, …). Хранится ядром рядом с vault, а не внутри него: экран
+  /// разблокировки уже говорит с человеком, а хранилище на тот момент закрыто. Дефолт — русский.
+  String lang = language();
+
+  void setLang(String code) {
+    if (code == lang) return;
+    lang = code;
+    setLanguage(code: code);
+    _pushNotifStrings();
+    notifyListeners();
+  }
+
+  /// Отдать Android'у тексты постоянной нотификации на языке ПРИЛОЖЕНИЯ. Нотификация — часть того
+  /// же интерфейса (при закрытом окне — единственная его видимая часть), а системная локаль
+  /// устройства может быть другой, поэтому строки идут отсюда, а не из ресурсов `values-xx`.
+  void _pushNotifStrings() {
+    if (!Platform.isAndroid) return;
+    final t = Strings.forCode(lang);
+    AndroidVpn.setNotifStrings(
+      up: t('notif_up'),
+      connecting: t('notif_connecting'),
+      reconnecting: t('notif_reconnecting'),
+      down: t('notif_down'),
+    );
+  }
+
+  /// Индикация трафика: показывать текущую скорость приёма/передачи на плашке подключения.
+  /// Персистится ядром рядом с vault; **дефолт выключен** (см. `traffic_meter_enabled` в ядре).
+  bool trafficMeter = trafficMeterEnabled();
+
+  void toggleTrafficMeter() {
+    trafficMeter = !trafficMeter;
+    setTrafficMeter(on_: trafficMeter);
+    notifyListeners();
+  }
+
   /// C8.5 запрет скриншотов/записи экрана (Android FLAG_SECURE). Персистится ядром рядом с vault;
   /// **дефолт включён** (файла нет → true). Флаг применяет платформа (Android); desktop не enforce'ит.
   bool screenshotBlock = screenshotBlockEnabled();
@@ -63,9 +100,10 @@ class AppState extends ChangeNotifier {
   /// (цепочка `{e:#}`), а человеку нужен итог. Полностью дублируется в журнал отладки.
   String errorMsg = '';
 
-  /// Заголовок отказа для человека («Сервер недоступен») и подсказка, что делать/куда смотреть.
+  /// КЛЮЧИ строк отказа: заголовок для человека («сервер недоступен») и подсказка, что делать.
   /// Разделены, потому что отказы бывают разные: недоступный сервер — это лог, а отсутствие
-  /// разрешения на VPN — действие пользователя, и путать их нельзя.
+  /// разрешения на VPN — действие пользователя, и путать их нельзя. Здесь именно ключи
+  /// локализации (см. [_classify]): текст собирает экран на языке, выбранном в момент отрисовки.
   String errorTitle = '';
   String errorHint = '';
 
@@ -104,6 +142,8 @@ class AppState extends ChangeNotifier {
     // C8.5: применить сохранённую настройку запрета скриншотов (onCreate уже поставил FLAG_SECURE
     // по умолчанию; здесь СНИМАЕМ, если пользователь выключил). Дефолт — запрет включён.
     if (Platform.isAndroid) AndroidVpn.setSecureFlag(screenshotBlock);
+    // Тексты нотификации VPN — на языке приложения (сервис мог пережить прошлый запуск с другим).
+    _pushNotifStrings();
     // C6/S3 (нюанс 2): новый изолят при перезапуске может застать ЖИВУЮ нативную сессию (loop
     // пережил закрытие окна, процесс держит foreground-сервис) — отразить её, а не показать «off».
     if (Platform.isAndroid) _restoreAndroidSession();
@@ -181,9 +221,10 @@ class AppState extends ChangeNotifier {
     refreshProfiles();
   }
 
-  /// Переместить профиль на позицию вверх/вниз (порядок живёт в хранилище).
-  void moveProfile(String id, {required bool up}) {
-    vaultMove(id: id, up: up);
+  /// Переставить профиль на позицию `index` (перетаскивание в списке). Порядок живёт в хранилище,
+  /// поэтому переживает перезапуск; ядро прижимает индекс за границей к концу списка.
+  void moveProfileTo(String id, int index) {
+    vaultMoveTo(id: id, index: index);
     refreshProfiles();
   }
 
@@ -234,7 +275,7 @@ class AppState extends ChangeNotifier {
 
     if (!await AndroidVpn.prepare()) {
       // Не «сервер недоступен»: пользователь не дал разрешение на VPN — это его действие.
-      _setError('Нет разрешения на VPN', 'разрешите подключение в системном диалоге',
+      _setError('err_no_vpn_permission', 'err_no_vpn_permission_hint',
           'VpnService.prepare отклонён пользователем');
       notifyListeners();
       return;
@@ -291,14 +332,18 @@ class AppState extends ChangeNotifier {
   /// выключённого режима отладки журнала попросту не существует, а совет «посмотрите в журнал»
   /// человеку, который хочет подключиться, ничего не даёт (полная цепочка причин пишется туда и
   /// так, когда режим включён).
+  ///
+  /// Возвращаем КЛЮЧИ строк, а не готовый текст: состояние живёт дольше одного кадра и не знает
+  /// про выбранный язык, а экран (`_StatusCard`) переводит их при отрисовке — так смена языка
+  /// перерисовывает и уже показанный отказ.
   static (String, String) _classify(String err) {
     if (err.contains('citadel-svc') || err.contains('CitadelPQVPN')) {
       if (err.contains('SERVICE_START') || err.contains('os error 5')) {
-        return ('Служба CitadelPQVPN не запущена', 'перезагрузите компьютер или переустановите приложение');
+        return ('err_service_not_started', 'err_service_not_started_hint');
       }
-      return ('Служба CitadelPQVPN недоступна', 'проверьте, что она установлена и запущена');
+      return ('err_service_unavailable', 'err_service_unavailable_hint');
     }
-    return ('Сервер недоступен', '');
+    return ('err_server_unreachable', '');
   }
 
   void _onState(String s) {

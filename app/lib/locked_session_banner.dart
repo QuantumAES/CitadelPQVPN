@@ -1,6 +1,7 @@
 import 'package:flutter/material.dart';
 
 import 'package:app/format.dart';
+import 'package:app/l10n/strings.dart';
 
 /// Плашка живой сессии на экране разблокировки хранилища.
 ///
@@ -36,6 +37,7 @@ class LockedSessionBanner extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     if (!busy) return const SizedBox.shrink();
+    final t = Strings.of(context);
     final dark = Theme.of(context).brightness == Brightness.dark;
     final bg = up
         ? (dark ? Colors.green.shade900 : Colors.green.shade50)
@@ -66,7 +68,7 @@ class LockedSessionBanner extends StatelessWidget {
               const SizedBox(width: 10),
               Expanded(
                 child: Text(
-                  up ? 'Туннель активен' : 'Подключение…',
+                  up ? t('tunnel_active') : t('status_connecting'),
                   style: Theme.of(context)
                       .textTheme
                       .titleSmall
@@ -87,7 +89,7 @@ class LockedSessionBanner extends StatelessWidget {
           FilledButton.tonalIcon(
             onPressed: onDisconnect,
             icon: const Icon(Icons.power_settings_new, size: 18),
-            label: const Text('Отключить'),
+            label: Text(t('disconnect')),
           ),
         ],
       ),
