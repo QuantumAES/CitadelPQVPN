@@ -54,6 +54,17 @@ class FlutterWindow : public Win32Window {
   // Применить фазу к уже добавленной иконке (иконка + tooltip); no-op, если трей не добавлен.
   void ApplyTrayPhase();
 
+  // ── C8.5 (Windows): запрет захвата окна ──
+  // Method-channel `citadel/window` (lib/windows_secure.dart): Dart → C++ `setSecure {on}`.
+  // Аналог Android FLAG_SECURE: SetWindowDisplayAffinity исключает окно из любого захвата
+  // экрана — скриншотов, записи, демонстрации И системных снимков Windows Recall на Copilot+ ПК.
+  void SetupWindowChannel();
+  // Включить/снять защиту от захвата. Возвращает false, если система её не дала (тогда Dart знает,
+  // что запрет не действует, и не показывает несуществующую гарантию).
+  bool ApplyCaptureGuard(bool on);
+
+  std::unique_ptr<flutter::MethodChannel<flutter::EncodableValue>> window_channel_;
+
   std::unique_ptr<flutter::MethodChannel<flutter::EncodableValue>> tray_channel_;
   NOTIFYICONDATAW tray_nid_{};
   bool tray_added_ = false;

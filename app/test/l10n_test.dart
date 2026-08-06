@@ -44,6 +44,17 @@ void main() {
     expect(kLangs.containsKey(kDefaultLang), isTrue);
   });
 
+  test('в списке выбора все языки помечены как beta', () {
+    for (final code in kLangs.keys) {
+      final label = langLabel(code);
+      expect(label, startsWith(kLangNames[code]!),
+          reason: 'название языка $code должно остаться на нём самом');
+      expect(label, endsWith(kLangBetaSuffix), reason: 'язык $code не помечен beta');
+    }
+    // Неизвестный код не должен ронять список — показываем сам код с той же пометкой.
+    expect(langLabel('xx'), 'xx$kLangBetaSuffix');
+  });
+
   test('все ключи, запрошенные интерфейсом, есть в эталоне', () {
     // Ищем обращения вида t('key') / Strings.of(ctx)('key') в исходниках приложения.
     final re = RegExp(r"""(?:\bt|\)\s*)\(\s*'([a-z0-9_]+)'""");

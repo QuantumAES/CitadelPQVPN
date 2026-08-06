@@ -88,7 +88,6 @@ const Map<String, String> langRu = {
   'profile_name': 'Имя профиля',
   'profile_renamed': 'Профиль переименован',
   'subscribers': 'Абоненты',
-  'reorder_hint': 'Порядок: удерживайте профиль и перетащите',
 
   // ── настройки ──
   'traffic_meter_title': 'Показывать индикацию трафика',

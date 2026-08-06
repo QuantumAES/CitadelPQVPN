@@ -71,7 +71,6 @@ const Map<String, String> langFr = {
   'profile_name': 'Nom du profil',
   'profile_renamed': 'Profil renommé',
   'subscribers': 'Abonnés',
-  'reorder_hint': 'Ordre : appuyez longuement sur un profil, puis faites-le glisser',
 
   'traffic_meter_title': 'Afficher le débit',
   'traffic_meter_sub': 'Débit actuel en réception et en envoi sur la carte de connexion',

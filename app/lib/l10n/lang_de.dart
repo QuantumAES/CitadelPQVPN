@@ -72,7 +72,6 @@ const Map<String, String> langDe = {
   'profile_name': 'Profilname',
   'profile_renamed': 'Profil umbenannt',
   'subscribers': 'Teilnehmer',
-  'reorder_hint': 'Reihenfolge: Profil gedrückt halten und ziehen',
 
   'traffic_meter_title': 'Datenrate anzeigen',
   'traffic_meter_sub': 'Aktuelle Empfangs- und Senderate auf der Verbindungskarte',

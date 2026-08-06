@@ -71,7 +71,6 @@ const Map<String, String> langMy = {
   'profile_name': 'ပရိုဖိုင် အမည်',
   'profile_renamed': 'ပရိုဖိုင် အမည်ပြောင်းပြီးပါပြီ',
   'subscribers': 'အသုံးပြုသူများ',
-  'reorder_hint': 'အစီအစဉ်− ပရိုဖိုင်ကို ဖိထားပြီး ဆွဲပါ',
 
   'traffic_meter_title': 'ဒေတာအသွားအလာ ပြရန်',
   'traffic_meter_sub': 'ချိတ်ဆက်မှုကတ်ပေါ်တွင် လက်ရှိ ဒေါင်းလုဒ်/အပ်လုဒ် အမြန်နှုန်း',

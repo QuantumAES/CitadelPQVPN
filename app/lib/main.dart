@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'dart:io' show Platform;
 
 import 'package:flutter/material.dart';
@@ -11,6 +12,7 @@ import 'package:app/format.dart';
 import 'package:app/home_page.dart';
 import 'package:app/l10n/strings.dart';
 import 'package:app/locked_session_banner.dart';
+import 'package:app/traffic.dart';
 import 'package:app/windows_tray.dart';
 import 'package:app/src/rust/api/citadel.dart';
 import 'package:app/src/rust/api/diag.dart';
@@ -291,6 +293,28 @@ class _UnlockScreenState extends State<UnlockScreen> {
   bool _busy = false;
   String? _error;
 
+  /// Индикация трафика на плашке живой сессии — тот же расчёт, что на главном экране
+  /// (`lib/traffic.dart`). Счётчики ядра к хранилищу отношения не имеют, поэтому под замком
+  /// доступны как обычно.
+  final _traffic = TrafficSampler();
+  Timer? _tick;
+
+  @override
+  void initState() {
+    super.initState();
+    _tick = Timer.periodic(const Duration(seconds: 1), (_) {
+      if (!mounted) return;
+      final live = widget.state.phase == VpnPhase.up;
+      if (!live || !widget.state.trafficMeter) {
+        _traffic.reset();
+        return;
+      }
+      final c = trafficCounters();
+      _traffic.sample(c.rxBytes.toInt(), c.txBytes.toInt(), DateTime.now());
+      setState(() {});
+    });
+  }
+
   Future<void> _submit() async {
     if (_pw.text.isEmpty) return;
     setState(() {
@@ -311,6 +335,7 @@ class _UnlockScreenState extends State<UnlockScreen> {
 
   @override
   void dispose() {
+    _tick?.cancel();
     _pw.dispose();
     super.dispose();
   }
@@ -350,6 +375,10 @@ class _UnlockScreenState extends State<UnlockScreen> {
                   busy: widget.state.isBusy,
                   up: widget.state.phase == VpnPhase.up,
                   exit: widget.state.exit,
+                  transport: widget.state.transport,
+                  trafficMeter: widget.state.trafficMeter,
+                  rxRate: _traffic.rxRate,
+                  txRate: _traffic.txRate,
                   onDisconnect: widget.state.disconnect,
                 ),
                 const SizedBox(height: 28),

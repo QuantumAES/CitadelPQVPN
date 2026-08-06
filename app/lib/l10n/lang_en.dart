@@ -71,7 +71,6 @@ const Map<String, String> langEn = {
   'profile_name': 'Profile name',
   'profile_renamed': 'Profile renamed',
   'subscribers': 'Subscribers',
-  'reorder_hint': 'Order: press and hold a profile, then drag',
 
   'traffic_meter_title': 'Show traffic indicator',
   'traffic_meter_sub': 'Current download and upload speed on the connection card',

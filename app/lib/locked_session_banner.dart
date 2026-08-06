@@ -2,6 +2,7 @@ import 'package:flutter/material.dart';
 
 import 'package:app/format.dart';
 import 'package:app/l10n/strings.dart';
+import 'package:app/traffic.dart';
 
 /// Плашка живой сессии на экране разблокировки хранилища.
 ///
@@ -10,6 +11,11 @@ import 'package:app/l10n/strings.dart';
 /// остальное, и без этой плашки работающий VPN оказывался невидимым и неуправляемым — со стороны
 /// это выглядело ровно как «туннель отвалился». Показываем состояние и даём отключить, не требуя
 /// сперва ввести мастер-пароль: отключение сессии секретов не касается.
+///
+/// Состав плашки — тот же, что у плашки на главном экране (`_StatusCard` в `home_page.dart`):
+/// строка «узел · транспорт» по центру и, если индикация трафика включена, текущая скорость.
+/// Замок хранилища прячет профили, а не состояние туннеля: два вида одной и той же сессии
+/// расходиться не должны.
 ///
 /// Виджет намеренно не знает про `AppState`: принимает снимок состояния значениями, поэтому
 /// проверяется обычным widget-тестом без нативного ядра (см. `app/test/locked_session_banner_test.dart`).
@@ -20,6 +26,10 @@ class LockedSessionBanner extends StatelessWidget {
     required this.up,
     required this.exit,
     required this.onDisconnect,
+    this.transport = '',
+    this.trafficMeter = false,
+    this.rxRate = 0,
+    this.txRate = 0,
   });
 
   /// Есть ли сессия, о которой стоит говорить (подключение или поднятый туннель).
@@ -30,6 +40,15 @@ class LockedSessionBanner extends StatelessWidget {
 
   /// Узел выхода как его знает движок (`host:port`); пусто — ещё не выбран.
   final String exit;
+
+  /// Транспорт сессии («QUIC/UDP» / «obfs-TCP»); пусто — ещё не установлена.
+  final String transport;
+
+  /// Показывать ли скорость (настройка «Индикация трафика», по умолчанию выключена).
+  final bool trafficMeter;
+
+  /// Текущая скорость приёма/передачи, байт/с (см. [TrafficSampler]).
+  final double rxRate, txRate;
 
   /// Отключить сессию (замок хранилища этого НЕ делает — только явное действие человека).
   final VoidCallback onDisconnect;
@@ -46,7 +65,10 @@ class LockedSessionBanner extends StatelessWidget {
         ? (dark ? Colors.green.shade200 : Colors.green.shade800)
         : (dark ? Colors.amber.shade200 : Colors.amber.shade900);
     // Узел выхода — без порта, как и на главном экране (см. format.dart).
-    final where = exit.isEmpty ? '' : hostOnly(exit);
+    final details = <String>[
+      if (exit.isNotEmpty) hostOnly(exit),
+      if (transport.isNotEmpty) transport,
+    ].join('  ·  ');
 
     return Container(
       margin: const EdgeInsets.only(top: 20),
@@ -77,13 +99,22 @@ class LockedSessionBanner extends StatelessWidget {
               ),
             ],
           ),
-          if (where.isNotEmpty) ...[
+          if (details.isNotEmpty) ...[
             const SizedBox(height: 4),
-            Text(where,
+            // По центру и тем же кеглем, что на главном экране: строка «узел · транспорт»
+            // относится ко всей плашке, а не к иконке слева, и не должна оказаться мельче строки
+            // скорости под ней.
+            Text(details,
+                textAlign: TextAlign.center,
                 style: Theme.of(context)
                     .textTheme
-                    .bodySmall
+                    .bodyMedium
                     ?.copyWith(color: fg.withValues(alpha: 0.9))),
+          ],
+          // Скорость — только на поднятом туннеле: на «подключении» цифры были бы нулями.
+          if (trafficMeter && up) ...[
+            const SizedBox(height: 8),
+            TrafficRow(rxRate: rxRate, txRate: txRate, fg: fg, t: t),
           ],
           const SizedBox(height: 10),
           FilledButton.tonalIcon(

@@ -9,6 +9,19 @@
 #include "flutter/generated_plugin_registrant.h"
 #include "resource.h"
 
+// C8.5 (Windows): константы аффинити отображения. Объявлены в winuser.h, но WDA_EXCLUDEFROMCAPTURE
+// добавили только в SDK 10.0.19041 — под старым SDK сборка иначе не пройдёт, а сам вызов рантайму
+// доступен по значению (проверку версии делает ядро Windows, а не заголовок).
+#ifndef WDA_NONE
+#define WDA_NONE 0x00000000
+#endif
+#ifndef WDA_MONITOR
+#define WDA_MONITOR 0x00000001
+#endif
+#ifndef WDA_EXCLUDEFROMCAPTURE
+#define WDA_EXCLUDEFROMCAPTURE 0x00000011
+#endif
+
 namespace {
 // #5.5 системный трей: сообщение-колбэк иконки, её UID и команды контекст-меню.
 constexpr UINT WM_CITADEL_TRAY = WM_APP + 1;
@@ -39,6 +52,12 @@ bool FlutterWindow::OnCreate() {
     return false;
   }
 
+  // C8.5: по умолчанию ЗАПРЕЩАЕМ захват окна — ставим здесь, до первого Show(), чтобы не осталось
+  // ни одного кадра, который успела бы снять система (на Copilot+ ПК Recall снимает экран сама, без
+  // участия пользователя). Dart снимет запрет, если он выключен в настройках, — как на Android,
+  // где FLAG_SECURE так же ставится в onCreate. Дефолт (настройки ещё не прочитаны) — защищено.
+  ApplyCaptureGuard(true);
+
   RECT frame = GetClientArea();
 
   // The size here must match the window dimensions to avoid unnecessary surface
@@ -50,7 +69,8 @@ bool FlutterWindow::OnCreate() {
     return false;
   }
   RegisterPlugins(flutter_controller_->engine());
-  SetupTrayChannel();  // #5.5: method-channel citadel/tray
+  SetupTrayChannel();    // #5.5: method-channel citadel/tray
+  SetupWindowChannel();  // C8.5: method-channel citadel/window
   SetChildContent(flutter_controller_->view()->GetNativeWindow());
 
   flutter_controller_->engine()->SetNextFrameCallback([&]() {
@@ -68,11 +88,58 @@ bool FlutterWindow::OnCreate() {
 void FlutterWindow::OnDestroy() {
   RemoveTrayIcon();     // #5.5: убрать иконку трея до сноса окна/движка
   tray_channel_ = nullptr;
+  window_channel_ = nullptr;
   if (flutter_controller_) {
     flutter_controller_ = nullptr;
   }
 
   Win32Window::OnDestroy();
+}
+
+// ── C8.5 (Windows): запрет захвата окна ──
+
+bool FlutterWindow::ApplyCaptureGuard(bool on) {
+  HWND hwnd = GetHandle();
+  if (!hwnd) return false;
+  if (!on) {
+    return SetWindowDisplayAffinity(hwnd, WDA_NONE) != FALSE;
+  }
+  // WDA_EXCLUDEFROMCAPTURE (Windows 10 2004 / build 19041 и новее) — окно просто отсутствует в
+  // захвате, а на самом экране видно как обычно. Именно это нужно на Copilot+ ПК: системные
+  // снимки Recall идут тем же путём, что запись экрана, и окно в них не попадёт.
+  if (SetWindowDisplayAffinity(hwnd, WDA_EXCLUDEFROMCAPTURE)) return true;
+  // Сборка старше 2004: значение не поддержано (ERROR_INVALID_PARAMETER). Откат на WDA_MONITOR —
+  // окно в захвате чёрное. Хуже по виду (в записи остаётся чёрный прямоугольник), но содержимое
+  // закрывает так же, поэтому молча деградировать до «не защищено» здесь нельзя.
+  return SetWindowDisplayAffinity(hwnd, WDA_MONITOR) != FALSE;
+}
+
+void FlutterWindow::SetupWindowChannel() {
+  window_channel_ =
+      std::make_unique<flutter::MethodChannel<flutter::EncodableValue>>(
+          flutter_controller_->engine()->messenger(), "citadel/window",
+          &flutter::StandardMethodCodec::GetInstance());
+  window_channel_->SetMethodCallHandler(
+      [this](const flutter::MethodCall<flutter::EncodableValue>& call,
+             std::unique_ptr<flutter::MethodResult<flutter::EncodableValue>>
+                 result) {
+        if (call.method_name() == "setSecure") {
+          // Аргумент {on: bool}. Отсутствующий/чужого типа — трактуем как «включить»: дефолт у
+          // защиты закрытый, ошибка в вызывающем не должна её снимать.
+          bool on = true;
+          if (const auto* args =
+                  std::get_if<flutter::EncodableMap>(call.arguments())) {
+            auto it = args->find(flutter::EncodableValue(std::string("on")));
+            if (it != args->end()) {
+              if (const auto* b = std::get_if<bool>(&it->second)) on = *b;
+            }
+          }
+          // Возвращаем ФАКТ применения: Dart по нему решает, можно ли обещать запрет человеку.
+          result->Success(flutter::EncodableValue(ApplyCaptureGuard(on)));
+        } else {
+          result->NotImplemented();
+        }
+      });
 }
 
 // ── #5.5 системный трей (Windows-native) ──

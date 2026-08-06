@@ -6,6 +6,7 @@ import 'package:flutter/foundation.dart';
 import 'package:app/android_vpn.dart';
 import 'package:app/l10n/strings.dart';
 import 'package:app/src/rust/api/citadel.dart';
+import 'package:app/windows_secure.dart';
 
 /// Человекочитаемая фаза подключения (UI ветвится по ней, не по сырым строкам ядра).
 enum VpnPhase { off, connecting, up, error }
@@ -79,15 +80,29 @@ class AppState extends ChangeNotifier {
     notifyListeners();
   }
 
-  /// C8.5 запрет скриншотов/записи экрана (Android FLAG_SECURE). Персистится ядром рядом с vault;
-  /// **дефолт включён** (файла нет → true). Флаг применяет платформа (Android); desktop не enforce'ит.
+  /// C8.5 запрет скриншотов/записи экрана. Персистится ядром рядом с vault; **дефолт включён**
+  /// (файла нет → true). Применяет платформа:
+  ///   * Android — `FLAG_SECURE` на окне Activity;
+  ///   * Windows — `SetWindowDisplayAffinity(WDA_EXCLUDEFROMCAPTURE)`; на Copilot+ ПК это
+  ///     единственное, что убирает окно из СИСТЕМНЫХ снимков экрана (Recall снимает сам, без
+  ///     участия пользователя, и складывает кадры в локальный индекс);
+  ///   * Linux — эквивалента нет (ни X11, ни Wayland такого не дают), настройка не показывается.
   bool screenshotBlock = screenshotBlockEnabled();
 
   void toggleScreenshotBlock() {
     screenshotBlock = !screenshotBlock;
     setScreenshotBlock(on_: screenshotBlock);
-    if (Platform.isAndroid) AndroidVpn.setSecureFlag(screenshotBlock);
+    _applyScreenshotBlock();
     notifyListeners();
+  }
+
+  /// Платформа, где запрет захвата экрана реально применяется (иначе тумблер обещал бы то, чего нет).
+  static bool get screenshotBlockSupported =>
+      Platform.isAndroid || WindowsSecure.supported;
+
+  void _applyScreenshotBlock() {
+    if (Platform.isAndroid) AndroidVpn.setSecureFlag(screenshotBlock);
+    if (WindowsSecure.supported) WindowsSecure.setSecure(screenshotBlock);
   }
 
   /// id сохранённого профиля в работе (null — «пробный» коннект ещё-не-сохранённой ссылки).
@@ -139,9 +154,11 @@ class AppState extends ChangeNotifier {
   bool get isBusy => phase == VpnPhase.connecting || phase == VpnPhase.up;
 
   AppState() {
-    // C8.5: применить сохранённую настройку запрета скриншотов (onCreate уже поставил FLAG_SECURE
-    // по умолчанию; здесь СНИМАЕМ, если пользователь выключил). Дефолт — запрет включён.
-    if (Platform.isAndroid) AndroidVpn.setSecureFlag(screenshotBlock);
+    // C8.5: применить сохранённую настройку запрета скриншотов. Платформа уже поставила запрет по
+    // умолчанию при создании окна (Android — FLAG_SECURE в onCreate, Windows — аффинити в
+    // FlutterWindow::OnCreate до первого показа), здесь мы его СНИМАЕМ, если пользователь выключил.
+    // Порядок именно такой: до чтения настройки не должно быть ни одного незащищённого кадра.
+    _applyScreenshotBlock();
     // Тексты нотификации VPN — на языке приложения (сервис мог пережить прошлый запуск с другим).
     _pushNotifStrings();
     // C6/S3 (нюанс 2): новый изолят при перезапуске может застать ЖИВУЮ нативную сессию (loop

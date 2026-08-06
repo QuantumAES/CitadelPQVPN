@@ -71,7 +71,6 @@ const Map<String, String> langHi = {
   'profile_name': 'प्रोफ़ाइल का नाम',
   'profile_renamed': 'प्रोफ़ाइल का नाम बदला गया',
   'subscribers': 'सब्सक्राइबर',
-  'reorder_hint': 'क्रम: प्रोफ़ाइल को दबाकर रखें और खींचें',
 
   'traffic_meter_title': 'ट्रैफ़िक संकेतक दिखाएँ',
   'traffic_meter_sub': 'कनेक्शन कार्ड पर मौजूदा डाउनलोड और अपलोड गति',

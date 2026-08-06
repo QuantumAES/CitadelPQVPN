@@ -14,6 +14,7 @@ import 'package:app/qr_scan_page.dart';
 import 'package:app/src/rust/api/citadel.dart';
 import 'package:app/split_tunnel_page.dart';
 import 'package:app/subscribers_page.dart';
+import 'package:app/traffic.dart';
 
 /// Версия сборки для экрана «О приложении». Задаётся `--dart-define=CITADEL_VERSION=<tag>` в
 /// mk-client-release.sh (совпадает с тегом релиза, напр. v0.3.0-pre2); для локальных `flutter run`
@@ -33,10 +34,9 @@ class _HomePageState extends State<HomePage> {
 
   /// Индикация трафика: текущая скорость (байт/с), посчитанная по дельте монотонных счётчиков ядра
   /// между двумя тиками. Итогов за сессию не ведём — их и не просили, а хранить историю трафика
-  /// пользователя на устройстве незачем.
-  double _rxRate = 0, _txRate = 0;
-  int? _rxPrev, _txPrev;
-  DateTime? _sampledAt;
+  /// пользователя на устройстве незачем. Сам расчёт — в `lib/traffic.dart` (общий с плашкой на
+  /// экране разблокировки).
+  final _traffic = TrafficSampler();
 
   @override
   void initState() {
@@ -50,31 +50,14 @@ class _HomePageState extends State<HomePage> {
     });
   }
 
-  /// Снять счётчики ядра и пересчитать скорость. Дельта делится на ФАКТИЧЕСКИ прошедшее время, а не
-  /// на «одну секунду»: таймер в фоне/под нагрузкой отстаёт, и деление на константу завышало бы
-  /// скорость. Отрицательная дельта (движок перезапущен, счётчики с нуля) → показываем ноль.
+  /// Снять счётчики ядра и пересчитать скорость (арифметика — в [TrafficSampler]).
   void _sampleTraffic() {
     if (!s.trafficMeter) {
-      _rxPrev = _txPrev = null;
-      _rxRate = _txRate = 0;
+      _traffic.reset();
       return;
     }
-    final now = DateTime.now();
     final c = trafficCounters();
-    final rx = c.rxBytes.toInt(), tx = c.txBytes.toInt();
-    final prevAt = _sampledAt;
-    if (_rxPrev != null && prevAt != null) {
-      final dt = now.difference(prevAt).inMicroseconds / 1e6;
-      // Длинная пауза между снимками (окно было свёрнуто, сессия падала и поднималась) — это не
-      // «медленная секунда», а разрыв ряда: берём её только как новую точку отсчёта.
-      if (dt > 0 && dt < 5) {
-        _rxRate = ((rx - _rxPrev!) / dt).clamp(0, double.maxFinite);
-        _txRate = ((tx - _txPrev!) / dt).clamp(0, double.maxFinite);
-      }
-    }
-    _rxPrev = rx;
-    _txPrev = tx;
-    _sampledAt = now;
+    _traffic.sample(c.rxBytes.toInt(), c.txBytes.toInt(), DateTime.now());
   }
 
   @override
@@ -206,8 +189,8 @@ class _HomePageState extends State<HomePage> {
               _StatusCard(
                 state: s,
                 onDisconnect: s.disconnect,
-                rxRate: _rxRate,
-                txRate: _txRate,
+                rxRate: _traffic.rxRate,
+                txRate: _traffic.txRate,
               ),
               if (s.debugEnabled) ...[
                 const SizedBox(height: 16),
@@ -217,26 +200,8 @@ class _HomePageState extends State<HomePage> {
               if (s.profiles.isNotEmpty) ...[
                 Padding(
                   padding: const EdgeInsets.symmetric(horizontal: 4),
-                  child: Row(
-                    children: [
-                      Expanded(
-                        child: Text(t('profiles'),
-                            style: Theme.of(context).textTheme.titleSmall),
-                      ),
-                      // Перетаскивание — жест невидимый: без подсказки о нём узнают случайно.
-                      // Показываем её только когда переставлять есть что (профилей больше одного).
-                      if (s.profiles.length > 1)
-                        Flexible(
-                          child: Text(
-                            t('reorder_hint'),
-                            textAlign: TextAlign.right,
-                            style: Theme.of(context).textTheme.labelSmall?.copyWith(
-                                  color: Theme.of(context).colorScheme.outline,
-                                ),
-                          ),
-                        ),
-                    ],
-                  ),
+                  child: Text(t('profiles'),
+                      style: Theme.of(context).textTheme.titleSmall),
                 ),
                 const SizedBox(height: 8),
               ],
@@ -450,8 +415,10 @@ class _HomePageState extends State<HomePage> {
                 Navigator.pop(sheetCtx);
               },
             ),
-            // C8.5 запрет скриншотов (Android FLAG_SECURE) — по умолчанию включён; desktop не enforce'ит.
-            if (Platform.isAndroid)
+            // C8.5 запрет скриншотов — по умолчанию включён. Показываем там, где он реально
+            // применяется: Android (FLAG_SECURE) и Windows (SetWindowDisplayAffinity). На Linux
+            // такого механизма нет, и тумблер обещал бы несуществующую защиту.
+            if (AppState.screenshotBlockSupported)
               SwitchListTile(
                 secondary: const Icon(Icons.screenshot_monitor_outlined),
                 title: Text(t('screenshot_title')),
@@ -521,7 +488,7 @@ class _HomePageState extends State<HomePage> {
             ListTile(
               leading: const Icon(Icons.language),
               title: Text(t('language_title')),
-              subtitle: Text(kLangNames[s.lang] ?? kLangNames[kDefaultLang]!),
+              subtitle: Text(langLabel(s.lang)),
               onTap: () {
                 Navigator.pop(sheetCtx);
                 _pickLanguage();
@@ -558,7 +525,7 @@ class _HomePageState extends State<HomePage> {
             for (final code in kSupportedLocales.map((l) => l.languageCode))
               RadioListTile<String>(
                 value: code,
-                title: Text(kLangNames[code] ?? code),
+                title: Text(langLabel(code)),
               ),
           ],
         ),
@@ -1129,7 +1096,7 @@ class _StatusCard extends StatelessWidget {
           // на «подключении» цифры были бы нулями, а место на плашке уже занято.
           if (state.trafficMeter && state.phase == VpnPhase.up) ...[
             const SizedBox(height: 10),
-            _TrafficRow(rxRate: rxRate, txRate: txRate, fg: fg, t: t),
+            TrafficRow(rxRate: rxRate, txRate: txRate, fg: fg, t: t),
           ],
           if (state.isBusy) ...[
             const SizedBox(height: 16),
@@ -1144,45 +1111,6 @@ class _StatusCard extends StatelessWidget {
           ],
         ],
       ),
-    );
-  }
-}
-
-/// Строка скорости на плашке подключения: «↓ 1,4 МБ/с   ↑ 320 КБ/с». Моноширинные цифры
-/// (`tabularFigures`) — иначе строка дёргается по ширине на каждом обновлении раз в секунду.
-class _TrafficRow extends StatelessWidget {
-  const _TrafficRow({
-    required this.rxRate,
-    required this.txRate,
-    required this.fg,
-    required this.t,
-  });
-  final double rxRate, txRate;
-  final Color fg;
-  final Strings t;
-
-  @override
-  Widget build(BuildContext context) {
-    final style = Theme.of(context).textTheme.bodyMedium?.copyWith(
-          color: fg.withValues(alpha: 0.9),
-          fontFeatures: const [FontFeature.tabularFigures()],
-        );
-    Widget item(IconData icon, String label, String value) => Row(
-          mainAxisSize: MainAxisSize.min,
-          children: [
-            Icon(icon, size: 16, color: fg.withValues(alpha: 0.9)),
-            const SizedBox(width: 4),
-            // Подпись для доступности (скринридер прочитает «приём»/«отправка», а не стрелку).
-            Semantics(label: label, child: Text(value, style: style)),
-          ],
-        );
-    return Row(
-      mainAxisAlignment: MainAxisAlignment.center,
-      children: [
-        item(Icons.arrow_downward, t('traffic_rx'), fmtRate(rxRate, t)),
-        const SizedBox(width: 20),
-        item(Icons.arrow_upward, t('traffic_tx'), fmtRate(txRate, t)),
-      ],
     );
   }
 }

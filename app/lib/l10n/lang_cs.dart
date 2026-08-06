@@ -71,7 +71,6 @@ const Map<String, String> langCs = {
   'profile_name': 'Název profilu',
   'profile_renamed': 'Profil přejmenován',
   'subscribers': 'Účastníci',
-  'reorder_hint': 'Pořadí: podržte profil a přetáhněte jej',
 
   'traffic_meter_title': 'Zobrazovat ukazatel provozu',
   'traffic_meter_sub': 'Aktuální rychlost příjmu a odesílání na kartě připojení',
