@@ -127,6 +127,15 @@ pub struct ClientConfig {
     /// S0.1/H2: разрешить QUIC БЕЗ серт-pin (AcceptAnyServerCert = MITM-открыто). Только
     /// dev/PoC (env `Citadel_INSECURE_NO_PIN=1`); прод — `false` (fail-closed).
     pub allow_insecure_no_pin: bool,
+    /// M-2/аудит-4: разрешить НЕ пост-квантовый KX-suite (`classical`/`all`). Дефолт `false` —
+    /// такая сессия не защищена от Harvest-Now-Decrypt-Later, а `kx_suite` приходит из ССЫЛКИ,
+    /// то есть подменённая ссылка иначе молча понижала бы криптографию до X25519. Включается
+    /// только явным dev-флагом `Citadel_INSECURE_CLASSICAL_KX=1` (харнес crypto-agility);
+    /// из ссылки/бандла — никогда.
+    pub allow_classical_kx: bool,
+    /// M-1/аудит-4: требовать PQ-аутентификацию сервера (ML-DSA pub либо commit). Дефолт `false`
+    /// (провижининг решает сам); `Citadel_REQUIRE_PQ_AUTH=1` делает отсутствие материала отказом.
+    pub require_pq_auth: bool,
     /// C6/M9 kill-switch: блокировать не-туннельный трафик, пока туннель активен (fail-closed при
     /// краше движка). Клиентская настройка (не из ссылки); env `Citadel_KILLSWITCH=1` / GUI-тумблер.
     pub killswitch: bool,
@@ -268,12 +277,10 @@ impl ClientConfig {
             token,
             pin,
             mldsa,
-            allow_insecure_no_pin: std::env::var("Citadel_INSECURE_NO_PIN")
-                .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-                .unwrap_or(false),
-            killswitch: std::env::var("Citadel_KILLSWITCH")
-                .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-                .unwrap_or(false),
+            allow_insecure_no_pin: env_flag("Citadel_INSECURE_NO_PIN"),
+            allow_classical_kx: env_flag("Citadel_INSECURE_CLASSICAL_KX"),
+            require_pq_auth: env_flag("Citadel_REQUIRE_PQ_AUTH"),
+            killswitch: env_flag("Citadel_KILLSWITCH"),
             split: Default::default(), // C8.3 split-tunnel — только клиентское GUI (Android), не env
         })
     }
@@ -301,21 +308,60 @@ impl ClientConfig {
     }
 
     /// Ожидание клиента по ML-DSA pub выбранного `host`: полный pub (Bytes/File/Dir) → `Pub`;
-    /// обязательство (ссылка/`Citadel_MLDSA_COMMIT`) → `Commit`; иначе `None` (PQ-auth не запрашивается).
-    /// Недоступный File/Dir → `None` (как и `mldsa_for`), а не «требуем, но нечем».
-    pub fn mldsa_expect(&self, host: &str) -> MldsaExpect {
-        match &self.mldsa {
+    /// обязательство (ссылка/`Citadel_MLDSA_COMMIT`) → `Commit`; источник не настроен → `None`
+    /// (PQ-auth не запрашивается).
+    ///
+    /// **M-1/аудит-4 — fail-closed.** Раньше нечитаемый File/Dir схлопывался в `None`, то есть
+    /// PQ-аутентификация сервера МОЛЧА выключалась и клиент подключался на одном классическом pin,
+    /// внешне неотличимо от штатной работы. Для контроля аутентификации это неверный дефолт: pin
+    /// в той же ситуации fail-closed (см. `client::require_pin_or_insecure`). Теперь:
+    ///   * `File` задан явно (`Citadel_MLDSA_PUB`) ⇒ файл ОБЯЗАН читаться, иначе ошибка;
+    ///   * `Dir` выводится неявно из `Citadel_PIN_DIR` и обслуживает multi-exit, где PQ-auth
+    ///     провижирована не для каждого exit'а ⇒ отсутствие файла — законное «не настроено»
+    ///     (`None`), а вот существующий, но нечитаемый/пустой — ошибка (права, обрезанный файл);
+    ///   * `Citadel_REQUIRE_PQ_AUTH=1` превращает любое `None` в отказ — рубильник для оператора,
+    ///     которому нужна гарантия, а не «как получится».
+    pub fn mldsa_expect(&self, host: &str) -> Result<MldsaExpect> {
+        let expect = match &self.mldsa {
             MldsaSource::Bytes(k) => MldsaExpect::Pub(k.clone()),
-            MldsaSource::File(f) => {
-                std::fs::read(f).map(MldsaExpect::Pub).unwrap_or(MldsaExpect::None)
+            MldsaSource::File(f) => MldsaExpect::Pub(read_mldsa_pub(f)?),
+            MldsaSource::Dir(dir) => {
+                let path = format!("{dir}/{host}.mldsa");
+                if std::path::Path::new(&path).exists() {
+                    MldsaExpect::Pub(read_mldsa_pub(&path)?)
+                } else {
+                    MldsaExpect::None // PQ-auth для этого exit'а не провижирована
+                }
             }
-            MldsaSource::Dir(dir) => std::fs::read(format!("{dir}/{host}.mldsa"))
-                .map(MldsaExpect::Pub)
-                .unwrap_or(MldsaExpect::None),
             MldsaSource::Commit(c) => MldsaExpect::Commit(*c),
             MldsaSource::None => MldsaExpect::None,
+        };
+        if self.require_pq_auth && matches!(expect, MldsaExpect::None) {
+            anyhow::bail!(
+                "PQ-auth обязательна (Citadel_REQUIRE_PQ_AUTH=1), но ML-DSA pub/commit для {host} \
+                 не провижирован — отказ (fail-closed)"
+            );
         }
+        Ok(expect)
     }
+}
+
+/// Прочитать провижированный ML-DSA pub. Пустой файл — тоже отказ: он даёт `Pub(vec![])`, под
+/// которым не сойдётся ни одна подпись, и клиент получил бы «подпись не прошла» вместо настоящей
+/// причины «ключ не доехал».
+fn read_mldsa_pub(path: &str) -> Result<Vec<u8>> {
+    let bytes = std::fs::read(path).with_context(|| {
+        format!("PQ-auth: ML-DSA pub провижирован ({path}), но не читается — отказ (fail-closed)")
+    })?;
+    if bytes.is_empty() {
+        anyhow::bail!("PQ-auth: ML-DSA pub {path} пуст — отказ (fail-closed)");
+    }
+    Ok(bytes)
+}
+
+/// Булев флаг окружения: `1`/`true` — включено, всё остальное (в т.ч. отсутствие) — выключено.
+fn env_flag(name: &str) -> bool {
+    std::env::var(name).map(|v| v == "1" || v.eq_ignore_ascii_case("true")).unwrap_or(false)
 }
 
 fn pin_from_file(path: &str) -> PinMode {
@@ -382,6 +428,8 @@ mod tests {
             pin,
             mldsa: MldsaSource::None,
             allow_insecure_no_pin: false,
+            allow_classical_kx: false,
+            require_pq_auth: false,
             killswitch: false,
             split: Default::default(),
         };
@@ -407,10 +455,98 @@ mod tests {
             pin: PinSource::None,
             mldsa: MldsaSource::Bytes(vec![1, 2, 3]),
             allow_insecure_no_pin: false,
+            allow_classical_kx: false,
+            require_pq_auth: false,
             killswitch: false,
             split: Default::default(),
         };
         assert_eq!(cfg.mldsa_for("any"), Some(vec![1, 2, 3]));
+    }
+
+    // ───────────── M-1/аудит-4: PQ-auth не должна выключаться молча ─────────────
+
+    fn cfg_with_mldsa(mldsa: MldsaSource, require_pq_auth: bool) -> ClientConfig {
+        ClientConfig {
+            servers: vec![],
+            server_name: "x".into(),
+            obfs_psk: None,
+            kx_suite: String::new(),
+            tcp_port: "443".into(),
+            routes: String::new(),
+            dns: None,
+            mtu: "1280".into(),
+            token: vec![],
+            pin: PinSource::None,
+            mldsa,
+            allow_insecure_no_pin: false,
+            allow_classical_kx: false,
+            require_pq_auth,
+            killswitch: false,
+            split: Default::default(),
+        }
+    }
+
+    /// Явно заданный (`Citadel_MLDSA_PUB`), но нечитаемый ML-DSA pub — ОТКАЗ, а не тихое
+    /// отключение PQ-аутентификации. Регрессия, которую это ловит: раньше удалённый/недоступный
+    /// по правам файл схлопывался в `MldsaExpect::None`, клиент подключался на одном классическом
+    /// pin и внешне это было неотличимо от штатной работы.
+    #[test]
+    fn missing_provisioned_mldsa_file_is_refused() {
+        let cfg = cfg_with_mldsa(MldsaSource::File("/nonexistent/exit.mldsa".into()), false);
+        // `expect_err` требовал бы `Debug` на `MldsaExpect`, а он несёт ML-DSA pub (1952 Б) —
+        // выводить его в диагностику незачем. Разбираем результат вручную.
+        let Err(err) = cfg.mldsa_expect("h") else { panic!("нечитаемый провижированный pub — отказ") };
+        assert!(format!("{err:#}").contains("не читается"), "err: {err:#}");
+    }
+
+    /// Пустой файл — тоже отказ: иначе клиент получил бы «подпись не прошла» вместо настоящей
+    /// причины «ключ не доехал».
+    #[test]
+    fn empty_provisioned_mldsa_file_is_refused() {
+        let p = std::env::temp_dir().join(format!("citadel-mldsa-empty-{}", std::process::id()));
+        std::fs::write(&p, b"").unwrap();
+        let cfg = cfg_with_mldsa(MldsaSource::File(p.to_string_lossy().into_owned()), false);
+        assert!(cfg.mldsa_expect("h").is_err(), "пустой pub — отказ");
+        let _ = std::fs::remove_file(&p);
+    }
+
+    /// `Dir` выводится неявно из `Citadel_PIN_DIR` и обслуживает multi-exit, где PQ-auth
+    /// провижирована не для каждого узла: ОТСУТСТВИЕ файла — законное «не настроено» (иначе
+    /// сломались бы работающие деплои), а вот существующий пустой — ошибка.
+    #[test]
+    fn mldsa_dir_absent_is_not_configured_but_broken_is_error() {
+        let dir = std::env::temp_dir().join(format!("citadel-mldsa-dir-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let d = dir.to_string_lossy().into_owned();
+
+        // файла нет → PQ-auth для этого host'а просто не провижирована
+        let cfg = cfg_with_mldsa(MldsaSource::Dir(d.clone()), false);
+        assert!(matches!(cfg.mldsa_expect("exit1").unwrap(), MldsaExpect::None));
+
+        // файл есть, но пустой → отказ (права/обрезанный файл — это поломка, а не «не настроено»)
+        std::fs::write(dir.join("exit2.mldsa"), b"").unwrap();
+        assert!(cfg.mldsa_expect("exit2").is_err());
+
+        // нормальный файл → Pub
+        std::fs::write(dir.join("exit3.mldsa"), vec![7u8; 1952]).unwrap();
+        assert!(matches!(cfg.mldsa_expect("exit3").unwrap(), MldsaExpect::Pub(k) if k.len() == 1952));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `Citadel_REQUIRE_PQ_AUTH=1` — рубильник оператора: любое «не провижировано» становится
+    /// отказом. Без флага поведение прежнее (провижининг решает сам).
+    #[test]
+    fn require_pq_auth_flag_turns_absent_into_refusal() {
+        assert!(matches!(
+            cfg_with_mldsa(MldsaSource::None, false).mldsa_expect("h").unwrap(),
+            MldsaExpect::None
+        ));
+        let Err(err) = cfg_with_mldsa(MldsaSource::None, true).mldsa_expect("h") else {
+            panic!("с рубильником отсутствие материала — отказ")
+        };
+        assert!(format!("{err:#}").contains("REQUIRE_PQ_AUTH"), "err: {err:#}");
+        // commit из ссылки удовлетворяет требование
+        assert!(cfg_with_mldsa(MldsaSource::Commit([1u8; 32]), true).mldsa_expect("h").is_ok());
     }
 
     #[test]

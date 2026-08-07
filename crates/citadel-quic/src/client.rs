@@ -193,6 +193,28 @@ fn require_pin_or_insecure(mode: &PinMode, allow_insecure_no_pin: bool) -> Resul
     Ok(())
 }
 
+/// M-2/аудит-4 fail-closed: сессия обязана быть пост-квантовой. `classical`/`all` пропускаются
+/// только явным dev-флагом (`Citadel_INSECURE_CLASSICAL_KX=1`) — им пользуется харнес
+/// crypto-agility, но ни ссылка, ни бандл его выставить не могут.
+fn require_pq_kx(suite: &str, allow_classical: bool) -> Result<()> {
+    if crate::kx_is_pq(suite) {
+        return Ok(());
+    }
+    if allow_classical {
+        eprintln!(
+            "[citadel-m1:client] ⚠ INSECURE: KX={} — сессия НЕ пост-квантовая (нет защиты от \
+             Harvest-Now-Decrypt-Later), разрешено флагом Citadel_INSECURE_CLASSICAL_KX",
+            crate::kx_suite_name(suite)
+        );
+        return Ok(());
+    }
+    Err(anyhow!(
+        "KX={} не гарантирует пост-квантовую сессию — отказ (fail-closed, M-2). Профиль требует \
+         kx_suite=pq; если ссылка пришла с другим значением, запросите новую у администратора",
+        crate::kx_suite_name(suite)
+    ))
+}
+
 /// Поднять сессию: failover по списку exit'ов (M5) + control-обмен (токен→адрес, PQ-auth M7).
 /// **Без TUN и без сетевой настройки** — только транспорт и назначенный адрес. `force_tcp` — идти
 /// сразу obfs-TCP (минуя QUIC/UDP): эскалация VpnController'а, когда QUIC-хендшейк проходит, но
@@ -200,13 +222,15 @@ fn require_pin_or_insecure(mode: &PinMode, allow_insecure_no_pin: bool) -> Resul
 /// сервера чёрнодырится) — TCP решает сегментацией/MSS.
 pub async fn establish_session(cfg: &ClientConfig, force_tcp: bool) -> Result<Session> {
     eprintln!("[citadel-m1:client] exit-серверы (перемешаны): {}", cfg.servers.join(", "));
-    // S1.1/M4: не-PQ suite (classical/all) не гарантирует анти-HNDL — предупреждаем явно.
-    if !crate::kx_is_pq(&cfg.kx_suite) {
-        eprintln!(
-            "[citadel-m1:client] ⚠ KX={} — сессия может быть НЕ пост-квантовой (нет защиты от Harvest-Now-Decrypt-Later); безопасный дефолт — pq",
-            crate::kx_suite_name(&cfg.kx_suite)
-        );
-    }
+    // M-2/аудит-4: не-PQ suite — ОТКАЗ, а не предупреждение.
+    //
+    // `kx_suite` приходит из ССЫЛКИ (`CredentialLink::to_client_config`), то есть подменённая при
+    // доставке или злонамеренно выпущенная ссылка со значением `classical` понижала бы сессию до
+    // чистого X25519 — без всякой защиты от Harvest-Now-Decrypt-Later. Раньше единственной
+    // реакцией был `eprintln!`, который не превращается в `VpnEvent` и до интерфейса не доходит:
+    // пользователь видел «Защищено» над классическим хендшейком. `all` тоже не гарантия — он
+    // молча откатывается на X25519, если сервер не PQ (см. `kx_is_pq`).
+    require_pq_kx(&cfg.kx_suite, cfg.allow_classical_kx)?;
 
     // M5 multi-server: идём по списку failover'ом — первый поднявшийся exit (QUIC или TCP-fallback).
     // Копим причины отказа по каждому exit — уходят в итоговую ошибку (видно в UI/лог-панели на
@@ -244,7 +268,7 @@ pub async fn establish_session(cfg: &ClientConfig, force_tcp: bool) -> Result<Se
     // M7 PQ-auth: pin (Ed25519-cert) + ML-DSA-65 pk выбранного exit — полный pub (провижирован)
     // ЛИБО обязательство H(pub) из ссылки (полный pub дотянем по каналу, commitment-fetch §S3).
     let host = host_of(&chosen);
-    let mldsa = cfg.mldsa_expect(host);
+    let mldsa = cfg.mldsa_expect(host)?; // M-1: нечитаемый провижированный ML-DSA pub — отказ
     let pq_active = !matches!(mldsa, MldsaExpect::None);
     // S0.1/H2: cert_pin для ML-DSA-привязки = АКТИВНЫЙ pin. При Pinned rustls уже заставил живой
     // серт совпасть с pin ⇒ привязка идёт к живой сессии. Без активного pin привязывать не к чему
@@ -581,6 +605,23 @@ mod tests {
         assert!(require_pin_or_insecure(&PinMode::Waiting, false).is_ok()); // ждёт pin, не fail-open
         assert!(require_pin_or_insecure(&PinMode::NoPin, false).is_err()); // ключевое: отказ
         assert!(require_pin_or_insecure(&PinMode::NoPin, true).is_ok()); // dev override
+    }
+
+    /// M-2/аудит-4: не-PQ suite отвергается. Ключевое — что `classical` приходит ИЗ ССЫЛКИ, то есть
+    /// подменённая ссылка иначе понижала бы сессию до X25519 при «Защищено» в интерфейсе.
+    /// `all` тоже не гарантия: он молча откатывается на классику против не-PQ сервера.
+    #[test]
+    fn non_pq_kx_is_refused_unless_dev_flag() {
+        for pq in ["", "pq"] {
+            assert!(require_pq_kx(pq, false).is_ok(), "PQ-suite {pq:?} обязан проходить");
+        }
+        for weak in ["classical", "x25519", "all", "hybrid"] {
+            let err = require_pq_kx(weak, false)
+                .expect_err("не-PQ suite обязан отвергаться (fail-closed)");
+            assert!(format!("{err:#}").contains("пост-квантов"), "err: {err:#}");
+            // dev-флаг (харнес crypto-agility) — единственный способ пропустить
+            assert!(require_pq_kx(weak, true).is_ok(), "{weak}: dev-флаг обязан пропускать");
+        }
     }
 
     /// §S3 commitment-fetch: клиент с обязательством H(pub) из ссылки принимает подпись сервера

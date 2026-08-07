@@ -320,7 +320,7 @@ mod tests {
                 let (tcp, _) = listener.accept().unwrap();
                 let srv = AdminServer { dir: dir.clone() };
                 if let Ok(tls) = pqtls::accept_tls(tcp, scfg.clone(), None) {
-                    let _ = srv.serve_conn(tls, &pq, &pin);
+                    let _ = srv.serve_conn(tls, &pq, &pin, || {});
                 }
             }
         });

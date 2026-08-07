@@ -288,7 +288,10 @@ wait "$M1D" 2>/dev/null || true   # дождаться смерти → закр
 sleep 1
 sed -i '1d' /shared/tokens 2>/dev/null || true   # свежий токен
 rm -f /tmp/Citadel-ready
-Citadel_SERVERS="${EXIT_IP}:4433" Citadel_PIN="$(cat /shared/exit.pin)" Citadel_KX=classical citadel-m1 &
+# M-2 (аудит-4): не-PQ suite теперь fail-closed в клиенте — этот тест намеренно проверяет
+# negotiate-ветку, поэтому явно поднимает dev-флаг. Из ссылки/бандла его выставить нельзя.
+Citadel_SERVERS="${EXIT_IP}:4433" Citadel_PIN="$(cat /shared/exit.pin)" Citadel_KX=classical \
+  Citadel_INSECURE_CLASSICAL_KX=1 citadel-m1 &
 M1E=$!
 for _ in $(seq 1 50); do [ -f /tmp/Citadel-ready ] && break; kill -0 "$M1E" 2>/dev/null || break; sleep 0.5; done
 if [ -f /tmp/Citadel-ready ]; then

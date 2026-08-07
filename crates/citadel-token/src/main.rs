@@ -15,8 +15,10 @@
 
 use std::collections::HashMap;
 use std::io::Write;
-use std::net::{TcpListener, TcpStream};
+use std::net::{IpAddr, TcpListener, TcpStream};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use citadel_token::{read_frame, write_frame}; // C5.3: фрейминг вынесен в lib (переиспользует fetch_tokens)
@@ -43,6 +45,201 @@ fn now_unix() -> u64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0)
+}
+
+// ============ H-1 (аудит-4): гейт соединений издателя ДО аутентификации ============
+//
+// Раньше `accept` порождал поток на КАЖДОЕ соединение, а поток немедленно вставал в блокирующем
+// чтении TLS/obfs-хендшейка — при этом на сокете НЕ стояло ни одного таймаута. Молчаливый коннект
+// парковал поток навсегда, знание obfs-PSK для этого не требовалось (блокировка наступает до
+// первого байта). Издатель — единая точка отказа всей системы: свежий Layer-1 токен нужен клиенту
+// на КАЖДЫЙ establish, включая реконнект, а в том же процессе живёт admin-канал. Тем же приёмом
+// абонент мог положить издателя изнутри туннеля через ADMIN_VIP.
+//
+// Закрываем тремя средствами (то же, что уже сделано на exit'е — см. семафоры и
+// TCP_HANDSHAKE_TIMEOUT в citadel-m1):
+//   * потолок ОДНОВРЕМЕННЫХ pre-auth соединений — общий и на адрес;
+//   * таймауты сокета (SO_RCVTIMEO/SO_SNDTIMEO) на время хендшейка;
+//   * жёсткий дедлайн всей фазы до аутентификации (таймаут сокета сбрасывается на каждый вызов
+//     read, поэтому одного его мало против «капающего по байту» противника).
+// Слот освобождается СРАЗУ после аутентификации: установленная сессия потолок не занимает.
+
+/// Потолок одновременных pre-auth соединений канала выдачи токенов.
+const MAX_PREAUTH: usize = 256;
+/// ...и одного адреса: без него один источник забирает весь потолок, и легитимные клиенты
+/// не проходят, хотя формально лимит «на всех» соблюдён.
+const MAX_PREAUTH_PER_IP: usize = 8;
+/// Потолки admin-канала — отдельные: флуд на выдачу токенов не должен отбирать у администратора
+/// возможность подключиться (и наоборот).
+const MAX_PREAUTH_ADMIN: usize = 32;
+const MAX_PREAUTH_ADMIN_PER_IP: usize = 4;
+
+/// Таймаут одной операции сокета ДО аутентификации. Хендшейк короткий (TLS 1.3 + hello ~3.4 КБ +
+/// auth-кадр ~5.3 КБ) — даже на плохом мобильном канале это доли секунды.
+const PREAUTH_TIMEOUT: Duration = Duration::from_secs(10);
+/// Жёсткий потолок всей фазы до аутентификации (см. про «каплю по байту» выше).
+const PREAUTH_DEADLINE: Duration = Duration::from_secs(20);
+/// Таймаут операций ПОСЛЕ аутентификации: слепая выдача идёт пачкой сразу, а admin-сессия ждёт
+/// команды человека — потолок щедрый, но конечный (мёртвый пир не висит вечно).
+const SESSION_TIMEOUT: Duration = Duration::from_secs(300);
+/// Шаг опроса сторожевого потока: чем мельче, тем быстрее он уходит после штатного завершения.
+const WATCH_TICK: Duration = Duration::from_millis(250);
+
+/// Учёт одновременных pre-auth соединений. Карта адресов ограничена сверху `max_total`
+/// (у каждой записи счётчик ≥ 1), поэтому неограниченно расти не может.
+#[derive(Default)]
+struct GateState {
+    total: usize,
+    per_ip: HashMap<IpAddr, usize>,
+}
+
+#[derive(Clone)]
+struct Gate {
+    state: Arc<Mutex<GateState>>,
+    max_total: usize,
+    max_per_ip: usize,
+}
+
+/// Занятый слот: держится, пока жив. Освобождается дропом — в том числе на любом раннем возврате
+/// по ошибке, поэтому «потерять» слот нельзя.
+struct Pass {
+    gate: Gate,
+    ip: IpAddr,
+}
+
+impl Drop for Pass {
+    fn drop(&mut self) {
+        self.gate.release(self.ip);
+    }
+}
+
+impl Gate {
+    fn new(max_total: usize, max_per_ip: usize) -> Self {
+        Self { state: Arc::new(Mutex::new(GateState::default())), max_total, max_per_ip }
+    }
+
+    /// Взять слот под pre-auth фазу. `None` — потолок исчерпан (соединение закрываем немедленно,
+    /// не заводя ни потока, ни состояния).
+    fn admit(&self, ip: IpAddr) -> Option<Pass> {
+        let mut st = self.state.lock().unwrap();
+        if st.total >= self.max_total {
+            return None;
+        }
+        let cur = st.per_ip.get(&ip).copied().unwrap_or(0);
+        if cur >= self.max_per_ip {
+            return None;
+        }
+        st.per_ip.insert(ip, cur + 1);
+        st.total += 1;
+        Some(Pass { gate: self.clone(), ip })
+    }
+
+    fn release(&self, ip: IpAddr) {
+        let mut st = self.state.lock().unwrap();
+        st.total = st.total.saturating_sub(1);
+        if let Some(n) = st.per_ip.get_mut(&ip) {
+            *n -= 1;
+            if *n == 0 {
+                st.per_ip.remove(&ip); // пустые записи не копим
+            }
+        }
+    }
+}
+
+/// Пульт сокета: жёсткий дедлайн фазы до аутентификации и смена таймаутов после неё.
+///
+/// Держит дублированный дескриптор — `SO_RCVTIMEO`/`SO_SNDTIMEO` и `shutdown` действуют на сам
+/// сокет, поэтому работают, хотя поток уже уехал внутрь TLS/obfs-обёртки.
+struct SockCtl {
+    sock: Option<TcpStream>,
+    /// «Сторож больше не нужен»: ставится и при успешной аутентификации, и при завершении
+    /// обслуживания (Drop). Без второго условия сторожевые потоки копились бы при высокой
+    /// текучке коротких соединений.
+    done: Arc<AtomicBool>,
+}
+
+impl SockCtl {
+    /// Завести пульт и сторожевой поток на `PREAUTH_DEADLINE`.
+    fn arm(tcp: &TcpStream) -> Self {
+        let done = Arc::new(AtomicBool::new(false));
+        if let Ok(watch) = tcp.try_clone() {
+            let flag = done.clone();
+            std::thread::spawn(move || {
+                let deadline = Instant::now() + PREAUTH_DEADLINE;
+                while Instant::now() < deadline {
+                    if flag.load(Ordering::Acquire) {
+                        return; // аутентифицировались или соединение уже закрыто — сторож не нужен
+                    }
+                    std::thread::sleep(WATCH_TICK);
+                }
+                if !flag.load(Ordering::Acquire) {
+                    // Аутентификации за отведённое время не случилось: закрываем сокет, чтобы
+                    // блокирующее чтение в рабочем потоке вернуло ошибку и поток вышел.
+                    let _ = watch.shutdown(std::net::Shutdown::Both);
+                }
+            });
+        }
+        Self { sock: tcp.try_clone().ok(), done }
+    }
+
+    /// Аутентификация пройдена: снять жёсткий дедлайн и ослабить таймауты до сессионных.
+    fn authenticated(&self) {
+        self.done.store(true, Ordering::Release);
+        if let Some(s) = &self.sock {
+            let _ = s.set_read_timeout(Some(SESSION_TIMEOUT));
+            let _ = s.set_write_timeout(Some(SESSION_TIMEOUT));
+        }
+    }
+}
+
+impl Drop for SockCtl {
+    fn drop(&mut self) {
+        self.done.store(true, Ordering::Release);
+    }
+}
+
+/// Общая accept-петля обоих каналов издателя: гейт, таймауты, throttl'ированный лог отказов.
+/// `serve` получает поток, слот (освобождает его после аутентификации) и пульт сокета.
+fn accept_loop<F>(listener: TcpListener, what: &'static str, gate: Gate, serve: F)
+where
+    F: Fn(TcpStream, Pass, SockCtl) + Send + Sync + 'static,
+{
+    let serve = Arc::new(serve);
+    // Лог отказов агрегируем раз в секунду: строка на каждый отбитый коннект — это лог-амплификация,
+    // то есть вторичный DoS поверх уже закрытого (тот же приём, что в citadel-m1).
+    let mut rejected: u64 = 0;
+    let mut last_log = Instant::now();
+    for conn in listener.incoming() {
+        let tcp = match conn {
+            Ok(t) => t,
+            Err(e) => {
+                eprintln!("[issuer] {what}: accept: {e}");
+                // EMFILE/ENFILE: без паузы петля крутилась бы вхолостую на полной скорости.
+                std::thread::sleep(WATCH_TICK);
+                continue;
+            }
+        };
+        let Ok(ip) = tcp.peer_addr().map(|a| a.ip()) else { continue };
+        let Some(pass) = gate.admit(ip) else {
+            drop(tcp); // потолок исчерпан — закрываем сразу, состояния не заводим
+            rejected += 1;
+            if last_log.elapsed() >= Duration::from_secs(1) {
+                eprintln!(
+                    "[issuer] {what}: лимит одновременных pre-auth соединений \
+                     ({} всего / {} на адрес) — отклонено {rejected} за секунду (H-1)",
+                    gate.max_total, gate.max_per_ip
+                );
+                rejected = 0;
+                last_log = Instant::now();
+            }
+            continue;
+        };
+        let _ = tcp.set_read_timeout(Some(PREAUTH_TIMEOUT));
+        let _ = tcp.set_write_timeout(Some(PREAUTH_TIMEOUT));
+        let ctl = SockCtl::arm(&tcp);
+        let serve = serve.clone();
+        std::thread::spawn(move || serve(tcp, pass, ctl));
+    }
 }
 
 // ===================== C5.2 Layer-1: реестр «абонентов» у issuer =====================
@@ -362,24 +559,21 @@ fn run_issuer() -> Result<()> {
             eprintln!(
                 "[issuer] admin-канал на {admin_listen} (PQ-TLS+pin, гибрид Ed25519+ML-DSA домен+EKM)"
             );
-            for conn in listener.incoming() {
-                match conn {
-                    Ok(tcp) => {
-                        let scfg = scfg.clone();
-                        let dir = dir.clone();
-                        let pq = pq.clone();
-                        std::thread::spawn(move || {
-                            let srv = citadel_token::admin::AdminServer { dir };
-                            let r = citadel_token::pqtls::accept_tls(tcp, scfg, obfs_psk)
-                                .and_then(|tls| srv.serve_conn(tls, &pq, &cert_pin));
-                            if let Err(e) = r {
-                                citadel_token::dlog!("[issuer] admin-соединение завершено: {e}");
-                            }
-                        });
-                    }
-                    Err(e) => eprintln!("[issuer] admin accept: {e}"),
+            // H-1: собственный гейт — флуд на :7000 не должен отбирать у админа возможность войти.
+            let gate = Gate::new(MAX_PREAUTH_ADMIN, MAX_PREAUTH_ADMIN_PER_IP);
+            accept_loop(listener, "admin-канал", gate, move |tcp, pass, ctl| {
+                let srv = citadel_token::admin::AdminServer { dir: dir.clone() };
+                let r = citadel_token::pqtls::accept_tls(tcp, scfg.clone(), obfs_psk).and_then(|tls| {
+                    // Слот и жёсткий дедлайн снимаются РОВНО на границе аутентификации.
+                    srv.serve_conn(tls, &pq, &cert_pin, move || {
+                        ctl.authenticated();
+                        drop(pass);
+                    })
+                });
+                if let Err(e) = r {
+                    citadel_token::dlog!("[issuer] admin-соединение завершено: {e}");
                 }
-            }
+            });
         });
     }
 
@@ -438,27 +632,22 @@ fn run_issuer() -> Result<()> {
         "[issuer] слепое подписание на {listen} (blind RSA-{bits}, epoch-scoped, PQ-TLS+pin, \
          гибридная PQ-аутентификация сторон)"
     );
-    for conn in listener.incoming() {
-        match conn {
-            Ok(stream) => {
-                let state = state.clone();
-                let dir = dir.clone();
-                let scfg = scfg.clone();
-                let quota = quota.clone();
-                let lease = lease.clone();
-                let pq = pq.clone();
-                std::thread::spawn(move || {
-                    if let Err(e) = serve_client(
-                        stream, scfg, &pq, &cert_pin, &state, &dir, &quota, max_per_epoch, &lease,
-                        lease_secs, obfs_psk,
-                    ) {
-                        citadel_token::dlog!("[issuer] соединение завершено: {e}");
-                    }
-                });
-            }
-            Err(e) => eprintln!("[issuer] accept: {e}"),
+    // H-1: гейт pre-auth соединений + таймауты/дедлайн хендшейка (см. модуль выше).
+    let gate = Gate::new(MAX_PREAUTH, MAX_PREAUTH_PER_IP);
+    eprintln!(
+        "[issuer] гейт pre-auth: {MAX_PREAUTH} одновременных хендшейков ({MAX_PREAUTH_PER_IP} на адрес), \
+         таймаут {}с, дедлайн {}с (H-1)",
+        PREAUTH_TIMEOUT.as_secs(),
+        PREAUTH_DEADLINE.as_secs()
+    );
+    accept_loop(listener, "выдача токенов", gate, move |stream, pass, ctl| {
+        if let Err(e) = serve_client(
+            stream, pass, ctl, scfg.clone(), &pq, &cert_pin, &state, &dir, &quota, max_per_epoch,
+            &lease, lease_secs, obfs_psk,
+        ) {
+            citadel_token::dlog!("[issuer] соединение завершено: {e}");
         }
-    }
+    });
     Ok(())
 }
 
@@ -504,6 +693,11 @@ fn lease_grant(map: &mut LeaseMap, client_id: [u8; 32], now: u64, lease_secs: u6
 #[allow(clippy::too_many_arguments)]
 fn serve_client(
     tcp: TcpStream,
+    // H-1: слот pre-auth и пульт сокета. Слот освобождается, а таймауты ослабляются РОВНО после
+    // того, как абонент доказал право на выдачу (подпись + активная запись реестра) — до этого
+    // соединение остаётся под жёстким дедлайном и занимает место в потолке.
+    pass: Pass,
+    ctl: SockCtl,
     scfg: Arc<rustls::ServerConfig>,
     pq: &citadel_token::pqid::IssuerPqIdentity,
     cert_pin: &[u8; 32],
@@ -551,6 +745,11 @@ fn serve_client(
     if !registry_allows(dir, &client_id, now_unix()) {
         anyhow::bail!("Layer-1: client_id не активен/истёк/отозван — отказ");
     }
+    // H-1: право на выдачу доказано (подпись сошлась И запись реестра активна) — освобождаем слот
+    // pre-auth и снимаем жёсткий дедлайн. Отозванный абонент с валидной подписью слот НЕ удерживает:
+    // проверка реестра идёт раньше этой строки.
+    ctl.authenticated();
+    drop(pass);
     // no-logs: связка client_id↔время — только при явном Citadel_DEBUG_LOG (см. citadel_token::debug_logs)
     citadel_token::dlog!("[issuer] Layer-1 ✔ абонент {}… авторизован", &hex::encode(client_id)[..12]);
     // Задача 4/B (мягкий single-session): аренда client_id ещё активна → отклоняем новую выдачу
@@ -798,6 +997,66 @@ mod tests {
         assert!(lease_grant(&mut off, a, 1, 0));
         assert!(lease_grant(&mut off, a, 1, 0));
         assert!(off.is_empty());
+    }
+
+    // ───────────────── H-1 (аудит-4): гейт pre-auth соединений издателя ─────────────────
+
+    fn ip(n: u8) -> std::net::IpAddr {
+        std::net::IpAddr::V4(std::net::Ipv4Addr::new(203, 0, 113, n))
+    }
+
+    /// Общий потолок: сверх него слот не выдаётся, а освобождение (дроп) возвращает место.
+    /// Это и есть замена «поток на каждый accept без единого таймаута».
+    #[test]
+    fn gate_caps_total_and_releases_on_drop() {
+        use super::Gate;
+        let g = Gate::new(3, 3);
+        let a = g.admit(ip(1)).expect("слот 1");
+        let b = g.admit(ip(2)).expect("слот 2");
+        let c = g.admit(ip(3)).expect("слот 3");
+        assert!(g.admit(ip(4)).is_none(), "сверх потолка слот выдаваться не должен");
+        drop(b);
+        assert!(g.admit(ip(4)).is_some(), "освободившееся место переиспользуется");
+        drop(a);
+        drop(c);
+    }
+
+    /// Потолок НА АДРЕС: без него один источник забирает весь общий лимит, и легитимные клиенты
+    /// не проходят — глобальный счётчик от этого не спасает.
+    #[test]
+    fn gate_caps_per_ip_so_one_source_cannot_starve_others() {
+        use super::Gate;
+        let g = Gate::new(100, 2);
+        let _a = g.admit(ip(1)).expect("первый от адреса");
+        let b = g.admit(ip(1)).expect("второй от адреса");
+        assert!(g.admit(ip(1)).is_none(), "третий с того же адреса — отказ");
+        // другой адрес при этом не задет (иначе флудер отключал бы всех)
+        assert!(g.admit(ip(2)).is_some(), "чужой адрес не должен страдать от флуда соседа");
+        drop(b);
+        assert!(g.admit(ip(1)).is_some(), "освобождённый слот адреса снова доступен");
+    }
+
+    /// Карта адресов не растёт: запись убирается, когда её счётчик обнуляется (иначе долгий
+    /// прогон с меняющихся адресов сам стал бы утечкой памяти).
+    #[test]
+    fn gate_forgets_addresses_with_no_slots() {
+        use super::Gate;
+        let g = Gate::new(8, 4);
+        for n in 0..200u8 {
+            let p = g.admit(ip(n)).expect("слот");
+            drop(p);
+        }
+        let st = g.state.lock().unwrap();
+        assert_eq!(st.total, 0, "все слоты освобождены");
+        assert!(st.per_ip.is_empty(), "пустые записи адресов не копятся: {}", st.per_ip.len());
+    }
+
+    /// Дедлайн pre-auth строго больше таймаута одной операции: иначе сторож рвал бы соединение
+    /// раньше, чем сокет успел бы честно отдать таймаут по чтению.
+    #[test]
+    fn preauth_deadline_exceeds_socket_timeout() {
+        assert!(super::PREAUTH_DEADLINE > super::PREAUTH_TIMEOUT);
+        assert!(super::SESSION_TIMEOUT > super::PREAUTH_DEADLINE, "сессия живёт дольше хендшейка");
     }
 
     /// valid_until: относительные формы и абсолют.

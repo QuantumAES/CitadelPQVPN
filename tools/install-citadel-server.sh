@@ -51,6 +51,13 @@ EPOCH_SECS="${CITADEL_EPOCH_SECS:-3600}"     # длина эпохи токен�
 LEASE_SECS="${CITADEL_LEASE_SECS:-0}"        # задача 4/B: single-session — окно аренды на абонента (с);
                                              # 0 = выкл. >0 ⇒ одна ссылка открывает новую сессию не чаще
                                              # раза в N с (ограничивает шеринг; реконнект в окне ждёт)
+# F7/D3 (M-3, аудит-4): per-client token-bucket на входящее направление exit'а. До аудита-4 эти
+# переменные выставлял только docker-демостенд, а установщик — нет: в реальном деплое лимит был
+# ВЫКЛЮЧЕН, и один абонент мог насытить аплинк exit'а (отказ в обслуживании для остальных + счёт
+# за трафик). Дефолт щедрый (~84 Мбит/с на абонента) — режет злоупотребление, а не нормальное
+# пользование. 0 = выключить осознанно.
+RATE_LIMIT="${CITADEL_RATE_LIMIT:-10485760}" # байт/с на клиента (10 MiB/с); 0 = без лимита
+RATE_BURST="${CITADEL_RATE_BURST:-20971520}" # допустимый всплеск, байт (20 MiB ≈ 2 с)
 
 log()  { printf '\033[1;36m[citadel]\033[0m %s\n' "$*"; }
 warn() { printf '\033[1;33m[citadel] ⚠ %s\033[0m\n' "$*" >&2; }
@@ -67,6 +74,10 @@ CitadelPQVPN — установщик exit-сервера (запускать н
   --tcp-port    N   (443)   obfs-over-TCP fallback      [CITADEL_TCP_PORT]
   --issuer-port N   (7000)  издатель токенов (публичный)[CITADEL_ISSUER_PORT]
   --admin-port  N   (7001)  admin-канал, НАРУЖУ НЕ ОТКРЫТ — только из туннеля [CITADEL_ADMIN_PORT]
+
+Ограничение полосы на абонента (F7/D3 — чтобы один клиент не съел аплинк exit'а):
+  --rate-limit  N   (10485760) байт/с на клиента; 0 = без лимита [CITADEL_RATE_LIMIT]
+  --rate-burst  N   (20971520) допустимый всплеск, байт          [CITADEL_RATE_BURST]
 
 Порты по умолчанию узнаваемы (4433/7000 — «подпись» Citadel). На сети, где это важно,
 задавай свои: клиент берёт их из ссылки, менять на нём ничего не нужно. Единственный порт,
@@ -109,6 +120,8 @@ while (($#)); do
     --tcp-port)     CITADEL_TCP_PORT="${2:-}";     shift 2 ;;
     --issuer-port)  CITADEL_ISSUER_PORT="${2:-}";  shift 2 ;;
     --admin-port)   CITADEL_ADMIN_PORT="${2:-}";   shift 2 ;;
+    --rate-limit)   CITADEL_RATE_LIMIT="${2:-}";   shift 2 ;;
+    --rate-burst)   CITADEL_RATE_BURST="${2:-}";   shift 2 ;;
     --host)         CITADEL_SERVER_HOST="${2:-}";  shift 2 ;;
     --routes)       CITADEL_ROUTES="${2:-}";       shift 2 ;;
     --dns)          CITADEL_DNS="${2:-}";          shift 2 ;;
@@ -131,6 +144,16 @@ DNS="${CITADEL_DNS:-$DNS}"
 DIR="${CITADEL_DIR:-$DIR}"
 ISSUER_ON="${CITADEL_ISSUER:-$ISSUER_ON}"
 ROLE="${CITADEL_ROLE:-all}"
+RATE_LIMIT="${CITADEL_RATE_LIMIT:-$RATE_LIMIT}"
+RATE_BURST="${CITADEL_RATE_BURST:-$RATE_BURST}"
+# Нечисловое значение молча уехало бы в entrypoint, а `RateCfg::from_env` разобрал бы его как
+# «лимита нет» — то есть опечатка в флаге тихо отключала бы защиту. Отваливаемся здесь.
+for spec in "RATE_LIMIT:--rate-limit" "RATE_BURST:--rate-burst"; do
+  var="${spec%%:*}"; flag="${spec##*:}"
+  [[ "${!var}" =~ ^[0-9]+$ ]] || die "$flag: '${!var}' — ожидается целое число байт (0 = без лимита)"
+done
+(( RATE_LIMIT == 0 || RATE_BURST >= RATE_LIMIT )) \
+  || die "--rate-burst ($RATE_BURST) меньше --rate-limit ($RATE_LIMIT): всплеск не может быть меньше секундного пополнения"
 
 # ─── 0a-bis. роль установки (P1: exit и издатель на разных машинах) ───
 case "$ROLE" in
@@ -421,6 +444,18 @@ export Citadel_TCP_LISTEN=0.0.0.0:443
 export Citadel_KX=pq   # S1.1/M4: PQ-only (анти-HNDL) — classical не принимаем
 rm -f /shared/exit.pin   # pin перезапишется тем же значением из постоянного серта (A7)
 EOF
+  if [[ "$RATE_LIMIT" != 0 ]]; then
+    cat <<EOF
+# F7/D3 (M-3, аудит-4): per-client token-bucket на входящее направление. Без него один абонент
+# насыщал аплинк exit'а — отказ в обслуживании остальным. Мелкие пакеты тоже считаются
+# (MIN_PACKET_COST), поэтому PPS-абуз режется наравне с полосой.
+export Citadel_RATE_LIMIT=$RATE_LIMIT
+export Citadel_RATE_BURST=$RATE_BURST
+echo "[citadel-exit] F7 rate-limit: $RATE_LIMIT б/с на абонента (всплеск $RATE_BURST б)"
+EOF
+  else
+    echo 'echo "[citadel-exit] ⚠ F7 rate-limit ВЫКЛЮЧЕН (--rate-limit 0): один абонент может занять весь аплинк"'
+  fi
   if [[ "$ISSUER_ON" == 1 ]]; then
     cat <<EOF
 # C5.4b: exit требует анонимный epoch-токен текущей эпохи (отзыв по времени, M6).

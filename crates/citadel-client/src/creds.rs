@@ -179,6 +179,8 @@ impl CredentialBundle {
                 .clone()
                 .map_or(MldsaSource::None, MldsaSource::Bytes),
             allow_insecure_no_pin: false,
+            allow_classical_kx: false,
+            require_pq_auth: false,
             killswitch: false, // клиентская настройка (GUI-тумблер), не из ссылки/бандла
             split: Default::default(), // C8.3: клиентская настройка, накатывается FFI-слоем
         }
@@ -396,6 +398,8 @@ impl CredentialLink {
             pin: self.cert_pin.map_or(PinSource::None, PinSource::Bytes),
             mldsa: self.mldsa_commit.map_or(MldsaSource::None, MldsaSource::Commit),
             allow_insecure_no_pin: false,
+            allow_classical_kx: false,
+            require_pq_auth: false,
             killswitch: false, // клиентская настройка (GUI-тумблер), не из ссылки/бандла
             split: Default::default(), // C8.3: клиентская настройка, накатывается FFI-слоем
         }

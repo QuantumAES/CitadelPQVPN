@@ -725,6 +725,8 @@ mod tests {
             pin: crate::config::PinSource::None,
             mldsa: crate::config::MldsaSource::None,
             allow_insecure_no_pin: false,
+            allow_classical_kx: false,
+            require_pq_auth: false,
             killswitch: false,
             split: Default::default(),
         }

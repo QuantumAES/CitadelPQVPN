@@ -221,11 +221,17 @@ impl AdminServer {
     /// гибридный auth-кадр админа (домен+EKM, сверка `admin_id`) → цикл CBOR-команд до закрытия
     /// клиентом. Провал auth → пауза 1с (анти-brute, R5) + разрыв БЕЗ ack (клиент не отличает
     /// «нет admin_id» от «чужой ключ» — не оракул).
+    ///
+    /// H-1 (аудит-4): `on_auth` зовётся РОВНО в момент, когда админ доказал право — вызывающий
+    /// освобождает по нему слот pre-auth и снимает жёсткий дедлайн хендшейка. Колбэк, а не
+    /// действие вызывающего «после `serve_conn`»: иначе живая admin-сессия занимала бы слот
+    /// потолка одновременных хендшейков всё время, пока открыта.
     pub fn serve_conn(
         &self,
         mut tls: IssuerTlsStream,
         pq: &IssuerPqIdentity,
         cert_pin: &[u8; 32],
+        on_auth: impl FnOnce(),
     ) -> Result<()> {
         let ekm = pqtls::handshake_server(&mut tls)?;
         let challenge: [u8; 32] = rand::random();
@@ -239,6 +245,7 @@ impl AdminServer {
             std::thread::sleep(std::time::Duration::from_secs(1)); // throttle brute-force
             return Err(e);
         }
+        on_auth();
         write_frame(&mut tls, b"OK")?; // ack: клиент отличает «auth прошёл» от разрыва
         loop {
             let Ok(raw) = read_frame(&mut tls) else {
@@ -515,7 +522,7 @@ mod tests {
                 let srv = AdminServer { dir: dir.clone() };
                 // провал auth — ожидаемый исход негативных тестов, не паника сервера
                 if let Ok(tls) = pqtls::accept_tls(tcp, scfg.clone(), None) {
-                    let _ = srv.serve_conn(tls, &pq, &pin);
+                    let _ = srv.serve_conn(tls, &pq, &pin, || {});
                 }
             }
         });
