@@ -524,6 +524,9 @@ export Citadel_EPOCH_SECS=$EPOCH_SECS
 export Citadel_TOKEN_LEASE_SECS=$LEASE_SECS   # задача 4/B: single-session (0=выкл; см. CITADEL_LEASE_SECS)
 export Citadel_REGISTER_PUBS="$CLIENT_PUB"   # client_id админа (issuer НЕ получает seed)
 rm -f /shared/issuer.pub /shared/issuer-*.pub /shared/tokens
+# M-4 (аудит-4): привилегии издателя режет compose (cap_drop: ALL + read_only + no-new-privileges).
+# Смена uid здесь не делается — том общий с exit'ом (и с pubsync при раздельной установке), и
+# переразметка владения затронула бы три роли сразу. Вне докера есть Citadel_DROP_UID.
 echo "[citadel-issuer] Layer-1 registry + слепая выдача epoch-токенов (epoch=${EPOCH_SECS}s, :7000) + admin-канал :$ADMIN_PORT…"
 exec citadel-token
 EOF
@@ -544,7 +547,11 @@ cat <<EOF
     entrypoint: ["/usr/local/bin/entrypoint-issuer.sh"]
     read_only: true                    # S1.5: неизменяемый rootfs (пишет только в /shared + tmpfs)
     tmpfs: ["/tmp"]
-    security_opt: ["no-new-privileges:true"]
+    # M-4 (аудит-4): издателю не нужна НИ ОДНА capability — он слушает порты >1024, не трогает
+    # сеть ядра и работает только со своим томом. Ни одной не оставляем. До этого он шёл с полным
+    # дефолтным набором docker — и это процесс, который разбирает ВЕСЬ недоверенный сетевой ввод и
+    # держит все ключи (RSA-sk эпохи, TLS-приватник, ML-DSA-seed, реестр, PSK).
+    cap_drop: ["ALL"]
     restart: unless-stopped
     environment:
       Citadel_OBFS_PSK: "$PSK"         # S2.1/A1-остаток: obfs-обёртка token-/admin-каналов (probe-resistance)
@@ -569,7 +576,11 @@ cat <<EOF
     entrypoint: ["/usr/local/bin/entrypoint-exit.sh"]
     read_only: true                    # S1.5: неизменяемый rootfs (пишем только в /shared + tmpfs)
     tmpfs: ["/tmp", "/run"]             # /run — xtables.lock (iptables); /tmp — runtime-scratch
-    cap_add: ["NET_ADMIN"]
+    # M-4: минимальный набор вместо дефолтного docker-набора (уходят DAC_OVERRIDE, FOWNER, MKNOD,
+    # SYS_CHROOT, AUDIT_WRITE, SETPCAP, SETFCAP, KILL). NET_ADMIN — TUN/iptables/ip route;
+    # NET_BIND_SERVICE — obfs-TCP на :443; NET_RAW — iptables; SETUID/SETGID — сброс привилегий (F4).
+    cap_drop: ["ALL"]
+    cap_add: ["NET_ADMIN", "NET_BIND_SERVICE", "NET_RAW", "SETUID", "SETGID"]
     security_opt: ["no-new-privileges:true"]
     devices: ["/dev/net/tun:/dev/net/tun"]
     sysctls: ["net.ipv4.ip_forward=1"]

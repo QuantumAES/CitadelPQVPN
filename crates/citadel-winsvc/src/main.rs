@@ -105,6 +105,10 @@ mod windows_svc {
     struct SessionSlot {
         /// Хэндл пайпа этой сессии (`isize`, чтобы структура была `Send`/`Sync`).
         pipe: isize,
+        /// M-5 (аудит-4): строковый SID пользователя, которому принадлежит сессия. Вытеснить её
+        /// вправе только он сам (см. [`crate::plan::session_owner_may_preempt`]). `None` —
+        /// dev-console, где аутентификации клиента нет вовсе.
+        owner: Option<String>,
         /// `true` — сессия свёрнута полностью и хэндл закрыт.
         done: Mutex<bool>,
         done_cv: Condvar,
@@ -114,9 +118,10 @@ mod windows_svc {
     unsafe impl Sync for SessionSlot {}
 
     impl SessionSlot {
-        fn new(pipe: HANDLE) -> Arc<Self> {
+        fn new(pipe: HANDLE, owner: Option<String>) -> Arc<Self> {
             Arc::new(SessionSlot {
                 pipe: pipe as isize,
+                owner,
                 done: Mutex::new(false),
                 done_cv: Condvar::new(),
             })
@@ -154,13 +159,31 @@ mod windows_svc {
     /// Занять слот сессии под нового клиента, свернув прежнюю. `false` — прежняя не свернулась за
     /// [`PREEMPT_TIMEOUT`]: поднимать туннель НЕЛЬЗЯ (два WinTUN-адаптера с одним именем + гонка за
     /// маршруты), клиент получит READY-err с причиной.
-    fn claim_session_slot(slot: &Arc<SessionSlot>) -> bool {
-        let old = SESSION.lock().unwrap().replace(slot.clone());
-        let Some(old) = old else { return true };
+    fn claim_session_slot(slot: &Arc<SessionSlot>) -> Result<(), String> {
+        let old = {
+            let mut g = SESSION.lock().unwrap();
+            // M-5: чужую сессию не трогаем ВООБЩЕ — ни свернуть, ни занять слот. Сверка идёт под
+            // тем же мьютексом, что и замена, иначе два клиента разошлись бы в гонке.
+            if let Some(cur) = g.as_ref() {
+                if !crate::plan::session_owner_may_preempt(cur.owner.as_deref(), slot.owner.as_deref())
+                {
+                    eprintln!(
+                        "[svc] M-5: клиент {} пытается вытеснить сессию пользователя {} — отказ",
+                        slot.owner.as_deref().unwrap_or("?"),
+                        cur.owner.as_deref().unwrap_or("?")
+                    );
+                    return Err("туннель уже поднят другим пользователем этого компьютера — \
+                                отключите его сеанс или войдите под ним"
+                        .into());
+                }
+            }
+            g.replace(slot.clone())
+        };
+        let Some(old) = old else { return Ok(()) };
         eprintln!("[svc] новый клиент вытесняет прежнюю сессию — сворачиваю её");
         if old.cancel_and_wait(PREEMPT_TIMEOUT) {
             eprintln!("[svc] прежняя сессия свёрнута — поднимаю новую");
-            return true;
+            return Ok(());
         }
         // Сюда попадать не должны (сворачивание разбужено и CancelIoEx'ом, и shutdown'ом WinTUN-
         // сессии), но если случилось — поднимать туннель поверх нельзя: второй WinTUN-адаптер с тем
@@ -181,7 +204,9 @@ mod windows_svc {
         }
         SHUTDOWN.store(true, Ordering::Release);
         cancel_accept();
-        false
+        Err("прежняя сессия туннеля не свернулась вовремя — повторите попытку \
+             (или перезапустите службу CitadelPQVPN)"
+            .into())
     }
 
     /// Освободить слот, если он всё ещё наш (нас могли уже вытеснить — тогда слот принадлежит новому
@@ -618,18 +643,24 @@ mod windows_svc {
             // (служба под юзером, клиент из build-дерева) → пропускаем. Проверка быстрая (OpenProcess
             // + QueryFullProcessImageNameW), поэтому остаётся на акцепторе: отсев чужого процесса не
             // должен стоить рабочего потока.
-            if enforce_client_auth {
-                if let Err(e) = verify_client_is_installed_app(h) {
-                    eprintln!("[svc] отклонён клиент пайпа (W3): {e:#}");
-                    unsafe {
-                        DisconnectNamedPipe(h);
-                        CloseHandle(h);
+            // W3 — образ клиента из install-dir; M-5 — SID его пользователя (владелец сессии).
+            let owner = if enforce_client_auth {
+                match authenticate_client(h) {
+                    Ok(sid) => Some(sid),
+                    Err(e) => {
+                        eprintln!("[svc] отклонён клиент пайпа (W3/M-5): {e:#}");
+                        unsafe {
+                            DisconnectNamedPipe(h);
+                            CloseHandle(h);
+                        }
+                        continue;
                     }
-                    continue;
                 }
-            }
+            } else {
+                None // dev-console: аутентификации клиента нет вовсе
+            };
             // Соединение уходит рабочему потоку вместе с владением хэндлом (закроет его `slot.finish`).
-            let slot = SessionSlot::new(h);
+            let slot = SessionSlot::new(h, owner);
             workers.retain(|w| !w.is_finished());
             workers.push(std::thread::spawn(move || {
                 let quit = handle_client(&slot);
@@ -706,6 +737,76 @@ mod windows_svc {
             }
             Ok(std::path::PathBuf::from(String::from_utf16_lossy(&buf[..len as usize])))
         }
+    }
+
+    /// M-5 (аудит-4): строковый SID пользователя, под которым работает процесс `pid` (`S-1-5-21-…`).
+    /// По нему служба решает, кому принадлежит активная сессия туннеля и кто вправе её вытеснить.
+    fn client_user_sid(pid: u32) -> anyhow::Result<String> {
+        use windows_sys::Win32::Foundation::LocalFree;
+        use windows_sys::Win32::Security::Authorization::ConvertSidToStringSidW;
+        use windows_sys::Win32::Security::{GetTokenInformation, TokenUser, TOKEN_QUERY, TOKEN_USER};
+        use windows_sys::Win32::System::Threading::{
+            OpenProcess, OpenProcessToken, PROCESS_QUERY_LIMITED_INFORMATION,
+        };
+
+        // SAFETY: стандартный путь «процесс → токен → TokenUser → строковый SID». Каждый успешно
+        // полученный хэндл закрывается; буфер выделяется по размеру, который вернул сам
+        // GetTokenInformation; строку SID освобождает LocalFree (её выделил ConvertSidToStringSidW).
+        unsafe {
+            let proc = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
+            if proc.is_null() {
+                anyhow::bail!("OpenProcess(pid={pid}) err={}", GetLastError());
+            }
+            let mut token: HANDLE = std::ptr::null_mut();
+            let ok = OpenProcessToken(proc, TOKEN_QUERY, &mut token);
+            CloseHandle(proc);
+            if ok == 0 {
+                anyhow::bail!("OpenProcessToken(pid={pid}) err={}", GetLastError());
+            }
+            // Первый вызов — только за размером буфера (вернёт FALSE + ERROR_INSUFFICIENT_BUFFER).
+            let mut need: u32 = 0;
+            GetTokenInformation(token, TokenUser, std::ptr::null_mut(), 0, &mut need);
+            if need == 0 {
+                CloseHandle(token);
+                anyhow::bail!("GetTokenInformation(размер) err={}", GetLastError());
+            }
+            let mut buf = vec![0u8; need as usize];
+            let ok = GetTokenInformation(token, TokenUser, buf.as_mut_ptr().cast(), need, &mut need);
+            CloseHandle(token);
+            if ok == 0 {
+                anyhow::bail!("GetTokenInformation(TokenUser) err={}", GetLastError());
+            }
+            let user: *const TOKEN_USER = buf.as_ptr().cast();
+            let mut wide: *mut u16 = std::ptr::null_mut();
+            if ConvertSidToStringSidW((*user).User.Sid, &mut wide) == 0 {
+                anyhow::bail!("ConvertSidToStringSidW err={}", GetLastError());
+            }
+            let mut len = 0usize;
+            while *wide.add(len) != 0 {
+                len += 1;
+            }
+            let sid = String::from_utf16_lossy(std::slice::from_raw_parts(wide, len));
+            LocalFree(wide.cast());
+            Ok(sid)
+        }
+    }
+
+    /// Аутентифицировать подключившегося клиента и вернуть **владельца** соединения (строковый SID).
+    /// W3 — образ из install-dir; M-5 — пользователь, которому будет принадлежать сессия.
+    ///
+    /// Не смогли определить владельца — отказ (fail-closed): иначе противник, умеющий сорвать эту
+    /// проверку, получал бы `None`, который «совпадает» с dev-режимом и вытеснял бы любую сессию.
+    fn authenticate_client(pipe: HANDLE) -> anyhow::Result<String> {
+        verify_client_is_installed_app(pipe)?;
+        let mut pid: u32 = 0;
+        // SAFETY: pipe — валидный серверный хэндл подключённого клиента; pid — out-указатель.
+        if unsafe { GetNamedPipeClientProcessId(pipe, &mut pid) } == 0 {
+            anyhow::bail!("GetNamedPipeClientProcessId err={}", unsafe { GetLastError() });
+        }
+        let sid = client_user_sid(pid)
+            .map_err(|e| anyhow::anyhow!("M-5: не определить владельца сессии: {e:#}"))?;
+        eprintln!("[svc] M-5: владелец соединения — {sid} (pid={pid})");
+        Ok(sid)
     }
 
     /// Прервать блокирующий `ConnectNamedPipe` на слушающем инстансе (control-handler на Stop,
@@ -817,14 +918,8 @@ mod windows_svc {
         // Слот занимаем ДО bring_up: адаптер один, и прежняя сессия (реконнект приложения, повторный
         // запуск) должна быть свёрнута полностью, иначе получим второй WinTUN с тем же именем и
         // гонку за маршруты. Не свернулась за отведённое время — честно отказываем.
-        if !claim_session_slot(slot) {
-            let _ = ov.write_all(
-                h,
-                &encode_ready_err(
-                    "прежняя сессия туннеля не свернулась вовремя — повторите попытку \
-                     (или перезапустите службу CitadelPQVPN)",
-                ),
-            );
+        if let Err(why) = claim_session_slot(slot) {
+            let _ = ov.write_all(h, &encode_ready_err(&why));
             return false;
         }
         let plan = plan_session(&setup, ADAPTER_NAME);

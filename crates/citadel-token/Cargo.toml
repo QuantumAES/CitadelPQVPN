@@ -8,6 +8,7 @@ description = "CitadelPQVPN — анонимные токены (blind RSA, RFC 
 [dependencies]
 anyhow = "1"
 rand = "0.8"
+libc = "0.2"                       # M-4: сброс привилегий издателя (setgroups/setgid/setuid)
 blind-rsa-signatures = "=0.15.0"   # =0.15.0: 0.15.1+ ломается (derive_more glob → PartialEq ambiguous, E0659)
 hex = "0.4"
 aws-lc-rs = { version = "1.17", features = ["unstable"] }  # Layer-1: Ed25519 + ML-DSA-65 (FIPS 204, unstable API) — тот же крипто-бэкенд, что в движке

@@ -382,8 +382,25 @@ fn spend_token(spent: &Mutex<HashMap<u64, HashSet<[u8; 32]>>>, nonce: [u8; 32], 
     map.entry(epoch).or_default().insert(nonce)
 }
 
-/// Обработать control-запрос: верифицировать токен, ВЫДЕЛИТЬ адрес (C6: только ПОСЛЕ токена),
-/// подписать привязку (M7) и вернуть выделенный `(addr, prefix)` (aux из `control_server`).
+/// Control-обмен серверной стороны — **два шага** (H-2/аудит-4).
+///
+/// Раньше это был один round-trip: клиент присылал `nonce‖токен‖ADDRESS_REQUEST`, а сервер лишь
+/// В ОТВЕТЕ доказывал подлинность ML-DSA-подписью. То есть анонимный токен уходил пиру, чья
+/// подлинность подтверждена ТОЛЬКО классически (pin на Ed25519-серте) — ровно то, что ML-DSA и
+/// введена компенсировать: CRQC подделывает CertVerify под тем же pin, проходит хендшейк и
+/// забирает неиспользованный токен. Канал издателя эту же задачу решает правильно (`IssuerHello`
+/// первым кадром, см. `citadel_token::pqid`), а канал exit'а — нет.
+///
+/// Теперь порядок симметричен канналу издателя:
+///   * шаг 1 — клиент шлёт только `nonce(32)`, сервер отвечает `pub‖sig(DOMAIN‖nonce‖cert_pin‖EKM)`;
+///   * шаг 2 — клиент, ПРОВЕРИВ подпись, шлёт `varint(len)‖токен‖ADDRESS_REQUEST`.
+///
+/// Цена — один дополнительный round-trip по уже поднятому QUIC. Побочная польза: крупный ответ
+/// (pub 1952 + sig 3309 Б) теперь уходит ДО предъявления токена, поэтому «мобильная» MTU-чёрная
+/// дыра на нём больше не сжигает токен впустую — эскалация на obfs-TCP идёт с нетронутым токеном.
+///
+/// **Слом wire-формата:** старый клиент и новый сервер (и наоборот) несовместимы — обновляются
+/// согласованно, как при obfs v1→v2 и бандле v3→v4.
 async fn server_assign_address(
     tunnel: &mut Tunnel,
     pool: &Mutex<AddrPool>,
@@ -395,15 +412,35 @@ async fn server_assign_address(
     // S2.6/A3: TLS exporter серверной сессии для channel-binding ML-DSA-подписи. Считаем ДО
     // control_server (он берёт &mut tunnel) и заносим в замыкание.
     let exporter = tunnel.exporter()?;
+
+    // ── Шаг 1: сервер представляется. Токена здесь нет и быть не может. ──
     tunnel
         .control_server(|buf| {
-            // M7: первые 32 байта — nonce клиента для PQ-auth привязки
-            if buf.len() < 32 {
-                return Err(anyhow!("нет PQ-auth nonce"));
+            // Ровно nonce: длина фиксирована, чтобы старый клиент (славший nonce‖токен‖капсулу)
+            // получил внятный отказ, а не «обрезанную капсулу» на следующем шаге.
+            if buf.len() != 32 {
+                return Err(anyhow!(
+                    "PQ-auth: ожидался nonce ровно 32 Б, получено {} (старый клиент? обновите приложение)",
+                    buf.len()
+                ));
             }
-            let nonce = &buf[..32];
-            let body = &buf[32..];
+            // M7/§S3: pub прикладывается всегда (commitment-fetch: клиент со ссылки держит лишь
+            // H(pub) и сверяет его с этим pub). Без signer'а pub и sig пусты (PQ-auth выкл).
+            let (pub_bytes, sig) = match signer {
+                Some(s) => (s.public_key(), s.sign_binding(buf, &cert_pin, &exporter)?),
+                None => (Vec::new(), Vec::new()),
+            };
+            let mut resp = citadel_masque::varint::to_vec(pub_bytes.len() as u64);
+            resp.extend_from_slice(&pub_bytes);
+            resp.extend_from_slice(&citadel_masque::varint::to_vec(sig.len() as u64));
+            resp.extend_from_slice(&sig);
+            Ok((resp, ()))
+        })
+        .await?;
 
+    // ── Шаг 2: клиент проверил подпись и только теперь предъявляет токен. ──
+    tunnel
+        .control_server(|body| {
             let (tok_len, n) =
                 citadel_masque::varint::decode(body).ok_or_else(|| anyhow!("нет токен-префикса"))?;
             let tok_end = n + tok_len as usize;
@@ -440,20 +477,7 @@ async fn server_assign_address(
             };
             let assign_bytes =
                 capsule::encode_address_assign_v4(&capsule::AssignedV4 { request_id: 1, addr, prefix });
-
-            // M7/§S3: ответ = varint(pub_len)‖ML-DSA-pub ‖ varint(sig_len)‖ML-DSA-sig(nonce‖cert_pin)
-            //         ‖ ADDRESS_ASSIGN. pub прикладывается всегда (commitment-fetch: клиент со ссылки
-            // держит лишь H(pub) и сверяет его с этим pub). Без signer'а pub и sig пусты (PQ-auth выкл).
-            let (pub_bytes, sig) = match signer {
-                Some(s) => (s.public_key(), s.sign_binding(nonce, &cert_pin, &exporter)?),
-                None => (Vec::new(), Vec::new()),
-            };
-            let mut resp = citadel_masque::varint::to_vec(pub_bytes.len() as u64);
-            resp.extend_from_slice(&pub_bytes);
-            resp.extend_from_slice(&citadel_masque::varint::to_vec(sig.len() as u64));
-            resp.extend_from_slice(&sig);
-            resp.extend_from_slice(&assign_bytes);
-            Ok((resp, (addr, prefix))) // aux = выделенный адрес (после токена)
+            Ok((assign_bytes, (addr, prefix))) // aux = выделенный адрес (после токена)
         })
         .await
 }
@@ -875,13 +899,23 @@ async fn run_auth_probe() -> Result<()> {
     let mut forged = vec![0u8; citadel_token::NONCE_LEN + citadel_token::RAND_LEN + 256];
     rand::thread_rng().fill_bytes(&mut forged);
     let req = capsule::encode_address_request_v4(&capsule::AssignedV4 { request_id: 1, addr: [0, 0, 0, 0], prefix: 0 });
-    // M7: сервер ждёт nonce(32)-префикс перед токеном (probe его не проверяет, но формат должен совпасть)
-    let mut out = vec![0u8; 32];
-    rand::thread_rng().fill_bytes(&mut out);
-    out.extend_from_slice(&citadel_masque::varint::to_vec(forged.len() as u64));
+
+    // H-2: обмен теперь двухшаговый. Шаг 1 — только nonce (проба ответ сервера не проверяет:
+    // её предмет — реакция на ПОДДЕЛЬНЫЙ ТОКЕН, а PQ-auth сервера покрыта ТЕСТом 15).
+    let mut nonce = vec![0u8; 32];
+    rand::thread_rng().fill_bytes(&mut nonce);
+    let (mut send, mut recv) = conn.open_bi().await?;
+    send.write_all(&nonce).await?;
+    send.finish()?;
+    if recv.read_to_end(8192).await.is_err() {
+        println!("[auth-probe] сервер не прошёл шаг 1 (PQ-auth) — до токена дело не дошло");
+        return Ok(());
+    }
+
+    // Шаг 2 — предъявляем поддельный токен.
+    let mut out = citadel_masque::varint::to_vec(forged.len() as u64);
     out.extend_from_slice(&forged);
     out.extend_from_slice(&req);
-
     let (mut send, mut recv) = conn.open_bi().await?;
     send.write_all(&out).await?;
     send.finish()?;

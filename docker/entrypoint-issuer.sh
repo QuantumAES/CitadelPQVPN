@@ -36,5 +36,9 @@ Citadel_TOKEN_ROLE=pubkey Citadel_CLIENT_SEED=$ADMIN_SEED citadel-token > /share
 # issuer отклоняет (анти-self-lockout, R6) — негатив проверяется в ТЕСТ 21.
 Citadel_TOKEN_ROLE=pubkey Citadel_CLIENT_SEED=$Citadel_REGISTER_SEEDS citadel-token > /shared/admin.client_id
 echo "[issuer] admin-плоскость: admin_id=$(cut -c1-16 /shared/admin_id)… (канал :${CITADEL_ADMIN_PORT:-7001}, только из туннеля)"
+# M-4 (аудит-4): привилегии издателя режет compose (cap_drop: ALL + read_only + no-new-privileges) —
+# capability у процесса не остаётся ни одной. Смену uid здесь НЕ делаем: том общий с exit'ом, и в
+# него как root пишут ещё и exit, и (при раздельной установке) pubsync — переразметка владения
+# затронула бы три роли сразу. Для запуска издателя вне докера есть Citadel_DROP_UID.
 echo "[issuer] старт слепого подписания (генерация RSA-ключа, затем TCP :${CITADEL_ISSUER_PORT:-7000})…"
 exec citadel-token

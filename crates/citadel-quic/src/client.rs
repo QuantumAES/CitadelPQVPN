@@ -464,45 +464,34 @@ pub(crate) async fn try_quic_connect(
     Ok(None)
 }
 
-/// Control-обмен (M2): nonce(32)‖varint(token_len)‖token‖ADDRESS_REQUEST → проверка ML-DSA
-/// подписи сервера (M7/§S3, согласно `expect`) → ADDRESS_ASSIGN. Возвращает назначенный адрес.
+/// Control-обмен (M2) в **два шага** — H-2/аудит-4.
+///
+/// Шаг 1: клиент шлёт только `nonce(32)` и получает `varint(pub_len)‖pub‖varint(sig_len)‖sig`;
+/// подпись проверяется НЕМЕДЛЕННО. Шаг 2: лишь после успешной проверки уходит
+/// `varint(token_len)‖token‖ADDRESS_REQUEST`, в ответ — `ADDRESS_ASSIGN`.
+///
+/// Раньше всё это был один round-trip, и токен уходил вместе с nonce — то есть ДО того, как
+/// сервер доказал подлинность пост-квантово. Пир, подтверждённый только классически (pin на
+/// Ed25519-серте), получал неиспользованный анонимный токен: под CRQC-MITM (ровно тот противник,
+/// ради которого введена ML-DSA-привязка) это кража доступа и отказ в обслуживании легитимному
+/// абоненту через double-spend. Канал издателя всегда делал наоборот — сервер представляется
+/// первым кадром (`citadel_token::pqid::verify_hello`), и exit теперь симметричен.
 async fn client_request_address(
     tunnel: &mut Tunnel,
     token: &[u8],
     expect: &MldsaExpect,
     cert_pin: [u8; 32],
 ) -> Result<capsule::AssignedV4> {
-    // M7 PQ-auth: nonce(32) для привязки подписи сервера; далее токен + ADDRESS_REQUEST
+    // ── Шаг 1: заставляем сервер представиться. Ничего своего, кроме случайного nonce. ──
     let mut nonce = [0u8; 32];
     rand::thread_rng().fill_bytes(&mut nonce);
-    let req = capsule::AssignedV4 { request_id: 1, addr: [0, 0, 0, 0], prefix: 0 };
-    let mut out = nonce.to_vec();
-    out.extend_from_slice(&citadel_masque::varint::to_vec(token.len() as u64));
-    out.extend_from_slice(token);
-    out.extend_from_slice(&capsule::encode_address_request_v4(&req));
-
-    let buf = tunnel.control_client(&out).await?;
+    let buf = tunnel.control_client(&nonce).await?;
     // S2.6/A3: TLS exporter клиентской сессии для channel-binding ML-DSA-подписи (см. verify ниже).
     let exporter = tunnel.exporter()?;
-    // ответ: varint(pub_len)‖ML-DSA-pub ‖ varint(sig_len)‖ML-DSA-sig ‖ ADDRESS_ASSIGN (§S3)
-    let (pub_len, p0) =
-        citadel_masque::varint::decode(&buf).ok_or_else(|| anyhow!("нет pub-префикса"))?;
-    let pub_end = p0 + pub_len as usize;
-    if buf.len() < pub_end {
-        return Err(anyhow!("обрезанный ML-DSA pub"));
-    }
-    let server_pub = &buf[p0..pub_end];
-    let tail = &buf[pub_end..];
-    let (sig_len, s0) =
-        citadel_masque::varint::decode(tail).ok_or_else(|| anyhow!("нет sig-префикса"))?;
-    let sig_end = s0 + sig_len as usize;
-    if tail.len() < sig_end {
-        return Err(anyhow!("обрезанная PQ-подпись"));
-    }
-    let sig = &tail[s0..sig_end];
-    let rest = &tail[sig_end..];
+    let (server_pub, sig) = parse_server_auth(&buf)?;
 
     // M7/§S3: проверяем ML-DSA-65 подпись сервера согласно ожиданию (полный pub / commitment-fetch).
+    // Не сошлось — выходим ЗДЕСЬ, не показав токен (в этом весь смысл разделения на два шага).
     verify_server_mldsa(expect, server_pub, &nonce, &cert_pin, &exporter, sig)?;
     match expect {
         MldsaExpect::Pub(_) => eprintln!(
@@ -514,11 +503,38 @@ async fn client_request_address(
         MldsaExpect::None => {}
     }
 
-    let (t, val, _) = capsule::decode(rest).ok_or_else(|| anyhow!("битая капсула в ответе"))?;
+    // ── Шаг 2: сервер доказан — предъявляем токен и просим адрес. ──
+    let req = capsule::AssignedV4 { request_id: 1, addr: [0, 0, 0, 0], prefix: 0 };
+    let mut out = citadel_masque::varint::to_vec(token.len() as u64);
+    out.extend_from_slice(token);
+    out.extend_from_slice(&capsule::encode_address_request_v4(&req));
+    let buf = tunnel.control_client(&out).await?;
+
+    let (t, val, _) = capsule::decode(&buf).ok_or_else(|| anyhow!("битая капсула в ответе"))?;
     if t != capsule::ADDRESS_ASSIGN {
         return Err(anyhow!("ожидался ADDRESS_ASSIGN, получен type={t}"));
     }
     capsule::decode_assigned_v4(val).ok_or_else(|| anyhow!("битое тело ADDRESS_ASSIGN"))
+}
+
+/// Разобрать ответ шага 1: `varint(pub_len)‖ML-DSA-pub‖varint(sig_len)‖ML-DSA-sig`.
+/// Оба поля пусты, если PQ-auth на сервере выключена (тогда `verify_server_mldsa` решает, беда ли это).
+fn parse_server_auth(buf: &[u8]) -> Result<(&[u8], &[u8])> {
+    let (pub_len, p0) =
+        citadel_masque::varint::decode(buf).ok_or_else(|| anyhow!("нет pub-префикса"))?;
+    let pub_end = p0
+        .checked_add(pub_len as usize)
+        .filter(|e| *e <= buf.len())
+        .ok_or_else(|| anyhow!("обрезанный ML-DSA pub"))?;
+    let server_pub = &buf[p0..pub_end];
+    let tail = &buf[pub_end..];
+    let (sig_len, s0) =
+        citadel_masque::varint::decode(tail).ok_or_else(|| anyhow!("нет sig-префикса"))?;
+    let sig_end = s0
+        .checked_add(sig_len as usize)
+        .filter(|e| *e <= tail.len())
+        .ok_or_else(|| anyhow!("обрезанная PQ-подпись"))?;
+    Ok((server_pub, &tail[s0..sig_end]))
 }
 
 /// SHA-256 (для сверки `H(pub)` с обязательством ссылки) — тем же алго, что `citadel_client` считает
@@ -605,6 +621,107 @@ mod tests {
         assert!(require_pin_or_insecure(&PinMode::Waiting, false).is_ok()); // ждёт pin, не fail-open
         assert!(require_pin_or_insecure(&PinMode::NoPin, false).is_err()); // ключевое: отказ
         assert!(require_pin_or_insecure(&PinMode::NoPin, true).is_ok()); // dev override
+    }
+
+    /// **H-2/аудит-4 — главный инвариант порядка:** анонимный токен НЕ должен уходить серверу,
+    /// чья ML-DSA-подпись не сошлась.
+    ///
+    /// Сервер в тесте моделирует ровно CRQC-MITM: предъявляет НАСТОЯЩИЙ ML-DSA pub (обязательство
+    /// `H(pub)` из ссылки сходится, как сошёлся бы и подделанный классический CertVerify под тем же
+    /// pin), но подписать привязку он не может — подпись ставится чужим ключом. До правки токен
+    /// улетал в одном пакете с nonce, то есть ещё ДО всякой проверки; теперь клиент обязан
+    /// оборваться на шаге 1 и второй стрим не открывать.
+    #[tokio::test]
+    async fn token_is_not_disclosed_before_server_pq_auth_verifies() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Mutex;
+
+        let psk = [0x5eu8; 32];
+        let real = crate::pqauth::ServerSigner::generate().unwrap();
+        let real_pk = real.public_key();
+        let commit = sha256(&real_pk);
+        let impostor = crate::pqauth::ServerSigner::generate().unwrap();
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let saw_token_stream = Arc::new(AtomicBool::new(false));
+        // ВСЁ, что клиент сказал серверу до момента проверки подписи. Именно по этому буферу и
+        // проверяется свойство: проверять «не открыл ли он второй стрим» недостаточно — при старом
+        // однопакетном обмене второго стрима тоже не было, а токен уже утёк в первом.
+        let heard = Arc::new(Mutex::new(Vec::<u8>::new()));
+        let (flag, heard_srv) = (saw_token_stream.clone(), heard.clone());
+
+        let srv = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let scfg = crate::server_config(crate::kx_groups_for("pq")).unwrap();
+            let ep = crate::server_endpoint_obfs_tcp(stream, scfg, psk).unwrap();
+            let conn = ep.accept().await.unwrap().await.unwrap();
+            let mut t = Tunnel::new(conn, true);
+            let exporter = t.exporter().unwrap();
+            // Шаг 1: настоящий pub + подпись ЧУЖИМ ключом.
+            t.control_server(|first| {
+                heard_srv.lock().unwrap().extend_from_slice(first);
+                let sig = impostor.sign_binding(first, &[0u8; 32], &exporter).unwrap();
+                let mut resp = citadel_masque::varint::to_vec(real_pk.len() as u64);
+                resp.extend_from_slice(&real_pk);
+                resp.extend_from_slice(&citadel_masque::varint::to_vec(sig.len() as u64));
+                resp.extend_from_slice(&sig);
+                Ok((resp, ()))
+            })
+            .await
+            .unwrap();
+            // Шаг 2 наступить не должен. `Ok(Ok(_))` — стрим реально открыли; закрытие соединения
+            // клиентом даёт `Ok(Err(_))` и за предъявление токена не считается.
+            let second = tokio::time::timeout(Duration::from_secs(1), t.conn().accept_bi()).await;
+            if matches!(second, Ok(Ok(_))) {
+                flag.store(true, Ordering::SeqCst);
+            }
+        });
+
+        let stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let ep = crate::client_endpoint_obfs_tcp(stream, psk).unwrap();
+        let ccfg = crate::client_config(crate::kx_groups_for("pq")).unwrap();
+        let conn = ep.connect_with(ccfg, addr, "Citadel.exit").unwrap().await.unwrap();
+        let mut t = Tunnel::new(conn, true);
+
+        const SECRET_TOKEN: &[u8] = b"anonymous-token-must-not-leak";
+        let err = client_request_address(&mut t, SECRET_TOKEN, &MldsaExpect::Commit(commit), [0u8; 32])
+            .await
+            .expect_err("подпись самозванца не должна проходить");
+        assert!(format!("{err:#}").contains("ML-DSA"), "err: {err:#}");
+
+        srv.await.unwrap();
+
+        // Главная проверка: в том, что клиент успел сказать, токена нет ни в каком виде.
+        let heard = heard.lock().unwrap();
+        assert!(
+            heard.windows(SECRET_TOKEN.len()).all(|w| w != SECRET_TOKEN),
+            "токен предъявлен серверу ДО проверки его PQ-подписи (H-2)"
+        );
+        assert_eq!(heard.len(), 32, "на шаге 1 клиент шлёт ровно nonce, и ничего больше");
+        assert!(
+            !saw_token_stream.load(Ordering::SeqCst),
+            "клиент открыл второй стрим после провала PQ-auth (H-2)"
+        );
+    }
+
+    /// Разбор ответа шага 1 не паникует и не выходит за границы на обрезанных/мусорных данных
+    /// (он читает недоверенную сеть до всякой верификации).
+    #[test]
+    fn parse_server_auth_rejects_truncated() {
+        assert!(parse_server_auth(&[]).is_err());
+        // varint обещает 100 байт pub, а их нет
+        let mut buf = citadel_masque::varint::to_vec(100);
+        buf.extend_from_slice(&[0u8; 10]);
+        assert!(parse_server_auth(&buf).is_err());
+        // pub есть, sig-префикса нет
+        let mut buf = citadel_masque::varint::to_vec(2);
+        buf.extend_from_slice(&[1, 2]);
+        assert!(parse_server_auth(&buf).is_err());
+        // корректная пара пустых полей (PQ-auth выключена на сервере)
+        let mut ok = citadel_masque::varint::to_vec(0);
+        ok.extend_from_slice(&citadel_masque::varint::to_vec(0));
+        assert_eq!(parse_server_auth(&ok).unwrap(), (&[][..], &[][..]));
     }
 
     /// M-2/аудит-4: не-PQ suite отвергается. Ключевое — что `classical` приходит ИЗ ССЫЛКИ, то есть

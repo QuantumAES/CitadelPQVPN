@@ -140,6 +140,26 @@ pub fn same_dir(file: &std::path::Path, dir: &std::path::Path) -> bool {
 }
 
 /// Префикс-длина → маска IPv4 в точечной нотации (`16` → `255.255.0.0`).
+/// M-5 (аудит-4): вправе ли клиент `new` вытеснить активную сессию, принадлежащую `cur`.
+///
+/// ACL пайпа даёт доступ ЛЮБОМУ интерактивному пользователю (`IU`), а W3-проверка убеждается лишь
+/// в том, что образ клиента лежит в install-dir. Владелец сессии не сверялся вовсе — и на машине с
+/// несколькими пользователями (быстрое переключение, RDP, терминальный сервер) пользователь B,
+/// просто запустив штатное приложение, обрывал туннель пользователя A, снимал его WFP-kill-switch
+/// и перенастраивал системные маршруты. То есть локальный DoS плюс привилегированная
+/// реконфигурация сети чужими руками.
+///
+/// Сравниваем строковые SID владельцев (`S-1-5-21-…`). `None` — режим dev-console, где
+/// аутентификации клиента нет вовсе; смешанный случай означает рассогласование режима и трактуется
+/// как отказ (fail-closed).
+pub fn session_owner_may_preempt(cur: Option<&str>, new: Option<&str>) -> bool {
+    match (cur, new) {
+        (Some(a), Some(b)) => a.eq_ignore_ascii_case(b),
+        (None, None) => true,
+        _ => false,
+    }
+}
+
 fn mask(prefix: u8) -> String {
     let p = prefix.min(32) as u32;
     let m: u32 = if p == 0 { 0 } else { u32::MAX << (32 - p) };
@@ -255,5 +275,24 @@ Network Destination        Netmask          Gateway       Interface  Metric
         assert!(!same_dir(Path::new(r"C:\Users\bob\AppData\Local\Temp\evil.exe"), dir), "чужой каталог");
         assert!(!same_dir(Path::new(r"C:\Program Files\CitadelPQVPN\sub\app.exe"), dir), "подкаталог ≠ каталог");
         assert!(!same_dir(Path::new("app.exe"), dir), "без родителя");
+    }
+
+    /// M-5: вытеснить активную сессию может только ЕЁ владелец. До правки любой интерактивный
+    /// пользователь, запустив штатное приложение, обрывал чужой туннель и снимал чужой kill-switch.
+    #[test]
+    fn only_session_owner_may_preempt() {
+        let alice = "S-1-5-21-1111111111-2222222222-3333333333-1001";
+        let bob = "S-1-5-21-1111111111-2222222222-3333333333-1002";
+        assert!(session_owner_may_preempt(Some(alice), Some(alice)), "свой реконнект — можно");
+        assert!(
+            session_owner_may_preempt(Some(alice), Some(&alice.to_lowercase())),
+            "строковый SID регистронезависим"
+        );
+        assert!(!session_owner_may_preempt(Some(alice), Some(bob)), "чужую сессию рвать нельзя");
+        // dev-console: аутентификации клиента нет вовсе — поведение прежнее
+        assert!(session_owner_may_preempt(None, None));
+        // рассогласование режима (одна сторона аутентифицирована, другая нет) — отказ
+        assert!(!session_owner_may_preempt(Some(alice), None));
+        assert!(!session_owner_may_preempt(None, Some(alice)));
     }
 }
