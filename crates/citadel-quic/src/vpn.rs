@@ -238,8 +238,7 @@ impl VpnController {
 
         loop {
             if self.stopped.load(Ordering::SeqCst) {
-                self.set_state(VpnState::Down);
-                return Ok(());
+                return self.finish_stopped();
             }
 
             // Свежий Layer-1 токен на КАЖДУЮ попытку establish: реконнект НЕ должен переиспользовать
@@ -248,7 +247,12 @@ impl VpnController {
             // (само-лечится по восстановлении сети). token-less/без Layer-1 → refresher не задан.
             let refresher = self.token_refresh.lock().unwrap().clone();
             if let Some(f) = &refresher {
-                match f().await {
+                // Фаза может тянуться (издатель недоступен → таймауты+ретраи), а пользователь
+                // вправе нажать «Отключить» прямо в ней: ждём токен, но не дольше, чем до отмены.
+                let Some(fetched) = self.until_stop(f()).await else {
+                    return self.finish_stopped();
+                };
+                match fetched {
                     Some(t) => cfg.token = t, // свежий токен — этой попытке есть что предъявить
                     // Свежего токена нет (issuer недоступен ЛИБО держит single-session-аренду 4/B
                     // после предыдущей сессии). Если прошлый токен уже предъявлялся — он потрачен,
@@ -262,10 +266,7 @@ impl VpnController {
                         self.set_state(if ever_up { VpnState::Migrating } else { VpnState::Connecting });
                         match self.backoff_wait(backoff).await {
                             Some(next) => backoff = next,
-                            None => {
-                                self.set_state(VpnState::Down);
-                                return Ok(());
-                            }
+                            None => return self.finish_stopped(),
                         }
                         continue;
                     }
@@ -275,7 +276,14 @@ impl VpnController {
             token_spent = true; // ниже токен уходит exit'у; повторно его предъявлять нельзя
 
             // ── establish: сперва QUIC/UDP ──
-            let mut established = establish_session(&cfg, false).await;
+            // Самая длинная фаза цикла (до 5 попыток QUIC по 3с + obfs-TCP): «Отключить» обязано
+            // прерывать её здесь, а не после. Иначе цикл доводил попытку до конца УЖЕ ПОСЛЕ
+            // остановки — и лез конфигурировать TUN поверх погашенного сервиса (на Android это и
+            // был «CitadelVpnService не зарегистрирован» в логе), а на desktop мог поднять туннель
+            // и kill-switch заново, когда пользователь их только что снял.
+            let Some(mut established) = self.until_stop(establish_session(&cfg, false)).await else {
+                return self.finish_stopped();
+            };
             // Эскалация на obfs-TCP: QUIC мог подняться (хендшейк), но крупный control-обмен не прошёл —
             // мобильный/NAT64-путь не несёт большой ML-DSA-ответ через QUIC (MTU: хендшейк ок, ответ
             // чёрнодырится → establish виснет). TCP решает это сегментацией/MSS. Токен берём свежий
@@ -287,14 +295,19 @@ impl VpnController {
                 if cfg.obfs_psk.is_some() && should_escalate_to_tcp(&first) {
                     eprintln!("[vpn] establish/QUIC не удался ({first}) — эскалация на obfs-TCP (мобильный MTU/NAT64?)");
                     if let Some(f) = &refresher {
-                        if let Some(t) = f().await {
+                        let Some(fresh) = self.until_stop(f()).await else {
+                            return self.finish_stopped();
+                        };
+                        if let Some(t) = fresh {
                             cfg.token = t;
                         }
                     }
                     // Причину QUIC-попытки тащим в итоговую ошибку: без неё в UI оставалась бы только
                     // вторая (часто менее информативная), и диагноз уходил в сторону.
-                    established = establish_session(&cfg, true).await
-                        .map_err(|e2| anyhow::anyhow!("{e2:#}; ранее по QUIC/UDP: {first}"));
+                    let Some(second) = self.until_stop(establish_session(&cfg, true)).await else {
+                        return self.finish_stopped();
+                    };
+                    established = second.map_err(|e2| anyhow::anyhow!("{e2:#}; ранее по QUIC/UDP: {first}"));
                 }
             }
             let session = match established {
@@ -309,14 +322,18 @@ impl VpnController {
                     self.set_state(if ever_up { VpnState::Migrating } else { VpnState::Connecting });
                     match self.backoff_wait(backoff).await {
                         Some(next) => backoff = next,
-                        None => {
-                            self.set_state(VpnState::Down);
-                            return Ok(());
-                        }
+                        None => return self.finish_stopped(),
                     }
                     continue;
                 }
             };
+            // Сессия могла подняться уже ПОСЛЕ «Отключить» (пользователь нажал, пока шёл establish):
+            // показывать «Подключено» и тем более строить TUN здесь нельзя — гасим транспорт (drop
+            // закрывает соединение) и выходим.
+            if self.stopped.load(Ordering::SeqCst) {
+                drop(session);
+                return self.finish_stopped();
+            }
             self.emit(VpnEvent::Connected {
                 exit: session.chosen.clone(),
                 transport: session.transport().to_string(),
@@ -362,6 +379,12 @@ impl VpnController {
                 dest_mode,
                 dest_routes,
             };
+            // Последняя проверка перед привилегированной операцией: между establish и этим местом
+            // были резолвы (exit_ips, назначения split'а), и «Отключить» могло прийти в них.
+            // `configure` уже НЕ отменяем — он синхронный и идёт в платформенный сервис/helper.
+            if self.stopped.load(Ordering::SeqCst) {
+                return self.finish_stopped();
+            }
             let tun = match provider.configure(&params) {
                 Ok(t) => t,
                 Err(e) => {
@@ -377,10 +400,7 @@ impl VpnController {
                     self.set_state(VpnState::Migrating);
                     match self.backoff_wait(backoff).await {
                         Some(next) => backoff = next,
-                        None => {
-                            self.set_state(VpnState::Down);
-                            return Ok(());
-                        }
+                        None => return self.finish_stopped(),
                     }
                     continue;
                 }
@@ -398,7 +418,10 @@ impl VpnController {
             let mut net_changed = false;
             let r = tokio::select! {
                 r = run_data_plane(session, tun) => r,
-                _ = self.shutdown.notified() => {
+                // `cancelled` (а не голый `shutdown.notified()`): disconnect, пришедший ДО входа в
+                // select (например, пока шёл configure), иначе потерялся бы — туннель остался бы
+                // жить до следующего разрыва транспорта.
+                _ = self.cancelled() => {
                     eprintln!("[vpn] disconnect — закрываю сессию");
                     tun_ctrl.clean_shutdown();
                     self.set_state(VpnState::Down);
@@ -415,8 +438,7 @@ impl VpnController {
             };
             drop(tun_ctrl); // реконнект: закрыть старый TUN/сокет сейчас (helper EOF без 'Q' → KS держится)
             if self.stopped.load(Ordering::SeqCst) {
-                self.set_state(VpnState::Down);
-                return Ok(());
+                return self.finish_stopped();
             }
 
             // Транспорт упал сам (не пользователь) → авто-реконнект.
@@ -434,13 +456,47 @@ impl VpnController {
             } else {
                 match self.backoff_wait(backoff).await {
                     Some(next) => backoff = next,
-                    None => {
-                        self.set_state(VpnState::Down);
-                        return Ok(());
-                    }
+                    None => return self.finish_stopped(),
                 }
             }
         }
+    }
+
+    /// Ждать запроса на разрыв ([`disconnect`]). Возвращается ТОЛЬКО когда сессию остановили.
+    ///
+    /// Гонку «сигнал пришёл между проверкой флага и подпиской» закрывает порядок: сначала
+    /// регистрируем ожидание (`enable`), и лишь потом читаем `stopped`. Так `disconnect`, успевший
+    /// пройти до подписки, виден по флагу, а успевший после — будит `notify_waiters`. Без этого
+    /// пропущенный сигнал означал бы туннель, живущий после нажатия «Отключить».
+    async fn cancelled(&self) {
+        loop {
+            let notified = self.shutdown.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            if self.stopped.load(Ordering::SeqCst) {
+                return;
+            }
+            notified.await;
+            if self.stopped.load(Ordering::SeqCst) {
+                return;
+            }
+        }
+    }
+
+    /// Выполнить длинную фазу подключения, прерываясь на `disconnect`. `None` — сессию остановили
+    /// (вызывающий обязан свернуться, ничего не поднимая).
+    async fn until_stop<T>(&self, fut: impl std::future::Future<Output = T>) -> Option<T> {
+        tokio::select! {
+            biased; // отмена важнее результата фазы: оба готовы — выигрывает пользователь
+            _ = self.cancelled() => None,
+            v = fut => Some(v),
+        }
+    }
+
+    /// Общий выход из `connect` по запросу пользователя: состояние `Down`, ошибки нет.
+    fn finish_stopped(&self) -> Result<()> {
+        self.set_state(VpnState::Down);
+        Ok(())
     }
 
     /// Пауза перед следующей попыткой реконнекта. Возвращает backoff для СЛЕДУЮЩЕЙ паузы либо
@@ -455,10 +511,11 @@ impl VpnController {
             return None;
         }
         tokio::select! {
+            biased;
+            _ = self.cancelled() => None,
             _ = tokio::time::sleep(cur) => {
                 if self.stopped.load(Ordering::SeqCst) { None } else { Some(next_backoff(cur)) }
             }
-            _ = self.shutdown.notified() => None,
             _ = self.network_changed.notified() => {
                 eprintln!("[vpn] смена сети во время паузы реконнекта — пробую сразу");
                 Some(RECONNECT_BACKOFF_START)
@@ -651,6 +708,89 @@ mod tests {
         let next = c.backoff_wait(RECONNECT_BACKOFF_MAX).await;
         assert_eq!(next, Some(RECONNECT_BACKOFF_START), "backoff сброшен: условия новые");
         assert!(started.elapsed() < Duration::from_secs(5), "проснулись досрочно, а не через 30с");
+    }
+
+    /// Тестовый конфиг: движку сети не даём — все проверки ниже про фазы ДО establish.
+    fn test_cfg() -> ClientConfig {
+        ClientConfig {
+            servers: vec![],
+            server_name: "x".into(),
+            obfs_psk: None,
+            kx_suite: String::new(),
+            tcp_port: "443".into(),
+            routes: String::new(),
+            dns: None,
+            mtu: "1280".into(),
+            token: vec![],
+            pin: crate::config::PinSource::None,
+            mldsa: crate::config::MldsaSource::None,
+            allow_insecure_no_pin: false,
+            killswitch: false,
+            split: Default::default(),
+        }
+    }
+
+    /// «Отключить» во время ФАЗЫ ПОДКЛЮЧЕНИЯ (здесь — добыча Layer-1 токена, которая может тянуться
+    /// на недоступном издателе): цикл обязан свернуться сразу и НЕ трогать туннель.
+    ///
+    /// Регрессия, которую это ловит: раньше `disconnect` замечался только между итерациями, поэтому
+    /// нажатие в фазе реконнекта доводило попытку до конца и лезло конфигурировать TUN — на Android
+    /// уже поверх погашенного сервиса («CitadelVpnService не зарегистрирован» в логе), на desktop —
+    /// поднимая туннель и kill-switch заново после того, как пользователь их снял.
+    #[tokio::test]
+    async fn disconnect_during_connect_phase_stops_without_touching_tun() {
+        struct SpyProvider(Arc<AtomicBool>);
+        impl TunProvider for SpyProvider {
+            fn configure(&self, _p: &TunParams) -> Result<Arc<dyn TunIo>> {
+                self.0.store(true, Ordering::SeqCst);
+                Err(anyhow::anyhow!("configure не должен вызываться после disconnect"))
+            }
+        }
+
+        let c = Arc::new(VpnController::new());
+        let configured = Arc::new(AtomicBool::new(false));
+        // Издатель «не отвечает никогда» — цикл стоит в фазе добычи токена, пока не придёт отмена.
+        c.set_token_refresher(Arc::new(|| {
+            Box::pin(async {
+                std::future::pending::<()>().await;
+                None
+            })
+        }));
+
+        let c2 = c.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            c2.disconnect();
+        });
+
+        let provider: Arc<dyn TunProvider> = Arc::new(SpyProvider(configured.clone()));
+        tokio::time::timeout(Duration::from_secs(5), c.connect(test_cfg(), provider))
+            .await
+            .expect("цикл обязан свернуться на disconnect, а не досиживать фазу")
+            .expect("остановка пользователем — не ошибка");
+
+        assert!(!configured.load(Ordering::SeqCst), "туннель после «Отключить» не конфигурируем");
+        assert_eq!(c.state(), VpnState::Down);
+    }
+
+    /// Гонка «disconnect ровно перед подпиской на сигнал»: флаг выставлен до входа в ожидание —
+    /// ждать нечего. Без этого порядка (подписка → проверка флага) сигнал терялся, и цикл
+    /// продолжал подключаться после нажатия «Отключить».
+    #[tokio::test]
+    async fn cancelled_returns_when_stop_came_before_subscribing() {
+        let c = VpnController::new();
+        c.disconnect();
+        tokio::time::timeout(Duration::from_millis(200), c.cancelled())
+            .await
+            .expect("уже остановлены — ожидание обязано вернуться сразу");
+        // и та же проверка через until_stop: длинная фаза не должна даже начинаться
+        let r = tokio::time::timeout(
+            Duration::from_millis(200),
+            c.until_stop(async { tokio::time::sleep(Duration::from_secs(30)).await }),
+        )
+        .await
+        .expect("until_stop обязан вернуться сразу");
+        assert!(r.is_none());
     }
 
     /// C5.4b: pre-connect провал (напр. фетч Layer-1 токена не удался) эмитит Error → Down,

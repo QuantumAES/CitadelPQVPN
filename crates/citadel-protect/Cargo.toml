@@ -1,0 +1,12 @@
+[package]
+name = "citadel-protect"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Исключение исходящих сокетов движка из собственного VPN-туннеля (Android VpnService.protect)"
+
+[dependencies]
+# Сокет нужен ДО connect (протектор ставит метку на несоединённый сокет) — std такого не умеет,
+# а socket2 уже в дереве (тянется quinn), новой зависимости в сборке не появляется.
+socket2 = "0.6"

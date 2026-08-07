@@ -323,6 +323,10 @@ impl AdminClient {
             .with_context(|| format!("разбор адреса admin-канала {addr}"))?
             .next()
             .ok_or_else(|| anyhow!("admin-канал {addr}: адрес не резолвится"))?;
+        // ВНИМАНИЕ: сокет admin-канала защищать протектором НЕЛЬЗЯ (в отличие от канала к издателю
+        // и транспорта к exit). Он идёт к ADMIN_VIP — адресу ВНУТРИ туннеля, ядро exit'а DNAT'ит
+        // его на издателя (C7.2). Пометка «мимо туннеля» увела бы соединение в обычную сеть, где
+        // такого адреса нет, и «Абоненты» перестали бы открываться.
         let tcp = TcpStream::connect_timeout(&sa, Self::CONNECT_TIMEOUT)
             .with_context(|| format!("admin-канал {addr} недоступен (туннель поднят?)"))?;
         tcp.set_read_timeout(Some(Self::IO_TIMEOUT)).context("set_read_timeout")?;

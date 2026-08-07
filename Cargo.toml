@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/citadel-obfs", "crates/citadel-masque", "crates/citadel-tun", "crates/citadel-token", "crates/citadel-quic", "crates/citadel-client", "crates/citadel-helper", "crates/citadel-winnet", "crates/citadel-winsvc", "crates/citadel-vpnd", "crates/citadel-engine", "crates/citadel-cli"]
+members = ["crates/citadel-obfs", "crates/citadel-masque", "crates/citadel-protect", "crates/citadel-tun", "crates/citadel-token", "crates/citadel-quic", "crates/citadel-client", "crates/citadel-helper", "crates/citadel-winnet", "crates/citadel-winsvc", "crates/citadel-vpnd", "crates/citadel-engine", "crates/citadel-cli"]
 # app/rust (rust_lib_app, FFI-мост Flutter) — отдельный крейт вне движкового workspace
 # (тянет flutter_rust_bridge; собирается cargokit'ом; citadel-client подключён path-зависимостью).
 exclude = ["app/rust"]

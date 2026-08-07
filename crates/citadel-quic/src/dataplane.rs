@@ -228,6 +228,19 @@ fn watchdog_trips(sent: u64, recvd: u64, transport_rx: u64) -> bool {
     sent >= WATCHDOG_TX_MIN && recvd == 0 && transport_rx == 0
 }
 
+/// Клиентская сторона pump: что движок знает о собственном пути. Ничего не фильтрует — политику
+/// трафика решает exit; это диагностика, чтобы «туннель поднят, а трафика нет» не выглядело
+/// загадкой (exit дропает такие пакеты молча, и клиент обязан объяснить причину сам).
+pub struct ClientPath {
+    /// Назначенный exit'ом адрес: пакет с другим src exit дропнет анти-спуфингом (S0.2/H3).
+    pub assigned: [u8; 4],
+    /// IPv4 транспортного пира (exit). Пакет из TUN, адресованный ЕМУ, — это наш собственный
+    /// транспорт, завернувшийся в собственный туннель: на Android так выглядит незащищённый
+    /// (`VpnService.protect`) сокет, на desktop — отсутствие bypass-маршрута к exit. Такая петля
+    /// убивает сессию за секунды и раньше читалась в логе лишь как «чужой src».
+    pub exit: Option<[u8; 4]>,
+}
+
 /// Двунаправленная перекачка TUN ⇄ транспорт (QUIC DATAGRAM либо obfs-TCP record).
 /// `egress = Some(назначенный клиенту адрес)` включает egress-политику exit: анти-спуфинг
 /// inner-src (S0.2/H3), default-deny не-IPv4 и F2 (дроп во внутренние/служебные сети); `None`
@@ -241,10 +254,9 @@ pub async fn pump(
     tunnel: Tunnel,
     tun: Arc<dyn TunIo>,
     egress: Option<[u8; 4]>,
-    // Назначенный НАМ адрес — только на КЛИЕНТЕ (взаимоисключимо с `egress`) и только для
-    // диагностики: exit принимает inner-пакеты, лишь если src равен этому адресу (S0.2/H3), так
-    // что пакет с чужим src гарантированно умрёт там молча. Клиент это видит и говорит вслух.
-    client_src: Option<[u8; 4]>,
+    // Что движок знает о собственном пути — только на КЛИЕНТЕ (взаимоисключимо с `egress`) и
+    // только для диагностики (см. [`ClientPath`]).
+    client: Option<ClientPath>,
     rate_limit: Option<RateCfg>,
     admin_dst: Option<([u8; 4], u16)>,
     // Источник return-пакетов (TUN→сеть). На КЛИЕНТЕ — `None`: pump сам читает свой TUN. На EXIT —
@@ -341,6 +353,13 @@ pub async fn pump(
     let bad_src = Arc::new(AtomicU64::new(0));
     let bad_src_last = Arc::new(AtomicU32::new(0));
     let (send_bad_src, send_bad_src_last) = (bad_src.clone(), bad_src_last.clone());
+    // Из них — адресованные самому exit'у: это уже не «чужой src», а петля собственного транспорта.
+    let self_loop = Arc::new(AtomicU64::new(0));
+    let send_self_loop = self_loop.clone();
+    let (client_assigned, client_exit) = match &client {
+        Some(c) => (Some(c.assigned), c.exit),
+        None => (None, None),
+    };
     let sender = tokio::spawn(async move {
         while let Some(pkt) = tun_to_net_rx.recv().await {
             // S2.2/A2: туннель IPv4-only (адрес назначается v4, exit по default-deny дропает
@@ -355,10 +374,14 @@ pub async fn pump(
             // Диагностика (не фильтр): src ≠ назначенный адрес ⇒ exit дропнет пакет анти-спуфингом
             // и ответа не будет НИКОГДА. Отправляем всё равно — политику решает exit, а клиент лишь
             // обязан объяснить человеку «туннель поднят, а трафика нет» вместо загадочных нулей.
-            if let Some(mine) = client_src {
+            if let Some(mine) = client_assigned {
                 if v4.src != mine {
                     send_bad_src.fetch_add(1, Ordering::Relaxed);
                     send_bad_src_last.store(u32::from_be_bytes(v4.src), Ordering::Relaxed);
+                    // Пакет к самому exit'у, пришедший из TUN, — петля собственного транспорта.
+                    if client_exit == Some(v4.dst) {
+                        send_self_loop.fetch_add(1, Ordering::Relaxed);
+                    }
                 }
             }
             let dg = datagram::encode(datagram::CTX_RAW_IP, &pkt);
@@ -417,13 +440,15 @@ pub async fn pump(
     let wd_stop = stop.clone();
     let wd_non_v4 = non_v4.clone();
     let (wd_bad_src, wd_bad_src_last) = (bad_src.clone(), bad_src_last.clone());
-    let wd_mine = client_src;
+    let wd_self_loop = self_loop.clone();
+    let wd_exit = client_exit;
+    let wd_mine = client_assigned;
     // Диагностику окна печатает только КЛИЕНТ (`egress == None`): на exit'е это был бы лог о
     // трафике пользователя — против no-logs (см. handle_client).
     let wd_client = egress.is_none();
     let watchdog = tokio::spawn(async move {
         let (mut seen_tx, mut seen_rx, mut seen_v6, mut seen_urx) = (0u64, 0u64, 0u64, 0u64);
-        let mut seen_bad_src = 0u64;
+        let (mut seen_bad_src, mut seen_self_loop) = (0u64, 0u64);
         loop {
             tokio::time::sleep(WATCHDOG_INTERVAL).await;
             if wd_stop.load(Ordering::Acquire) {
@@ -470,6 +495,22 @@ pub async fn pump(
             let bad_src = wd_bad_src.load(Ordering::Relaxed);
             let bad_delta = bad_src.wrapping_sub(seen_bad_src);
             seen_bad_src = bad_src;
+            // Частный (и самый злой) случай «чужого src»: пакет адресован самому exit'у — значит,
+            // в туннель заворачивается НАШ ЖЕ транспорт. Он так не доедет никогда, сессия умрёт за
+            // секунды, и виноват не сервер, а маршрутизация на устройстве — говорим это прямо.
+            let loops = wd_self_loop.load(Ordering::Relaxed);
+            let loop_delta = loops.wrapping_sub(seen_self_loop);
+            seen_self_loop = loops;
+            if wd_client && loop_delta > 0 {
+                let exit = wd_exit.map(std::net::Ipv4Addr::from);
+                eprintln!(
+                    "[pump] ПЕТЛЯ: {loop_delta} пакетов к самому exit'у ({}) ушли в туннель — \
+                     собственный транспорт заворачивается в собственный туннель. На Android это \
+                     означает незащищённый сокет (VpnService.protect не сработал), на desktop — \
+                     отсутствие bypass-маршрута к exit. Сессия в таком виде не выживет",
+                    exit.map(|e| e.to_string()).unwrap_or_else(|| "?".into())
+                );
+            }
             if wd_client && bad_delta > 0 {
                 let last = std::net::Ipv4Addr::from(wd_bad_src_last.load(Ordering::Relaxed));
                 let mine = wd_mine.map(std::net::Ipv4Addr::from);

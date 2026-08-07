@@ -61,9 +61,9 @@ pub async fn run_diagnostics(
     for server in &cfg.servers {
         let host = host_of(server);
 
-        // 2. DNS-резолв
-        let addr = match tokio::net::lookup_host(server).await.map(|mut it| it.next()) {
-            Ok(Some(a)) => {
+        // 2. DNS-резолв (v4-first — как в боевом connect_server: QUIC-эндпоинт IPv4)
+        let addr = match crate::client::resolve_prefer_v4(server).await {
+            Some(a) => {
                 emit(DiagStep::ok(format!("DNS · {server}"), format!("резолвится в {a}")));
                 a
             }
@@ -90,20 +90,26 @@ pub async fn run_diagnostics(
             Err(e) => emit(DiagStep::fail(format!("QUIC/UDP · {server}"), format!("ошибка: {e:#}"))),
         }
 
-        // 4. TCP-проба к obfs-fallback порту
+        // 4. TCP-проба к obfs-fallback порту. Сокет — через тот же защищённый connect, что и боевой
+        // транспорт: на Android незащищённая проба при поднятом туннеле ушла бы в него самого и
+        // соврала бы «порт недоступен» там, где он доступен.
         let tcp_target = format!("{host}:{}", cfg.tcp_port);
-        match tokio::time::timeout(
-            Duration::from_secs(3),
-            tokio::net::TcpStream::connect(&tcp_target),
-        )
-        .await
-        {
-            Ok(Ok(_)) => emit(DiagStep::ok(
-                format!("TCP · {tcp_target}"),
-                "порт принимает соединения (obfs-fallback доступен)",
-            )),
-            Ok(Err(e)) => emit(DiagStep::fail(format!("TCP · {tcp_target}"), format!("connect: {e:#}"))),
-            Err(_) => emit(DiagStep::fail(format!("TCP · {tcp_target}"), "таймаут connect (3с)")),
+        let taddr = crate::client::resolve_prefer_v4(&tcp_target).await;
+        match taddr {
+            None => emit(DiagStep::fail(format!("TCP · {tcp_target}"), "не удалось разрезолвить host:port")),
+            Some(taddr) => match tokio::time::timeout(
+                Duration::from_secs(3),
+                crate::protect::connect_tcp(taddr),
+            )
+            .await
+            {
+                Ok(Ok(_)) => emit(DiagStep::ok(
+                    format!("TCP · {tcp_target}"),
+                    "порт принимает соединения (obfs-fallback доступен)",
+                )),
+                Ok(Err(e)) => emit(DiagStep::fail(format!("TCP · {tcp_target}"), format!("connect: {e:#}"))),
+                Err(_) => emit(DiagStep::fail(format!("TCP · {tcp_target}"), "таймаут connect (3с)")),
+            },
         }
     }
 

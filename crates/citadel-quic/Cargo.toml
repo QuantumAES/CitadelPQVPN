@@ -21,6 +21,7 @@ rand = "0.8"
 zeroize = "1"               # S1.3/M7: затирание секретов (obfs PSK, токен) в памяти
 libc = "0.2"
 citadel-obfs = { path = "../citadel-obfs" }
+citadel-protect = { path = "../citadel-protect" }   # анти-петля: сокеты движка мимо собственного туннеля (Android)
 citadel-masque = { path = "../citadel-masque" }
 citadel-tun = { path = "../citadel-tun" }
 citadel-token = { path = "../citadel-token" }

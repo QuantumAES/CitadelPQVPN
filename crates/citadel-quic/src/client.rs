@@ -21,8 +21,7 @@ use citadel_masque::{capsule, datagram, ip};
 use citadel_tun::TunIo;
 
 use crate::config::{ClientConfig, MldsaExpect, PinMode};
-use crate::dataplane::{pump, Tunnel};
-use tokio::net::TcpStream;
+use crate::dataplane::{pump, ClientPath, Tunnel};
 
 /// Установленная клиентская сессия: поднятый транспорт + назначенный сервером адрес.
 /// Сетевую настройку интерфейса делает вызывающий (Linux `NetConfigurator`, Android
@@ -286,10 +285,15 @@ pub async fn establish_session(cfg: &ClientConfig, force_tcp: bool) -> Result<Se
 pub async fn run_data_plane(session: Session, tun: Arc<dyn TunIo>) -> Result<()> {
     // клиент: egress-фильтр/rate-limit/admin-VIP выключены (это политика exit-стороны).
     // return_rx=None — у клиента один TUN и одно соединение, читает свой TUN сам (демукс — только exit).
-    // client_src = назначенный адрес: pump не фильтрует по нему (это политика exit'а), но
-    // говорит вслух, если в туннель ушёл пакет с чужим src — иначе такой трафик умирает на exit'е
-    // молча и выглядит как «отправлено много, принято 0».
-    pump(session.tunnel, tun, None, Some(session.addr), None, None, None).await
+    // ClientPath — чистая диагностика (pump ничего не фильтрует): назначенный адрес, чтобы назвать
+    // пакеты с чужим src (exit дропнет их молча), и адрес exit'а, чтобы отдельно назвать петлю
+    // собственного транспорта в собственный туннель.
+    let exit = match session.peer_addr().ip() {
+        std::net::IpAddr::V4(v4) => Some(v4.octets()),
+        std::net::IpAddr::V6(_) => None,
+    };
+    let path = ClientPath { assigned: session.addr, exit };
+    pump(session.tunnel, tun, None, Some(path), None, None, None).await
 }
 
 /// Подключиться к ОДНОМУ exit'у: основной путь PQ-QUIC, при недоступности — obfs-over-TCP
@@ -298,9 +302,8 @@ pub async fn run_data_plane(session: Session, tun: Arc<dyn TunIo>) -> Result<()>
 /// QUIC-пакеты). `None` — exit недоступен → вызывающий пробует следующий из списка (M5 failover).
 async fn connect_server(server: &str, cfg: &ClientConfig, force_tcp: bool) -> Result<Option<Tunnel>> {
     let host = host_of(server);
-    let addr = match tokio::net::lookup_host(server).await.map(|mut it| it.next()) {
-        Ok(Some(a)) => a,
-        _ => return Ok(None),
+    let Some(addr) = resolve_prefer_v4(server).await else {
+        return Ok(None);
     };
     // failover/fallback хотят быстрый QUIC-timeout; один сервер без fallback — ждём дольше.
     if !force_tcp {
@@ -315,7 +318,7 @@ async fn connect_server(server: &str, cfg: &ClientConfig, force_tcp: bool) -> Re
     // Та же TLS/pin/KX/токены; TCP-транспорт снимает QUIC-MTU-проблему на мобильном/NAT64-пути (MSS).
     if let Some(psk) = cfg.obfs_psk {
         let tcp_target = format!("{host}:{}", cfg.tcp_port);
-        if let Ok(Some(taddr)) = tokio::net::lookup_host(&tcp_target).await.map(|mut it| it.next()) {
+        if let Some(taddr) = resolve_prefer_v4(&tcp_target).await {
             eprintln!(
                 "[citadel-m1:client] {} → PQ-QUIC поверх obfs-TCP к {tcp_target}",
                 if force_tcp { format!("MTU-эскалация {server}") } else { format!("QUIC/UDP к {server} недоступен") }
@@ -335,6 +338,23 @@ async fn connect_server(server: &str, cfg: &ClientConfig, force_tcp: bool) -> Re
     Ok(None)
 }
 
+/// Резолв `host:port` с ПРЕДПОЧТЕНИЕМ IPv4.
+///
+/// Клиентский QUIC-эндпоинт биндится на `0.0.0.0:0` (IPv4), а туннель IPv4-only по построению
+/// (S2.2/A2). Если у exit'а есть и AAAA, и A, а система вернула первым IPv6, `connect_with` падал
+/// сразу на каждой попытке — «UDP:4433 недоступен», хотя недоступен он только по v6. При этом
+/// obfs-TCP поднимался (там семейство сокета выбирается по адресу), и снаружи это выглядело как
+/// «QUIC не работает, TCP работает» — на мобильных сетях с IPv6 куда чаще, чем на домашнем ПК.
+/// Берём v4, если он есть; иначе — первый, что дала система (поведение как раньше).
+pub(crate) async fn resolve_prefer_v4(target: &str) -> Option<SocketAddr> {
+    let addrs: Vec<SocketAddr> = tokio::net::lookup_host(target).await.ok()?.collect();
+    addrs
+        .iter()
+        .find(|a| a.is_ipv4())
+        .copied()
+        .or_else(|| addrs.first().copied())
+}
+
 /// S0.3/H1: PQ-QUIC поверх obfs-TCP к exit (fallback при заблокированном UDP). Та же TLS-1.3/
 /// hybrid-KEX/pin-логика, что и UDP-путь (`try_quic_connect`) — просто транспорт по TCP.
 /// Fail-closed по pin (S0.1): без активного pin — отказ.
@@ -345,7 +365,12 @@ async fn quic_over_tcp_connect(
     pin_host: &str,
 ) -> Result<quinn::Connection> {
     require_pin_or_insecure(&cfg.pin_for(pin_host), cfg.allow_insecure_no_pin)?;
-    let tcp = TcpStream::connect(taddr).await?;
+    // Анти-петля (Android): сокет транспорта помечается «мимо туннеля» ДО connect. Без этого
+    // obfs-TCP сессия, поднятая до создания TUN, после `establish()` начинала маршрутизироваться
+    // в НАШ ЖЕ туннель: её сегменты приходили на exit с адресом источника локальной сети, тот
+    // дропал их анти-спуфингом (S0.2) — транспорт умирал за секунды, и клиент падал в бесконечный
+    // реконнект. UDP-путь был защищён с C3.3, TCP — нет (на Android этот путь вживую не гоняли).
+    let tcp = crate::protect::connect_tcp(taddr).await?;
     let ep = crate::client_endpoint_obfs_tcp(tcp, psk)?;
     let qcfg = match cfg.pin_for(pin_host) {
         PinMode::Pinned(p) => crate::client_config_pinned(crate::kx_groups_for(&cfg.kx_suite), p)?,
@@ -518,6 +543,31 @@ fn verify_server_mldsa(
         return Err(anyhow!("PQ-auth: ML-DSA подпись сервера НЕ прошла — возможен MITM"));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod resolve_tests {
+    use super::resolve_prefer_v4;
+
+    /// Exit с обеими записями (A и AAAA) обязан дать IPv4: клиентский QUIC-эндпоинт биндится на
+    /// `0.0.0.0`, и выбранный системой IPv6 ронял бы каждую попытку QUIC при живом obfs-TCP.
+    /// `localhost` резолвится в 127.0.0.1 и ::1 (порядок зависит от системы) — то, что нужно.
+    #[tokio::test]
+    async fn prefers_ipv4_when_both_families_resolve() {
+        let a = resolve_prefer_v4("localhost:4433").await;
+        // Если в окружении localhost вообще не резолвится — тест не о чем, пропускаем.
+        if let Some(a) = a {
+            assert!(a.is_ipv4(), "выбран {a}, а нужен IPv4");
+            assert_eq!(a.port(), 4433);
+        }
+    }
+
+    /// Литерал IPv6 остаётся собой (v4 не выдумываем — поведение как раньше).
+    #[tokio::test]
+    async fn keeps_v6_when_nothing_else() {
+        let a = resolve_prefer_v4("[::1]:443").await.expect("литерал резолвится");
+        assert!(a.is_ipv6());
+    }
 }
 
 #[cfg(test)]

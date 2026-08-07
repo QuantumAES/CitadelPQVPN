@@ -1,88 +1,60 @@
 //! Защита исходящих сокетов движка от заворачивания в собственный туннель (анти-петля).
 //!
-//! На Android `VpnService` создаёт TUN, в который по умолчанию попадает ВЕСЬ трафик процесса —
-//! включая исходящий UDP/TCP самого движка к exit. Без исключения он зациклится (туннель-в-себя).
-//! Android даёт `VpnService.protect(fd)` — пометить сокет «мимо туннеля». Движок зовёт
-//! [`protect_socket`] сразу после bind каждого исходящего сокета (initial + rebind при миграции);
-//! платформа (Android, через FFI) один раз ставит протектор глобально [`set_socket_protector`].
-//! На desktop/сервере протектор не установлен → [`protect_socket`] — no-op.
+//! Сам реестр протектора живёт в крейте [`citadel_protect`] — им пользуется и `citadel-token`
+//! (канал к издателю), который на `citadel-quic` зависеть не может (цикл). Здесь — реэкспорт
+//! (чтобы `citadel_quic::protect::*` остался прежним адресом для FFI/приложения) плюс
+//! асинхронный TCP-connect для транспортных путей движка.
 
-use std::sync::{Arc, Mutex};
+pub use citadel_protect::{
+    clear_socket_protector, connect_tcp_str, connect_tcp_timeout, handle_of, protect_socket,
+    protector_active, set_socket_protector, SocketHandle, SocketProtector,
+};
 
-/// Сырой хэндл сокета для протектора: `RawFd` (Unix) / `RawSocket` (Windows). Абстрагирует
-/// платформу, чтобы движок кроссился и под Windows (там протектор — no-op: анти-петлю к exit
-/// держит WFP/маршрут-bypass, VpnService-аналога нет).
-#[cfg(unix)]
-pub type SocketHandle = std::os::fd::RawFd;
-#[cfg(windows)]
-pub type SocketHandle = std::os::windows::io::RawSocket;
-
-/// Сырой хэндл UDP-сокета для [`protect_socket`] (fd на Unix, SOCKET на Windows).
-#[cfg(unix)]
-pub fn raw_socket_handle(s: &std::net::UdpSocket) -> SocketHandle {
-    use std::os::fd::AsRawFd;
-    s.as_raw_fd()
-}
-#[cfg(windows)]
-pub fn raw_socket_handle(s: &std::net::UdpSocket) -> SocketHandle {
-    use std::os::windows::io::AsRawSocket;
-    s.as_raw_socket()
-}
-
-/// Платформенный протектор сокета (Android: обёртка над `VpnService.protect`).
-pub trait SocketProtector: Send + Sync {
-    /// Исключить сокет из VPN-маршрутизации. Возвращает `true` при успехе.
-    fn protect(&self, sock: SocketHandle) -> bool;
-}
-
-static PROTECTOR: Mutex<Option<Arc<dyn SocketProtector>>> = Mutex::new(None);
-
-/// Установить глобальный протектор (один раз при старте VPN на Android). Перезапись допустима.
-pub fn set_socket_protector(p: Arc<dyn SocketProtector>) {
-    *PROTECTOR.lock().unwrap() = Some(p);
-}
-
-/// Снять протектор (при остановке VPN-сервиса).
-pub fn clear_socket_protector() {
-    *PROTECTOR.lock().unwrap() = None;
-}
-
-/// Применить протектор к свежесозданному исходящему сокету. No-op, если не установлен (desktop).
-/// Вызывать ДО connect/первой отправки — иначе первые пакеты уйдут в туннель.
-pub fn protect_socket(sock: SocketHandle) {
-    if let Some(p) = PROTECTOR.lock().unwrap().as_ref() {
-        if !p.protect(sock) {
-            eprintln!("[protect] VpnService.protect({sock}) вернул false — возможна маршрутная петля");
-        }
-    }
+/// Асинхронный TCP-connect с защитой сокета ДО соединения (Android) — obfs-TCP транспорт и
+/// TCP-пробы диагностики.
+///
+/// Именно здесь была дыра: `TcpStream::connect` создаёт и соединяет сокет одним вызовом, вклиниться
+/// с `protect()` некуда. `TcpSocket` даёт несоединённый сокет, который мы помечаем «мимо туннеля»,
+/// и только потом соединяем — иначе на Android obfs-TCP сессия заворачивалась в собственный TUN
+/// (её пакеты приходили на exit с «чужим» src и дропались анти-спуфингом → разрыв за секунды).
+pub async fn connect_tcp(addr: std::net::SocketAddr) -> std::io::Result<tokio::net::TcpStream> {
+    let sock = if addr.is_ipv4() {
+        tokio::net::TcpSocket::new_v4()?
+    } else {
+        tokio::net::TcpSocket::new_v6()?
+    };
+    protect_socket(handle_of(&sock));
+    sock.connect(addr).await
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex};
 
-    struct Counter(Arc<AtomicUsize>);
-    impl SocketProtector for Counter {
-        fn protect(&self, _sock: SocketHandle) -> bool {
-            self.0.fetch_add(1, Ordering::SeqCst);
+    struct Peeker(Arc<Mutex<Vec<SocketHandle>>>);
+    impl SocketProtector for Peeker {
+        fn protect(&self, sock: SocketHandle) -> bool {
+            self.0.lock().unwrap().push(sock);
             true
         }
     }
 
-    #[test]
-    fn noop_without_protector_then_invoked_after_set() {
-        clear_socket_protector();
-        protect_socket(7); // без протектора — просто no-op, не паникует
+    /// Транспортный obfs-TCP сокет обязан быть защищён ДО connect — иначе на Android туннель
+    /// заворачивает собственный транспорт в себя (сессия живёт секунды). Проверяем сам helper,
+    /// через который ходят `quic_over_tcp_connect` и TCP-проба диагностики.
+    #[tokio::test]
+    async fn tcp_transport_socket_goes_through_protector() {
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let srv = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = srv.local_addr().unwrap();
 
-        let n = Arc::new(AtomicUsize::new(0));
-        set_socket_protector(Arc::new(Counter(n.clone())));
-        protect_socket(7);
-        protect_socket(8);
-        assert_eq!(n.load(Ordering::SeqCst), 2);
-
+        set_socket_protector(Arc::new(Peeker(seen.clone())));
+        let s = connect_tcp(addr).await.unwrap();
         clear_socket_protector();
-        protect_socket(9); // снова no-op
-        assert_eq!(n.load(Ordering::SeqCst), 2);
+
+        let seen = seen.lock().unwrap().clone();
+        assert_eq!(seen.len(), 1, "протектор вызван ровно один раз");
+        assert_eq!(seen[0], handle_of(&s), "защищали тот сокет, который соединили");
     }
 }

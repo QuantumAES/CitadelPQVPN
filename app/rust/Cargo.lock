@@ -541,6 +541,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "citadel-protect"
+version = "0.1.0"
+dependencies = [
+ "socket2",
+]
+
+[[package]]
 name = "citadel-quic"
 version = "0.1.0"
 dependencies = [
@@ -551,6 +558,7 @@ dependencies = [
  "bytes",
  "citadel-masque",
  "citadel-obfs",
+ "citadel-protect",
  "citadel-token",
  "citadel-tun",
  "hex",
@@ -573,6 +581,7 @@ dependencies = [
  "blind-rsa-signatures",
  "ciborium",
  "citadel-obfs",
+ "citadel-protect",
  "hex",
  "rand 0.8.6",
  "rcgen",

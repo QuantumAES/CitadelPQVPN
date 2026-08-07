@@ -17,7 +17,6 @@ use blind_rsa_signatures::{
 };
 use rand::RngCore;
 use std::io::{self, Read, Write};
-use std::net::TcpStream;
 
 /// **No-logs (приватность серверных ролей).** Издатель и admin-канал по умолчанию НЕ пишут в лог
 /// ничего, что связывает абонента, его адрес и время: ни `client_id`, ни IP пира, ни факт выдачи.
@@ -118,6 +117,10 @@ pub fn read_frame(r: &mut impl Read) -> io::Result<Vec<u8>> {
     Ok(buf)
 }
 
+/// Потолок ожидания TCP-connect к издателю. Без него недоступный издатель держал попытку минуты
+/// (ретраи SYN в стеке), подвешивая весь цикл реконнекта клиента.
+const ISSUER_CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(8);
+
 /// Поднять канал к издателю и проверить ЕГО подлинность: TCP (с ретраями) → obfs → PQ-TLS с
 /// пиннингом → `IssuerHello` с ML-DSA-подписью привязки. Возвращает поток, EKM сессии и челлендж.
 ///
@@ -133,7 +136,12 @@ fn connect_authenticated_issuer(
 ) -> Result<(pqtls::ClientTlsStream, [u8; pqtls::EKM_LEN], Vec<u8>)> {
     let mut tcp = None;
     for _ in 0..retries.max(1) {
-        match TcpStream::connect(issuer_addr) {
+        // Анти-петля (Android) + таймаут: сокет помечается «мимо туннеля» ДО connect. Клиент
+        // ходит к издателю за свежим Layer-1 токеном на КАЖДЫЙ establish, в том числе при
+        // реконнекте — незащищённый сокет здесь либо заворачивается в собственный туннель, либо
+        // (при системном always-on с блокировкой без VPN) вообще не выпускается ОС, и реконнект
+        // не может добыть токен. На сервере/desktop протектор не установлен → обычный connect.
+        match citadel_protect::connect_tcp_str(issuer_addr, ISSUER_CONNECT_TIMEOUT) {
             Ok(c) => {
                 tcp = Some(c);
                 break;
