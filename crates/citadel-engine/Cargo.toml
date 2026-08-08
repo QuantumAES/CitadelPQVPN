@@ -1,6 +1,7 @@
 [package]
 name = "citadel-engine"
 version.workspace = true
+publish.workspace = true
 edition.workspace = true
 license.workspace = true
 description = "CitadelPQVPN — движок Linux-клиента: работает БЕЗ привилегий (uid citadel-vpn), TUN-fd получает от citadel-vpnd по SCM_RIGHTS"

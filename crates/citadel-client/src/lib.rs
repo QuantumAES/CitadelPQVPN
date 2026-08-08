@@ -18,10 +18,12 @@ pub mod admin; // C7.3: admin-плоскость по туннелю (управ
 // frb_generated.rs (ссылается на vpn_connect → GuiTunProvider) собирался под android.
 #[cfg(any(target_os = "linux", target_os = "android"))]
 pub mod gui_tun;
-// AdminDeployer (C4): SSH-деплой сервера. Admin — десктоп-функция, на мобильных деплоя нет →
-// гейт not(mobile) (исключает russh из APK). См. deploy.rs / Cargo.toml.
-#[cfg(not(any(target_os = "android", target_os = "ios")))]
-pub mod deploy;
+// L-7/L-8 (аудит-4): модуль `deploy` (SSH-деплой сервера через russh, C4/C5.5) УДАЛЁН.
+// Путь был мёртв с перехода на in-band admin-плоскость (C7.3, см. api/admin.rs), но продолжал
+// собираться в desktop-бинарь и тянуть за собой `russh 0.61` вместе с pre-release зависимостями
+// (`ssh-key 0.7.0-rc.10`, `argon2 0.6.0-rc.8`), а внутри содержал `MemoryTofu`, молча принимавший
+// ЛЮБОЙ SSH host-key, и неэкранированную сборку `registry_cmd`. Единственный админский путь —
+// `citadel_client::admin` по туннелю (PQ-TLS + pin + ML-DSA-подпись домена admin).
 // C3-Windows (W2): платформо-нейтральное ядро сервис-модели (IPC-кадры app↔служба, WFP-план,
 // маршруты). Компилируется на ВСЕХ ОС (юнит-тесты гоняются на Linux); WinAPI живёт в cfg(windows)
 // провайдере/службе, что потребляют эти планы. Аналог чистых функций killswitch_rules в helper.
@@ -56,11 +58,6 @@ pub use vault::{
 pub use gui_tun::GuiTunProvider;
 #[cfg(windows)]
 pub use win_tun::WindowsTunProvider;
-#[cfg(not(any(target_os = "android", target_os = "ios")))]
-pub use deploy::{
-    AdminDeployer, CommandOutput, DeployConfig, HostKeyDecision, HostKeyVerifier, MemoryTofu,
-    RegistryEntry, ServerArch, SshAuth, DEPLOY_DIR,
-};
 
 /// Версия ядра (about-экран UI / диагностика).
 pub fn version() -> &'static str {

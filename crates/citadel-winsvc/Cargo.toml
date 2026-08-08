@@ -1,6 +1,7 @@
 [package]
 name = "citadel-winsvc"
 version.workspace = true
+publish.workspace = true
 edition.workspace = true
 license.workspace = true
 description = "CitadelPQVPN — привилегированная Windows-служба citadel-svc (модель W2): WinTUN + WFP kill-switch + маршруты/DNS, packet-pump ↔ named pipe приложения"

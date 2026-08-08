@@ -760,7 +760,12 @@ async fn run_server(tun: Arc<Tun>) -> Result<()> {
                     drop(permit); // хендшейк прошёл → освободить pre-auth слот (established не держит)
                     handle_client(Tunnel::new(conn, false), tun, issuer_auth, spent, rate_limit, admin_dst, signer, pin, router, pool).await;
                 }
-                Err(e) => eprintln!("[citadel-m1:server] хендшейк не удался: {e}"),
+                // L-15: сообщение об ошибке несёт reason-фразу КЛИЕНТА (недоверенный пир) —
+                // без обеззараживания он вписывал бы свои строки в лог exit'а.
+                Err(e) => eprintln!(
+                    "[citadel-m1:server] хендшейк не удался: {}",
+                    citadel_quic::peer_text(e)
+                ),
             }
         });
     }
@@ -804,7 +809,7 @@ async fn handle_client(
     router.unregister(addr);
     pool.lock().unwrap().free(addr); // C4: вернуть адрес в пул
     if let Err(e) = res {
-        citadel_quic::dlog!("[citadel-m1:server] pump завершён: {e}");
+        citadel_quic::dlog!("[citadel-m1:server] pump завершён: {}", citadel_quic::peer_text(e));
     }
 }
 

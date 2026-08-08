@@ -4,13 +4,17 @@
 //! и лежат одним файлом. Крипта — в Rust-ядре (aws-lc-rs, та же библиотека, что и в движке;
 //! кроссится под Android/iOS), НЕ в открытом виде и без зависимости от OS-keyring-демона.
 //!
-//! Формат файла (binary):
+//! Формат файла (binary), v3 — текущий:
 //! ```text
-//! "CPQV" | ver(1) | iters(u32 BE) | salt(16) | nonce(12) | AES-256-GCM(ciphertext‖tag)
+//! "CPQV" | ver(1)=3 | m_kib(u32 BE) | t(u32 BE) | p(u32 BE) | salt(16) | nonce(12) | AES-256-GCM(ct‖tag)
 //! ```
-//! Ключ = PBKDF2-HMAC-SHA256(passphrase, salt, iters) → 32 B. Открытый текст = CBOR(VaultData).
+//! Ключ = Argon2id(passphrase, salt, m_kib/t/p) → 32 B. Открытый текст = CBOR(VaultData).
+//! **Весь заголовок входит в AAD** (L-2/аудит-4), поэтому его правка ломает проверку тега.
 //! Неверный пароль → AEAD open не проходит → `open` возвращает ошибку (аутентификация AEAD =
 //! проверка пароля, отдельный верификатор не нужен).
+//!
+//! Читаются и прозрачно пере-сохраняются как v3: **v2** (тот же Argon2id, но AAD пустой) и
+//! **v1** (legacy PBKDF2-HMAC-SHA256 — миграция на Argon2id при первом открытии, C1/аудит-3).
 
 use std::num::NonZeroU32;
 use std::path::{Path, PathBuf};
@@ -26,8 +30,10 @@ use zeroize::Zeroize;
 use crate::creds::CredentialLink;
 
 const MAGIC: &[u8; 4] = b"CPQV";
-/// v2 (C1/аудит-3) = Argon2id (memory-hard). v1 = legacy PBKDF2 — читается для миграции на open.
-const VERSION: u8 = 2;
+/// v3 (L-2/аудит-4) = Argon2id + заголовок под AAD. v2 = Argon2id без AAD, v1 = legacy PBKDF2 —
+/// оба читаются и прозрачно пере-сохраняются как v3 при первом успешном открытии.
+const VERSION: u8 = 3;
+const VERSION_ARGON_NO_AAD: u8 = 2;
 const VERSION_PBKDF2: u8 = 1;
 const SALT_LEN: usize = 16;
 const KEY_LEN: usize = 32;
@@ -57,6 +63,48 @@ const ARGON_P: u32 = 1; // parallelism (без тредпула → кроссп
 /// (в т.ч. на другой платформе: у Android и десктопа разный баланс памяти/времени).
 fn argon_cost(m_kib: u32, t: u32) -> u64 {
     u64::from(m_kib) * u64::from(t)
+}
+
+/// **L-2/аудит-4: границы Argon2-параметров, ПРИНИМАЕМЫХ ИЗ ФАЙЛА.**
+///
+/// Параметры лежат в заголовке открытым текстом, а прочитать их приходится ДО того, как AEAD
+/// подтвердит подлинность файла (из них же и выводится ключ). Значит, подложенный/битый файл
+/// диктует нам объём аллокации и число проходов: `m_kib = 0xFFFFFFFF` — это запрос на 4 ТиБ
+/// (OOM-killer вместо сообщения об ошибке, а на Android — падение приложения), `t = 2^32` — вечное
+/// «открываю…». Владелец файла — не всегда владелец устройства: vault может прийти из бэкапа,
+/// синхронизации или от локального соседа (противник A6), поэтому границы — обязательны, и это
+/// **не** проверка криптостойкости, а защита доступности процесса.
+///
+/// Диапазон заведомо шире любых наших дефолтов (desktop 256 MiB/t=4, Android 64 MiB/t=8), чтобы
+/// будущий рост параметров не сделал старые файлы нечитаемыми, но с потолком по произведению
+/// «память × проходы» — иначе комбинация «1 GiB × 16» даёт минуты работы на телефоне.
+const ARGON_M_KIB_MIN: u32 = 8; // argon2 требует ≥ 8·p KiB
+const ARGON_M_KIB_MAX: u32 = 1024 * 1024; // 1 GiB
+const ARGON_T_MAX: u32 = 16;
+const ARGON_P_MAX: u32 = 4;
+const ARGON_COST_MAX: u64 = 8 * 1024 * 1024; // m_kib × t — 8× текущего десктопного набора
+
+fn check_argon_params(m_kib: u32, t: u32, p: u32) -> Result<()> {
+    if !(ARGON_M_KIB_MIN..=ARGON_M_KIB_MAX).contains(&m_kib)
+        || !(1..=ARGON_T_MAX).contains(&t)
+        || !(1..=ARGON_P_MAX).contains(&p)
+        || m_kib < ARGON_M_KIB_MIN.saturating_mul(p)
+        || argon_cost(m_kib, t) > ARGON_COST_MAX
+    {
+        bail!(
+            "параметры Argon2id в заголовке вне допустимых границ (m={m_kib}KiB, t={t}, p={p}) — \
+             файл повреждён или подложен"
+        );
+    }
+    Ok(())
+}
+
+/// AAD для AEAD хранилища (L-2): весь заголовок — `magic‖version‖m_kib‖t‖p‖salt‖nonce`.
+/// Заголовок перестаёт быть «свободным» полем: любая его правка (в т.ч. подмена версии на v2,
+/// чтобы отключить саму эту привязку, или перестановка salt/nonce/шифртекста между двумя
+/// файлами) ломает проверку тега и даёт честную ошибку вместо тихой работы с чужим заголовком.
+fn header_aad(header: &[u8]) -> Aad<&[u8]> {
+    Aad::from(header)
 }
 /// Минимальная длина мастер-пароля (backstop; визуальную «силу» показывает UI отдельно).
 /// Публичная: UI обязан проверять то же самое ДО дорогого Argon2-derive и говорить человеку
@@ -217,7 +265,9 @@ impl Vault {
             )));
         }
         match raw[4] {
-            VERSION => Self::open_v2(path, passphrase, &raw),
+            // v3 — заголовок под AAD; v2 — тот же Argon2id, но AAD пустой (читаем и апгрейдим).
+            VERSION => Self::open_v2(path, passphrase, &raw, true),
+            VERSION_ARGON_NO_AAD => Self::open_v2(path, passphrase, &raw, false),
             VERSION_PBKDF2 => Self::open_v1_migrate(path, passphrase, &raw),
             v => Err(VaultOpenError::Unavailable(anyhow!(
                 "неподдерживаемая версия хранилища: {v}"
@@ -236,11 +286,13 @@ impl Vault {
         }
     }
 
-    /// v2: Argon2id-заголовок `m_kib‖t‖p‖salt‖nonce` → derive → decrypt.
+    /// v2/v3: Argon2id-заголовок `m_kib‖t‖p‖salt‖nonce` → derive → decrypt.
+    /// `aad = true` (v3) — заголовок входит в AAD (L-2); `false` (v2) — как раньше, пустой AAD.
     fn open_v2(
         path: PathBuf,
         passphrase: &str,
         raw: &[u8],
+        aad: bool,
     ) -> std::result::Result<Vault, VaultOpenError> {
         if raw.len() < HEADER_LEN_V2 {
             return Err(VaultOpenError::Unavailable(anyhow!("повреждённый v2-заголовок хранилища")));
@@ -248,6 +300,8 @@ impl Vault {
         let m_kib = u32::from_be_bytes(raw[5..9].try_into().unwrap());
         let t = u32::from_be_bytes(raw[9..13].try_into().unwrap());
         let p = u32::from_be_bytes(raw[13..17].try_into().unwrap());
+        // L-2: границы ДО derive — иначе подложенный заголовок сам назначает нам аллокацию и время.
+        check_argon_params(m_kib, t, p).map_err(VaultOpenError::Unavailable)?;
         let mut salt = [0u8; SALT_LEN];
         salt.copy_from_slice(&raw[17..17 + SALT_LEN]);
         let mut nonce = [0u8; NONCE_LEN];
@@ -255,10 +309,16 @@ impl Vault {
 
         let key = derive_key_argon2(passphrase, &salt, m_kib, t, p)
             .map_err(VaultOpenError::Unavailable)?;
+        let header = raw[..HEADER_LEN_V2].to_vec();
         let mut in_out = raw[HEADER_LEN_V2..].to_vec();
         // AEAD не сошёлся = пароль (штатный случай), а не поломка машины — отдельная ветка.
         let plain = key
-            .open_in_place(Nonce::assume_unique_for_key(nonce), Aad::empty(), &mut in_out)
+            .open_in_place(
+                Nonce::assume_unique_for_key(nonce),
+                // v2 читается с пустым AAD, v3 — с заголовком (типы должны совпасть → срез).
+                header_aad(if aad { &header } else { &[] }),
+                &mut in_out,
+            )
             .map_err(|_| VaultOpenError::WrongPassword)?;
         let data: VaultData = ciborium::from_reader(&plain[..])
             .context("разобрать профили (CBOR)")
@@ -274,6 +334,13 @@ impl Vault {
                     "[vault] параметры Argon2id подняты: m={m_kib}KiB,t={t} → m={ARGON_M_KIB}KiB,t={ARGON_T}"
                 ),
                 Err(e) => eprintln!("[vault] апгрейд параметров Argon2id пропущен: {e:#}"),
+            }
+        } else if !aad {
+            // L-2: файл v2 (без AAD) — пере-сохранить как v3 тем же ключом. Пароль менять не надо:
+            // salt и параметры те же, меняется только привязка заголовка к шифртексту.
+            match v.save() {
+                Ok(()) => eprintln!("[vault] хранилище пере-сохранено как v3 (заголовок под AAD)"),
+                Err(e) => eprintln!("[vault] апгрейд формата v2→v3 пропущен: {e:#}"),
             }
         }
         Ok(v)
@@ -509,19 +576,25 @@ impl Vault {
         let mut nonce = [0u8; NONCE_LEN];
         rng.fill(&mut nonce).map_err(|_| anyhow!("RNG"))?;
 
-        let mut in_out = plain;
-        self.key
-            .seal_in_place_append_tag(Nonce::assume_unique_for_key(nonce), Aad::empty(), &mut in_out)
-            .map_err(|_| anyhow!("шифрование AEAD"))?;
-
-        let mut out = Vec::with_capacity(HEADER_LEN_V2 + in_out.len());
+        // Заголовок собирается ПЕРВЫМ: он же AAD (L-2), значит шифруем уже под него.
+        let mut out = Vec::with_capacity(HEADER_LEN_V2 + plain.len() + AES_256_GCM.tag_len());
         out.extend_from_slice(MAGIC);
-        out.push(VERSION); // v2 = Argon2id
+        out.push(VERSION); // v3 = Argon2id + заголовок под AAD
         out.extend_from_slice(&self.m_kib.to_be_bytes());
         out.extend_from_slice(&self.t.to_be_bytes());
         out.extend_from_slice(&self.p.to_be_bytes());
         out.extend_from_slice(&self.salt);
         out.extend_from_slice(&nonce);
+        debug_assert_eq!(out.len(), HEADER_LEN_V2);
+
+        let mut in_out = plain;
+        self.key
+            .seal_in_place_append_tag(
+                Nonce::assume_unique_for_key(nonce),
+                header_aad(&out),
+                &mut in_out,
+            )
+            .map_err(|_| anyhow!("шифрование AEAD"))?;
         out.extend_from_slice(&in_out);
 
         if let Some(dir) = self.path.parent() {
@@ -722,6 +795,101 @@ mod tests {
     /// Хранилище, созданное прежними (слабыми) Argon2-параметрами, при открытии поднимается до
     /// текущих: пароль тот же, профили на месте, а файл на диске пере-шифрован — иначе усиление KDF
     /// не дошло бы до тех, у кого хранилище уже есть.
+    /// L-2: параметры Argon2id из заголовка проверяются ДО derive. Подложенный «m=4 ТиБ» обязан
+    /// давать ошибку `Unavailable`, а не OOM-killer, и обязан отваливаться быстро (мы не начинаем
+    /// derive). Тест не трогает диск дважды: правим байты заголовка на месте.
+    #[test]
+    fn planted_argon_params_rejected_before_derive() {
+        let path = tmp_path("argon-bounds");
+        let pass = "boundspass1";
+        Vault::create(&path, pass).unwrap();
+        let good = std::fs::read(&path).unwrap();
+
+        // (позиция, значение) → каждое сочетание должно быть отвергнуто
+        let cases: [(&str, u32, u32, u32); 6] = [
+            ("память 4 ТиБ", u32::MAX, ARGON_T, ARGON_P),
+            ("память 0", 0, ARGON_T, ARGON_P),
+            ("проходов 0", ARGON_M_KIB, 0, ARGON_P),
+            ("проходов 2^32-1", ARGON_M_KIB, u32::MAX, ARGON_P),
+            ("parallelism 2^32-1", ARGON_M_KIB, ARGON_T, u32::MAX),
+            ("произведение выше потолка", ARGON_M_KIB_MAX, ARGON_T_MAX, 1),
+        ];
+        for (why, m, t, p) in cases {
+            let mut raw = good.clone();
+            raw[5..9].copy_from_slice(&m.to_be_bytes());
+            raw[9..13].copy_from_slice(&t.to_be_bytes());
+            raw[13..17].copy_from_slice(&p.to_be_bytes());
+            std::fs::write(&path, &raw).unwrap();
+            let started = std::time::Instant::now();
+            match Vault::open_detailed(&path, pass) {
+                Err(VaultOpenError::Unavailable(_)) => {}
+                Err(VaultOpenError::WrongPassword) => panic!("{why}: диагноз «неверный пароль» вместо отказа по границам"),
+                Ok(_) => panic!("{why}: файл с такими параметрами открылся"),
+            }
+            assert!(started.elapsed().as_secs() < 2, "{why}: derive всё-таки запустился");
+        }
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// L-2: старый файл v2 (заголовок не в AAD) открывается тем же паролем и молча
+    /// пере-сохраняется как v3; попытка выдать v3 за v2 (сброс версии, чтобы «отключить» AAD)
+    /// ломает AEAD — ровно то, ради чего заголовок и попал в AAD.
+    #[test]
+    fn v2_upgrades_to_v3_and_version_downgrade_breaks_aead() {
+        let path = tmp_path("aad-upgrade");
+        let pass = "aadpass12345";
+        let uri = sample_uri();
+        // v2-файл: те же параметры (иначе сработает ветка апгрейда стойкости), но AAD пустой.
+        {
+            let mut v = Vault::create(&path, pass).unwrap();
+            v.add("p", &uri).unwrap();
+            let mut plain = Vec::new();
+            ciborium::into_writer(&v.data, &mut plain).unwrap();
+            let nonce = [0x11u8; NONCE_LEN];
+            let mut in_out = plain;
+            v.key
+                .seal_in_place_append_tag(
+                    Nonce::assume_unique_for_key(nonce),
+                    Aad::empty(),
+                    &mut in_out,
+                )
+                .unwrap();
+            let mut out = Vec::new();
+            out.extend_from_slice(MAGIC);
+            out.push(VERSION_ARGON_NO_AAD);
+            out.extend_from_slice(&v.m_kib.to_be_bytes());
+            out.extend_from_slice(&v.t.to_be_bytes());
+            out.extend_from_slice(&v.p.to_be_bytes());
+            out.extend_from_slice(&v.salt);
+            out.extend_from_slice(&nonce);
+            out.extend_from_slice(&in_out);
+            std::fs::write(&path, &out).unwrap();
+        }
+        assert_eq!(std::fs::read(&path).unwrap()[4], VERSION_ARGON_NO_AAD, "исходно v2");
+
+        let v = Vault::open(&path, pass).unwrap();
+        assert_eq!(v.list().len(), 1, "профиль пережил апгрейд формата");
+        drop(v);
+        let raw = std::fs::read(&path).unwrap();
+        assert_eq!(raw[4], VERSION, "после открытия файл стал v3");
+        assert!(Vault::open(&path, pass).is_ok(), "v3 открывается тем же паролем");
+
+        // downgrade-атака на формат: объявляем v3-файл как v2 (AAD «выключен») → тег не сойдётся
+        let mut tampered = raw.clone();
+        tampered[4] = VERSION_ARGON_NO_AAD;
+        std::fs::write(&path, &tampered).unwrap();
+        assert!(
+            matches!(Vault::open_detailed(&path, pass), Err(VaultOpenError::WrongPassword)),
+            "подмена версии обязана ломать AEAD"
+        );
+        // правка любого поля заголовка — то же самое (здесь: parallelism в допустимых границах)
+        let mut tampered = raw.clone();
+        tampered[16] = 2;
+        std::fs::write(&path, &tampered).unwrap();
+        assert!(Vault::open_detailed(&path, pass).is_err(), "правка заголовка обязана ломать open");
+        std::fs::remove_file(&path).ok();
+    }
+
     #[test]
     fn weak_argon_params_upgraded_on_open() {
         let path = tmp_path("argon-upgrade");

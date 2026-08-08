@@ -263,7 +263,17 @@ pub mod ip {
     }
 
     /// Назначение, которое exit НЕ должен форвардить (анти-пивот во внутреннюю сеть):
-    /// приватные/loopback/link-local(incl. 169.254.169.254 metadata)/CGNAT/multicast/reserved.
+    /// приватные/loopback/link-local(incl. 169.254.169.254 metadata)/CGNAT/multicast/reserved
+    /// плюс IANA special-purpose (RFC 6890) и облачные metadata-адреса вне link-local.
+    ///
+    /// **L-1/аудит-4.** Одного 169.254.169.254 недостаточно: у Azure «wireserver» живёт на
+    /// **168.63.129.16** — это адрес из ГЛОБАЛЬНО маршрутизируемого диапазона, поэтому прежний
+    /// фильтр его пропускал, и абонент дотягивался из туннеля до metadata-плоскости хостера
+    /// (в т.ч. до agent'а расширений, т.е. до потенциального RCE на самом VPS). Заодно закрыты
+    /// диапазоны, которых в интернете быть не может, но которые ядро/приложения трактуют
+    /// по-особому: `192.0.0.0/24` (IETF protocol assignments, DS-Lite `192.0.0.0/29`),
+    /// TEST-NET-1/2/3, `198.18.0.0/15` (benchmarking — на роутерах часто заведён локально),
+    /// `192.88.99.0/24` (6to4-relay anycast).
     pub fn is_blocked_dst(a: [u8; 4]) -> bool {
         match a {
             [0, ..] => true,                       // 0.0.0.0/8 «this host»
@@ -273,6 +283,13 @@ pub mod ip {
             [172, b, ..] if (16..=31).contains(&b) => true, // 172.16/12 private (docker!)
             [192, 168, ..] => true,                // 192.168.0.0/16 private
             [100, b, ..] if (64..=127).contains(&b) => true, // 100.64/10 CGNAT
+            [168, 63, 129, 16] => true,            // L-1: Azure IMDS/wireserver (публичный диапазон!)
+            [192, 0, 0, ..] => true,               // 192.0.0.0/24 IETF protocol assignments (DS-Lite)
+            [192, 0, 2, ..] => true,               // TEST-NET-1
+            [198, 51, 100, ..] => true,            // TEST-NET-2
+            [203, 0, 113, ..] => true,             // TEST-NET-3
+            [198, b, ..] if (18..=19).contains(&b) => true, // 198.18.0.0/15 benchmarking
+            [192, 88, 99, ..] => true,             // 192.88.99.0/24 6to4-relay anycast (deprecated)
             [b, ..] if b >= 224 => true,           // 224/4 multicast + 240/4 reserved + 255.. broadcast
             _ => false,                            // публичный — разрешаем
         }
@@ -632,11 +649,27 @@ pub mod ip {
                 [100, 64, 0, 1],      // CGNAT
                 [224, 0, 0, 1],       // multicast
                 [0, 0, 0, 0],
+                // L-1: metadata вне link-local + IANA special-purpose
+                [168, 63, 129, 16],  // Azure wireserver — публичный диапазон, но metadata
+                [192, 0, 0, 8],      // IETF protocol assignments
+                [192, 0, 2, 5],      // TEST-NET-1
+                [198, 51, 100, 5],   // TEST-NET-2
+                [203, 0, 113, 5],    // TEST-NET-3
+                [198, 18, 0, 1],     // benchmarking
+                [198, 19, 255, 254], // benchmarking (верхняя граница /15)
+                [192, 88, 99, 1],    // 6to4-relay anycast
             ] {
                 assert!(is_blocked_dst(a), "{a:?} должен быть заблокирован");
             }
             assert!(!is_blocked_dst([172, 15, 0, 1])); // вне 172.16/12 — публичный
             assert!(!is_blocked_dst([172, 32, 0, 1]));
+            // соседние адреса заблокированных диапазонов остаются публичными (нет over-block)
+            assert!(!is_blocked_dst([168, 63, 129, 17]));
+            assert!(!is_blocked_dst([168, 63, 128, 16]));
+            assert!(!is_blocked_dst([192, 0, 1, 1])); // между 192.0.0/24 и TEST-NET-1
+            assert!(!is_blocked_dst([198, 20, 0, 1])); // сразу за 198.18/15
+            assert!(!is_blocked_dst([198, 17, 255, 254]));
+            assert!(!is_blocked_dst([203, 0, 114, 1]));
         }
     }
 }

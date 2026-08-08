@@ -94,7 +94,10 @@ impl Session {
             }
             let dg = match tokio::time::timeout(remaining, conn.read_datagram()).await {
                 Ok(Ok(dg)) => dg,
-                Ok(Err(e)) => return Err(anyhow!("egress-проба: транспорт закрыт: {e}")),
+                Ok(Err(e)) => {
+                    // L-15: reason-фраза закрытия — текст пира
+                    return Err(anyhow!("egress-проба: транспорт закрыт: {}", crate::peer_text(e)));
+                }
                 Err(_) => return Err(anyhow!("egress-проба: нет DNS-ответа за {}с (exit не форвардит?)", timeout.as_secs())),
             };
             let Some((datagram::CTX_RAW_IP, inner)) = datagram::decode(&dg) else { continue };
@@ -144,7 +147,9 @@ impl Session {
             }
             let dg = match tokio::time::timeout(remaining, conn.read_datagram()).await {
                 Ok(Ok(dg)) => dg,
-                Ok(Err(e)) => return Err(anyhow!("admin-проба: транспорт закрыт: {e}")),
+                Ok(Err(e)) => {
+                    return Err(anyhow!("admin-проба: транспорт закрыт: {}", crate::peer_text(e)));
+                }
                 Err(_) => continue, // истечёт на следующей проверке deadline
             };
             let Some((datagram::CTX_RAW_IP, inner)) = datagram::decode(&dg) else { continue };
@@ -354,7 +359,7 @@ async fn connect_server(server: &str, cfg: &ClientConfig, force_tcp: bool) -> Re
                     eprintln!("[citadel-m1:client] PQ-туннель (QUIC/obfs-TCP) к {tcp_target} ✔");
                     return Ok(Some(Tunnel::new(conn, true)));
                 }
-                Ok(Err(e)) => eprintln!("[citadel-m1:client] obfs-TCP не удался: {e}"),
+                Ok(Err(e)) => eprintln!("[citadel-m1:client] obfs-TCP не удался: {}", crate::peer_text(e)),
                 Err(_) => eprintln!("[citadel-m1:client] obfs-TCP: таймаут"),
             }
         }
@@ -456,7 +461,10 @@ pub(crate) async fn try_quic_connect(
         };
         match tokio::time::timeout(Duration::from_secs(3), ep.connect_with(qcfg, addr, &cfg.server_name)?).await {
             Ok(Ok(c)) => return Ok(Some(c)),
-            Ok(Err(e)) => eprintln!("[citadel-m1:client] QUIC попытка {attempt}: {e}"),
+            Ok(Err(e)) => eprintln!(
+                "[citadel-m1:client] QUIC попытка {attempt}: {}",
+                crate::peer_text(e)
+            ),
             Err(_) => eprintln!("[citadel-m1:client] QUIC попытка {attempt}: таймаут (exit/UDP недоступен?)"),
         }
         tokio::time::sleep(Duration::from_secs(1)).await;

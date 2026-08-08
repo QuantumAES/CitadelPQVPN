@@ -6,6 +6,10 @@ members = ["crates/citadel-obfs", "crates/citadel-masque", "crates/citadel-prote
 exclude = ["app/rust"]
 
 [workspace.package]
+# Крейты внутренние: на crates.io не публикуются никогда (нет стабильного API, есть path-зависимости).
+# Флаг здесь — и страховка от `cargo publish` по ошибке, и то, что позволяет cargo-deny считать
+# path-зависимости без версии нормой, а не «wildcard» (L-6, см. deny.toml).
+publish = false
 version = "0.1.0"
 edition = "2021"
 license = "Apache-2.0"

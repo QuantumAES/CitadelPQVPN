@@ -1,6 +1,7 @@
 [package]
 name = "citadel-quic"
 version = "0.1.0"
+publish.workspace = true
 edition.workspace = true
 license.workspace = true
 description = "CitadelPQVPN M0 PoC — гибридный постквантовый QUIC-хендшейк (X25519MLKEM768) на quinn + rustls/aws-lc-rs"
@@ -16,7 +17,10 @@ quinn = { version = "0.11", default-features = false, features = ["runtime-tokio
 rustls = { version = "0.23", default-features = false, features = ["aws_lc_rs", "std"] }
 # M7 PQ-auth: ML-DSA-65 (FIPS 204) подпись — unstable API aws-lc-rs (уже тянется через rustls)
 aws-lc-rs = { version = "1.17", features = ["unstable"] }
-rcgen = "0.13"
+# L-6: rcgen БЕЗ дефолтных фич — иначе он тянет второй крипто-бэкенд (`ring`) рядом с нашим
+# aws-lc-rs: два независимых набора примитивов в одном бинаре = двойная поверхность аудита и
+# обновлений. Бэкенд aws_lc_rs — ровно тот, на котором работают rustls/quinn и вся крипта проекта.
+rcgen = { version = "0.13", default-features = false, features = ["aws_lc_rs", "pem"] }
 rand = "0.8"
 zeroize = "1"               # S1.3/M7: затирание секретов (obfs PSK, токен) в памяти
 libc = "0.2"

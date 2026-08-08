@@ -1,6 +1,7 @@
 [package]
 name = "citadel-token"
 version = "0.1.0"
+publish.workspace = true
 edition.workspace = true
 license.workspace = true
 description = "CitadelPQVPN — анонимные токены (blind RSA, RFC 9474): per-user unlinkable аутентификация (Privacy Pass-стиль)"
@@ -16,7 +17,10 @@ citadel-obfs = { path = "../citadel-obfs" }   # S2.1/A1 (остаток): obfs-�
 citadel-protect = { path = "../citadel-protect" }   # анти-петля: канал к издателю мимо собственного туннеля (Android)
 # S2.1/A1: защищённый (PQ-TLS + pin) канал к издателю. rustls/rcgen/blake3 — те же версии, что в движке.
 rustls = { version = "0.23", default-features = false, features = ["aws_lc_rs", "std"] }
-rcgen = "0.13"
+# L-6: rcgen БЕЗ дефолтных фич — иначе он тянет второй крипто-бэкенд (`ring`) рядом с нашим
+# aws-lc-rs: два независимых набора примитивов в одном бинаре = двойная поверхность аудита и
+# обновлений. Бэкенд aws_lc_rs — ровно тот, на котором работают rustls/quinn и вся крипта проекта.
+rcgen = { version = "0.13", default-features = false, features = ["aws_lc_rs", "pem"] }
 blake3 = "1"
 # C7.1 admin-плоскость: CBOR-кадры команд (те же версии, что в citadel-client)
 serde = { version = "1", features = ["derive"] }

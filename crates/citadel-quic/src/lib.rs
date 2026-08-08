@@ -16,6 +16,7 @@ use rustls::{DigitallySignedStruct, SignatureScheme};
 mod obfs_socket;
 mod obfs_tcp;
 pub mod client;
+pub mod clientfw;
 pub mod config;
 pub mod dataplane;
 pub mod diag;
@@ -41,6 +42,40 @@ pub fn debug_logs() -> bool {
     *ON.get_or_init(|| {
         matches!(std::env::var("Citadel_DEBUG_LOG").as_deref(), Ok(v) if v != "0" && !v.is_empty())
     })
+}
+
+/// Максимальная длина строки, пришедшей от пира, в наших сообщениях.
+const PEER_TEXT_MAX: usize = 200;
+
+/// **Обеззараживание текста, пришедшего от сетевого пира** (аудит-5 / L-15).
+///
+/// Ошибки quinn печатают reason-фразу CONNECTION_CLOSE так, как её прислал пир
+/// (`String::from_utf8_lossy`, см. `quinn_proto::frame::{ConnectionClose,ApplicationClose}`), а
+/// reason-фразу можно прислать ЛЮБУЮ и **до аутентификации** — transport-уровень закрывает
+/// соединение ещё во время хендшейка. Мы эти ошибки печатаем в лог и подставляем в текст отказа,
+/// который видит пользователь (журнал TUI, `citadel-svc.log`, панель диагностики в приложении).
+/// Без фильтра пир получает: ANSI/OSC-управление терминалом (подделка строк журнала, скрытие
+/// текста, OSC-8 «ссылка», OSC-52 работа с буфером обмена в части терминалов), перевод строки для
+/// вставки СВОИХ строк лога и «телефонного» текста вида «обновите приложение по ссылке …».
+///
+/// Политика: только печатаемые символы (C0/C1/DEL/ESC — вон), лимит длины, пустая строка
+/// заменяется явным маркером, чтобы не получить «закрыто: » без причины.
+pub fn peer_text(e: impl std::fmt::Display) -> String {
+    let cleaned: String = e
+        .to_string()
+        .chars()
+        .filter(|c| !c.is_control() && !('\u{80}'..='\u{9f}').contains(c))
+        .collect();
+    if cleaned.trim().is_empty() {
+        return "<причина не указана>".into();
+    }
+    let mut out: String = cleaned.chars().take(PEER_TEXT_MAX).collect();
+    // Многоточие ставим ТОЛЬКО при обрезке по длине: иначе «…» появлялось бы от одного лишь
+    // отфильтрованного управляющего символа и врало бы про полноту сообщения.
+    if cleaned.chars().count() > PEER_TEXT_MAX {
+        out.push('…');
+    }
+    out
 }
 
 /// `eprintln!`, который на серверной стороне молчит без [`debug_logs`].
@@ -375,6 +410,29 @@ mod tests {
                 "бюджет датаграммы {b} < INNER_MTU {INNER_MTU} + 1 байт контекста"
             );
         }
+    }
+
+    /// L-15: текст, пришедший от пира (reason-фраза CONNECTION_CLOSE), не должен управлять
+    /// терминалом и вставлять свои строки в наш журнал.
+    #[test]
+    fn peer_text_strips_control_and_bounds_length() {
+        // ANSI/OSC-управление, перевод строки с поддельной строкой лога, DEL, C1
+        let evil = "\u{1b}[2J\u{1b}]8;;http://evil\u{7}клик\u{1b}]8;;\u{7}\nЗащищено ✔\u{7f}\u{9b}";
+        let got = peer_text(evil);
+        assert!(!got.contains('\u{1b}'), "ESC остался: {got:?}");
+        assert!(!got.contains('\n'), "перевод строки остался: {got:?}");
+        assert!(!got.contains('\u{7}') && !got.contains('\u{7f}') && !got.contains('\u{9b}'));
+        assert!(got.contains("Защищено"), "печатаемый текст сохраняется (диагностика нужна)");
+        // длинную «простыню» режем и помечаем обрезку
+        let long = peer_text("щ".repeat(10_000));
+        assert!(long.chars().count() <= PEER_TEXT_MAX + 1, "лимит длины не сработал");
+        assert!(long.ends_with('…'));
+        // пустая причина (пир закрыл соединение без текста) — явный маркер, а не пустое место
+        assert_eq!(peer_text(""), "<причина не указана>");
+        // после снятия ESC остаётся печатаемый остаток — он и печатается (это уже не управление)
+        assert_eq!(peer_text("\u{1b}[0m"), "[0m");
+        // обычная ошибка проходит без изменений
+        assert_eq!(peer_text("timed out"), "timed out");
     }
 
     /// A7: `server_config_with_cert` даёт pin = BLAKE3(cert DER) — стабильный для одной идентичности

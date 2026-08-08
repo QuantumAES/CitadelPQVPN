@@ -111,7 +111,9 @@ install_cargo_tools() {
   log "Cargo-инструменты (FFI/кросс/тесты)"
   # shellcheck disable=SC1090,SC1091
   source "$HOME/.cargo/env"
-  local tools=(cargo-ndk flutter_rust_bridge_codegen cargo-nextest)
+  # cargo-deny (L-6/аудит-4) — supply-chain гейт: CVE/RUSTSEC, yanked, лицензии, источники,
+  # запрет второго крипто-бэкенда. Обязателен: job `supply-chain` в CI без него падает.
+  local tools=(cargo-ndk flutter_rust_bridge_codegen cargo-nextest cargo-deny)
   for t in "${tools[@]}"; do
     local bin="${t/flutter_rust_bridge_codegen/flutter_rust_bridge_codegen}"
     if have "${bin}"; then ok "$t уже стоит"; else log "cargo install $t"; cargo install --locked "$t"; fi
@@ -210,7 +212,7 @@ doctor() {
   printf '  rustc      : %s\n' "$(rustc --version 2>/dev/null || echo НЕТ)"
   printf '  cargo      : %s (%s)\n' "$(cargo --version 2>/dev/null | awk '{print $2}' || echo НЕТ)" "$(command -v cargo)"
   printf '  targets    : %s\n' "$(rustup target list --installed 2>/dev/null | tr '\n' ' ' || echo '— (нет rustup)')"
-  for t in cargo-ndk flutter_rust_bridge_codegen cargo-nextest cargo-fuzz uniffi-bindgen; do
+  for t in cargo-ndk flutter_rust_bridge_codegen cargo-nextest cargo-deny cargo-fuzz uniffi-bindgen; do
     printf '  %-10s : %s\n' "$t" "$(have "$t" && echo есть || echo НЕТ)"
   done
   printf '  cmake/clang: %s / %s\n' "$(have cmake && echo есть || echo НЕТ)" "$(have clang && echo есть || echo НЕТ)"

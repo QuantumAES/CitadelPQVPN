@@ -66,11 +66,22 @@ impl Tunnel {
 
     /// Клиент: послать один control-запрос и получить ответ (reliable QUIC bi-stream).
     /// Лимит 8192 — ответ несёт ML-DSA-65 pub(1952)+sig(3309) для commitment-fetch (§S3) ⇒ ~5.3 КБ.
+    /// L-15: ошибки quinn несут reason-фразу CONNECTION_CLOSE ровно так, как её прислал пир
+    /// (в т.ч. до аутентификации) ⇒ любой текст пира проходит через [`crate::peer_text`], прежде
+    /// чем попасть в наш лог и в текст отказа для пользователя.
     pub async fn control_client(&mut self, req: &[u8]) -> Result<Vec<u8>> {
-        let (mut send, mut recv) = self.conn.open_bi().await?;
-        send.write_all(req).await?;
+        let (mut send, mut recv) = self
+            .conn
+            .open_bi()
+            .await
+            .map_err(|e| anyhow::anyhow!("control: стрим не открыт: {}", crate::peer_text(e)))?;
+        send.write_all(req)
+            .await
+            .map_err(|e| anyhow::anyhow!("control: запрос не отправлен: {}", crate::peer_text(e)))?;
         send.finish()?;
-        Ok(recv.read_to_end(8192).await?)
+        recv.read_to_end(8192)
+            .await
+            .map_err(|e| anyhow::anyhow!("control: ответ не получен: {}", crate::peer_text(e)))
     }
 
     /// Сервер: принять один control-запрос, обработать `handle` (→ ответ + aux) и ответить. `aux`
@@ -80,10 +91,21 @@ impl Tunnel {
     where
         F: FnOnce(&[u8]) -> Result<(Vec<u8>, T)>,
     {
-        let (mut send, mut recv) = self.conn.accept_bi().await?;
-        let req = recv.read_to_end(8192).await?;
+        // L-15: та же гигиена в обратную сторону — клиент для exit'а такой же недоверенный пир,
+        // и его reason-фраза не должна оказаться строкой в логе сервера.
+        let (mut send, mut recv) = self
+            .conn
+            .accept_bi()
+            .await
+            .map_err(|e| anyhow::anyhow!("control: стрим не принят: {}", crate::peer_text(e)))?;
+        let req = recv
+            .read_to_end(8192)
+            .await
+            .map_err(|e| anyhow::anyhow!("control: запрос не прочитан: {}", crate::peer_text(e)))?;
         let (resp, aux) = handle(&req)?;
-        send.write_all(&resp).await?;
+        send.write_all(&resp)
+            .await
+            .map_err(|e| anyhow::anyhow!("control: ответ не отправлен: {}", crate::peer_text(e)))?;
         send.finish()?;
         Ok(aux)
     }
@@ -228,9 +250,10 @@ fn watchdog_trips(sent: u64, recvd: u64, transport_rx: u64) -> bool {
     sent >= WATCHDOG_TX_MIN && recvd == 0 && transport_rx == 0
 }
 
-/// Клиентская сторона pump: что движок знает о собственном пути. Ничего не фильтрует — политику
-/// трафика решает exit; это диагностика, чтобы «туннель поднят, а трафика нет» не выглядело
-/// загадкой (exit дропает такие пакеты молча, и клиент обязан объяснить причину сам).
+/// Клиентская сторона pump: что движок знает о собственном пути. Диагностика (чтобы «туннель
+/// поднят, а трафика нет» не выглядело загадкой — exit дропает такие пакеты молча, и клиент обязан
+/// объяснить причину сам) И вход для F8: `assigned` — единственный адрес, на который клиент
+/// принимает пакеты из туннеля (см. [`crate::clientfw`]).
 pub struct ClientPath {
     /// Назначенный exit'ом адрес: пакет с другим src exit дропнет анти-спуфингом (S0.2/H3).
     pub assigned: [u8; 4],
@@ -360,6 +383,22 @@ pub async fn pump(
         Some(c) => (Some(c.assigned), c.exit),
         None => (None, None),
     };
+    // F8 (H-4/аудит-5): клиентский inbound-фильтр — «сервер не открывает соединений к абоненту».
+    // Живёт только на КЛИЕНТЕ (`client = Some`); свою, обратную политику exit держит в `Inbound`.
+    // Один объект на сессию, общий для sender-задачи (отмечает наши исходящие порты/протоколы) и
+    // receiver-задачи (решает по входящим) — см. [`crate::clientfw`].
+    let cfw = client
+        .as_ref()
+        .map(|c| Arc::new(crate::clientfw::ClientFilter::new(c.assigned)));
+    if let Some(f) = &cfw {
+        if f.audit_only() {
+            eprintln!(
+                "[pump] ⚠ F8 в режиме наблюдения (Citadel_INBOUND_OPEN=1): входящее из туннеля \
+                 НЕ фильтруется, только считается"
+            );
+        }
+    }
+    let send_cfw = cfw.clone();
     let sender = tokio::spawn(async move {
         while let Some(pkt) = tun_to_net_rx.recv().await {
             // S2.2/A2: туннель IPv4-only (адрес назначается v4, exit по default-deny дропает
@@ -371,6 +410,10 @@ pub async fn pump(
                 send_non_v4.fetch_add(1, Ordering::Relaxed);
                 continue;
             };
+            // F8: наш исходящий порт/протокол открывает обратный путь ЕГО ответам — и только им.
+            if let Some(f) = &send_cfw {
+                f.note_egress(&v4);
+            }
             // Диагностика (не фильтр): src ≠ назначенный адрес ⇒ exit дропнет пакет анти-спуфингом
             // и ответа не будет НИКОГДА. Отправляем всё равно — политику решает exit, а клиент лишь
             // обязан объяснить человеку «туннель поднят, а трафика нет» вместо загадочных нулей.
@@ -399,6 +442,7 @@ pub async fn pump(
     let recv_conn = conn.clone();
     let recv_stop = stop.clone();
     let recv_rx = rx_count.clone();
+    let recv_cfw = cfw.clone();
     let receiver = tokio::spawn(async move {
         let mut inb = Inbound::with_admin(egress, rate_limit, admin_dst);
         loop {
@@ -407,6 +451,12 @@ pub async fn pump(
                     // любой принятый датаграм = обратный путь жив (для watchdog); фильтр — дальше
                     recv_rx.fetch_add(1, Ordering::Relaxed);
                     if let Some((datagram::CTX_RAW_IP, pkt)) = datagram::decode(&dg) {
+                        // F8 (клиент): пропускаем только ответы на собственный трафик. Дропы
+                        // считаются и печатаются окном (см. watchdog) — это ещё и сигнал о
+                        // недобросовестном exit'е, который пытается «позвонить» на устройство.
+                        if recv_cfw.as_ref().is_some_and(|f| !f.accept(pkt)) {
+                            continue;
+                        }
                         if inb.accept(pkt) {
                             if count_traffic {
                                 TRAFFIC_RX.fetch_add(pkt.len() as u64, Ordering::Relaxed);
@@ -418,7 +468,8 @@ pub async fn pump(
                     }
                 }
                 Err(e) => {
-                    pump_log!("[pump] соединение закрыто: {e}");
+                    // L-15: reason-фраза приходит от пира — печатаем только обеззараженной.
+                    pump_log!("[pump] соединение закрыто: {}", crate::peer_text(e));
                     break;
                 }
             }
@@ -441,6 +492,7 @@ pub async fn pump(
     let wd_non_v4 = non_v4.clone();
     let (wd_bad_src, wd_bad_src_last) = (bad_src.clone(), bad_src_last.clone());
     let wd_self_loop = self_loop.clone();
+    let wd_cfw = cfw.clone();
     let wd_exit = client_exit;
     let wd_mine = client_assigned;
     // Диагностику окна печатает только КЛИЕНТ (`egress == None`): на exit'е это был бы лог о
@@ -449,6 +501,9 @@ pub async fn pump(
     let watchdog = tokio::spawn(async move {
         let (mut seen_tx, mut seen_rx, mut seen_v6, mut seen_urx) = (0u64, 0u64, 0u64, 0u64);
         let (mut seen_bad_src, mut seen_self_loop) = (0u64, 0u64);
+        // F8: предыдущий снимок счётчиков клиентского inbound-фильтра (не-IPv4, чужой dst, без
+        // запроса, ICMP-тип) — печатаем дельту за окно, а не итог за сессию.
+        let mut seen_fw = (0u64, 0u64, 0u64, 0u64);
         loop {
             tokio::time::sleep(WATCHDOG_INTERVAL).await;
             if wd_stop.load(Ordering::Acquire) {
@@ -522,6 +577,34 @@ pub async fn pump(
                      привязанном к другому интерфейсу",
                     mine.map(|m| m.to_string()).unwrap_or_else(|| "?".into())
                 );
+            }
+            // F8: что exit прислал нам сверх ответов на наш трафик. Ноль — норма; ненулевой
+            // «не наш dst» или «без запроса» означает, что сервер пытается достучаться до
+            // устройства (сканирование портов, пивот в локалку) — это прямой признак
+            // скомпрометированного/недобросовестного exit'а, и человек должен об этом узнать.
+            if let Some(f) = &wd_cfw {
+                let (nv4, ours, uns, icmp, last) = f.counters();
+                let d = (
+                    nv4.wrapping_sub(seen_fw.0),
+                    ours.wrapping_sub(seen_fw.1),
+                    uns.wrapping_sub(seen_fw.2),
+                    icmp.wrapping_sub(seen_fw.3),
+                );
+                seen_fw = (nv4, ours, uns, icmp);
+                if wd_client && d.0 + d.1 + d.2 + d.3 > 0 {
+                    let verb = if f.audit_only() { "ЗАСЧИТАНО (не дропнуто)" } else { "отброшено" };
+                    eprintln!(
+                        "[pump] F8: {verb} входящих из туннеля за {}с: не наш адрес {} (последний {}), \
+                         без нашего запроса {}, ICMP не того типа {}, не-IPv4 {} — ответом на наш \
+                         трафик это быть не может; исправный exit такого не присылает",
+                        WATCHDOG_INTERVAL.as_secs(),
+                        d.1,
+                        last.map(|a| std::net::Ipv4Addr::from(a).to_string()).unwrap_or_else(|| "—".into()),
+                        d.2,
+                        d.3,
+                        d.0,
+                    );
+                }
             }
             // Отдельный сигнал про IPv6: он уходит в blackhole по дизайну (туннель IPv4-only) —
             // без этой строки «интернет не работает» на v6-only ресурсах выглядит как загадка.
@@ -748,7 +831,10 @@ mod tests {
         assert!(!exit.accept(&[0x60, 0, 0, 0, 0, 0]), "IPv6 (версия 6) — default-deny");
         assert!(!exit.accept(&[0xff]), "мусор/обрезок — default-deny");
 
-        // клиентский режим: фильтра нет — пропускаем даже «спуфнутый» и приватный
+        // Клиентский режим `Inbound` по-прежнему без egress-политики: она про то, что клиенту
+        // позволено ОТПРАВИТЬ, и решает это exit. Входящее на клиенте фильтрует отдельный рубеж
+        // F8 (`crate::clientfw`, находка H-4) — см. его тесты; здесь проверяется только, что
+        // клиент не применяет к себе серверную политику.
         let mut client = Inbound::new(None, None);
         assert!(client.accept(&ipv4([9, 9, 9, 9], [10, 0, 0, 1])));
     }

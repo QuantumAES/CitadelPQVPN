@@ -2,6 +2,11 @@
 name = "rust_lib_app"
 version = "0.1.0"
 edition = "2021"
+# L-6: лицензия и запрет публикации указаны явно — supply-chain гейт (cargo-deny) обязан видеть
+# лицензию КАЖДОГО крейта в дереве, включая наш собственный FRB-мост, иначе проверка лицензий
+# падает на нём же. app/rust — отдельный воркспейс, `[workspace.package]` движка сюда не достаёт.
+license = "Apache-2.0"
+publish = false
 
 [lib]
 crate-type = ["cdylib", "staticlib"]
