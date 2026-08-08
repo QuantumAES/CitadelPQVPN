@@ -981,13 +981,21 @@ fn spawn_controller(
                 )
                 .await
                 {
-                    Ok(mut v) => v.pop(),
+                    // H-3: тем же заходом приезжает ключ L1 текущей эпохи (канал данных к exit'у).
+                    Ok(mut g) => g.tokens.pop().map(|token| citadel_client::SessionGrant {
+                        token,
+                        data_psk: g.data_psk,
+                    }),
                     Err(e) => {
                         eprintln!("[token] Layer-1 фетч у issuer {iss} не удался: {e:#}");
                         None
                     }
                 }
-            }) as std::pin::Pin<Box<dyn std::future::Future<Output = Option<Vec<u8>>> + Send>>
+            }) as std::pin::Pin<
+                Box<
+                    dyn std::future::Future<Output = Option<citadel_client::SessionGrant>> + Send,
+                >,
+            >
         }));
     }
     // Подписка ДО begin() (первый Connecting буферизуется в broadcast до старта форвард-задачи).

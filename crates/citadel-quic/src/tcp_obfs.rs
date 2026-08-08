@@ -36,11 +36,9 @@ pub async fn write_record<W: AsyncWriteExt + Unpin>(
     Ok(())
 }
 
-/// Прочитать один obfs-record и открыть его. AEAD-fail (мусор/проба/чужой PSK) → `InvalidData`.
-pub async fn read_record<R: AsyncReadExt + Unpin>(
-    r: &mut R,
-    psk: &[u8; 32],
-) -> io::Result<citadel_obfs::Opened> {
+/// Прочитать байты одного record (без открытия). Отдельно от `open`, чтобы приёмник мог
+/// попробовать НЕСКОЛЬКО ключей (H-3: exit принимает ключи текущей и прошлой эпохи).
+pub async fn read_record_bytes<R: AsyncReadExt + Unpin>(r: &mut R) -> io::Result<Vec<u8>> {
     let mut lenb = [0u8; 2];
     r.read_exact(&mut lenb).await?;
     let len = u16::from_be_bytes(lenb) as usize;
@@ -49,8 +47,24 @@ pub async fn read_record<R: AsyncReadExt + Unpin>(
     }
     let mut buf = vec![0u8; len];
     r.read_exact(&mut buf).await?;
+    Ok(buf)
+}
+
+/// Прочитать один obfs-record и открыть его. AEAD-fail (мусор/проба/чужой PSK) → `InvalidData`.
+pub async fn read_record<R: AsyncReadExt + Unpin>(
+    r: &mut R,
+    psk: &[u8; 32],
+) -> io::Result<citadel_obfs::Opened> {
+    let buf = read_record_bytes(r).await?;
     citadel_obfs::open(psk, &buf)
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "obfs open провалился (проба?)"))
+}
+
+/// H-3: открыть record ЛЮБЫМ из ключей (порядок = приоритет проб) и сказать, какой подошёл.
+/// Дальше соединение фиксируется на этом ключе: TCP-поток — один пир, перебирать на каждом
+/// record'е незачем (и это была бы лишняя работа на пакет под флудом).
+pub fn open_any(keys: &[[u8; 32]], buf: &[u8]) -> Option<(citadel_obfs::Opened, [u8; 32])> {
+    keys.iter().find_map(|k| citadel_obfs::open(k, buf).ok().map(|o| (o, *k)))
 }
 
 #[cfg(test)]

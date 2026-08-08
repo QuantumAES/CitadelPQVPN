@@ -49,7 +49,9 @@ impl std::fmt::Debug for ObfsTcpSocket {
 
 impl ObfsTcpSocket {
     /// Обернуть установленный TCP-поток: split на half'ы + reader/writer-задачи.
-    fn new(stream: TcpStream, psk: [u8; 32]) -> io::Result<Self> {
+    /// `first` — уже прочитанный и открытый первый record (H-3: сервер им же определяет, ключом
+    /// какой эпохи говорит клиент, см. [`accept_obfs_tcp`]); клиент передаёт `None`.
+    fn new(stream: TcpStream, psk: [u8; 32], first: Option<Vec<u8>>) -> io::Result<Self> {
         let local = stream.local_addr()?;
         let peer = stream.peer_addr()?;
         let (mut rd, mut wr) = stream.into_split();
@@ -58,6 +60,11 @@ impl ObfsTcpSocket {
         // завершается, канал закрывается → poll_recv вернёт ошибку → quinn закроет соединение.
         let (recv_tx, recv_rx) = mpsc::channel::<Vec<u8>>(RECV_CAP);
         tokio::spawn(async move {
+            if let Some(f) = first {
+                if recv_tx.send(f).await.is_err() {
+                    return;
+                }
+            }
             // Err (EOF / битый record — проба/чужой PSK) завершает цикл → канал закрывается.
             while let Ok(opened) = read_record(&mut rd, &psk).await {
                 if recv_tx.send(opened.inner).await.is_err() {
@@ -151,8 +158,9 @@ fn endpoint_over(
     stream: TcpStream,
     server_config: Option<quinn::ServerConfig>,
     psk: [u8; 32],
+    first: Option<Vec<u8>>,
 ) -> Result<quinn::Endpoint> {
-    let socket: Arc<dyn AsyncUdpSocket> = Arc::new(ObfsTcpSocket::new(stream, psk)?);
+    let socket: Arc<dyn AsyncUdpSocket> = Arc::new(ObfsTcpSocket::new(stream, psk, first)?);
     let runtime = quinn::default_runtime().ok_or_else(|| anyhow!("нет async runtime (tokio)"))?;
     let ep = quinn::Endpoint::new_with_abstract_socket(
         quinn::EndpointConfig::default(),
@@ -166,17 +174,30 @@ fn endpoint_over(
 /// Клиент: quinn-Endpoint поверх установленного obfs-TCP соединения к exit. Вызывающий делает
 /// `ep.connect_with(pinned_cfg, peer_addr, server_name)` — обычный PQ-QUIC хендшейк, просто по TCP.
 pub fn client_endpoint_obfs_tcp(stream: TcpStream, psk: [u8; 32]) -> Result<quinn::Endpoint> {
-    endpoint_over(stream, None, psk)
+    endpoint_over(stream, None, psk, None)
 }
 
 /// Сервер: quinn-Endpoint поверх ОДНОГО accept'нутого obfs-TCP стрима (single-conn). Вызывающий
 /// делает `ep.accept()` ровно один раз. `server_config` — тот же серт/pin/KX, что у UDP-endpoint.
-pub fn server_endpoint_obfs_tcp(
-    stream: TcpStream,
+///
+/// **H-3: асинхронный, потому что ключ определяется по первому record'у.** Exit принимает ключи
+/// текущей и прошлой эпохи; какой из них у этого клиента — известно только после того, как record
+/// открылся. Открытый первый record не выбрасывается, а отдаётся сокету (в нём лежит QUIC Initial —
+/// потеряй мы его, хендшейк ждал бы ретрансмита).
+///
+/// Неоткрывшийся первый record = проба/чужой ключ → ошибка, соединение рвётся, отличимого ответа
+/// пробер не получает (та же политика, что была при одном PSK).
+pub async fn server_endpoint_obfs_tcp(
+    mut stream: TcpStream,
     server_config: quinn::ServerConfig,
-    psk: [u8; 32],
+    keys: &[[u8; 32]],
 ) -> Result<quinn::Endpoint> {
-    endpoint_over(stream, Some(server_config), psk)
+    let buf = crate::tcp_obfs::read_record_bytes(&mut stream)
+        .await
+        .map_err(|e| anyhow!("obfs-TCP: первый record не прочитан: {e}"))?;
+    let (opened, psk) = crate::tcp_obfs::open_any(keys, &buf)
+        .ok_or_else(|| anyhow!("obfs-TCP: первый record не открылся ни одним ключом (проба?)"))?;
+    endpoint_over(stream, Some(server_config), psk, Some(opened.inner))
 }
 
 #[cfg(test)]
@@ -195,7 +216,7 @@ mod tests {
         let srv = tokio::spawn(async move {
             let (stream, _) = listener.accept().await.unwrap();
             let scfg = crate::server_config(crate::kx_groups_for("pq")).unwrap();
-            let ep = server_endpoint_obfs_tcp(stream, scfg, psk).unwrap();
+            let ep = server_endpoint_obfs_tcp(stream, scfg, &[psk]).await.unwrap();
             let conn = ep.accept().await.unwrap().await.unwrap();
             let dg = conn.read_datagram().await.unwrap();
             conn.send_datagram(dg).unwrap(); // эхо

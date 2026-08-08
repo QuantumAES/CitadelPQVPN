@@ -15,6 +15,10 @@ export Citadel_PIN_DIR=/shared                  # M5: pin per-host — /shared/<
 export Citadel_OBFS_PSK=$(cat /shared/obfs.psk)   # общий PSK от издателя (генерируется, не хардкод)
 export Citadel_DNS=1.1.1.1
 export Citadel_TOKENS=/shared/tokens   # анонимный токен для предъявления exit (M4/M5)
+# H-3: ключ L1 ТЕКУЩЕЙ эпохи для канала данных. Его отдаёт издатель вместе с токеном (после
+# Layer-1) — `citadel-token` кладёт файлом, `citadel-m1` читает. Бутстрапный Citadel_OBFS_PSK
+# остаётся только для канала к издателю: сам туннель он больше не открывает.
+export Citadel_OBFS_EPOCH_FILE=/shared/obfs.epoch
 # obfs-over-TCP fallback (M4): порт derive из host выбранного exit (Citadel_TCP_PORT, по умолчанию 443)
 
 # резолвим IP exit ДО того, как citadel-m1 заблокирует DNS (F6) — нужен для auth-probe позже

@@ -24,7 +24,7 @@ pub async fn fetch_tokens(
     count: usize,
     retries: u32,
     obfs_psk: Option<[u8; 32]>,
-) -> Result<Vec<Vec<u8>>> {
+) -> Result<citadel_token::Grant> {
     let issuer = issuer.to_string();
     let pin = *issuer_pin;
     let mldsa = *issuer_mldsa;
@@ -62,9 +62,13 @@ pub async fn with_token(
         // S2.1/A1-остаток: obfs-обёртка issuer-канала берётся из того же ClientConfig.obfs_psk,
         // что и туннель (probe-resistance; None → голый TLS для ссылок без obfs).
         let obfs_psk = config.obfs_psk;
-        let mut tokens = fetch_tokens(issuer, pin, mldsa, seed, 1, 20, obfs_psk).await?;
-        if let Some(t) = tokens.pop() {
+        let mut grant = fetch_tokens(issuer, pin, mldsa, seed, 1, 20, obfs_psk).await?;
+        if let Some(t) = grant.tokens.pop() {
             config.token = t;
+        }
+        // H-3: тем же заходом приезжает ключ L1 текущей эпохи для канала данных к exit'у.
+        if grant.data_psk.is_some() {
+            config.data_psk = grant.data_psk;
         }
     }
     Ok(config)

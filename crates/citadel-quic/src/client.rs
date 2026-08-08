@@ -252,7 +252,7 @@ pub async fn establish_session(cfg: &ClientConfig, force_tcp: bool) -> Result<Se
                 break;
             }
             Ok(None) => {
-                let why = if cfg.obfs_psk.is_some() {
+                let why = if cfg.transport_psk().is_some() {
                     format!("{server}: QUIC/UDP:{} и obfs-TCP:{} недоступны", port_of(server), cfg.tcp_port)
                 } else {
                     format!("{server}: QUIC/UDP:{} недоступен (obfs-fallback не настроен)", port_of(server))
@@ -337,7 +337,7 @@ async fn connect_server(server: &str, cfg: &ClientConfig, force_tcp: bool) -> Re
     // failover/fallback хотят быстрый QUIC-timeout; один сервер без fallback — ждём дольше.
     if !force_tcp {
         let multi = cfg.servers.len() > 1;
-        let attempts = if multi || cfg.obfs_psk.is_some() { 5 } else { 60 };
+        let attempts = if multi || cfg.transport_psk().is_some() { 5 } else { 60 };
         if let Some(conn) = try_quic_connect(server, addr, cfg, attempts, host).await? {
             eprintln!("[citadel-m1:client] PQ-туннель (QUIC/UDP) к {server} ✔");
             return Ok(Some(Tunnel::new(conn, false)));
@@ -345,7 +345,7 @@ async fn connect_server(server: &str, cfg: &ClientConfig, force_tcp: bool) -> Re
     }
     // S0.3/H1: fallback (или форсированный force_tcp) — PQ-QUIC ПОВЕРХ obfs-TCP (не «голый» PSK).
     // Та же TLS/pin/KX/токены; TCP-транспорт снимает QUIC-MTU-проблему на мобильном/NAT64-пути (MSS).
-    if let Some(psk) = cfg.obfs_psk {
+    if let Some(psk) = cfg.transport_psk() {
         let tcp_target = format!("{host}:{}", cfg.tcp_port);
         if let Some(taddr) = resolve_prefer_v4(&tcp_target).await {
             eprintln!(
@@ -420,7 +420,10 @@ pub(crate) async fn try_quic_connect(
     attempts: u32,
     pin_host: &str,
 ) -> Result<Option<quinn::Connection>> {
-    let ep = match cfg.obfs_psk {
+    // H-3: канал ДАННЫХ заворачивается ключом эпохи, выданным издателем (`data_psk`). Бутстрапный
+    // PSK из ссылки — только запасной путь для деплоя без ротации: если бы им шифровался и канал
+    // данных, ротация ничего не значила бы (ключ лежит в каждой ссылке).
+    let ep = match cfg.transport_psk() {
         Some(psk) => crate::client_endpoint_obfs(psk)?,
         None => quinn::Endpoint::client("0.0.0.0:0".parse()?)?,
     };
@@ -733,7 +736,7 @@ mod tests {
         let srv = tokio::spawn(async move {
             let (stream, _) = listener.accept().await.unwrap();
             let scfg = crate::server_config(crate::kx_groups_for("pq")).unwrap();
-            let ep = crate::server_endpoint_obfs_tcp(stream, scfg, psk).unwrap();
+            let ep = crate::server_endpoint_obfs_tcp(stream, scfg, &[psk]).await.unwrap();
             let conn = ep.accept().await.unwrap().await.unwrap();
             let mut t = Tunnel::new(conn, true);
             let exporter = t.exporter().unwrap();

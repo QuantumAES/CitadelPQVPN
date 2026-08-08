@@ -25,7 +25,7 @@ pub mod protect;
 pub mod ratelimit;
 pub mod tcp_obfs;
 pub mod vpn;
-pub use obfs_socket::{client_endpoint_obfs, server_endpoint_obfs};
+pub use obfs_socket::{client_endpoint_obfs, server_endpoint_obfs, PskSource};
 pub use obfs_tcp::{client_endpoint_obfs_tcp, server_endpoint_obfs_tcp};
 pub use protect::{clear_socket_protector, set_socket_protector, SocketProtector};
 
@@ -407,7 +407,7 @@ mod tests {
         let srv = tokio::spawn(async move {
             let (stream, _) = listener.accept().await.unwrap();
             let scfg = server_config(kx_groups_for("pq")).unwrap();
-            let ep = server_endpoint_obfs_tcp(stream, scfg, psk).unwrap();
+            let ep = server_endpoint_obfs_tcp(stream, scfg, &[psk]).await.unwrap();
             let conn = ep.accept().await.unwrap().await.unwrap();
             let budget = conn.max_datagram_size().unwrap();
             tokio::time::sleep(Duration::from_millis(200)).await;

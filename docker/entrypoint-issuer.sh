@@ -16,6 +16,12 @@ echo "[issuer] общий obfs-PSK → /shared/obfs.psk"
 # S2.1/A1-остаток: issuer оборачивает token- и admin-каналы в obfs тем же PSK (probe-resistance:
 # issuer-порт молчит на не-obfs пробу и на проводе неотличим от туннеля). Клиент берёт PSK из ссылки.
 export Citadel_OBFS_PSK=$(cat /shared/obfs.psk)
+# H-3: МАСТЕР-секрет L1 (в ссылки не попадает!). Из него издатель выдаёт абоненту ключ ТЕКУЩЕЙ
+# эпохи — после Layer-1 и ровно на эпоху; exit тем же мастером выводит ключи, которыми принимает.
+# Бутстрапный obfs.psk остаётся обёрткой канала К ИЗДАТЕЛЮ (его адрес и так лежит в ссылке).
+[ -f /shared/obfs.master ] || { head -c 32 /dev/urandom | od -An -tx1 | tr -d ' \n' > /shared/obfs.master; }
+chmod 640 /shared/obfs.master
+export Citadel_OBFS_MASTER=$(cat /shared/obfs.master)
 export Citadel_TOKEN_ROLE=issuer
 # ДЕМО/E2E-стенд: включаем диагностический вывод. В проде (env от AdminDeployer) его НЕТ —
 # серверные роли по умолчанию молчат о клиентах и их трафике (no-logs, citadel_quic::debug_logs).

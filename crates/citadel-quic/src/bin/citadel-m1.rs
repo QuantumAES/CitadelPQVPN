@@ -145,6 +145,30 @@ fn obfs_psk() -> Result<Option<[u8; 32]>> {
     citadel_quic::config::env_obfs_psk()
 }
 
+/// **H-3/аудит-4: чем exit шифрует L1 канала данных.**
+///
+/// `Citadel_OBFS_MASTER` (64 hex) — мастер-секрет, из которого выводится ключ КАЖДОЙ эпохи. Он
+/// **не покидает сервер**: абоненту издатель отдаёт только ключ текущей эпохи, и только после
+/// Layer-1. Отсюда и весь смысл H-3 — утёкшая ссылка перестаёт быть бессрочным пропуском в L1, а
+/// `registry revoke` начинает действовать и на этом слое (со следующей эпохи).
+///
+/// Не задан — прежнее поведение: единый `Citadel_OBFS_PSK` (token-less деплой, где раздавать ключ
+/// эпохи попросту некому). Обе переменные пусты — obfs выключен.
+///
+/// **Мастер и бутстрапный PSK — РАЗНЫЕ секреты, и это принципиально.** `Citadel_OBFS_PSK` лежит в
+/// каждой ссылке; если бы ключи эпох выводились из него, любой владелец ссылки считал бы их сам, и
+/// ротация не значила бы ничего. Поэтому мастер генерится отдельно и в ссылки не попадает.
+fn obfs_source() -> Result<Option<citadel_quic::PskSource>> {
+    if let Some(master) = citadel_quic::config::parse_env_psk("Citadel_OBFS_MASTER")? {
+        let epoch_secs: u64 = std::env::var("Citadel_EPOCH_SECS")
+            .ok()
+            .and_then(|s| s.trim().parse().ok())
+            .unwrap_or(3600);
+        return Ok(Some(citadel_quic::PskSource::Epoch { master, epoch_secs }));
+    }
+    Ok(obfs_psk()?.map(citadel_quic::PskSource::Fixed))
+}
+
 /// F4: сброс привилегий до nobody (def 65534) после привилегированной настройки сети.
 /// Дальше процессу root не нужен — TUN-fd открыт, сокеты QUIC забинжены, NAT в ядре.
 fn drop_privileges() -> Result<()> {
@@ -762,10 +786,21 @@ async fn run_server(tun: Arc<Tun>) -> Result<()> {
     }
     // S0.3/H1: клон серверного QUIC-конфига (тот же серт/pin!) для endpoint'ов поверх obfs-TCP.
     let tcp_server_cfg = cfg.clone();
-    let ep = match obfs_psk()? {
-        Some(psk) => {
-            eprintln!("[Citadel-m1:server] obfs L1 включён (probe-resistance + анти-DPI)");
-            citadel_quic::server_endpoint_obfs(listen, cfg, psk)?
+    let obfs = obfs_source()?;
+    let ep = match obfs {
+        Some(src) => {
+            // H-3: в epoch-режиме exit принимает ключи текущей и прошлой эпохи, и то же кольцо
+            // используется для obfs-TCP. Fixed — прежний единый PSK (token-less деплой).
+            eprintln!(
+                "[Citadel-m1:server] obfs L1 включён (probe-resistance + анти-DPI), ключ: {}",
+                match src {
+                    citadel_quic::PskSource::Epoch { epoch_secs, .. } =>
+                        format!("ротация по эпохам ({epoch_secs}с, H-3) — ссылка L1-доступа не даёт"),
+                    citadel_quic::PskSource::Fixed(_) =>
+                        "единый PSK из ссылок (ротации нет — token-less деплой)".to_string(),
+                }
+            );
+            citadel_quic::server_endpoint_obfs(listen, cfg, src)?
         }
         None => quinn::Endpoint::server(cfg, listen)?,
     };
@@ -846,7 +881,7 @@ async fn run_server(tun: Arc<Tun>) -> Result<()> {
 
     // TCP-fallback listener (M4): bind ДО сброса привилегий (порт <1024). Только при obfs PSK
     // (obfs-over-TCP использует тот же L1). Включается env `Citadel_TCP_LISTEN` (напр. 0.0.0.0:443).
-    let tcp_listener = match (std::env::var("Citadel_TCP_LISTEN"), obfs_psk()?) {
+    let tcp_listener = match (std::env::var("Citadel_TCP_LISTEN"), obfs) {
         (Ok(a), Some(_)) => {
             let l = tokio::net::TcpListener::bind(&a)
                 .await
@@ -861,7 +896,7 @@ async fn run_server(tun: Arc<Tun>) -> Result<()> {
 
     // TCP-fallback acceptor (S0.3/H1): каждый accept'нутый obfs-TCP стрим → свой quinn-Endpoint
     // (single-conn); клиент делает обычный PQ-QUIC хендшейк поверх TCP. Та же крипта/pin/токены.
-    if let (Some(listener), Some(psk)) = (tcp_listener, obfs_psk()?) {
+    if let (Some(listener), Some(src)) = (tcp_listener, obfs) {
         let tun = tun.clone();
         let issuer_auth = issuer_auth.clone();
         let spent = spent.clone();
@@ -906,7 +941,9 @@ async fn run_server(tun: Arc<Tun>) -> Result<()> {
                             pool.clone(),
                         );
                         tokio::spawn(async move {
-                            let ep = match citadel_quic::server_endpoint_obfs_tcp(stream, scfg, psk) {
+                            // H-3: те же ключи, что у UDP-кольца — текущая и прошлая эпоха.
+                            let keys = src.accepted_keys();
+                            let ep = match citadel_quic::server_endpoint_obfs_tcp(stream, scfg, &keys).await {
                                 Ok(ep) => ep,
                                 Err(e) => {
                                     eprintln!("[citadel-m1:server] obfs-TCP endpoint: {e}");
@@ -1108,7 +1145,10 @@ async fn run_auth_probe() -> Result<()> {
         .await?
         .next()
         .ok_or_else(|| anyhow!("не разрешился {connect}"))?;
-    let ep = match obfs_psk()? {
+    // H-3: проба идёт по тому же L1, что и настоящий клиент — ключом эпохи, если он выдан
+    // (`Citadel_OBFS_EPOCH_FILE`), иначе бутстрапным PSK. Иначе auth-probe стучалась бы в exit
+    // ключом, который тот больше не принимает, и «отказ» означал бы не то, что проверяется.
+    let ep = match citadel_quic::config::ClientConfig::from_env()?.transport_psk() {
         Some(p) => citadel_quic::client_endpoint_obfs(p)?,
         None => quinn::Endpoint::client("0.0.0.0:0".parse()?)?,
     };

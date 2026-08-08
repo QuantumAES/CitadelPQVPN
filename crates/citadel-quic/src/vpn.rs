@@ -126,11 +126,20 @@ pub trait TunProvider: Send + Sync + 'static {
     fn configure(&self, p: &TunParams) -> Result<Arc<dyn TunIo>>;
 }
 
+/// Что абонент приносит от издателя перед establish: токен Layer-2 и — с H-3 — ключ L1 текущей
+/// эпохи для канала данных. Оба живут ровно одну попытку подключения, поэтому и добываются вместе.
+#[derive(Clone, Debug, Default)]
+pub struct SessionGrant {
+    pub token: Vec<u8>,
+    /// `None` — ротация L1 не настроена (сервер отдаёт данные под бутстрапным PSK из ссылки).
+    pub data_psk: Option<[u8; 32]>,
+}
+
 /// Асинхронный добытчик свежего Layer-1 токена: зовётся перед КАЖДЫМ establish (в т.ч. реконнект),
 /// чтобы не переиспользовать потраченный токен (exit ловит double-spend, M4/M5). `None` из замыкания —
 /// токен не обновляем (token-less exit / нет Layer-1). Ставится приложением ([`VpnController::set_token_refresher`]).
 pub type TokenRefresher = Arc<
-    dyn Fn() -> std::pin::Pin<Box<dyn std::future::Future<Output = Option<Vec<u8>>> + Send>>
+    dyn Fn() -> std::pin::Pin<Box<dyn std::future::Future<Output = Option<SessionGrant>> + Send>>
         + Send
         + Sync,
 >;
@@ -253,7 +262,15 @@ impl VpnController {
                     return self.finish_stopped();
                 };
                 match fetched {
-                    Some(t) => cfg.token = t, // свежий токен — этой попытке есть что предъявить
+                    Some(g) => {
+                        cfg.token = g.token; // свежий токен — этой попытке есть что предъявить
+                        // H-3: ключ L1 текущей эпохи приезжает тем же заходом. Не затираем прежний,
+                        // если издатель ротацию не настроил (`None`) — иначе рабочая сессия после
+                        // обновления сервера «теряла» бы ключ на ровном месте.
+                        if g.data_psk.is_some() {
+                            cfg.data_psk = g.data_psk;
+                        }
+                    }
                     // Свежего токена нет (issuer недоступен ЛИБО держит single-session-аренду 4/B
                     // после предыдущей сессии). Если прошлый токен уже предъявлялся — он потрачен,
                     // и повтор гарантированно даст «auth-failed» от exit: получился бы шторм
@@ -292,14 +309,17 @@ impl VpnController {
             // иначе жжём второй токен и подменяем настоящую причину бесполезным «auth-failed»).
             if let Err(e) = &established {
                 let first = format!("{e:#}");
-                if cfg.obfs_psk.is_some() && should_escalate_to_tcp(&first) {
+                if cfg.transport_psk().is_some() && should_escalate_to_tcp(&first) {
                     eprintln!("[vpn] establish/QUIC не удался ({first}) — эскалация на obfs-TCP (мобильный MTU/NAT64?)");
                     if let Some(f) = &refresher {
                         let Some(fresh) = self.until_stop(f()).await else {
                             return self.finish_stopped();
                         };
-                        if let Some(t) = fresh {
-                            cfg.token = t;
+                        if let Some(g) = fresh {
+                            cfg.token = g.token;
+                            if g.data_psk.is_some() {
+                                cfg.data_psk = g.data_psk; // H-3: ключ мог смениться на границе эпохи
+                            }
                         }
                     }
                     // Причину QUIC-попытки тащим в итоговую ошибку: без неё в UI оставалась бы только
@@ -722,6 +742,7 @@ mod tests {
             dns: None,
             mtu: "1280".into(),
             token: vec![],
+            data_psk: None,
             pin: crate::config::PinSource::None,
             mldsa: crate::config::MldsaSource::None,
             allow_insecure_no_pin: false,

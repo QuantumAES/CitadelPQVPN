@@ -48,7 +48,11 @@ pub async fn run_diagnostics(
             cfg.servers.join(", "),
             cfg.server_name,
             crate::kx_suite_name(&cfg.kx_suite),
-            if cfg.obfs_psk.is_some() { "да" } else { "нет" },
+            match (cfg.data_psk.is_some(), cfg.obfs_psk.is_some()) {
+                (true, _) => "да (ключ эпохи, H-3)",
+                (false, true) => "да (бутстрапный PSK)",
+                (false, false) => "нет",
+            },
             if cfg.token.is_empty() { "нет" } else { "есть" },
         ),
     ));

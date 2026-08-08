@@ -120,6 +120,15 @@ pub struct ClientConfig {
     pub mtu: String,
     /// Анонимный токен для предъявления exit (M4/M5); пусто → exit может отказать.
     pub token: Vec<u8>,
+    /// **H-3: ключ L1 для канала данных** — тот, что издатель выдал на текущую эпоху вместе с
+    /// токеном. `None` — ротация не настроена (token-less/legacy деплой), и тогда канал к exit'у
+    /// заворачивается бутстрапным [`Self::obfs_psk`] из ссылки, как раньше.
+    ///
+    /// Разделение принципиальное: `obfs_psk` лежит в каждой ссылке и годится только на то, чтобы
+    /// дойти до издателя (его адрес там же). Ключ, который открывает L1 канала данных, выдаётся
+    /// ТОЛЬКО прошедшему Layer-1 и живёт одну эпоху — иначе утёкшая ссылка навсегда оставалась бы
+    /// пропуском в L1 и классификатором трафика всего деплоя.
+    pub data_psk: Option<[u8; 32]>,
     /// Источник pin'ов сервера (F1).
     pub pin: PinSource,
     /// Источник ML-DSA pub (M7).
@@ -153,6 +162,9 @@ impl Drop for ClientConfig {
         use zeroize::Zeroize;
         if let Some(psk) = self.obfs_psk.as_mut() {
             psk.zeroize();
+        }
+        if let Some(psk) = self.data_psk.as_mut() {
+            psk.zeroize(); // H-3: ключ эпохи — такой же секрет, как PSK
         }
         self.token.zeroize();
     }
@@ -190,13 +202,34 @@ pub fn parse_obfs_psk(v: &str) -> Option<[u8; 32]> {
 /// молча выключенный L1-слой при внешне настроенном PSK (и рассинхрон с другой стороной, которая
 /// свой PSK разобрала). Ровно тот класс дефекта, что M-1 и `Citadel_ISSUER_PUB`.
 pub fn env_obfs_psk() -> Result<Option<[u8; 32]>> {
-    let Ok(raw) = std::env::var("Citadel_OBFS_PSK") else { return Ok(None) };
+    parse_env_psk("Citadel_OBFS_PSK")
+}
+
+/// H-3: ключ L1 текущей эпохи для CLI-пути. `citadel-token` (роль клиента) кладёт его файлом
+/// рядом с токенами, `citadel-m1` читает — процессы разные, структуру между ними не передать.
+/// Путь задаётся `Citadel_OBFS_EPOCH_FILE`; файла нет — ротация не используется (не ошибка:
+/// token-less стенд так и работает).
+fn env_epoch_psk() -> Result<Option<[u8; 32]>> {
+    let Ok(path) = std::env::var("Citadel_OBFS_EPOCH_FILE") else { return Ok(None) };
+    if path.trim().is_empty() {
+        return Ok(None);
+    }
+    let Ok(raw) = std::fs::read_to_string(&path) else { return Ok(None) };
+    parse_obfs_psk(&raw).map(Some).ok_or_else(|| {
+        anyhow::anyhow!("{path}: L1-ключ эпохи должен быть 64 hex-символа (файл битый?)")
+    })
+}
+
+/// Тот же fail-closed разбор для любой переменной с 32-байтным ключом (`Citadel_OBFS_PSK`,
+/// `Citadel_OBFS_MASTER` — H-3). Пусто/нет = не настроено; мусор = ошибка запуска.
+pub fn parse_env_psk(var: &str) -> Result<Option<[u8; 32]>> {
+    let Ok(raw) = std::env::var(var) else { return Ok(None) };
     if raw.trim().is_empty() {
         return Ok(None);
     }
     parse_obfs_psk(&raw).map(Some).ok_or_else(|| {
         anyhow::anyhow!(
-            "Citadel_OBFS_PSK: ожидаются ровно 64 hex-символа (32 байта). Парольные фразы больше \
+            "{var}: ожидаются ровно 64 hex-символа (32 байта). Парольные фразы больше \
              не принимаются: они выводились в ключ одним проходом BLAKE3, без соли и work-factor, \
              и вскрывались офлайн-перебором (M-7). Сгенерируйте: head -c 32 /dev/urandom | xxd -p -c 32"
         )
@@ -297,6 +330,8 @@ impl ClientConfig {
             dns,
             mtu: std::env::var("Citadel_MTU").unwrap_or_else(|_| "1280".into()),
             token,
+            // H-3: для CLI-роли ключ эпохи приезжает файлом от `citadel-token` (см. env ниже).
+            data_psk: env_epoch_psk()?,
             pin,
             mldsa,
             // L-5: только в сборке `--features insecure-dev`; в релизе — всегда false (см. фн.)
@@ -306,6 +341,13 @@ impl ClientConfig {
             killswitch: env_flag("Citadel_KILLSWITCH"),
             split: Default::default(), // C8.3 split-tunnel — только клиентское GUI (Android), не env
         })
+    }
+
+    /// H-3: каким ключом заворачивать транспорт к EXIT'у — ключом эпохи, если издатель его выдал,
+    /// иначе бутстрапным PSK из ссылки (деплой без ротации). Единая точка: раньше «есть ли obfs»
+    /// проверялось по `obfs_psk` в трёх местах, и после H-3 они разошлись бы.
+    pub fn transport_psk(&self) -> Option<[u8; 32]> {
+        self.data_psk.or(self.obfs_psk)
     }
 
     /// Pin сервера `host`: Shared > Dir/`<host>.pin` > File. Совпадает со старым `read_pin_for`.
@@ -524,6 +566,7 @@ mod tests {
             dns: None,
             mtu: "1280".into(),
             token: vec![],
+            data_psk: None,
             pin,
             mldsa: MldsaSource::None,
             allow_insecure_no_pin: false,
@@ -551,6 +594,7 @@ mod tests {
             dns: None,
             mtu: "1280".into(),
             token: vec![],
+            data_psk: None,
             pin: PinSource::None,
             mldsa: MldsaSource::Bytes(vec![1, 2, 3]),
             allow_insecure_no_pin: false,
@@ -575,6 +619,7 @@ mod tests {
             dns: None,
             mtu: "1280".into(),
             token: vec![],
+            data_psk: None,
             pin: PinSource::None,
             mldsa,
             allow_insecure_no_pin: false,

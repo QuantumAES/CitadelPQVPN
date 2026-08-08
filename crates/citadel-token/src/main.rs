@@ -591,6 +591,20 @@ fn parse_hex32(arg: Option<&String>, what: &str) -> Result<[u8; 32]> {
         .with_context(|| format!("<{what}> должен быть ровно 32 байта hex"))
 }
 
+/// 32-байтный ключ из переменной окружения, fail-closed: нет/пусто — не настроено, мусор — ошибка
+/// старта (тот же принцип, что у `Citadel_OBFS_PSK`, M-7).
+fn parse_hex32_env(var: &str) -> Result<Option<[u8; 32]>> {
+    let Ok(raw) = std::env::var(var) else { return Ok(None) };
+    if raw.trim().is_empty() {
+        return Ok(None);
+    }
+    let v: [u8; 32] = hex::decode(raw.trim())
+        .ok()
+        .and_then(|v| v.try_into().ok())
+        .with_context(|| format!("{var}: ожидаются ровно 64 hex-символа (32 байта)"))?;
+    Ok(Some(v))
+}
+
 /// `valid_until`: абсолютные unix-секунды, либо относительно now — `+<N>d`/`+<N>h`/`+<секунды>`.
 /// Пусто → now + 365 дней.
 fn parse_valid_until(arg: Option<&str>) -> Result<u64> {
@@ -768,6 +782,18 @@ fn run_issuer() -> Result<()> {
     // C7.1: admin-канал (управление реестром по PQ-TLS: domain-sep Ed25519 + EKM channel binding).
     // Отдельный listener — в деплое наружу НЕ публикуется (доступ только из туннеля через DNAT
     // exit'а, C7.2). TLS-идентичность общая с token-fetch → pin из ссылки валиден для обоих каналов.
+    // H-3: мастер-секрет L1. Есть — издатель раздаёт абонентам ключ ТЕКУЩЕЙ эпохи (ротация L1,
+    // отзыв начинает работать и на этом слое); нет — канал данных остаётся на бутстрапном PSK.
+    // Разбор fail-closed: опечатка роняет старт, а не выключает ротацию молча.
+    let obfs_master = parse_hex32_env("Citadel_OBFS_MASTER")?;
+    eprintln!(
+        "[issuer] L1-ключ для абонентов: {}",
+        match obfs_master {
+            Some(_) => format!("ротация по эпохам ({epoch_secs}с, H-3)"),
+            None => "не ротируется (Citadel_OBFS_MASTER не задан — token-less/legacy)".into(),
+        }
+    );
+
     // L-14: список источников разбираем ДО потока — опечатка в адресе обязана уронить старт, а не
     // всплыть отказами admin-канала посреди работы.
     let admin_allow = PeerAllow::from_env("Citadel_ADMIN_PEER")?;
@@ -881,7 +907,7 @@ fn run_issuer() -> Result<()> {
     accept_loop(listener, "выдача токенов", gate, PeerAllow::default(), move |stream, pass, ctl| {
         if let Err(e) = serve_client(
             stream, pass, ctl, scfg.clone(), &pq, &cert_pin, &state, &dir, &quota, max_per_epoch,
-            &lease, lease_secs, obfs_psk, keysync_id.as_ref(),
+            &lease, lease_secs, obfs_psk, keysync_id.as_ref(), obfs_master, epoch_secs,
         ) {
             citadel_token::dlog!("[issuer] соединение завершено: {e}");
         }
@@ -928,6 +954,26 @@ fn lease_grant(map: &mut LeaseMap, client_id: [u8; 32], now: u64, lease_secs: u6
     }
 }
 
+/// H-3: кадр с ключом L1 текущей эпохи для абонента.
+///
+/// `0x00` — ротация не настроена (`Citadel_OBFS_MASTER` пуст): канал данных живёт на бутстрапном
+/// PSK из ссылки, как раньше. `0x01 ‖ psk(32)` — ключ текущей эпохи.
+///
+/// Кадр отправляется ВСЕГДА, даже когда ротации нет: иначе клиент не смог бы отличить «сервер
+/// старый» от «сервер новый, но ротация выключена» — а различать их придётся ровно в тот момент,
+/// когда что-то пошло не так, и гадать на длине ответа не хочется.
+fn epoch_obfs_frame(master: Option<[u8; 32]>, epoch_secs: u64) -> Vec<u8> {
+    match master {
+        None => vec![0x00],
+        Some(m) => {
+            let mut v = Vec::with_capacity(33);
+            v.push(0x01);
+            v.extend_from_slice(&citadel_obfs::psk_epoch(&m, citadel_token::current_epoch(epoch_secs)));
+            v
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn serve_client(
     tcp: TcpStream,
@@ -947,6 +993,10 @@ fn serve_client(
     lease_secs: u64,
     obfs_psk: Option<[u8; 32]>,
     keysync_id: Option<&[u8; 32]>,
+    // H-3: мастер-секрет L1 (не покидает сервер) + длина эпохи — из них выводится ключ, который
+    // издатель отдаёт абоненту после Layer-1.
+    obfs_master: Option<[u8; 32]>,
+    epoch_secs: u64,
 ) -> Result<()> {
     let peer = tcp.peer_addr().ok();
     // S2.1/A1: поднять PQ-TLS поверх TCP ДО любого обмена — Layer-1 и слепая выдача идут в шифре
@@ -1022,6 +1072,13 @@ fn serve_client(
     // выдачи (и заметит, если издатель применит не тот ключ).
     let cur = state.lock().unwrap().1.clone();
     write_frame(&mut conn, &cur.public_bytes())?;
+    // H-3: следом — ключ L1-обфускации текущей эпохи. Он выводится из мастер-секрета, которого нет
+    // ни в одной ссылке, поэтому получить его может ТОЛЬКО прошедший Layer-1 абонент — и ровно на
+    // одну эпоху. Отсюда два свойства, которых не было: отзыв абонента гасит и L1-доступ (≤ эпохи),
+    // а утёкшая ссылка перестаёт быть бессрочным классификатором трафика деплоя.
+    // Кадр всегда есть (протокол фиксирован): `0x00` = ротация не настроена (token-less/legacy —
+    // канал данных живёт на бутстрапном PSK из ссылки), `0x01 ‖ psk(32)` = ключ эпохи.
+    write_frame(&mut conn, &epoch_obfs_frame(obfs_master, epoch_secs))?;
 
     let mut n = 0u32;
     // клиент закрыл соединение → read_frame вернёт Err → выходим из цикла
@@ -1083,15 +1140,44 @@ fn run_client_fetch() -> Result<()> {
     eprintln!("[client] Layer-1 issuance у издателя {issuer} ({count} токенов, PQ-TLS+pin{}, VOPRF epoch-scoped)…",
         if obfs_psk.is_some() { "+obfs" } else { "" });
     // C5.3: весь протокол (Layer-1 auth + получение K текущей эпохи + слепая выдача) — в citadel_token.
-    let tokens =
+    let grant =
         citadel_token::fetch_tokens(&issuer, &issuer_pin, &issuer_mldsa, &seed, count, 20, obfs_psk)?;
 
     let mut f = std::fs::File::create(format!("{dir}/tokens")).context("запись tokens")?;
-    for t in &tokens {
+    for t in &grant.tokens {
         writeln!(f, "{}", hex::encode(t))?;
     }
-    eprintln!("[client] получено {} токенов → {dir}/tokens (издатель их НЕ видел → unlinkable)", tokens.len());
+    // H-3: ключ L1 текущей эпохи — рядом с токенами. Эта роль CLI работает как отдельный процесс
+    // (демо/стенд: сначала добыть токен, потом поднять туннель `citadel-m1`), поэтому ключ надо
+    // передать «вбок» файлом, ровно как токены. В GUI/консольном клиенте того же не требуется:
+    // там движок и добытчик токенов живут в одном процессе и обмениваются структурой.
+    match grant.data_psk {
+        Some(psk) => {
+            let path = format!("{dir}/obfs.epoch");
+            std::fs::write(&path, hex::encode(psk)).context("запись L1-ключа эпохи")?;
+            set_file_perms_600(&path);
+            eprintln!("[client] L1-ключ текущей эпохи → {path} (ротация H-3)");
+        }
+        None => {
+            let _ = std::fs::remove_file(format!("{dir}/obfs.epoch")); // не тащить ключ прошлого стенда
+        }
+    }
+    eprintln!(
+        "[client] получено {} токенов → {dir}/tokens (издатель их НЕ видел → unlinkable)",
+        grant.tokens.len()
+    );
     Ok(())
+}
+
+/// Ключевой материал на диске — только владельцу (как `vault.bin`/`issuer-*.key`).
+fn set_file_perms_600(path: &str) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
+    }
+    #[cfg(not(unix))]
+    let _ = path;
 }
 
 /// C5.4: печатает Ed25519 pub (hex) для `Citadel_CLIENT_SEED` — для добавления в реестр issuer'а

@@ -21,6 +21,10 @@ export Citadel_MTU=1161   # = citadel_quic::INNER_MTU: ровно то, что �
 export Citadel_NAT_SRC=10.7.0.0/16
 export Citadel_PIN_FILE=${Citadel_PIN_FILE:-/shared/exit.pin}   # exit2 переопределяет (multi-server, M5)
 export Citadel_OBFS_PSK=$(cat /shared/obfs.psk)   # общий PSK сгенерирован издателем (не хардкод)
+# H-3: канал данных принимает ТОЛЬКО ключи эпох, выведенные из мастера (PSK из ссылки его больше
+# не открывает). Мастер кладёт издатель; ждём его появления так же, как ключа эпохи.
+for _ in $(seq 1 60); do [ -f /shared/obfs.master ] && break; sleep 1; done
+[ -f /shared/obfs.master ] && export Citadel_OBFS_MASTER=$(cat /shared/obfs.master)
 export Citadel_ISSUER_KEY=/shared/issuer.key   # F-M4: проверка анонимных токенов (M-6: ключ эпохи СЕКРЕТЕН)
 export Citadel_EPOCH_SECS=3600   # C5.1: epoch-scoped — exit читает issuer-<epoch>.key (current±prev)
 export Citadel_RATE_LIMIT=131072   # F7/D3: 128 KiB/с на клиента вверх (анти-абуз/исчерпание ресурсов)

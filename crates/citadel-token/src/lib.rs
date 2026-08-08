@@ -263,7 +263,7 @@ pub fn fetch_tokens(
     count: usize,
     retries: u32,
     obfs_psk: Option<[u8; 32]>,
-) -> Result<Vec<Vec<u8>>> {
+) -> Result<Grant> {
     let (mut conn, ekm, challenge) =
         connect_authenticated_issuer(issuer_addr, issuer_pin, issuer_mldsa, retries, obfs_psk)?;
 
@@ -279,6 +279,11 @@ pub fn fetch_tokens(
     // здесь, чем после цикла выдачи (иначе квота абонента тратится впустую, а причина всплывает
     // только на finalize).
     voprf::parse_public_element(&issuer_public).context("публичный элемент эпохи от издателя")?;
+
+    // H-3: ключ L1-обфускации текущей эпохи (или явное «ротации нет»).
+    let data_psk = parse_epoch_obfs_frame(
+        &read_frame(&mut conn).context("издатель не прислал L1-ключ эпохи (старая версия?)")?,
+    )?;
 
     let mut tokens = Vec::with_capacity(count);
     for _ in 0..count {
@@ -297,7 +302,30 @@ pub fn fetch_tokens(
         let (evaluated, proof) = resp.split_at(voprf::ELEMENT_LEN);
         tokens.push(st.finalize(&issuer_public, evaluated, proof)?.to_bytes());
     }
-    Ok(tokens)
+    Ok(Grant { tokens, data_psk })
+}
+
+/// Что абонент получает у издателя за один заход: токены Layer-2 и — с H-3 — ключ L1 текущей
+/// эпохи для канала данных.
+#[derive(Debug, Clone)]
+pub struct Grant {
+    pub tokens: Vec<Vec<u8>>,
+    /// `Some` — этим ключом заворачивать транспорт к exit'у (ротация H-3 включена);
+    /// `None` — ротации нет, канал данных живёт на бутстрапном PSK из ссылки.
+    pub data_psk: Option<[u8; 32]>,
+}
+
+/// H-3: разбор кадра с ключом L1 эпохи. Формат фиксирован (`0x00` | `0x01 ‖ psk(32)`), поэтому
+/// любое отклонение — это несовместимый или подставной издатель, и лучше отказаться сразу, чем
+/// молча уйти на «ротации нет» и получить необъяснимо не поднимающийся туннель.
+fn parse_epoch_obfs_frame(f: &[u8]) -> Result<Option<[u8; 32]>> {
+    match f {
+        [0x00] => Ok(None),
+        [0x01, rest @ ..] if rest.len() == 32 => {
+            Ok(Some(rest.try_into().expect("длина проверена")))
+        }
+        _ => bail!("издатель прислал непонятный L1-кадр ({} Б) — несовместимая версия?", f.len()),
+    }
 }
 
 // ===================== интерактивный issuance по ролям (M5, issuer↔exit split) =====================
@@ -423,17 +451,20 @@ mod tests {
             let got = pqid::verify_auth(&auth, pqid::DOMAIN_CLIENT, &challenge, &ekm).unwrap();
             assert_eq!(got, client_id, "зарегистрированный абонент");
             write_frame(&mut conn, &epoch_public).unwrap(); // публичный элемент текущей эпохи
+            // H-3: следом кадр L1-ключа эпохи; здесь ротация выключена → «нет» (0x00)
+            write_frame(&mut conn, &[0x00]).unwrap();
             while let Ok(blinded) = read_frame(&mut conn) {
                 let (e, proof) = epoch_key.evaluate(&blinded).unwrap();
                 write_frame(&mut conn, &[e, proof].concat()).unwrap();
             }
             epoch_key
         });
-        let tokens = fetch_tokens(&addr, &issuer_pin, &issuer_mldsa, &seed, 3, 3, None).unwrap();
-        assert_eq!(tokens.len(), 3);
+        let grant = fetch_tokens(&addr, &issuer_pin, &issuer_mldsa, &seed, 3, 3, None).unwrap();
+        assert_eq!(grant.tokens.len(), 3);
+        assert!(grant.data_psk.is_none(), "издатель сказал «ротации нет» — клиент это и увидел");
         let key = srv.join().unwrap();
         let ctx = redeem_context(b"e");
-        for t in &tokens {
+        for t in &grant.tokens {
             let redeem = Token::from_bytes(t).unwrap().redeem(&ctx);
             assert!(key.verify_redemption(&redeem, &ctx).is_some(), "токен валиден под ключом эпохи");
         }

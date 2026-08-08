@@ -33,6 +33,115 @@ use tokio::io::ReadBuf;
 /// QUIC ретрансмитит). Защита от OOM (STRIDE D2), как у datagram-каналов.
 const SEND_QUEUE_CAP: usize = 1024;
 
+/// Потолок таблицы «адрес пира → каким ключом он говорит» (H-3). Записи вытесняются по LRU;
+/// вытеснение легитимного пира стоит ему ровно одной лишней пробы ключа на следующем пакете,
+/// поэтому потолок можно держать скромным и не бояться флуда с подменённых адресов.
+const PEER_KEY_CAP: usize = 4096;
+
+/// **H-3/аудит-4: чем сокет шифрует L1.**
+///
+/// `Fixed` — один PSK на всё время (клиент; token-less деплой; канал издателя). `Epoch` — ключ
+/// выводится из мастер-секрета сервера на номер эпохи и меняется вместе с ней; принимающая сторона
+/// держит **две** соседние эпохи (current и prev), потому что клиент мог получить ключ за секунду
+/// до смены эпохи, а сессия живёт дольше.
+#[derive(Clone, Copy, Debug)]
+pub enum PskSource {
+    Fixed([u8; 32]),
+    /// Мастер-секрет сервера + длина эпохи (та же, что у токенов Layer-2).
+    Epoch { master: [u8; 32], epoch_secs: u64 },
+}
+
+impl PskSource {
+    /// Номер эпохи «сейчас» (для `Fixed` — константа 0: ключ не меняется никогда).
+    fn epoch_now(&self) -> u64 {
+        match self {
+            PskSource::Fixed(_) => 0,
+            PskSource::Epoch { epoch_secs, .. } => citadel_token::current_epoch(*epoch_secs),
+        }
+    }
+
+    /// Эпохи, ключами которых принимаем СЕЙЧАС — свежайшая первой.
+    fn accepted(&self, cur: u64) -> Vec<u64> {
+        match self {
+            PskSource::Fixed(_) => vec![0],
+            PskSource::Epoch { .. } => vec![cur, cur.wrapping_sub(1)],
+        }
+    }
+
+    /// H-3: ключи, которыми принимаем сейчас (для obfs-TCP, где кольцо не нужно — соединение
+    /// фиксируется на подошедшем ключе с первого record'а).
+    pub fn accepted_keys(&self) -> Vec<[u8; 32]> {
+        let cur = self.epoch_now();
+        self.accepted(cur).into_iter().map(|e| self.key_for(e)).collect()
+    }
+
+    fn key_for(&self, epoch: u64) -> [u8; 32] {
+        match self {
+            PskSource::Fixed(k) => *k,
+            PskSource::Epoch { master, .. } => citadel_obfs::psk_epoch(master, epoch),
+        }
+    }
+}
+
+/// Сколько ключей эпох держим одновременно (анти-OOM: см. вытеснение в [`EpochCache::sweep`]).
+const EPOCH_CACHE_CAP: usize = 32;
+/// Сколько ключ прошлой эпохи живёт после последнего использования. Держать его дольше окна
+/// «current ± prev» приходится намеренно: сессия, поднятая под ключом эпохи `e`, при дефолтной
+/// часовой эпохе иначе умирала бы через 1–2 часа на ровном месте — а десктопные сессии живут
+/// сутками. Пока по ключу идёт трафик, он не вытесняется; замолчал — уходит через это окно.
+const EPOCH_KEY_IDLE: Duration = Duration::from_secs(180);
+
+/// Кеш «эпоха → криптоматериал» с вытеснением по простою.
+struct EpochCache<T> {
+    items: Vec<(u64, T, Instant)>,
+}
+
+impl<T> EpochCache<T> {
+    fn new() -> Self {
+        Self { items: Vec::new() }
+    }
+
+    /// Материал для эпохи; отсутствующий создаётся `make` (BLAKE3-derive + key schedule).
+    /// Возвращает индекс, а не ссылку: вызывающему обычно нужно ещё и «потрогать» запись.
+    fn slot(&mut self, epoch: u64, make: impl FnOnce() -> T) -> usize {
+        match self.items.iter().position(|(e, _, _)| *e == epoch) {
+            Some(i) => i,
+            None => {
+                self.items.push((epoch, make(), Instant::now()));
+                self.items.len() - 1
+            }
+        }
+    }
+
+    fn touch(&mut self, i: usize) {
+        self.items[i].2 = Instant::now();
+    }
+
+    /// Убрать ключи вне окна `keep`, по которым давно нет трафика; при переполнении — самые
+    /// давние независимо от активности (иначе абонент, собравший ключи многих эпох, мог бы
+    /// заставить нас держать их все).
+    fn sweep(&mut self, keep: &[u64]) {
+        let now = Instant::now();
+        self.items
+            .retain(|(e, _, used)| keep.contains(e) || now.duration_since(*used) < EPOCH_KEY_IDLE);
+        while self.items.len() > EPOCH_CACHE_CAP {
+            let oldest = self
+                .items
+                .iter()
+                .enumerate()
+                .filter(|(_, (e, _, _))| !keep.contains(e))
+                .min_by_key(|(_, (_, _, used))| *used)
+                .map(|(i, _)| i);
+            match oldest {
+                Some(i) => {
+                    self.items.remove(i);
+                }
+                None => break,
+            }
+        }
+    }
+}
+
 /// Политика тайминг-шейпинга исходящих пакетов (анти-корреляция по времени, вторая ось I5).
 /// DAITA-стиль: выпуск по слот-сетке + adaptive chaff, а не constant-rate (тот убил бы throughput).
 #[derive(Clone, Copy, Debug)]
@@ -138,10 +247,18 @@ impl ReplayGuard {
 pub struct ObfsUdpSocket {
     /// Внутренний UDP-сокет, атомарно сменяемый при миграции пути (rebind) — lock-free на hot path.
     inner: ArcSwap<tokio::net::UdpSocket>,
-    /// Кешированный отправитель (k_hdr/k_sess/cipher деривятся раз на сессию, не на пакет — M6).
-    sealer: citadel_obfs::Sealer,
-    /// Кешированный приёмник (под Mutex, т.к. open берёт &mut для кеша cipher по sid).
-    opener: Mutex<citadel_obfs::Opener>,
+    /// H-3: чем шифруем L1 — фиксированный PSK либо ключ эпохи из мастер-секрета сервера.
+    psk: PskSource,
+    /// Наш `sid` (общий для всех ключей: `k_sess` и так разный, т.к. разный PSK).
+    sid: [u8; citadel_obfs::SID_LEN],
+    /// Отправители по эпохам. `Arc` — чтобы AEAD считался ВНЕ замка: иначе на exit'е с многими
+    /// клиентами отправка сериализовалась бы на одном мьютексе (было параллельно — стало бы нет).
+    sealers: Mutex<EpochCache<Arc<citadel_obfs::Sealer>>>,
+    /// Приёмники по эпохам (под Mutex: `open` берёт `&mut` ради кеша cipher по sid).
+    openers: Mutex<EpochCache<citadel_obfs::Opener>>,
+    /// Какой эпохой говорит пир: ответ обязан уйти тем же ключом, которым он к нам обратился.
+    /// Промах (новый адрес, NAT-rebind, вытеснение) стоит одной лишней пробы ключа.
+    peer_epoch: Mutex<std::collections::HashMap<SocketAddr, u64>>,
     /// C3: анти-реплей окно (по `nonce_pkt`) — дубликат = реплей, дропаем в `poll_recv`.
     replay: Mutex<ReplayGuard>,
     send_ctr: AtomicU64,
@@ -166,15 +283,18 @@ impl fmt::Debug for ObfsUdpSocket {
 }
 
 impl ObfsUdpSocket {
-    fn new(std_sock: std::net::UdpSocket, psk: [u8; 32], pacing: Pacing) -> io::Result<Self> {
+    fn new(std_sock: std::net::UdpSocket, psk: PskSource, pacing: Pacing) -> io::Result<Self> {
         std_sock.set_nonblocking(true)?;
         let inner = tokio::net::UdpSocket::from_std(std_sock)?;
         let mut sid = [0u8; citadel_obfs::SID_LEN];
         rand::thread_rng().fill_bytes(&mut sid);
         Ok(Self {
             inner: ArcSwap::from_pointee(inner),
-            sealer: citadel_obfs::Sealer::new(&psk, &sid),
-            opener: Mutex::new(citadel_obfs::Opener::new(&psk)),
+            psk,
+            sid,
+            sealers: Mutex::new(EpochCache::new()),
+            openers: Mutex::new(EpochCache::new()),
+            peer_epoch: Mutex::new(std::collections::HashMap::new()),
             replay: Mutex::new(ReplayGuard::new(REPLAY_CAP)), // C3: анти-реплей окно
 
             // M2-full (obfs v2): 16-байтный случайный sid — 128-битная per-session соль в k_sess
@@ -212,8 +332,24 @@ impl ObfsUdpSocket {
         Ok(())
     }
 
+    /// H-3: отправитель для пира — тем ключом, которым он с нами говорит. Неизвестный пир (мы
+    /// инициатор либо адрес ещё не привязан) → ключ текущей эпохи. Замок держится только на
+    /// поиск/создание, сам AEAD считается снаружи.
+    fn sealer_for(&self, dst: SocketAddr) -> Arc<citadel_obfs::Sealer> {
+        let cur = self.psk.epoch_now();
+        let epoch = self.peer_epoch.lock().unwrap().get(&dst).copied().unwrap_or(cur);
+        let mut cache = self.sealers.lock().unwrap();
+        let i = cache.slot(epoch, || {
+            Arc::new(citadel_obfs::Sealer::new(&self.psk.key_for(epoch), &self.sid))
+        });
+        cache.touch(i);
+        let s = cache.items[i].1.clone();
+        cache.sweep(&self.psk.accepted(cur));
+        s
+    }
+
     /// Заворачивает реальную quic-нагрузку в DATA-пакет со случайным паддингом (C2).
-    fn seal(&self, quic: &[u8]) -> Vec<u8> {
+    fn seal(&self, quic: &[u8], dst: SocketAddr) -> Vec<u8> {
         let pid = self.send_ctr.fetch_add(1, Ordering::Relaxed);
         let mut nonce = [0u8; 12];
         rand::thread_rng().fill_bytes(&mut nonce);
@@ -221,7 +357,46 @@ impl ObfsUdpSocket {
         // на проводе всё равно псевдослучайный шифртекст.
         let padding = vec![0u8; self.pad_len(quic.len())];
         let inner = citadel_obfs::build_inner(citadel_obfs::TYPE_DATA, None, None, &padding, quic);
-        self.sealer.seal(pid, &nonce, &inner)
+        self.sealer_for(dst).seal(pid, &nonce, &inner)
+    }
+
+    /// H-3: попытка открыть пакет ключами принимаемых эпох (свежайшая первой) плюс теми, по
+    /// которым ещё идёт трафик. Успех запоминает эпоху пира — ответ уйдёт тем же ключом.
+    fn open_any(&self, addr: SocketAddr, packet: &[u8]) -> Option<citadel_obfs::Opened> {
+        let cur = self.psk.epoch_now();
+        let accepted = self.psk.accepted(cur);
+        let mut cache = self.openers.lock().unwrap();
+        for &e in &accepted {
+            cache.slot(e, || citadel_obfs::Opener::new(&self.psk.key_for(e)));
+        }
+        // Порядок проб: сначала эпоха, которой этот пир говорил в прошлый раз (обычный случай —
+        // одна проба), затем остальные от свежей к старой.
+        let known = self.peer_epoch.lock().unwrap().get(&addr).copied();
+        let mut order: Vec<u64> = cache.items.iter().map(|(e, _, _)| *e).collect();
+        order.sort_unstable_by(|a, b| b.cmp(a));
+        if let Some(k) = known {
+            order.retain(|e| *e != k);
+            order.insert(0, k);
+        }
+        for e in order {
+            let Some(i) = cache.items.iter().position(|(x, _, _)| *x == e) else { continue };
+            if let Ok(opened) = cache.items[i].1.open(packet) {
+                cache.touch(i);
+                cache.sweep(&accepted);
+                drop(cache);
+                if known != Some(e) {
+                    let mut peers = self.peer_epoch.lock().unwrap();
+                    // Анти-OOM: таблица адресов не растёт бесконечно от флуда с подменённых src.
+                    if peers.len() >= PEER_KEY_CAP {
+                        peers.clear();
+                    }
+                    peers.insert(addr, e);
+                }
+                return Some(opened);
+            }
+        }
+        cache.sweep(&accepted);
+        None
     }
 
     /// C2: длина паддинга DATA-пакета. `Random` → случайно (RNG здесь, чтобы `pad_len_random`
@@ -241,7 +416,7 @@ impl ObfsUdpSocket {
 
     /// Chaff-пакет (`TYPE_PAD`): случайный размер на проводе в `[floor, cap]` (совпадает с
     /// распределением DATA при Random-паддинге, C2) → на проводе неотличим от реального трафика.
-    fn seal_chaff(&self) -> Vec<u8> {
+    fn seal_chaff(&self, dst: SocketAddr) -> Vec<u8> {
         let pid = self.send_ctr.fetch_add(1, Ordering::Relaxed);
         let mut nonce = [0u8; 12];
         rand::thread_rng().fill_bytes(&mut nonce);
@@ -252,7 +427,7 @@ impl ObfsUdpSocket {
         let wire = floor + (rand::thread_rng().next_u32() as usize) % (cap - floor + 1);
         let pad = wire.saturating_sub(citadel_obfs::FRAMING_OVERHEAD);
         let inner = citadel_obfs::build_chaff(&vec![0u8; pad]);
-        self.sealer.seal(pid, &nonce, &inner)
+        self.sealer_for(dst).seal(pid, &nonce, &inner)
     }
 
     /// Кладёт пакет в очередь пейсинга; при переполнении дропает (= потеря UDP, QUIC ретрансмитит).
@@ -274,7 +449,7 @@ impl ObfsUdpSocket {
         while sent_real < burst {
             let item = self.queue.lock().unwrap().pop_front();
             let Some((quic, dst)) = item else { break };
-            let sealed = self.seal(&quic);
+            let sealed = self.seal(&quic, dst);
             let _ = self.inner.load().try_send_to(&sealed, dst);
             *self.last_dst.lock().unwrap() = Some(dst);
             *self.last_real.lock().unwrap() = Instant::now();
@@ -285,7 +460,7 @@ impl ObfsUdpSocket {
             let idle = self.last_real.lock().unwrap().elapsed();
             if let Some(dst) = dst {
                 if chaff_decision(chaff, true, idle) {
-                    let sealed = self.seal_chaff();
+                    let sealed = self.seal_chaff(dst);
                     let _ = self.inner.load().try_send_to(&sealed, dst);
                 }
             }
@@ -329,7 +504,7 @@ impl AsyncUdpSocket for ObfsUdpSocket {
         // max_transmit_segments()==1 → transmit.contents — одна датаграмма
         match self.pacing {
             Pacing::None => {
-                let sealed = self.seal(transmit.contents);
+                let sealed = self.seal(transmit.contents, transmit.destination);
                 self.inner.load().try_send_to(&sealed, transmit.destination).map(|_| ())
             }
             Pacing::Slotted { .. } => {
@@ -357,7 +532,7 @@ impl AsyncUdpSocket for ObfsUdpSocket {
                     let filled = rb.filled();
                     // C3: nonce_pkt (первые 12 байт, в клере) — ключ анти-реплея.
                     let nonce_pkt: Option<[u8; 12]> = filled.get(..12).map(|s| s.try_into().unwrap());
-                    if let Ok(opened) = self.opener.lock().unwrap().open(filled) {
+                    if let Some(opened) = self.open_any(addr, filled) {
                         // C3: реплей валидного пакета (дубликат nonce) → молча дропаем (анти
                         // replay-probing: не даём серверу «ответить» на перехваченный и переигранный
                         // пакет). Проверяем ПОСЛЕ open — мусор/проба с чужим nonce не засоряет окно.
@@ -412,7 +587,7 @@ impl AsyncUdpSocket for ObfsUdpSocket {
 fn build_endpoint(
     std_sock: std::net::UdpSocket,
     server_config: Option<quinn::ServerConfig>,
-    psk: [u8; 32],
+    psk: PskSource,
 ) -> Result<quinn::Endpoint> {
     // Android: исключить исходящий сокет движка из собственного туннеля (анти-петля).
     // На desktop/сервере протектор не установлен → no-op. Должно быть ДО connect.
@@ -450,16 +625,20 @@ fn build_endpoint(
     Ok(ep)
 }
 
+/// EXIT: слушающий endpoint под obfs. `psk` — [`PskSource::Epoch`] при включённой ротации (H-3)
+/// либо [`PskSource::Fixed`] в token-less деплое, где раздавать ключ эпохи некому.
 pub fn server_endpoint_obfs(
     listen: SocketAddr,
     server_config: quinn::ServerConfig,
-    psk: [u8; 32],
+    psk: PskSource,
 ) -> Result<quinn::Endpoint> {
     build_endpoint(std::net::UdpSocket::bind(listen)?, Some(server_config), psk)
 }
 
+/// КЛИЕНТ: ключ всегда один — тот, что он получил у издателя на текущую эпоху (или бутстрапный
+/// в token-less деплое). Перебирать эпохи клиенту незачем: он знает, чем говорит.
 pub fn client_endpoint_obfs(psk: [u8; 32]) -> Result<quinn::Endpoint> {
-    build_endpoint(std::net::UdpSocket::bind("0.0.0.0:0")?, None, psk)
+    build_endpoint(std::net::UdpSocket::bind("0.0.0.0:0")?, None, PskSource::Fixed(psk))
 }
 
 #[cfg(test)]
@@ -536,7 +715,7 @@ mod tests {
             burst: 8,
             chaff: Chaff::Always,
         };
-        let sock = Arc::new(ObfsUdpSocket::new(tx_std, psk, pacing).unwrap());
+        let sock = Arc::new(ObfsUdpSocket::new(tx_std, PskSource::Fixed(psk), pacing).unwrap());
         tokio::spawn(pace_loop(Arc::downgrade(&sock)));
 
         sock.enqueue(b"hello-quic", rx_addr);
@@ -567,11 +746,82 @@ mod tests {
         assert!(got_chaff, "pacer не сгенерировал chaff");
     }
 
+    /// **H-3, главное свойство:** exit принимает ТОЛЬКО ключи эпохи (текущей и прошлой), а
+    /// бутстрапный PSK из ссылки канал данных больше не открывает. Именно поэтому утёкшая ссылка
+    /// перестаёт быть бессрочным пропуском в L1 и классификатором трафика деплоя.
+    #[tokio::test]
+    async fn epoch_ring_takes_current_and_prev_but_not_the_link_psk() {
+        let master = [0x5cu8; 32];
+        let epoch_secs = 3600;
+        let link_psk = [0xAAu8; 32]; // «тот самый» PSK из citadel:// — к мастеру отношения не имеет
+        let sock = ObfsUdpSocket::new(
+            std::net::UdpSocket::bind("127.0.0.1:0").unwrap(),
+            PskSource::Epoch { master, epoch_secs },
+            Pacing::None,
+        )
+        .unwrap();
+        let cur = citadel_token::current_epoch(epoch_secs);
+        let peer: SocketAddr = "127.0.0.1:40000".parse().unwrap();
+
+        let pkt = |psk: [u8; 32]| {
+            let inner = citadel_obfs::build_inner(citadel_obfs::TYPE_DATA, None, None, &[], b"quic");
+            let mut sid = [0u8; citadel_obfs::SID_LEN];
+            sid[0] = 1;
+            citadel_obfs::seal(&psk, &sid, 1, &[9u8; 12], &inner)
+        };
+
+        // ключ текущей эпохи — открывается
+        assert!(sock.open_any(peer, &pkt(citadel_obfs::psk_epoch(&master, cur))).is_some());
+        // ключ прошлой эпохи — тоже (grace: клиент взял его за секунду до смены эпохи)
+        let prev_peer: SocketAddr = "127.0.0.1:40001".parse().unwrap();
+        assert!(sock
+            .open_any(prev_peer, &pkt(citadel_obfs::psk_epoch(&master, cur - 1)))
+            .is_some());
+        // позапрошлая — уже нет (иначе «ротация» ничего не отзывала бы)
+        let old_peer: SocketAddr = "127.0.0.1:40002".parse().unwrap();
+        assert!(sock.open_any(old_peer, &pkt(citadel_obfs::psk_epoch(&master, cur - 2))).is_none());
+        // и, главное, PSK из ссылки не открывает канал данных ВООБЩЕ
+        assert!(sock.open_any(old_peer, &pkt(link_psk)).is_none(), "утёкшая ссылка не даёт L1");
+
+        // Ответ уходит тем же ключом, которым говорил пир: иначе клиент на прошлом ключе оглох бы
+        // ровно в момент смены эпохи.
+        let back = sock.seal(b"answer", prev_peer);
+        assert!(
+            citadel_obfs::open(&citadel_obfs::psk_epoch(&master, cur - 1), &back).is_ok(),
+            "пиру прошлой эпохи обязаны отвечать его ключом"
+        );
+        let fresh = sock.seal(b"answer", "127.0.0.1:40009".parse().unwrap());
+        assert!(
+            citadel_obfs::open(&citadel_obfs::psk_epoch(&master, cur), &fresh).is_ok(),
+            "незнакомому пиру — ключ текущей эпохи"
+        );
+    }
+
+    /// `Fixed` (клиент, token-less деплой) ведёт себя ровно как раньше: один ключ, без эпох.
+    #[tokio::test]
+    async fn fixed_psk_source_is_single_key() {
+        let psk = [0x11u8; 32];
+        let sock = ObfsUdpSocket::new(
+            std::net::UdpSocket::bind("127.0.0.1:0").unwrap(),
+            PskSource::Fixed(psk),
+            Pacing::None,
+        )
+        .unwrap();
+        let peer: SocketAddr = "127.0.0.1:41000".parse().unwrap();
+        let inner = citadel_obfs::build_inner(citadel_obfs::TYPE_DATA, None, None, &[], b"quic");
+        let sealed = citadel_obfs::seal(&psk, &[2u8; citadel_obfs::SID_LEN], 1, &[3u8; 12], &inner);
+        assert!(sock.open_any(peer, &sealed).is_some());
+        assert!(citadel_obfs::open(&psk, &sock.seal(b"x", peer)).is_ok());
+        // чужой ключ не открывается (probe-resistance на месте)
+        let alien = citadel_obfs::seal(&[0xFFu8; 32], &[2u8; citadel_obfs::SID_LEN], 1, &[3u8; 12], &inner);
+        assert!(sock.open_any(peer, &alien).is_none());
+    }
+
     /// Миграция (M4): rebind атомарно меняет внутренний сокет на новый порт (механика ArcSwap).
     #[tokio::test]
     async fn rebind_swaps_socket_to_new_port() {
         let std_sock = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
-        let sock = ObfsUdpSocket::new(std_sock, [9u8; 32], Pacing::None).unwrap();
+        let sock = ObfsUdpSocket::new(std_sock, PskSource::Fixed([9u8; 32]), Pacing::None).unwrap();
         let before = sock.inner.load().local_addr().unwrap();
         sock.rebind().unwrap();
         let after = sock.inner.load().local_addr().unwrap();

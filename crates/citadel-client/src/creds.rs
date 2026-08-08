@@ -178,6 +178,7 @@ impl CredentialBundle {
                 .mldsa_pub
                 .clone()
                 .map_or(MldsaSource::None, MldsaSource::Bytes),
+            data_psk: None, // H-3: ключ эпохи приходит от издателя перед establish, не из ссылки
             allow_insecure_no_pin: false,
             allow_classical_kx: false,
             require_pq_auth: false,
@@ -397,6 +398,7 @@ impl CredentialLink {
             token: Vec::new(),
             pin: self.cert_pin.map_or(PinSource::None, PinSource::Bytes),
             mldsa: self.mldsa_commit.map_or(MldsaSource::None, MldsaSource::Commit),
+            data_psk: None, // H-3: ключ эпохи приходит от издателя перед establish, не из ссылки
             allow_insecure_no_pin: false,
             allow_classical_kx: false,
             require_pq_auth: false,

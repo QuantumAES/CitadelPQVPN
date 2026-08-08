@@ -43,7 +43,7 @@ pub use citadel_quic::dataplane::traffic_bytes;
 pub use citadel_quic::diag::{run_diagnostics, DiagStep};
 pub use citadel_quic::protect::{clear_socket_protector, set_socket_protector, SocketProtector};
 pub use citadel_quic::vpn::{
-    clamp_tun_mtu, TunParams, TunProvider, VpnController, VpnEvent, VpnState,
+    clamp_tun_mtu, SessionGrant, TunParams, TunProvider, VpnController, VpnEvent, VpnState,
 };
 pub use citadel_tun::TunIo;
 pub use creds::{CredentialBundle, CredentialLink, BUNDLE_VERSION, DEFAULT_ADMIN_PORT};

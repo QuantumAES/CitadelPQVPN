@@ -98,13 +98,22 @@ async fn run(chan: Arc<Chan>, req: ConnectReq) -> Result<()> {
                 match citadel_client::token_agent::fetch_tokens(&iss, &pin, &mldsa, &seed, 1, 3, obfs_psk)
                     .await
                 {
-                    Ok(mut v) => v.pop(),
+                    // H-3: вместе с токеном приезжает ключ L1 текущей эпохи для канала данных.
+                    Ok(mut g) => g.tokens.pop().map(|token| citadel_client::SessionGrant {
+                        token,
+                        data_psk: g.data_psk,
+                    }),
                     Err(e) => {
                         eprintln!("[engine] Layer-1 фетч у issuer {iss} не удался: {e:#}");
                         None
                     }
                 }
-            }) as std::pin::Pin<Box<dyn std::future::Future<Output = Option<Vec<u8>>> + Send>>
+            }) as std::pin::Pin<
+                Box<
+                    dyn std::future::Future<Output = Option<citadel_client::SessionGrant>>
+                        + Send,
+                >,
+            >
         }));
     }
 

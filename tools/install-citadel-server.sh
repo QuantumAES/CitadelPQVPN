@@ -196,7 +196,7 @@ if [[ -n "${CITADEL_ISSUER_BUNDLE:-}" ]]; then
     k="${k%%[[:space:]]*}"; v="${v%%[[:space:]]*}"
     [[ -z "$k" || "$k" == \#* ]] && continue
     case "$k" in
-      CITADEL_ISSUER_ADDR|CITADEL_ISSUER_PIN|CITADEL_ISSUER_MLDSA|CITADEL_OBFS_PSK|\
+      CITADEL_ISSUER_ADDR|CITADEL_ISSUER_PIN|CITADEL_ISSUER_MLDSA|CITADEL_OBFS_PSK|CITADEL_OBFS_MASTER|\
       CITADEL_CLIENT_SEED|CITADEL_ADMIN_SEED|CITADEL_ADMIN_PORT|CITADEL_EPOCH_SECS|CITADEL_ISSUER_PORT|\
       CITADEL_KEYSYNC_SEED)
         # уже заданный флаг/env приоритетнее файла (позволяет точечно переопределить)
@@ -385,7 +385,7 @@ if [[ -f "$DIR/keys/obfs.psk" && "${CITADEL_KEEP_KEYS:-0}" != 1 ]]; then
   warn "недействительны. Раздай новые ссылки из вывода ниже. (CITADEL_KEEP_KEYS=1 — сохранить старые.)"
   # остановить контейнеры, держащие старые ключи в RAM — при up перечитают свежие из тома
   [[ -f "$DIR/etc/compose.yml" ]] && docker compose -f "$DIR/etc/compose.yml" down >/dev/null 2>&1 || true
-  rm -f "$DIR/keys/"obfs.psk "$DIR/keys/"client.seed "$DIR/keys/"admin.seed \
+  rm -f "$DIR/keys/"obfs.psk "$DIR/keys/"obfs.master "$DIR/keys/"client.seed "$DIR/keys/"admin.seed \
         "$DIR/keys/"issuer-mldsa.seed "$DIR/keys/"issuer-mldsa.pin \
         "$DIR/keys/"admin_id "$DIR/keys/"admin.client_id "$DIR/keys/"registry "$DIR/keys/"tokens \
         "$DIR/keys/"exit.pin "$DIR/keys/"exit-cert.der "$DIR/keys/"exit-key.der \
@@ -407,6 +407,26 @@ elif [[ ! -f "$PSK_FILE" ]]; then
   chmod 600 "$PSK_FILE"
 fi
 PSK="$(cat "$PSK_FILE")"
+
+# H-3 (аудит-4): МАСТЕР-секрет L1 — из него выводится ключ obfs КАЖДОЙ эпохи. В отличие от
+# $PSK он в ссылки НЕ попадает и машину не покидает: абонент получает ключ текущей эпохи у
+# издателя после Layer-1, ровно на одну эпоху. Отсюда два свойства, которых не было:
+#   * `registry revoke` гасит и L1-доступ (со следующей эпохи), а не только выдачу токенов;
+#   * утёкшая ссылка перестаёт быть бессрочным классификатором трафика этого деплоя.
+# Бутстрапный $PSK остаётся тем, чем и был, — обёрткой канала К ИЗДАТЕЛЮ (его адрес и так в ссылке).
+# Мастер нужен ОБЕИМ серверным ролям: издатель раздаёт ключи эпох, exit ими принимает.
+MASTER_FILE="$DIR/keys/obfs.master"
+if [[ "$ROLE" == exit && -n "${CITADEL_OBFS_MASTER:-}" ]]; then
+  printf '%s' "$CITADEL_OBFS_MASTER" > "$MASTER_FILE"
+  chmod 600 "$MASTER_FILE"
+elif [[ ! -f "$MASTER_FILE" ]]; then
+  head -c 32 /dev/urandom | od -An -tx1 | tr -d ' \n' > "$MASTER_FILE"
+  chmod 600 "$MASTER_FILE"
+fi
+MASTER="$(cat "$MASTER_FILE")"
+# Ротация L1 живёт на канале издателя: без него ключ эпохи некому раздать, и exit обязан
+# остаться на бутстрапном PSK (иначе token-less деплой просто перестал бы принимать клиентов).
+[[ "$ISSUER_ON" == 1 ]] || MASTER=""
 
 CLIENT_SEED=""; CLIENT_PUB=""
 ADMIN_SEED=""; ADMIN_PUB=""
@@ -505,6 +525,9 @@ export Citadel_NAT_SRC=10.7.0.0/16
 export Citadel_PIN_FILE=/shared/exit.pin
 export Citadel_KEY_DIR=/shared   # A7: постоянная идентичность exit (cert/pin + ML-DSA seed) → рестарт НЕ ломает розданные ссылки
 export Citadel_OBFS_PSK="${Citadel_OBFS_PSK:-}"
+# H-3: мастер L1 (если издатель есть) — канал данных принимает только ключи эпох, не PSK из ссылок.
+export Citadel_OBFS_MASTER="${Citadel_OBFS_MASTER:-}"
+export Citadel_EPOCH_SECS=$EPOCH_SECS   # та же эпоха, что у токенов: ключ L1 ротируется с ней
 export Citadel_TCP_LISTEN=0.0.0.0:443
 export Citadel_KX=pq   # S1.1/M4: PQ-only (анти-HNDL) — classical не принимаем
 rm -f /shared/exit.pin   # pin перезапишется тем же значением из постоянного серта (A7)
@@ -605,6 +628,8 @@ export Citadel_KEYSYNC_ID=$KEYSYNC_ID
 # L-14: при раздельном деплое admin-порт публикуется наружу — процесс сам закрывает всех, кроме
 # exit-машины (до TLS, до слота гейта). Пусто = совмещённая установка, порт наружу не смотрит.
 export Citadel_ADMIN_PEER="$ADMIN_PEER"
+# H-3: мастер L1 — из него абоненту выдаётся ключ текущей эпохи (после Layer-1, ровно на эпоху).
+export Citadel_OBFS_MASTER="${Citadel_OBFS_MASTER:-}"
 rm -f /shared/issuer.key /shared/issuer-*.key /shared/issuer.pub /shared/issuer-*.pub /shared/tokens
 # M-4 (аудит-4): привилегии издателя режет compose (cap_drop: ALL + read_only + no-new-privileges).
 # Смена uid здесь не делается — том общий с exit'ом (и с keysync при раздельной установке), и
@@ -637,6 +662,7 @@ cat <<EOF
     restart: unless-stopped
     environment:
       Citadel_OBFS_PSK: "$PSK"         # S2.1/A1-остаток: obfs-обёртка token-/admin-каналов (probe-resistance)
+      Citadel_OBFS_MASTER: "$MASTER"   # H-3: из него издатель выводит ключ L1 текущей эпохи для абонентов
     # M-6: ключ эпохи — секрет (0640 на общем томе). Группа файла обязана совпасть с той, в которую
     # садится exit после сброса привилегий, иначе он не прочитает ключ и откажет всем токенам.
     # Через chown это не сделать: у издателя cap_drop ALL (M-4), CAP_CHOWN нет.
@@ -673,6 +699,7 @@ cat <<EOF
     restart: unless-stopped
     environment:
       Citadel_OBFS_PSK: "$PSK"
+      Citadel_OBFS_MASTER: "$MASTER"   # H-3: пусто = ротации нет (token-less деплой)
     ports:
       - "$UDP_PORT:4433/udp"
       - "$TCP_PORT:443/tcp"
@@ -768,6 +795,7 @@ CITADEL_ISSUER_ADDR=$SERVER_HOST:$ISSUER_PORT
 CITADEL_ISSUER_PIN=$ISSUER_TLS_PIN
 CITADEL_ISSUER_MLDSA=$ISSUER_MLDSA
 CITADEL_OBFS_PSK=$PSK
+CITADEL_OBFS_MASTER=$MASTER
 CITADEL_CLIENT_SEED=$CLIENT_SEED
 CITADEL_ADMIN_SEED=$ADMIN_SEED
 CITADEL_ADMIN_PORT=$ADMIN_PORT
