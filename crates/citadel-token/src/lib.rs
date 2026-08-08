@@ -33,7 +33,18 @@ pub use voprf::{BlindState, EpochKey, Token};
 pub fn debug_logs() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| {
-        matches!(std::env::var("Citadel_DEBUG_LOG").as_deref(), Ok(v) if v != "0" && !v.is_empty())
+        let on =
+            matches!(std::env::var("Citadel_DEBUG_LOG").as_deref(), Ok(v) if v != "0" && !v.is_empty());
+        // L-10: включённый режим обязан быть ВИДЕН в логе с первой же строки. Иначе разница между
+        // «no-logs» и «пишем IP, client_id и назначения» существует только в чужом env-файле —
+        // а именно так демо-entrypoint и переезжает в прод копипастой.
+        if on && !matches!(std::env::var("Citadel_DEMO_STAND").as_deref(), Ok("1")) {
+            eprintln!(
+                "[!] Citadel_DEBUG_LOG=1: диагностический лог ВКЛЮЧЁН — в него попадают адреса \
+                 клиентов, client_id и назначения. Для прода это не режим по умолчанию (no-logs)"
+            );
+        }
+        on
     })
 }
 

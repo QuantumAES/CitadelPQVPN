@@ -125,13 +125,14 @@ pub struct ClientConfig {
     /// Источник ML-DSA pub (M7).
     pub mldsa: MldsaSource,
     /// S0.1/H2: разрешить QUIC БЕЗ серт-pin (AcceptAnyServerCert = MITM-открыто). Только
-    /// dev/PoC (env `Citadel_INSECURE_NO_PIN=1`); прод — `false` (fail-closed).
+    /// dev/PoC (env `Citadel_INSECURE_NO_PIN=1` И сборка `--features insecure-dev`, L-5);
+    /// прод — `false` (fail-closed), переменная в релизном бинаре ничего не включает.
     pub allow_insecure_no_pin: bool,
     /// M-2/аудит-4: разрешить НЕ пост-квантовый KX-suite (`classical`/`all`). Дефолт `false` —
     /// такая сессия не защищена от Harvest-Now-Decrypt-Later, а `kx_suite` приходит из ССЫЛКИ,
     /// то есть подменённая ссылка иначе молча понижала бы криптографию до X25519. Включается
-    /// только явным dev-флагом `Citadel_INSECURE_CLASSICAL_KX=1` (харнес crypto-agility);
-    /// из ссылки/бандла — никогда.
+    /// только явным dev-флагом `Citadel_INSECURE_CLASSICAL_KX=1` в сборке `--features
+    /// insecure-dev` (харнес crypto-agility, L-5); из ссылки/бандла — никогда.
     pub allow_classical_kx: bool,
     /// M-1/аудит-4: требовать PQ-аутентификацию сервера (ML-DSA pub либо commit). Дефолт `false`
     /// (провижининг решает сам); `Citadel_REQUIRE_PQ_AUTH=1` делает отсутствие материала отказом.
@@ -298,8 +299,9 @@ impl ClientConfig {
             token,
             pin,
             mldsa,
-            allow_insecure_no_pin: env_flag("Citadel_INSECURE_NO_PIN"),
-            allow_classical_kx: env_flag("Citadel_INSECURE_CLASSICAL_KX"),
+            // L-5: только в сборке `--features insecure-dev`; в релизе — всегда false (см. фн.)
+            allow_insecure_no_pin: insecure_dev_flag("Citadel_INSECURE_NO_PIN"),
+            allow_classical_kx: insecure_dev_flag("Citadel_INSECURE_CLASSICAL_KX"),
             require_pq_auth: env_flag("Citadel_REQUIRE_PQ_AUTH"),
             killswitch: env_flag("Citadel_KILLSWITCH"),
             split: Default::default(), // C8.3 split-tunnel — только клиентское GUI (Android), не env
@@ -385,6 +387,43 @@ fn env_flag(name: &str) -> bool {
     std::env::var(name).map(|v| v == "1" || v.eq_ignore_ascii_case("true")).unwrap_or(false)
 }
 
+/// **L-5/аудит-4: небезопасные dev-эскейпы существуют только в сборке с фичей `insecure-dev`.**
+///
+/// `Citadel_INSECURE_NO_PIN` (принимать ЛЮБОЙ сертификат) и `Citadel_INSECURE_CLASSICAL_KX`
+/// (согласовать не-PQ группу) — это переключатели, отключающие ровно те два контроля, на которых
+/// держится весь L2: аутентификацию узла и анти-HNDL. В релизном бинаре их быть не должно вовсе:
+/// иначе достаточно повлиять на окружение процесса (сервисный юнит, `.desktop`, обёртка-скрипт,
+/// вредонос с правами пользователя), чтобы молча снять защиту — без единого изменения кода,
+/// подписи бинаря и без следа в конфиге приложения.
+///
+/// Поэтому: в релизе функция всегда возвращает `false` и, если переменная всё-таки выставлена,
+/// ГРОМКО говорит, что она проигнорирована (тихое игнорирование одинаково выглядит и когда
+/// защита снята, и когда нет — оператор обязан видеть разницу). Дев-харнесы (docker-демо, где
+/// нужен TEST 14 crypto-agility) собираются `--features insecure-dev`.
+fn insecure_dev_flag(name: &str) -> bool {
+    let set = env_flag(name);
+    #[cfg(feature = "insecure-dev")]
+    {
+        if set {
+            eprintln!(
+                "[config] ⚠ НЕБЕЗОПАСНО: {name}=1 в сборке с фичей insecure-dev — контроль отключён. \
+                 Это dev/PoC-сборка, в проде такой бинарь использовать нельзя"
+            );
+        }
+        set
+    }
+    #[cfg(not(feature = "insecure-dev"))]
+    {
+        if set {
+            eprintln!(
+                "[config] {name} ПРОИГНОРИРОВАН: небезопасные эскейпы вырезаны из релизной сборки \
+                 (собери с --features insecure-dev, если это dev-стенд)"
+            );
+        }
+        false
+    }
+}
+
 fn pin_from_file(path: &str) -> PinMode {
     match std::fs::read_to_string(path) {
         Ok(s) => parse_pin(&s).map(PinMode::Pinned).unwrap_or(PinMode::Waiting),
@@ -453,6 +492,24 @@ mod tests {
         if let Some(v) = restore {
             std::env::set_var("Citadel_OBFS_PSK", v);
         }
+    }
+
+    /// L-5: в релизной сборке (без фичи `insecure-dev`) переменная окружения НЕ включает
+    /// небезопасный эскейп. Тест держит гарантию «эскейпа нет в бинаре» проверяемой: собери
+    /// с `--features insecure-dev` — и он потребует обратного (эскейп обязан работать на стенде).
+    #[test]
+    fn insecure_escape_only_in_dev_build() {
+        // SAFETY (тест): своя переменная, не пересекается с другими тестами; убирается сразу.
+        std::env::set_var("Citadel_TEST_INSECURE_PROBE", "1");
+        let on = insecure_dev_flag("Citadel_TEST_INSECURE_PROBE");
+        std::env::remove_var("Citadel_TEST_INSECURE_PROBE");
+        if cfg!(feature = "insecure-dev") {
+            assert!(on, "dev-сборка: эскейп обязан включаться (иначе ТЕСТ 14 демо не пройдёт)");
+        } else {
+            assert!(!on, "релизная сборка: env НЕ должен снимать pin/PQ-KX (L-5)");
+        }
+        // не выставленная переменная — false в любой сборке
+        assert!(!insecure_dev_flag("Citadel_TEST_INSECURE_PROBE"));
     }
 
     #[test]

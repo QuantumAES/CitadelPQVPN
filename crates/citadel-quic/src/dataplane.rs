@@ -16,7 +16,7 @@ use anyhow::Result;
 use citadel_masque::{datagram, ip};
 use citadel_tun::TunIo;
 
-use crate::ratelimit::{RateCfg, TokenBucket};
+use crate::ratelimit::{RateCfg, RateLimits, TokenBucket};
 
 /// Транспорт туннеля: **всегда** PQ-QUIC (TLS 1.3 + гибридный KEX). Обычно поверх UDP; при
 /// заблокированном UDP — поверх obfs-TCP (S0.3/H1), но крипта/control/data-plane идентичны.
@@ -188,10 +188,18 @@ impl Inbound {
                 }
             }
         }
+        self.charge(pkt.len())
+    }
+
+    /// Списать стоимость датаграммы из bucket'а, не проверяя политику. Нужно для датаграмм,
+    /// которые в TUN не идут (служебный контекст, keep-alive M-8): полезной нагрузки в них нет,
+    /// но обработку и полосу они занимают, а значит, должны считаться в per-client лимит —
+    /// иначе злоупотребляющий клиент обходит F7, просто выбрав другой context id.
+    pub fn charge(&mut self, len: usize) -> bool {
         if let Some(b) = self.bucket.as_mut() {
-            if !b.allow(TokenBucket::packet_cost(pkt.len()), Instant::now()) {
+            if !b.allow(TokenBucket::packet_cost(len), Instant::now()) {
                 self.dropped += 1;
-                self.dropped_bytes += pkt.len() as u64;
+                self.dropped_bytes += len as u64;
                 if self.dropped == 1 || self.dropped.is_multiple_of(50) {
                     crate::dlog!(
                         "[exit] F7: rate-limit — дропнуто {} пакетов / {} б (клиент превысил лимит)",
@@ -203,6 +211,25 @@ impl Inbound {
         }
         true
     }
+}
+
+/// M-8: задержка до следующего keep-alive — РАВНОМЕРНО в `[2, 4]` с, выбирается заново каждый раз.
+///
+/// Верхняя граница держится ниже `keep_alive_interval` quinn (5 с), чтобы штатный периодический
+/// PING не срабатывал и не возвращал в поток тот самый строгий период; нижняя — чтобы маячки не
+/// стоили заметного трафика. Обе — сильно ниже `max_idle_timeout` (15 с), так что потеря одного
+/// пакета соединение не рвёт.
+fn keepalive_delay() -> std::time::Duration {
+    use rand::Rng;
+    std::time::Duration::from_millis(rand::thread_rng().gen_range(2_000..=4_000))
+}
+
+/// Длина случайного тела keep-alive: на UDP-пути L1 всё равно добьёт пакет паддингом до общего
+/// распределения длин (C2), но на obfs-TCP-пути record'ы идут потоком, и постоянная длина маячка
+/// была бы отдельной сигнатурой.
+fn keepalive_body_len() -> usize {
+    use rand::Rng;
+    rand::thread_rng().gen_range(0..=96)
 }
 
 // ─────────────────────────── счётчики трафика туннеля (индикация скорости в UI) ───────────────
@@ -267,7 +294,8 @@ pub struct ClientPath {
 /// Двунаправленная перекачка TUN ⇄ транспорт (QUIC DATAGRAM либо obfs-TCP record).
 /// `egress = Some(назначенный клиенту адрес)` включает egress-политику exit: анти-спуфинг
 /// inner-src (S0.2/H3), default-deny не-IPv4 и F2 (дроп во внутренние/служебные сети); `None`
-/// (клиент) — без фильтра. `rate_limit` (на exit) ограничивает входящее token-bucket'ом (F7/D3).
+/// (клиент) — без фильтра. `rate` (на exit) ограничивает ОБА направления token-bucket'ами
+/// (F7/D3 + M-3-bis: `up` — в `Inbound`, `down` — в sender-задаче ниже).
 /// `admin_dst` (C7.2, только exit) — `Some((vip, port))` пропускает TCP к admin-VIP мимо F2
 /// (ядро DNAT'ит на issuer); `None` — admin-плоскость по туннелю выключена.
 ///
@@ -280,7 +308,7 @@ pub async fn pump(
     // Что движок знает о собственном пути — только на КЛИЕНТЕ (взаимоисключимо с `egress`) и
     // только для диагностики (см. [`ClientPath`]).
     client: Option<ClientPath>,
-    rate_limit: Option<RateCfg>,
+    rate: RateLimits,
     admin_dst: Option<([u8; 4], u16)>,
     // Источник return-пакетов (TUN→сеть). На КЛИЕНТЕ — `None`: pump сам читает свой TUN. На EXIT —
     // `Some(rx)` из [`ExitTunRouter`]: единый reader общего exit-TUN демультиплексирует пакеты по
@@ -399,6 +427,13 @@ pub async fn pump(
         }
     }
     let send_cfw = cfw.clone();
+    // M-3-bis: bucket обратного направления (интернет → клиент). Только на exit'е: на клиенте
+    // `rate` пуст, а его собственный upload резать незачем. Живёт в sender-задаче, потому что
+    // именно она отдаёт клиенту return-трафик из демукса (`return_rx`); дроп здесь TCP переживает
+    // как обычную потерю и сам сбрасывает окно.
+    let mut down_bucket = rate.down.map(|c| TokenBucket::new(c, Instant::now()));
+    let mut down_dropped = 0u64;
+    let mut down_dropped_bytes = 0u64;
     let sender = tokio::spawn(async move {
         while let Some(pkt) = tun_to_net_rx.recv().await {
             // S2.2/A2: туннель IPv4-only (адрес назначается v4, exit по default-deny дропает
@@ -427,6 +462,22 @@ pub async fn pump(
                     }
                 }
             }
+            // M-3-bis/F7: лимит «вниз» (exit → клиент). Ровно та же механика, что у `Inbound`,
+            // и та же реакция: дроп, а не буферизация (буфер на медленного клиента — это уже
+            // память exit'а, которую и хотел бы съесть злоупотребляющий абонент).
+            if let Some(b) = down_bucket.as_mut() {
+                if !b.allow(TokenBucket::packet_cost(pkt.len()), Instant::now()) {
+                    down_dropped += 1;
+                    down_dropped_bytes += pkt.len() as u64;
+                    if down_dropped == 1 || down_dropped.is_multiple_of(50) {
+                        crate::dlog!(
+                            "[exit] F7↓: rate-limit обратного направления — дропнуто {} пакетов / {} б",
+                            down_dropped, down_dropped_bytes
+                        );
+                    }
+                    continue;
+                }
+            }
             let dg = datagram::encode(datagram::CTX_RAW_IP, &pkt);
             match send_conn.send_datagram(bytes::Bytes::from(dg)) {
                 Ok(()) => {
@@ -444,13 +495,24 @@ pub async fn pump(
     let recv_rx = rx_count.clone();
     let recv_cfw = cfw.clone();
     let receiver = tokio::spawn(async move {
-        let mut inb = Inbound::with_admin(egress, rate_limit, admin_dst);
+        let mut inb = Inbound::with_admin(egress, rate.up, admin_dst);
         loop {
             match recv_conn.read_datagram().await {
                 Ok(dg) => {
-                    // любой принятый датаграм = обратный путь жив (для watchdog); фильтр — дальше
-                    recv_rx.fetch_add(1, Ordering::Relaxed);
-                    if let Some((datagram::CTX_RAW_IP, pkt)) = datagram::decode(&dg) {
+                    // Счётчик обратного ТУННЕЛЬНОГО трафика (для watchdog) — только `CTX_RAW_IP`.
+                    // M-8: keep-alive (`CTX_KEEPALIVE`) сюда намеренно НЕ входит, иначе он
+                    // маскировал бы диагностику «датаграммы уходят, ответов нет»: пир слал бы
+                    // маячки, счётчик рос бы, и клиент молчал бы о том, что трафик не ходит.
+                    // Живость самого пути и без того меряется `udp_rx` на транспорте.
+                    if let Some((ctx, pkt)) = datagram::decode(&dg) {
+                        if ctx != datagram::CTX_RAW_IP {
+                            // Чужой/служебный контекст в TUN не попадает, но ресурсы тратит —
+                            // засчитываем в per-client лимит (иначе флуд keep-alive'ами обходил бы
+                            // F7 целиком: `Inbound::accept` вызывается только для полезных пакетов).
+                            inb.charge(dg.len());
+                            continue;
+                        }
+                        recv_rx.fetch_add(1, Ordering::Relaxed);
                         // F8 (клиент): пропускаем только ответы на собственный трафик. Дропы
                         // считаются и печатаются окном (см. watchdog) — это ещё и сигнал о
                         // недобросовестном exit'е, который пытается «позвонить» на устройство.
@@ -618,12 +680,47 @@ pub async fn pump(
         }
     });
 
+    // M-8/аудит-4: собственный keep-alive со СЛУЧАЙНЫМ интервалом. `keep_alive_interval` у quinn
+    // фиксирован (5,000 с) — в простое туннель превращается в маяк со строгой периодичностью,
+    // который снимается автокорреляцией по десятку интервалов и не маскируется ни паддингом
+    // размеров (I5/C2), ни шифрованием. Здесь интервал выбирается заново перед каждой отправкой
+    // (см. [`keepalive_delay`]), поэтому периода в потоке нет. Пакет — датаграмма `CTX_KEEPALIVE`
+    // со случайным телом: приёмник её отбрасывает (не `CTX_RAW_IP`), а L1 паддит её до того же
+    // распределения длин, что и данные, — на проводе она неотличима от полезного трафика.
+    //
+    // Отправляем только в ПРОСТОЕ (за окно не ушло ни одной датаграммы) — под нагрузкой канал
+    // и так не даёт quinn'у сработать по неактивности, а лишний пакет только жёг бы трафик.
+    // `keep_alive_interval` остаётся страховкой: если эта задача умрёт, соединение не развалится.
+    let ka_conn = conn.clone();
+    let ka_tx = tx_count.clone();
+    let ka_stop = stop.clone();
+    let keepalive = tokio::spawn(async move {
+        let mut seen = ka_tx.load(Ordering::Relaxed);
+        loop {
+            tokio::time::sleep(keepalive_delay()).await;
+            if ka_stop.load(Ordering::Acquire) {
+                break;
+            }
+            let now = ka_tx.load(Ordering::Relaxed);
+            if now == seen {
+                let mut body = vec![0u8; keepalive_body_len()];
+                rand::RngCore::fill_bytes(&mut rand::thread_rng(), &mut body);
+                let dg = datagram::encode(datagram::CTX_KEEPALIVE, &body);
+                if ka_conn.send_datagram(bytes::Bytes::from(dg)).is_err() {
+                    break; // транспорт закрыт — держать нечего
+                }
+            }
+            seen = now;
+        }
+    });
+
     let _guard = CancelGuard {
         stop,
         aborts: vec![
             sender.abort_handle(),
             receiver.abort_handle(),
             watchdog.abort_handle(),
+            keepalive.abort_handle(),
         ],
         tun: tun.clone(),
     };
@@ -790,6 +887,38 @@ mod tests {
         let mut seg = vec![0u8; 20];
         seg[2..4].copy_from_slice(&dport.to_be_bytes()); // dst-порт
         ip::build_ipv4(6, src, dst, &seg)
+    }
+
+    /// M-8: интервал keep-alive случаен и ВСЕГДА строго меньше `keep_alive_interval` quinn (5 с) —
+    /// иначе штатный PING успевал бы раньше и возвращал в поток ту самую строгую периодичность,
+    /// ради ухода от которой всё и делалось. И сильно меньше `max_idle_timeout` (15 с), чтобы
+    /// потеря одного маячка не рвала сессию.
+    #[test]
+    fn keepalive_interval_is_random_and_below_quinn_fallback() {
+        let mut seen = std::collections::HashSet::new();
+        for _ in 0..200 {
+            let d = keepalive_delay();
+            assert!(d >= std::time::Duration::from_secs(2), "слишком часто: {d:?}");
+            assert!(d <= std::time::Duration::from_secs(4), "не успеет до PING quinn: {d:?}");
+            seen.insert(d);
+            assert!(keepalive_body_len() <= 96);
+        }
+        assert!(seen.len() > 50, "интервал обязан гулять, а не быть константой: {}", seen.len());
+    }
+
+    /// M-8/F7: датаграмма служебного контекста в TUN не идёт, но ресурсы тратит — она обязана
+    /// списываться из того же bucket'а. Иначе лимит обходится сменой context id.
+    #[test]
+    fn service_datagrams_are_charged_to_the_bucket() {
+        let cfg = crate::ratelimit::RateCfg { rate: 1.0, burst: 200.0 };
+        let mut inb = Inbound::new(Some([10, 7, 0, 9]), Some(cfg));
+        // burst 200 при MIN_PACKET_COST=64 → три «служебные» датаграммы съедают лимит…
+        assert!(inb.charge(10));
+        assert!(inb.charge(10));
+        assert!(inb.charge(10));
+        assert!(!inb.charge(10), "четвёртая обязана упереться в лимит");
+        // …и полезный пакет после этого тоже не проходит (bucket общий на направление)
+        assert!(!inb.accept(&ipv4([10, 7, 0, 9], [1, 1, 1, 1])));
     }
 
     /// EXIT-демукс: return-пакет уходит ИМЕННО клиенту с этим dst, а не «первому попавшемуся»

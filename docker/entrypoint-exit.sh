@@ -6,6 +6,11 @@ export Citadel_ROLE=server
 # ДЕМО/E2E-стенд: включаем диагностический вывод. В проде (env от AdminDeployer) его НЕТ —
 # серверные роли по умолчанию молчат о клиентах и их трафике (no-logs, citadel_quic::debug_logs).
 export Citadel_DEBUG_LOG=1
+# L-10 (аудит-4): ЭТО ДЕМО-СТЕНД, НЕ ПРОД. Флаг разрешает то, что в проде запрещено: слабые
+# seed'ы из повторяющегося шаблона (c5c5…/adad…) и диагностический лог без предупреждения.
+# Прод-установщик (tools/install-citadel-server.sh) его НЕ выставляет — скопированный отсюда
+# entrypoint без правок просто не запустится.
+export Citadel_DEMO_STAND=1
 # Порты стенда параметризованы (п.2 «порты первым классом»): CLI-стенд поднимается на
 # НЕСТАНДАРТНЫХ портах, и это постоянная проверка, что 4433/443/7000 нигде не захардкожены
 # на пути клиента. Дефолты — прежние.
@@ -18,8 +23,10 @@ export Citadel_PIN_FILE=${Citadel_PIN_FILE:-/shared/exit.pin}   # exit2 пере
 export Citadel_OBFS_PSK=$(cat /shared/obfs.psk)   # общий PSK сгенерирован издателем (не хардкод)
 export Citadel_ISSUER_KEY=/shared/issuer.key   # F-M4: проверка анонимных токенов (M-6: ключ эпохи СЕКРЕТЕН)
 export Citadel_EPOCH_SECS=3600   # C5.1: epoch-scoped — exit читает issuer-<epoch>.key (current±prev)
-export Citadel_RATE_LIMIT=131072   # F7/D3: 128 KiB/с на клиента (анти-абуз/исчерпание ресурсов)
+export Citadel_RATE_LIMIT=131072   # F7/D3: 128 KiB/с на клиента вверх (анти-абуз/исчерпание ресурсов)
 export Citadel_RATE_BURST=262144   # допустимый всплеск 256 KiB
+# M-3-bis: направление «вниз» намеренно НЕ задано — стенд проверяет дефолт «симметрично вверх»
+# (Citadel_RATE_LIMIT_DOWN не задан ⇒ тот же bucket-конфиг на return-трафик).
 export Citadel_TCP_LISTEN=0.0.0.0:${CITADEL_TCP_PORT:-443}   # M4: obfs-over-TCP fallback (когда UDP/QUIC заблокирован)
 export Citadel_KX=all   # M6 crypto-agility: exit принимает PQ и classical (negotiate с клиентом)
 export Citadel_MLDSA=1   # M7 PQ-auth: гибрид Ed25519 + ML-DSA-65 (квантово-стойкая подпись сервера)

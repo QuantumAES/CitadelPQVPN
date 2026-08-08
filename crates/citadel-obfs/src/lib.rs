@@ -240,17 +240,31 @@ impl Sealer {
     }
 }
 
-/// Кешированный приёмник: `k_hdr` (от psk) + cipher по последнему `sid` (per-connection обычно
-/// один → попадание в кеш). Несовпадение sid → пере-derive `k_sess` и обновление кеша (корректно).
+/// Ёмкость кеша сессионных шифров приёмника (L-11). 64 — это про exit с несколькими десятками
+/// одновременных клиентов; память на запись — ключ ChaCha20Poly1305, десятки байт.
+const OPENER_CACHE_CAP: usize = 64;
+
+/// Кешированный приёмник: `k_hdr` (от psk) + шифры по `sid` (MRU-кеш).
+///
+/// **L-11/аудит-4: кеш был на ОДИН sid.** На exit'е один сокет принимает пакеты всех клиентов
+/// вперемежку, поэтому кеш промахивался почти на каждом пакете, и каждый пакет стоил `BLAKE3-derive`
+/// плюс разворачивание ключа ChaCha20Poly1305 заново. Под флудом это множитель стоимости обработки,
+/// то есть усиление того самого DoS, от которого стоят гейты pre-auth.
+///
+/// **Важно, что в кеш попадает только ПРОВЕРЕННЫЙ sid.** Раньше запись делалась до расшифровки,
+/// поэтому пакет с произвольным (мусорным) sid вытеснял из кеша живую сессию: атакующий без
+/// всякого PSK мог гарантированно держать кеш холодным. Теперь запись — после успешного AEAD, а
+/// мусор не оставляет следа вообще.
 pub struct Opener {
     psk: [u8; 32],
     k_hdr: [u8; 32],
-    cache: Option<([u8; SID_LEN], ChaCha20Poly1305)>,
+    /// MRU в начале: попаданий на длинных сессиях подавляющее большинство, поиск — memcmp по 16 Б.
+    cache: Vec<([u8; SID_LEN], ChaCha20Poly1305)>,
 }
 
 impl Opener {
     pub fn new(psk_obf: &[u8; 32]) -> Self {
-        Self { psk: *psk_obf, k_hdr: k_hdr(psk_obf), cache: None }
+        Self { psk: *psk_obf, k_hdr: k_hdr(psk_obf), cache: Vec::new() }
     }
 
     pub fn open(&mut self, packet: &[u8]) -> Result<Opened, ObfsError> {
@@ -270,19 +284,32 @@ impl Opener {
         sid.copy_from_slice(&hdr_pt[..SID_LEN]);
         let packet_id = u64::from_be_bytes(hdr_pt[SID_LEN..HDR_PT_LEN].try_into().unwrap());
 
-        // cipher по sid: переиспользуем кеш при совпадении; иначе derive k_sess и кешируем
-        if !matches!(&self.cache, Some((csid, _)) if *csid == sid) {
-            let cipher = ChaCha20Poly1305::new_from_slice(&k_sess(&self.psk, &sid)).expect("len 32");
-            self.cache = Some((sid, cipher));
-        }
-        let cipher = &self.cache.as_ref().unwrap().1;
-
         let mut aad = [0u8; 12 + HDR_PT_LEN];
         aad[..12].copy_from_slice(nonce_pkt);
         aad[12..].copy_from_slice(enc_header);
-        let inner = cipher
-            .decrypt(Nonce::from_slice(&body_nonce(packet_id)), Payload { msg: aead_body, aad: &aad })
-            .map_err(|_| ObfsError::AuthFailed)?;
+        let bn = body_nonce(packet_id);
+        let nonce = Nonce::from_slice(&bn);
+        let payload = Payload { msg: aead_body, aad: &aad };
+
+        // cipher по sid: попадание в кеш → используем и поднимаем в MRU; промах → derive k_sess,
+        // и в кеш он попадает ТОЛЬКО если пакет оказался подлинным (иначе кеш вытесняется мусором).
+        let inner = match self.cache.iter().position(|(s, _)| *s == sid) {
+            Some(i) => {
+                let inner = self.cache[i].1.decrypt(nonce, payload).map_err(|_| ObfsError::AuthFailed)?;
+                if i > 0 {
+                    self.cache.swap(0, i);
+                }
+                inner
+            }
+            None => {
+                let cipher =
+                    ChaCha20Poly1305::new_from_slice(&k_sess(&self.psk, &sid)).expect("len 32");
+                let inner = cipher.decrypt(nonce, payload).map_err(|_| ObfsError::AuthFailed)?;
+                self.cache.insert(0, (sid, cipher));
+                self.cache.truncate(OPENER_CACHE_CAP);
+                inner
+            }
+        };
         Ok(Opened { sid, packet_id, inner })
     }
 }
@@ -594,6 +621,41 @@ mod tests {
         }
         // probe-resistance сохранена: неверный PSK → AuthFailed
         assert_eq!(Opener::new(&[0xFFu8; 32]).open(&p1), Err(ObfsError::AuthFailed));
+    }
+
+    /// L-11: кеш держит МНОГО сессий (exit обслуживает клиентов одним сокетом), а мусорный пакет
+    /// в него не попадает — иначе поток случайных sid'ов гарантированно вымывал бы живые сессии.
+    #[test]
+    fn opener_cache_holds_many_sessions_and_ignores_garbage() {
+        let psk = psk();
+        let inner = build_inner(TYPE_DATA, None, None, &[], b"multi-client");
+        let nonce = arr12("0102030405060708090a0b0c");
+        // 16 «клиентов» со своими sid
+        let sids: Vec<[u8; SID_LEN]> = (0u8..16).map(|i| [i.wrapping_add(1); SID_LEN]).collect();
+        let pkts: Vec<Vec<u8>> = sids.iter().map(|s| seal(&psk, s, 7, &nonce, &inner)).collect();
+
+        let mut op = Opener::new(&psk);
+        for p in &pkts {
+            op.open(p).unwrap();
+        }
+        assert_eq!(op.cache.len(), sids.len(), "все сессии обязаны осесть в кеше");
+
+        // мусор с чужим PSK (валидная длина, но AEAD не сойдётся) кеш не трогает
+        let junk = seal(&[0xFFu8; 32], &[0xEE; SID_LEN], 1, &nonce, &inner);
+        assert_eq!(op.open(&junk), Err(ObfsError::AuthFailed));
+        assert_eq!(op.cache.len(), sids.len(), "мусорный sid не должен вытеснять живые сессии");
+
+        // перемежающийся приём остаётся корректным (тот же результат, что stateless open)
+        for (s, p) in sids.iter().zip(&pkts) {
+            let o = op.open(p).unwrap();
+            assert_eq!((o.sid, &o.inner), (*s, &inner));
+        }
+        // потолок кеша соблюдается
+        for i in 0..(OPENER_CACHE_CAP + 8) {
+            let sid = [(i % 251) as u8 + 3; SID_LEN];
+            op.open(&seal(&psk, &sid, 1, &nonce, &inner)).unwrap();
+        }
+        assert!(op.cache.len() <= OPENER_CACHE_CAP, "кеш не должен расти без предела");
     }
 
     // ----------------------- robustness / fuzz (no-panic на недоверенном вводе, M6) -----------------------

@@ -51,13 +51,24 @@ EPOCH_SECS="${CITADEL_EPOCH_SECS:-3600}"     # длина эпохи токен�
 LEASE_SECS="${CITADEL_LEASE_SECS:-0}"        # задача 4/B: single-session — окно аренды на абонента (с);
                                              # 0 = выкл. >0 ⇒ одна ссылка открывает новую сессию не чаще
                                              # раза в N с (ограничивает шеринг; реконнект в окне ждёт)
-# F7/D3 (M-3, аудит-4): per-client token-bucket на входящее направление exit'а. До аудита-4 эти
+# L-4 (аудит-4): дефолт 0 — ОСОЗНАННЫЙ, а не забытый. Издатель не может отличить «второе устройство
+# с той же ссылки» от «то же устройство переехало с Wi-Fi на LTE»: и то, и другое — новый запрос
+# токена от того же client_id, а различить их можно только связав сессии на exit'е, то есть сломав
+# ровно ту неразличимость, ради которой сделан весь Layer-2. Поэтому включённая аренда бьёт в первую
+# очередь по честному мобильному абоненту (реконнект в окне = «нет доступа на N секунд»), а шеринг
+# ограничивает лишь мягко. Включать имеет смысл там, где абонент стационарный, и с окном 60–120 с.
+# F7/D3 (M-3, аудит-4): per-client token-bucket на ОБА направления exit'а. До аудита-4 эти
 # переменные выставлял только docker-демостенд, а установщик — нет: в реальном деплое лимит был
 # ВЫКЛЮЧЕН, и один абонент мог насытить аплинк exit'а (отказ в обслуживании для остальных + счёт
 # за трафик). Дефолт щедрый (~84 Мбит/с на абонента) — режет злоупотребление, а не нормальное
 # пользование. 0 = выключить осознанно.
-RATE_LIMIT="${CITADEL_RATE_LIMIT:-10485760}" # байт/с на клиента (10 MiB/с); 0 = без лимита
+# M-3-bis: направление «вниз» (интернет → абонент) до этого не ограничивалось ВООБЩЕ, хотя именно
+# оно несёт основную нагрузку релея и амплификацию «мало запросил — много получил». Пусто ⇒ тот же
+# лимит, что и вверх; отдельные CITADEL_RATE_LIMIT_DOWN/BURST_DOWN — если каналы асимметричны.
+RATE_LIMIT="${CITADEL_RATE_LIMIT:-10485760}" # байт/с на клиента вверх (10 MiB/с); 0 = без лимита
 RATE_BURST="${CITADEL_RATE_BURST:-20971520}" # допустимый всплеск, байт (20 MiB ≈ 2 с)
+RATE_LIMIT_DOWN="${CITADEL_RATE_LIMIT_DOWN:-$RATE_LIMIT}" # байт/с вниз; 0 = не резать вниз
+RATE_BURST_DOWN="${CITADEL_RATE_BURST_DOWN:-$RATE_BURST}"
 
 log()  { printf '\033[1;36m[citadel]\033[0m %s\n' "$*"; }
 warn() { printf '\033[1;33m[citadel] ⚠ %s\033[0m\n' "$*" >&2; }
@@ -74,10 +85,15 @@ CitadelPQVPN — установщик exit-сервера (запускать н
   --tcp-port    N   (443)   obfs-over-TCP fallback      [CITADEL_TCP_PORT]
   --issuer-port N   (7000)  издатель токенов (публичный)[CITADEL_ISSUER_PORT]
   --admin-port  N   (7001)  admin-канал, НАРУЖУ НЕ ОТКРЫТ — только из туннеля [CITADEL_ADMIN_PORT]
+  --admin-peer  IP  адрес exit-машины, которому разрешён admin-канал (L-14).
+                    ОБЯЗАТЕЛЕН при --role issuer (там порт публикуется наружу);
+                    'any' — открыть всем осознанно                [CITADEL_ADMIN_PEER]
 
 Ограничение полосы на абонента (F7/D3 — чтобы один клиент не съел аплинк exit'а):
-  --rate-limit  N   (10485760) байт/с на клиента; 0 = без лимита [CITADEL_RATE_LIMIT]
+  --rate-limit  N   (10485760) байт/с на клиента вверх; 0 = без лимита [CITADEL_RATE_LIMIT]
   --rate-burst  N   (20971520) допустимый всплеск, байт          [CITADEL_RATE_BURST]
+  --rate-limit-down N  (= --rate-limit) байт/с вниз; 0 = без лимита [CITADEL_RATE_LIMIT_DOWN]
+  --rate-burst-down N  (= --rate-burst) всплеск вниз, байт        [CITADEL_RATE_BURST_DOWN]
 
 Порты по умолчанию узнаваемы (4433/7000 — «подпись» Citadel). На сети, где это важно,
 задавай свои: клиент берёт их из ссылки, менять на нём ничего не нужно. Единственный порт,
@@ -122,8 +138,11 @@ while (($#)); do
     --tcp-port)     CITADEL_TCP_PORT="${2:-}";     shift 2 ;;
     --issuer-port)  CITADEL_ISSUER_PORT="${2:-}";  shift 2 ;;
     --admin-port)   CITADEL_ADMIN_PORT="${2:-}";   shift 2 ;;
+    --admin-peer)   CITADEL_ADMIN_PEER="${2:-}";   shift 2 ;;
     --rate-limit)   CITADEL_RATE_LIMIT="${2:-}";   shift 2 ;;
     --rate-burst)   CITADEL_RATE_BURST="${2:-}";   shift 2 ;;
+    --rate-limit-down) CITADEL_RATE_LIMIT_DOWN="${2:-}"; shift 2 ;;
+    --rate-burst-down) CITADEL_RATE_BURST_DOWN="${2:-}"; shift 2 ;;
     --host)         CITADEL_SERVER_HOST="${2:-}";  shift 2 ;;
     --routes)       CITADEL_ROUTES="${2:-}";       shift 2 ;;
     --dns)          CITADEL_DNS="${2:-}";          shift 2 ;;
@@ -148,14 +167,20 @@ ISSUER_ON="${CITADEL_ISSUER:-$ISSUER_ON}"
 ROLE="${CITADEL_ROLE:-all}"
 RATE_LIMIT="${CITADEL_RATE_LIMIT:-$RATE_LIMIT}"
 RATE_BURST="${CITADEL_RATE_BURST:-$RATE_BURST}"
+# M-3-bis: «вниз» по умолчанию симметрично «вверх» — в том числе когда лимит вверх задан флагом.
+RATE_LIMIT_DOWN="${CITADEL_RATE_LIMIT_DOWN:-$RATE_LIMIT}"
+RATE_BURST_DOWN="${CITADEL_RATE_BURST_DOWN:-$RATE_BURST}"
 # Нечисловое значение молча уехало бы в entrypoint, а `RateCfg::from_env` разобрал бы его как
 # «лимита нет» — то есть опечатка в флаге тихо отключала бы защиту. Отваливаемся здесь.
-for spec in "RATE_LIMIT:--rate-limit" "RATE_BURST:--rate-burst"; do
+for spec in "RATE_LIMIT:--rate-limit" "RATE_BURST:--rate-burst" \
+            "RATE_LIMIT_DOWN:--rate-limit-down" "RATE_BURST_DOWN:--rate-burst-down"; do
   var="${spec%%:*}"; flag="${spec##*:}"
   [[ "${!var}" =~ ^[0-9]+$ ]] || die "$flag: '${!var}' — ожидается целое число байт (0 = без лимита)"
 done
 (( RATE_LIMIT == 0 || RATE_BURST >= RATE_LIMIT )) \
   || die "--rate-burst ($RATE_BURST) меньше --rate-limit ($RATE_LIMIT): всплеск не может быть меньше секундного пополнения"
+(( RATE_LIMIT_DOWN == 0 || RATE_BURST_DOWN >= RATE_LIMIT_DOWN )) \
+  || die "--rate-burst-down ($RATE_BURST_DOWN) меньше --rate-limit-down ($RATE_LIMIT_DOWN)"
 
 # ─── 0a-bis. роль установки (P1: exit и издатель на разных машинах) ───
 case "$ROLE" in
@@ -204,6 +229,24 @@ if [[ "$ROLE" == exit && "$ISSUER_ON" == 1 ]]; then
     [[ -n "${!var}" ]] || die "--role exit: нужен $flag (или --issuer-bundle с ним)"
     hex64 "${!var}" || die "$flag: ожидается 64 hex-символа"
   done
+fi
+
+# ─── 0a-ter. L-14: кто имеет право стучаться в admin-канал издателя ───
+# При раздельном деплое admin-порт приходится публиковать наружу (его дёргает exit-машина через
+# DNAT из туннеля), и до аудита-4 его «закрывала» строчка в выводе установщика — то есть контроль
+# существовал только в голове оператора и исчезал при первой же переустановке хоста. Теперь адрес
+# exit-машины обязателен и уезжает в сам процесс издателя (`Citadel_ADMIN_PEER`), который закрывает
+# чужие коннекты ДО TLS. Осознанный отказ — `--admin-peer any` (тогда порт открыт всем, как раньше).
+ADMIN_PEER="${CITADEL_ADMIN_PEER:-}"
+if [[ "$ROLE" == issuer ]]; then
+  [[ -n "$ADMIN_PEER" ]] || die \
+    "--role issuer: нужен --admin-peer <IP exit-машины> — admin-порт $ADMIN_PORT публикуется наружу,
+   и без списка разрешённых адресов он открыт всему интернету. Осознанно открыть: --admin-peer any"
+  if [[ "$ADMIN_PEER" != "any" ]]; then
+    for a in ${ADMIN_PEER//,/ }; do
+      [[ "$a" =~ ^[0-9a-fA-F:.]+$ ]] || die "--admin-peer: '$a' не похоже на IP-адрес"
+    done
+  fi
 fi
 
 # ─── 0a. валидация портов ───
@@ -468,15 +511,21 @@ rm -f /shared/exit.pin   # pin перезапишется тем же значе
 EOF
   if [[ "$RATE_LIMIT" != 0 ]]; then
     cat <<EOF
-# F7/D3 (M-3, аудит-4): per-client token-bucket на входящее направление. Без него один абонент
-# насыщал аплинк exit'а — отказ в обслуживании остальным. Мелкие пакеты тоже считаются
-# (MIN_PACKET_COST), поэтому PPS-абуз режется наравне с полосой.
+# F7/D3 (M-3, аудит-4): per-client token-bucket. Без него один абонент насыщал аплинк exit'а —
+# отказ в обслуживании остальным. Мелкие пакеты тоже считаются (MIN_PACKET_COST), поэтому
+# PPS-абуз режется наравне с полосой. M-3-bis: направления считаются раздельно.
 export Citadel_RATE_LIMIT=$RATE_LIMIT
 export Citadel_RATE_BURST=$RATE_BURST
-echo "[citadel-exit] F7 rate-limit: $RATE_LIMIT б/с на абонента (всплеск $RATE_BURST б)"
+export Citadel_RATE_LIMIT_DOWN=$RATE_LIMIT_DOWN
+export Citadel_RATE_BURST_DOWN=$RATE_BURST_DOWN
+echo "[citadel-exit] F7 rate-limit на абонента: ↑ $RATE_LIMIT б/с (всплеск $RATE_BURST) · ↓ $RATE_LIMIT_DOWN б/с (всплеск $RATE_BURST_DOWN)"
 EOF
   else
-    echo 'echo "[citadel-exit] ⚠ F7 rate-limit ВЫКЛЮЧЕН (--rate-limit 0): один абонент может занять весь аплинк"'
+    cat <<EOF
+export Citadel_RATE_LIMIT_DOWN=$RATE_LIMIT_DOWN
+export Citadel_RATE_BURST_DOWN=$RATE_BURST_DOWN
+echo "[citadel-exit] ⚠ F7 rate-limit вверх ВЫКЛЮЧЕН (--rate-limit 0): один абонент может занять весь аплинк"
+EOF
   fi
   if [[ "$ISSUER_ON" == 1 ]]; then
     cat <<EOF
@@ -553,6 +602,9 @@ export Citadel_REGISTER_PUBS="$CLIENT_PUB"   # client_id админа (issuer Н
 # «всё на одном сервере» ключ читается с общего тома и раздача по сети не нужна — но id всё равно
 # задан, чтобы `--role issuer` и `--role all` вели себя одинаково.
 export Citadel_KEYSYNC_ID=$KEYSYNC_ID
+# L-14: при раздельном деплое admin-порт публикуется наружу — процесс сам закрывает всех, кроме
+# exit-машины (до TLS, до слота гейта). Пусто = совмещённая установка, порт наружу не смотрит.
+export Citadel_ADMIN_PEER="$ADMIN_PEER"
 rm -f /shared/issuer.key /shared/issuer-*.key /shared/issuer.pub /shared/issuer-*.pub /shared/tokens
 # M-4 (аудит-4): привилегии издателя режет compose (cap_drop: ALL + read_only + no-new-privileges).
 # Смена uid здесь не делается — том общий с exit'ом (и с keysync при раздельной установке), и
@@ -591,7 +643,7 @@ cat <<EOF
     user: "0:65534"
     ports:
       - "$ISSUER_PORT:7000/tcp"        # клиент фетчит epoch-токены сюда (Layer-1)$(
-      if [[ "$ROLE" == issuer ]]; then printf '\n      - "%s:%s/tcp"   # admin-канал: НУЖЕН только exit-машине — закрой его firewall\x27ом для всех остальных' "$ADMIN_PORT" "$ADMIN_PORT"; fi)
+      if [[ "$ROLE" == issuer ]]; then printf '\n      - "%s:%s/tcp"   # admin-канал: нужен только exit-машине (%s). L-14: посторонние адреса режет сам издатель (Citadel_ADMIN_PEER), firewall — второй рубеж' "$ADMIN_PORT" "$ADMIN_PORT" "$ADMIN_PEER"; fi)
     volumes:
       - "$DIR/keys:/shared"
     healthcheck:                       # готов, когда ключ эпохи сгенерирован и issuer.key лежит на томе
@@ -733,8 +785,9 @@ EOF
 
 Порты этой машины:
   • $ISSUER_PORT/tcp  — выдача токенов          → ОТКРЫТЬ для клиентов
-  • $ADMIN_PORT/tcp  — admin-канал            → открыть ТОЛЬКО для адреса exit-машины, например:
-      ufw allow from <IP_EXIT> to any port $ADMIN_PORT proto tcp
+  • $ADMIN_PORT/tcp  — admin-канал            → разрешён только адресу: $ADMIN_PEER (L-14, режет сам издатель)
+    Второй рубеж — firewall хоста, например:
+      ufw allow from $ADMIN_PEER to any port $ADMIN_PORT proto tcp
     (канал и сам защищён PQ-TLS+pin и подписью админа, но лишней публичности ему не нужно)
 
 ────────────────── СЕКРЕТ: bundle для установки exit-узла ──────────────────

@@ -322,7 +322,7 @@ pub async fn run_data_plane(session: Session, tun: Arc<dyn TunIo>) -> Result<()>
         std::net::IpAddr::V6(_) => None,
     };
     let path = ClientPath { assigned: session.addr, exit };
-    pump(session.tunnel, tun, None, Some(path), None, None, None).await
+    pump(session.tunnel, tun, None, Some(path), Default::default(), None, None).await
 }
 
 /// Подключиться к ОДНОМУ exit'у: основной путь PQ-QUIC, при недоступности — obfs-over-TCP

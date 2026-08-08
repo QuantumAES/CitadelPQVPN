@@ -61,6 +61,14 @@ struct Shared {
     clean: bool,
     /// Растёт на каждую сессию: поток-супервизор понимает, что его сессию уже сменили.
     generation: u64,
+    /// L-13/аудит-4: uid, чья сессия последней армировала fail-closed правила. Снять их вручную
+    /// (`--disarm`) может только он или root — иначе сосед по машине (тоже член группы vpnd)
+    /// снимал бы чужую защиту. `None` — с момента старта демона сессий не было: правила либо
+    /// осиротели от прошлого запуска, либо их нет вовсе, и тогда снятие обязано быть доступно
+    /// любому члену группы. Иначе залипший после краха kill-switch снимать было бы некому —
+    /// ровно тот сценарий «нет интернета даже при закрытом приложении», из-за которого disarm и
+    /// появился.
+    armed_by: Option<u32>,
 }
 
 struct Session {
@@ -372,6 +380,7 @@ impl Daemon {
             ..Default::default()
         };
         sh.session = Some(Session { chan: chan.clone(), child, owner_uid: uid });
+        sh.armed_by = Some(uid); // L-13: kill-switch этой сессии снимает её владелец (или root)
         drop(sh);
 
         self.broadcast(EventMsg::state("connecting"));
@@ -462,12 +471,19 @@ impl Daemon {
     }
 
     /// Снять fail-closed правила вручную (L11).
-    fn disarm(&self, _uid: u32) -> Result<()> {
+    fn disarm(&self, uid: u32) -> Result<()> {
         let mut sh = self.shared.lock().unwrap();
         if sh.session.is_some() {
             bail!("сессия активна — сначала отключитесь (иначе снятие защиты откроет утечку)");
         }
+        // L-13: право снимать защиту — у того, чья сессия её поставила (или у root). См. `armed_by`.
+        if let Some(owner) = sh.armed_by {
+            if uid != 0 && uid != owner {
+                bail!("kill-switch армирован другим пользователем (uid {owner}) — снять может он или root");
+            }
+        }
         sh.net.disarm(&self.tools);
+        sh.armed_by = None;
         eprintln!("[vpnd] kill-switch и IPv6-блок сняты по запросу");
         Ok(())
     }

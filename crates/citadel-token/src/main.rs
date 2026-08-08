@@ -24,7 +24,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use anyhow::{Context, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use citadel_token::{read_frame, write_frame}; // C5.3: фрейминг вынесен в lib (переиспользует fetch_tokens)
 
 fn token_dir() -> String {
@@ -261,7 +261,56 @@ impl Drop for SockCtl {
 
 /// Общая accept-петля обоих каналов издателя: гейт, таймауты, throttl'ированный лог отказов.
 /// `serve` получает поток, слот (освобождает его после аутентификации) и пульт сокета.
-fn accept_loop<F>(listener: TcpListener, what: &'static str, gate: Gate, serve: F)
+/// L-14/аудит-4: allowlist адресов, с которых принимается admin-канал.
+///
+/// При раздельном деплое (`--role issuer`) admin-порт приходится публиковать наружу — его дёргает
+/// exit-машина через DNAT из туннеля. До этого его «защищала» строчка в выводе установщика
+/// («закрой firewall'ом»), то есть контроль существовал только в голове оператора. Теперь список
+/// разрешённых источников знает сам процесс: чужой коннект закрывается ДО TLS, не тратя ни
+/// хендшейка, ни слота гейта. Это не замена firewall'у, а второй рубеж, который нельзя забыть
+/// применить и который переживает переустановку хоста.
+///
+/// Пусто или `any` — без ограничения (совмещённый деплой: порт вообще не публикуется).
+#[derive(Clone, Default)]
+struct PeerAllow(Option<Arc<Vec<std::net::IpAddr>>>);
+
+impl PeerAllow {
+    fn from_env(var: &str) -> Result<Self> {
+        let raw = match std::env::var(var) {
+            Ok(v) => v,
+            Err(_) => return Ok(Self(None)),
+        };
+        let t = raw.trim();
+        if t.is_empty() || t.eq_ignore_ascii_case("any") {
+            return Ok(Self(None));
+        }
+        let mut ips = Vec::new();
+        for p in t.split([',', ' ', ';']).map(str::trim).filter(|s| !s.is_empty()) {
+            // Опечатка в адресе не должна превращаться в «пускаем всех»: это ровно тот
+            // fail-open, за который аудит уже ловил mldsa_expect (M-1) и parse_obfs_psk (M-7).
+            ips.push(p.parse::<std::net::IpAddr>().map_err(|_| {
+                anyhow!("{var}: '{p}' — не IP-адрес (ожидается список адресов через запятую либо 'any')")
+            })?);
+        }
+        Ok(Self(if ips.is_empty() { None } else { Some(Arc::new(ips)) }))
+    }
+
+    fn permits(&self, ip: std::net::IpAddr) -> bool {
+        match &self.0 {
+            None => true,
+            Some(list) => list.contains(&ip),
+        }
+    }
+
+    fn describe(&self) -> String {
+        match &self.0 {
+            None => "любой адрес (ограничение не задано)".into(),
+            Some(l) => l.iter().map(|a| a.to_string()).collect::<Vec<_>>().join(", "),
+        }
+    }
+}
+
+fn accept_loop<F>(listener: TcpListener, what: &'static str, gate: Gate, allow: PeerAllow, serve: F)
 where
     F: Fn(TcpStream, Pass, SockCtl) + Send + Sync + 'static,
 {
@@ -281,6 +330,21 @@ where
             }
         };
         let Ok(ip) = tcp.peer_addr().map(|a| a.ip()) else { continue };
+        // L-14: посторонний источник закрывается до всего остального (и до слота гейта).
+        if !allow.permits(ip) {
+            drop(tcp);
+            rejected += 1;
+            if last_log.elapsed() >= Duration::from_secs(1) {
+                eprintln!(
+                    "[issuer] {what}: отклонено {rejected} соединений с посторонних адресов за \
+                     секунду — разрешены только {} (L-14)",
+                    allow.describe()
+                );
+                rejected = 0;
+                last_log = Instant::now();
+            }
+            continue;
+        }
         let Some(pass) = gate.admit(ip) else {
             drop(tcp); // потолок исчерпан — закрываем сразу, состояния не заводим
             rejected += 1;
@@ -333,6 +397,30 @@ fn registry_allows(dir: &str, client_id: &[u8], now: u64) -> bool {
 /// Это критично — иначе admin-revoke (`status=revoked`) терялся бы при рестарте контейнера и отозванный
 /// абонент «воскресал» бы `active`. Добавляются только новые pub'ы как `active` на +10 лет. В проде
 /// правкой файла (revoke/add) управляет админ (C5.5); bootstrap лишь досевает недостающих.
+/// L-10/аудит-4: стенд обязан быть помечен стендом. Демо-`entrypoint`'ы включают диагностический
+/// лог и держат seed'ы вида `c5c5…`/`adad…` прямо в тексте — а аудит справедливо считает
+/// реалистичным сценарий «взяли готовый entrypoint из репозитория и подняли им прод».
+/// `Citadel_DEMO_STAND=1` — единственное место, где такие значения разрешены.
+fn demo_stand() -> bool {
+    matches!(std::env::var("Citadel_DEMO_STAND").as_deref(), Ok("1"))
+}
+
+/// L-10: отказать в старте на seed'е с очевидно нулевой энтропией (повтор одного и того же
+/// 1/2/4-байтного шаблона — ровно так выглядят и демо-seed'ы, и «набрано руками»). Такой seed —
+/// это приватный ключ абонента/админа/keysync, и подобрать его может кто угодно за один вечер.
+fn guard_weak_seed(what: &str, seed: &[u8; 32]) -> Result<()> {
+    let weak = [1usize, 2, 4].iter().any(|&p| seed.chunks(p).all(|c| c == &seed[..p]));
+    if weak && !demo_stand() {
+        bail!(
+            "{what}: seed из повторяющегося шаблона ({}…) — это не секрет, а демо-значение. \
+             Сгенерируй настоящий: `head -c 32 /dev/urandom | xxd -p -c 32`. \
+             Если это заведомо стенд — Citadel_DEMO_STAND=1",
+            hex::encode(&seed[..4])
+        );
+    }
+    Ok(())
+}
+
 fn bootstrap_registry(dir: &str) -> Result<()> {
     let mut pubs: Vec<[u8; 32]> = Vec::new();
     if let Ok(list) = std::env::var("Citadel_REGISTER_PUBS") {
@@ -350,6 +438,7 @@ fn bootstrap_registry(dir: &str) -> Result<()> {
                 .ok()
                 .and_then(|v| v.try_into().ok())
                 .context("Citadel_REGISTER_SEEDS: seed должен быть 32 байта hex")?;
+            guard_weak_seed("Citadel_REGISTER_SEEDS", &seed)?; // L-10
             pubs.push(citadel_token::pqid::id_from_seed(&seed)?);
         }
     }
@@ -679,10 +768,14 @@ fn run_issuer() -> Result<()> {
     // C7.1: admin-канал (управление реестром по PQ-TLS: domain-sep Ed25519 + EKM channel binding).
     // Отдельный listener — в деплое наружу НЕ публикуется (доступ только из туннеля через DNAT
     // exit'а, C7.2). TLS-идентичность общая с token-fetch → pin из ссылки валиден для обоих каналов.
+    // L-14: список источников разбираем ДО потока — опечатка в адресе обязана уронить старт, а не
+    // всплыть отказами admin-канала посреди работы.
+    let admin_allow = PeerAllow::from_env("Citadel_ADMIN_PEER")?;
     if let Ok(admin_listen) = std::env::var("Citadel_ADMIN_LISTEN") {
         let scfg = scfg.clone();
         let dir = dir.clone();
         let pq = pq.clone();
+        eprintln!("[issuer] admin-канал принимает: {}", admin_allow.describe());
         std::thread::spawn(move || {
             let listener = match TcpListener::bind(&admin_listen) {
                 Ok(l) => l,
@@ -693,7 +786,7 @@ fn run_issuer() -> Result<()> {
             );
             // H-1: собственный гейт — флуд на :7000 не должен отбирать у админа возможность войти.
             let gate = Gate::new(MAX_PREAUTH_ADMIN, MAX_PREAUTH_ADMIN_PER_IP);
-            accept_loop(listener, "admin-канал", gate, move |tcp, pass, ctl| {
+            accept_loop(listener, "admin-канал", gate, admin_allow, move |tcp, pass, ctl| {
                 let srv = citadel_token::admin::AdminServer { dir: dir.clone() };
                 let r = citadel_token::pqtls::accept_tls(tcp, scfg.clone(), obfs_psk).and_then(|tls| {
                     // Слот и жёсткий дедлайн снимаются РОВНО на границе аутентификации.
@@ -785,7 +878,7 @@ fn run_issuer() -> Result<()> {
         PREAUTH_TIMEOUT.as_secs(),
         PREAUTH_DEADLINE.as_secs()
     );
-    accept_loop(listener, "выдача токенов", gate, move |stream, pass, ctl| {
+    accept_loop(listener, "выдача токенов", gate, PeerAllow::default(), move |stream, pass, ctl| {
         if let Err(e) = serve_client(
             stream, pass, ctl, scfg.clone(), &pq, &cert_pin, &state, &dir, &quota, max_per_epoch,
             &lease, lease_secs, obfs_psk, keysync_id.as_ref(),
@@ -969,6 +1062,7 @@ fn run_client_fetch() -> Result<()> {
         .and_then(|s| hex::decode(s.trim()).ok())
         .and_then(|v| v.try_into().ok())
         .context("Citadel_CLIENT_SEED (32 байта hex) обязателен для Layer-1")?;
+    guard_weak_seed("Citadel_CLIENT_SEED", &seed)?; // L-10
     // S2.1/A1: pin TLS-серта издателя — обязателен (fail-closed: без него канал был бы MITM-открыт).
     let issuer_pin: [u8; 32] = std::env::var("Citadel_ISSUER_PIN")
         .ok()
@@ -1044,6 +1138,7 @@ fn run_keysync() -> Result<()> {
         std::env::var("Citadel_KEYSYNC_SEED").ok().as_ref(),
         "Citadel_KEYSYNC_SEED (идентичность exit-узла для получения ключа эпохи, 64 hex)",
     )?;
+    guard_weak_seed("Citadel_KEYSYNC_SEED", &keysync_seed)?; // L-10
     let dir = token_dir();
     let epoch_secs: u64 =
         std::env::var("Citadel_EPOCH_SECS").ok().and_then(|s| s.parse().ok()).unwrap_or(3600);
@@ -1161,6 +1256,59 @@ mod tests {
         // смена эпохи сбрасывает счётчик a
         assert!(quota_grant(&mut m, a, 101, 3));
         assert!(quota_grant(&mut m, a, 101, 3));
+    }
+
+    /// L-10: seed из повторяющегося шаблона (ровно такие стоят в демо-entrypoint'ах) — отказ
+    /// старта, если стенд не помечен стендом. Настоящий случайный seed проходит всегда.
+    #[test]
+    fn weak_seed_is_rejected_outside_demo_stand() {
+        use super::guard_weak_seed;
+        // SAFETY (тест): своя переменная, снимается сразу.
+        std::env::remove_var("Citadel_DEMO_STAND");
+        for pat in [[0xc5u8; 32], [0u8; 32], [0xffu8; 32]] {
+            assert!(guard_weak_seed("тест", &pat).is_err(), "{}", hex::encode(&pat[..4]));
+        }
+        // повтор 2- и 4-байтного шаблона тоже не секрет
+        let mut p2 = [0u8; 32];
+        for (i, b) in p2.iter_mut().enumerate() {
+            *b = if i % 2 == 0 { 0xab } else { 0xcd };
+        }
+        assert!(guard_weak_seed("тест", &p2).is_err());
+        // настоящий seed (32 разных байта) проходит
+        let real: [u8; 32] = std::array::from_fn(|i| (i as u8).wrapping_mul(37).wrapping_add(11));
+        assert!(guard_weak_seed("тест", &real).is_ok());
+        // на помеченном стенде демо-значения разрешены
+        std::env::set_var("Citadel_DEMO_STAND", "1");
+        assert!(guard_weak_seed("тест", &[0xc5u8; 32]).is_ok());
+        std::env::remove_var("Citadel_DEMO_STAND");
+    }
+
+    /// L-14: allowlist admin-канала. Ключевое — «не задано» и «задано неверно» это РАЗНЫЕ исходы:
+    /// первое штатно (совмещённый деплой, порт наружу не смотрит), второе обязано ронять старт,
+    /// иначе опечатка в адресе тихо превращается в «пускаем всех».
+    #[test]
+    fn admin_peer_allowlist() {
+        use super::PeerAllow;
+        let ip = |s: &str| s.parse::<std::net::IpAddr>().unwrap();
+
+        // SAFETY (тест): своя переменная, снимается в конце.
+        std::env::remove_var("Citadel_TEST_PEER");
+        let any = PeerAllow::from_env("Citadel_TEST_PEER").unwrap();
+        assert!(any.permits(ip("203.0.113.9")), "не задано — ограничения нет");
+
+        std::env::set_var("Citadel_TEST_PEER", "any");
+        assert!(PeerAllow::from_env("Citadel_TEST_PEER").unwrap().permits(ip("203.0.113.9")));
+
+        std::env::set_var("Citadel_TEST_PEER", "203.0.113.7, 2001:db8::1");
+        let a = PeerAllow::from_env("Citadel_TEST_PEER").unwrap();
+        assert!(a.permits(ip("203.0.113.7")));
+        assert!(a.permits(ip("2001:db8::1")));
+        assert!(!a.permits(ip("203.0.113.8")), "посторонний адрес обязан отбиваться");
+        assert!(!a.permits(ip("127.0.0.1")));
+
+        std::env::set_var("Citadel_TEST_PEER", "203.0.113.7, не-адрес");
+        assert!(PeerAllow::from_env("Citadel_TEST_PEER").is_err(), "мусор в списке = отказ старта");
+        std::env::remove_var("Citadel_TEST_PEER");
     }
 
     /// Задача 4/B: аренда client_id блокирует новую выдачу в окне; истекла → снова разрешена;

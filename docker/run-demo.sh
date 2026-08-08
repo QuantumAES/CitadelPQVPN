@@ -6,7 +6,9 @@ ROOT="$PWD"
 export PATH="$ROOT/.venv/bin:$PATH"   # cmake для aws-lc-rs
 
 echo "[1/5] сборка citadel-m1 + citadel-token…"
-cargo build -q -p citadel-quic --bin citadel-m1
+# L-5: фича insecure-dev включает эскейпы Citadel_INSECURE_* (нужны ТЕСТу 14 crypto-agility).
+# Собирается только здесь — в релизной сборке (tools/mk-release.sh) этих переключателей нет.
+cargo build -q -p citadel-quic --bin citadel-m1 --features insecure-dev
 cargo build -q -p citadel-token --bin citadel-token
 cp -f target/debug/citadel-m1 docker/citadel-m1
 cp -f target/debug/citadel-token docker/citadel-token

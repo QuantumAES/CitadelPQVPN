@@ -6,6 +6,14 @@ edition.workspace = true
 license.workspace = true
 description = "CitadelPQVPN M0 PoC — гибридный постквантовый QUIC-хендшейк (X25519MLKEM768) на quinn + rustls/aws-lc-rs"
 
+[features]
+default = []
+# L-5/аудит-4: включает dev-эскейпы `Citadel_INSECURE_NO_PIN` (принять любой серт) и
+# `Citadel_INSECURE_CLASSICAL_KX` (не-PQ группа). Собирается ТОЛЬКО для стендов
+# (docker/run-demo.sh). В релизных бинарях (tools/mk-release.sh) фичи нет ⇒ переменные
+# окружения не могут снять аутентификацию узла и анти-HNDL. См. `config::insecure_dev_flag`.
+insecure-dev = []
+
 [dependencies]
 anyhow = "1"
 arc-swap = "1"

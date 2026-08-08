@@ -172,6 +172,24 @@ fn drop_privileges() -> Result<()> {
     Ok(())
 }
 
+/// L-3: открыть журнал потраченных токенов ДО [`drop_privileges`] — на чтение И запись.
+///
+/// Открывать надо именно здесь: после F4 процесс работает под nobody, а каталог `/shared`
+/// принадлежит root'у; отдать каталог сброшенному uid тоже нельзя — `cap_drop: ALL` (M-4) снимает
+/// с exit'а CAP_CHOWN. Дескриптор же проверяется на `open`, поэтому запись через него переживает
+/// смену uid, а ротация делается перезаписью того же файла, без обращений к каталогу.
+fn open_spent_log(path: &std::path::Path) -> Result<std::fs::File> {
+    let f = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(path)
+        .with_context(|| format!("журнал {}", path.display()))?;
+    set_key_perms(&path.to_string_lossy()); // 0600 — постороннему процессу читать незачем
+    Ok(f)
+}
+
 // ----------------------- сетевая обвязка (ip/iptables) -----------------------
 fn run(cmd: &str, args: &[&str]) {
     match Command::new(cmd).args(args).status() {
@@ -366,6 +384,37 @@ impl IssuerAuth {
         !matches!(self, IssuerAuth::Disabled)
     }
 
+    /// Номер эпохи «сейчас» (Legacy/Disabled — бакет 0, он же не истекает).
+    fn epoch_now(&self) -> u64 {
+        match self {
+            IssuerAuth::Epoch { epoch_secs, .. } => citadel_token::current_epoch(*epoch_secs),
+            _ => 0,
+        }
+    }
+
+    /// L-3: где вести журнал потраченных токенов. `Citadel_SPENT_LOG` — явно (пустое значение или
+    /// `off` = осознанный отказ, только RAM); иначе `<каталог ключей эпохи>/spent.bin`, то есть
+    /// рядом с тем, что exit и так обязан иметь на диске. Токены выключены → журнал не нужен вовсе.
+    fn spent_log_path(&self) -> Option<std::path::PathBuf> {
+        if !self.enabled() {
+            return None;
+        }
+        match std::env::var("Citadel_SPENT_LOG") {
+            Ok(v) if v.trim().is_empty() || v.trim() == "off" => None,
+            Ok(v) => Some(std::path::PathBuf::from(v)),
+            Err(_) => {
+                let dir = match self {
+                    IssuerAuth::Epoch { dir, .. } => Some(std::path::PathBuf::from(dir)),
+                    IssuerAuth::Legacy(_) => std::env::var("Citadel_ISSUER_KEY")
+                        .ok()
+                        .and_then(|k| std::path::Path::new(&k).parent().map(|p| p.to_path_buf())),
+                    IssuerAuth::Disabled => None,
+                };
+                dir.map(|d| d.join("spent.bin"))
+            }
+        }
+    }
+
     /// Проверить предъявление токена → `(nonce для double-spend, epoch-бакет для prune)` или None
     /// (невалид/чужая эпоха/чужая сессия). Legacy → бакет `0` (не истекает, не чистится); Epoch →
     /// текущая эпоха (C5: бакеты старше current-1 можно чистить — токен той эпохи всё равно не
@@ -396,16 +445,133 @@ impl IssuerAuth {
     }
 }
 
+/// C5/аудит-3 + L-3/аудит-4: множество потраченных токенов по epoch-бакетам.
+///
+/// **Почему на диске (L-3).** До аудита-4 множество жило только в RAM процесса, поэтому рестарт
+/// exit'а (передеплой, крэш, OOM-killer) обнулял его — и КАЖДЫЙ выданный в текущей эпохе токен
+/// становился годен второй раз. Квота издателя (64/эпоха) при этом остаётся соблюдённой, так что
+/// снаружи это выглядит как штатная работа: тихое умножение доступа на число рестартов.
+///
+/// **Что при этом появляется на диске и почему это приемлемо.** Файл `spent-<epoch>.bin` — это
+/// список 32-байтных nonce'ов, случайных и ни с чем не связанных: ни `client_id`, ни адреса, ни
+/// назначения в нём нет и быть не может (exit их и не знает — в этом смысл слепой выдачи). Что из
+/// него читается — «сколько сессий было в эту эпоху»; файлы старше `epoch-1` удаляются, поэтому
+/// горизонт артефакта ≤ 2 эпох. Это осознанный размен: анти-double-spend против почти нулевого
+/// прироста наблюдаемости у противника, который и так снял бы RAM живого процесса.
+///
+/// **Границы.** Второй exit с тем же ключом эпохи по-прежнему примет уже потраченный токен —
+/// множество локально для узла. Закрывается per-exit выводом ключа эпохи (см. отчёт §13),
+/// который всё равно обязателен перед первым мультиэкзитным деплоем.
+///
+/// **Почему ОДИН файл, открытый заранее, а не каталог с файлом на эпоху.** Exit сбрасывает
+/// привилегии до nobody (F4) и живёт так до конца, а `cap_drop: ALL` в compose (M-4) отбирает у
+/// него ещё и CAP_CHOWN — то есть отдать каталог во владение сброшенному uid нечем, и создать в
+/// нём файл на новой эпохе процесс уже не сможет. Поэтому дескриптор открывается ОДИН раз, root'ом,
+/// до сброса: права проверяются на `open`, а не на `write`, поэтому дальше запись работает под
+/// любым uid. Ротация бакетов — перезапись того же файла на месте (`set_len` + запись с нуля),
+/// она тоже не требует прав на каталог. Формат записи: `epoch(8 BE) ‖ nonce(32)`.
+struct SpentStore {
+    seen: HashMap<u64, HashSet<[u8; 32]>>,
+    /// Журнал; `None` — только RAM (токены выключены либо файл недоступен).
+    log: Option<std::fs::File>,
+}
+
+const SPENT_REC: usize = 8 + 32;
+
+impl SpentStore {
+    fn ram_only() -> Self {
+        Self { seen: HashMap::new(), log: None }
+    }
+
+    /// Поднять журнал из уже открытого дескриптора: подхватить бакеты `epoch` и `epoch-1` (ровно
+    /// те, что exit ещё проверяет ключами current±prev) плюс legacy-бакет 0; остальное отбросить и
+    /// сразу переписать файл, чтобы горизонт артефакта не рос.
+    fn open(mut log: std::fs::File, epoch: u64) -> Self {
+        use std::io::Read;
+        let mut raw = Vec::new();
+        let read_ok = log.read_to_end(&mut raw).is_ok();
+        let mut seen: HashMap<u64, HashSet<[u8; 32]>> = HashMap::new();
+        let mut total = 0usize;
+        for rec in raw.chunks_exact(SPENT_REC) {
+            total += 1;
+            let e = u64::from_be_bytes(rec[..8].try_into().expect("8 байт"));
+            if e != 0 && e + 1 < epoch {
+                continue; // бакет, который уже не проверяется ни одним ключом эпохи
+            }
+            seen.entry(e)
+                .or_default()
+                .insert(rec[8..].try_into().expect("32 байта"));
+        }
+        let restored: usize = seen.values().map(|s| s.len()).sum();
+        let mut s = Self { seen, log: Some(log) };
+        if !read_ok {
+            eprintln!("[citadel-m1:server] ⚠ L-3: журнал не читается — продолжаю только в RAM");
+            s.log = None;
+        } else if restored != total {
+            s.rewrite(); // отбросили просроченные бакеты — не тащить их на диске дальше
+        }
+        eprintln!(
+            "[citadel-m1:server] L-3: журнал потраченных токенов подхвачен ({restored} записей) — \
+             рестарт больше не обнуляет защиту от повторной траты"
+        );
+        s
+    }
+
+    /// Переписать файл целиком по текущему состоянию `seen` (ротация бакетов).
+    fn rewrite(&mut self) {
+        let Some(f) = self.log.as_mut() else { return };
+        use std::io::{Seek, Write};
+        let mut buf = Vec::with_capacity(self.seen.values().map(|s| s.len()).sum::<usize>() * SPENT_REC);
+        for (e, set) in &self.seen {
+            for n in set {
+                buf.extend_from_slice(&e.to_be_bytes());
+                buf.extend_from_slice(n);
+            }
+        }
+        let ok = f.set_len(0).is_ok()
+            && f.seek(std::io::SeekFrom::Start(0)).is_ok()
+            && f.write_all(&buf).is_ok();
+        if !ok {
+            eprintln!("[citadel-m1:server] ⚠ L-3: журнал не перезаписан — продолжаю только в RAM");
+            self.log = None;
+        }
+    }
+
+    /// Дописать запись. Ошибка записи не отменяет приём токена: журнал — защита от повторной
+    /// траты, а не условие доступа, и ронять из-за него живые сессии незачем. `fsync` намеренно
+    /// нет: потеря последних записей при внезапном питании возвращает ровно сегодняшнее поведение,
+    /// а платить fsync за каждое подключение — заметно.
+    fn append(&mut self, nonce: &[u8; 32], epoch: u64) {
+        let Some(f) = self.log.as_mut() else { return };
+        use std::io::Write;
+        let mut rec = [0u8; SPENT_REC];
+        rec[..8].copy_from_slice(&epoch.to_be_bytes());
+        rec[8..].copy_from_slice(nonce);
+        if f.write_all(&rec).is_err() {
+            eprintln!("[citadel-m1:server] ⚠ L-3: журнал недоступен на запись — дальше только RAM");
+            self.log = None;
+        }
+    }
+}
+
 /// C5/аудит-3: учесть потраченный токен в epoch-бакете + prune бакетов старше `epoch-1`. Без prune
 /// `spent` рос бы со ВСЕМИ когда-либо принятыми токенами (утечка памяти на долгом exit). Legacy
 /// (эпоха 0) не чистится (не истекает). Возвращает `true`, если токен свежий (не double-spend).
-fn spend_token(spent: &Mutex<HashMap<u64, HashSet<[u8; 32]>>>, nonce: [u8; 32], epoch: u64) -> bool {
-    let mut map = spent.lock().unwrap();
+fn spend_token(spent: &Mutex<SpentStore>, nonce: [u8; 32], epoch: u64) -> bool {
+    let mut st = spent.lock().unwrap();
     if epoch > 1 {
         // токен эпохи e принимается ТОЛЬКО ключами current±prev ⇒ бакеты < epoch-1 бесполезны
-        map.retain(|&e, _| e == 0 || e + 1 >= epoch);
+        let stale = st.seen.keys().any(|&e| e != 0 && e + 1 < epoch);
+        st.seen.retain(|&e, _| e == 0 || e + 1 >= epoch);
+        if stale {
+            st.rewrite(); // эпоха сменилась — просроченные бакеты уходят и с диска
+        }
     }
-    map.entry(epoch).or_default().insert(nonce)
+    if !st.seen.entry(epoch).or_default().insert(nonce) {
+        return false;
+    }
+    st.append(&nonce, epoch);
+    true
 }
 
 /// Control-обмен серверной стороны — **два шага** (H-2/аудит-4).
@@ -431,7 +597,7 @@ async fn server_assign_address(
     tunnel: &mut Tunnel,
     pool: &Mutex<AddrPool>,
     issuer: &IssuerAuth,
-    spent: &Mutex<HashMap<u64, HashSet<[u8; 32]>>>,
+    spent: &Mutex<SpentStore>,
     signer: Option<&citadel_quic::pqauth::ServerSigner>,
     cert_pin: [u8; 32],
 ) -> Result<([u8; 4], u8)> {
@@ -610,7 +776,22 @@ async fn run_server(tun: Arc<Tun>) -> Result<()> {
         eprintln!("[Citadel-m1:server] per-user epoch-токены включены (C5.1, VOPRF v2)");
     }
     // C5: spent-токены по epoch-бакетам (prune старых эпох → без утечки памяти на долгом exit).
-    let spent: Arc<Mutex<HashMap<u64, HashSet<[u8; 32]>>>> = Arc::new(Mutex::new(HashMap::new()));
+    // L-3: множество переживает рестарт — журнал поднимается ЗДЕСЬ, до `drop_privileges`, потому
+    // что каталог создаётся root'ом и передаётся во владение сбрасываемому uid (после setuid
+    // создать его уже нельзя, а эпоха сменится и файл понадобится новый).
+    let spent = Arc::new(Mutex::new(match issuer_auth.spent_log_path() {
+        Some(path) => match open_spent_log(&path) {
+            Ok(f) => SpentStore::open(f, issuer_auth.epoch_now()),
+            Err(e) => {
+                eprintln!(
+                    "[citadel-m1:server] ⚠ L-3: {e:#} — spent-множество только в RAM: рестарт \
+                     exit'а снова позволит потратить токен второй раз"
+                );
+                SpentStore::ram_only()
+            }
+        },
+        None => SpentStore::ram_only(),
+    }));
     // C4: пул адресов с освобождением на disconnect (замена монотонного AtomicU16).
     let pool = Arc::new(Mutex::new(AddrPool::from_env()));
 
@@ -634,12 +815,22 @@ async fn run_server(tun: Arc<Tun>) -> Result<()> {
         None
     });
 
-    let rate_limit = RateCfg::from_env(); // F7: per-client лимит на входящее направление (D3)
-    if let Some(cfg) = rate_limit {
-        eprintln!(
-            "[Citadel-m1:server] F7 rate-limit включён: {:.0} б/с (burst {:.0} б) на клиента",
-            cfg.rate, cfg.burst
-        );
+    // F7/D3: per-client лимит. M-3-bis — по ОБОИМ направлениям (вниз лимита не было вовсе, а
+    // именно вниз идёт основная нагрузка релея и амплификация «мало запросил — много получил»).
+    let rate_limit = citadel_quic::ratelimit::RateLimits::from_env();
+    match (rate_limit.up, rate_limit.down) {
+        (None, None) => {}
+        (up, down) => {
+            let show = |c: Option<RateCfg>| match c {
+                Some(c) => format!("{:.0} б/с (burst {:.0} б)", c.rate, c.burst),
+                None => "без лимита".to_string(),
+            };
+            eprintln!(
+                "[Citadel-m1:server] F7 rate-limit на клиента: ↑ {} · ↓ {}",
+                show(up),
+                show(down)
+            );
+        }
     }
 
     // C7.2: admin-VIP:порт (пропуск в data-plane к admin-каналу issuer'а по туннелю). Копируемое
@@ -808,8 +999,8 @@ async fn handle_client(
     mut tunnel: Tunnel,
     tun: Arc<Tun>,
     issuer_auth: Arc<IssuerAuth>,
-    spent: Arc<Mutex<HashMap<u64, HashSet<[u8; 32]>>>>,
-    rate_limit: Option<RateCfg>,
+    spent: Arc<Mutex<SpentStore>>,
+    rate_limit: citadel_quic::ratelimit::RateLimits,
     admin_dst: Option<([u8; 4], u16)>,
     signer: Arc<Option<citadel_quic::pqauth::ServerSigner>>,
     cert_pin: [u8; 32],
@@ -1059,26 +1250,73 @@ mod tests {
     /// C5: double-spend ловится; prune чистит бакеты старше current-1; Legacy (эпоха 0) не чистится.
     #[test]
     fn spend_token_double_spend_and_prune() {
-        let spent = Mutex::new(HashMap::new());
+        let spent = Mutex::new(SpentStore::ram_only());
         let (n1, n2) = ([1u8; 32], [2u8; 32]);
         assert!(spend_token(&spent, n1, 100));
         assert!(!spend_token(&spent, n1, 100), "double-spend в той же эпохе");
         assert!(spend_token(&spent, n2, 100));
         // эпоха 101 (current) — prev-бакет 100 остаётся (grace)
         assert!(spend_token(&spent, [3u8; 32], 101));
-        assert!(spent.lock().unwrap().contains_key(&100), "prev-эпоха цела");
+        assert!(spent.lock().unwrap().seen.contains_key(&100), "prev-эпоха цела");
         // эпоха 103 → prune бакетов < 102 (100 и 101 удаляются)
         assert!(spend_token(&spent, [4u8; 32], 103));
         let m = spent.lock().unwrap();
-        assert!(!m.contains_key(&100) && !m.contains_key(&101), "старые эпохи очищены (нет утечки)");
-        assert!(m.contains_key(&103));
+        assert!(!m.seen.contains_key(&100) && !m.seen.contains_key(&101), "старые эпохи очищены");
+        assert!(m.seen.contains_key(&103));
         drop(m);
 
         // Legacy (эпоха 0) — не чистится даже при больших эпохах; double-spend всё равно ловится
-        let legacy = Mutex::new(HashMap::new());
+        let legacy = Mutex::new(SpentStore::ram_only());
         assert!(spend_token(&legacy, [9u8; 32], 0));
         assert!(spend_token(&legacy, [8u8; 32], 500));
-        assert!(legacy.lock().unwrap().contains_key(&0), "Legacy-бакет цел");
+        assert!(legacy.lock().unwrap().seen.contains_key(&0), "Legacy-бакет цел");
         assert!(!spend_token(&legacy, [9u8; 32], 0), "Legacy double-spend ловится");
+    }
+
+    /// L-3: журнал переживает «рестарт» exit'а — потраченный токен не проходит второй раз в новом
+    /// процессе, а бакеты старше current-1 (которые всё равно не проверить ключами) удаляются.
+    #[test]
+    fn spent_log_survives_restart_and_prunes_old_epochs() {
+        let path = std::env::temp_dir().join(format!("citadel-spent-{}.bin", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let reopen = |epoch: u64| Mutex::new(SpentStore::open(open_spent_log(&path).unwrap(), epoch));
+        let (n1, n2) = ([0xa1u8; 32], [0xa2u8; 32]);
+
+        // «первый запуск»: потратили два токена в эпохе 100
+        {
+            let s = reopen(100);
+            assert!(spend_token(&s, n1, 100));
+            assert!(spend_token(&s, n2, 100));
+            assert!(!spend_token(&s, n1, 100));
+        }
+        // «рестарт» в той же эпохе: множество поднялось с диска — повторная трата не проходит
+        {
+            let s = reopen(100);
+            assert!(!spend_token(&s, n1, 100), "рестарт обнулил spent — токен потрачен дважды");
+            assert!(!spend_token(&s, n2, 100));
+            assert!(spend_token(&s, [0xa3u8; 32], 100), "новый токен по-прежнему принимается");
+        }
+        // grace: в эпохе 101 бакет 100 ещё проверяется (ключ prev-эпохи жив)
+        {
+            let s = reopen(101);
+            assert!(!spend_token(&s, n1, 100));
+        }
+        // эпоха 103: бакет 100 уже не проверить ни одним ключом ⇒ он уходит и из файла
+        {
+            let s = reopen(103);
+            assert!(spend_token(&s, [0xa4u8; 32], 103));
+            assert!(spend_token(&s, n1, 103), "тот же nonce в НОВОЙ эпохе — другой бакет");
+        }
+        let raw = std::fs::read(&path).unwrap();
+        assert_eq!(raw.len() % SPENT_REC, 0);
+        assert!(
+            raw.chunks_exact(SPENT_REC)
+                .all(|r| u64::from_be_bytes(r[..8].try_into().unwrap()) >= 102),
+            "просроченные бакеты не должны оставаться на диске"
+        );
+        // …и после ротации файл читается обратно без мусора
+        let s = reopen(103);
+        assert!(!spend_token(&s, [0xa4u8; 32], 103));
+        std::fs::remove_file(&path).ok();
     }
 }

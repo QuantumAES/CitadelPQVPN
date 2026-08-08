@@ -2,6 +2,8 @@
 # client-узел: адрес получает динамически капсулой (M2), сервер пиннит (F1).
 # После подъёма — ping/curl через туннель + проверка egress-фильтра (F2).
 set -e
+# L-10: демо-стенд (см. entrypoint-issuer.sh) — разрешает демо-seed'ы клиента.
+export Citadel_DEMO_STAND=1
 export Citadel_ROLE=client
 export Citadel_SERVERS="exit:4433 exit2:4433"   # M5 multi-server: клиент выбирает (shuffle+failover)
 export Citadel_CONNECT=exit:4433                # single-target для probe/auth-probe (ТЕСТ 4/8)

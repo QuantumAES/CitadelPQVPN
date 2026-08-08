@@ -40,7 +40,17 @@ pub const ALPN: &[u8] = b"Citadel-pq";
 pub fn debug_logs() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| {
-        matches!(std::env::var("Citadel_DEBUG_LOG").as_deref(), Ok(v) if v != "0" && !v.is_empty())
+        let on =
+            matches!(std::env::var("Citadel_DEBUG_LOG").as_deref(), Ok(v) if v != "0" && !v.is_empty());
+        // L-10: см. `citadel_token::debug_logs` — режим, отменяющий no-logs, обязан объявлять себя
+        // сам, а не жить незаметной строчкой в чужом env-файле, приехавшем из демо-стенда.
+        if on && !matches!(std::env::var("Citadel_DEMO_STAND").as_deref(), Ok("1")) {
+            eprintln!(
+                "[!] Citadel_DEBUG_LOG=1: диагностический лог ВКЛЮЧЁН — в него попадают адреса \
+                 клиентов и назначения их трафика. Для прода это не режим по умолчанию (no-logs)"
+            );
+        }
+        on
     })
 }
 
@@ -160,6 +170,11 @@ fn transport() -> Arc<quinn::TransportConfig> {
     let mut tc = quinn::TransportConfig::default();
     tc.datagram_receive_buffer_size(Some(1 << 20));
     tc.datagram_send_buffer_size(1 << 20);
+    // M-8/аудит-4: это СТРАХОВКА, а не основной keep-alive. Штатно туннель держит собственный
+    // маячок со случайным интервалом 2–4 с (`dataplane::keepalive_delay`) — он всегда успевает
+    // раньше, поэтому периодический PING quinn'а в поток не попадает и не даёт цензору строгую
+    // 5-секундную периодичность для автокорреляции. Если задача keep-alive умрёт (или пир —
+    // старой версии), соединение всё равно не развалится: сработает вот это.
     tc.keep_alive_interval(Some(Duration::from_secs(5)));
     // 15с (не 30): быстрее детектим мёртвое соединение при смене сети (WiFi↔LTE/toggle) → быстрее
     // авто-реконнект. Эффективный idle = min(client, server) ⇒ снижение только на клиенте уже

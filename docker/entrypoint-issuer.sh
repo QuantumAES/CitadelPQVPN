@@ -20,6 +20,11 @@ export Citadel_TOKEN_ROLE=issuer
 # ДЕМО/E2E-стенд: включаем диагностический вывод. В проде (env от AdminDeployer) его НЕТ —
 # серверные роли по умолчанию молчат о клиентах и их трафике (no-logs, citadel_quic::debug_logs).
 export Citadel_DEBUG_LOG=1
+# L-10 (аудит-4): ЭТО ДЕМО-СТЕНД, НЕ ПРОД. Флаг разрешает то, что в проде запрещено: слабые
+# seed'ы из повторяющегося шаблона (c5c5…/adad…) и диагностический лог без предупреждения.
+# Прод-установщик (tools/install-citadel-server.sh) его НЕ выставляет — скопированный отсюда
+# entrypoint без правок просто не запустится.
+export Citadel_DEMO_STAND=1
 export Citadel_TOKEN_DIR=/shared
 export Citadel_TOKEN_LISTEN=0.0.0.0:${CITADEL_ISSUER_PORT:-7000}
 export Citadel_EPOCH_SECS=3600   # C5.1: длина эпохи (ДОЛЖНА совпадать с exit) — токены epoch-scoped
