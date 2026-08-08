@@ -28,7 +28,7 @@
 
 ## 1. Контекст: что уже готово и что строим
 
-**Готово (PoC-уровень, M0–M7 ✅):** Rust-воркспейс `citadel-{obfs,masque,tun,token,quic}`; бинарь `citadel-m1` (роли `server|client|probe|auth-probe`, конфиг через `Citadel_*` env, сам открывает TUN через ioctl); `citadel-token` (issuer/client/batch, blind-RSA RFC 9474); `docker/` демка (issuer :7000 → exit :4433 + TCP-fallback :443 → client). Гибрид X25519+ML-KEM-768, obfs L1, миграция, multi-server, ML-DSA-65 PQ-auth.
+**Готово (PoC-уровень, M0–M7 ✅):** Rust-воркспейс `citadel-{obfs,masque,tun,token,quic}`; бинарь `citadel-m1` (роли `server|client|probe|auth-probe`, конфиг через `Citadel_*` env, сам открывает TUN через ioctl); `citadel-token` (issuer/client/keysync/batch, анонимные токены VOPRF — до 2026-08 blind-RSA RFC 9474); `docker/` демка (issuer :7000 → exit :4433 + TCP-fallback :443 → client). Гибрид X25519+ML-KEM-768, obfs L1, миграция, multi-server, ML-DSA-65 PQ-auth.
 
 **Строим (трек C*):** клиентское приложение, которое:
 1. оборачивает движок как **встраиваемую библиотеку** `citadel-client`;
@@ -108,7 +108,7 @@ impl TunIo for Tun { /* делегирует к существующим recv/se
 | `obfs_psk` | `Citadel_OBFS_PSK` | obfs L1 PSK |
 | `kx_suite` | `Citadel_KX` | crypto-agility (M6) |
 | `tcp_fallback_port` | `Citadel_TCP_PORT`/`TCP_CONNECT` | :443 fallback (M4) |
-| `issuer` + `issuer_pub` | `Citadel_ISSUER_PUB` + endpoint | минт токенов (M5) |
+| `issuer` + endpoint | `Citadel_ISSUER_KEY` (на exit'е — ключ эпохи) | минт токенов (M5) |
 | `routes`, `dns`, `mtu` | `Citadel_ROUTES`/`DNS`/`MTU` | split-tunnel, DoH (F6) |
 
 ### 4.3 `VpnController` — управление сессией
@@ -224,7 +224,7 @@ vault/движка), пока приходят по-русски — их лок
 2. `uname -m` → выбор арки; проверка Docker — **нет → авто-установка** (официальный `get.docker.com` под root; Debian/Ubuntu — наша база, надёжно; RHEL/прочие — best-effort + внятный фолбэк, не молчим).
 3. **Сервер сам тянет бинарь** с GitHub Release (`curl` на хосте — не льём 70 МБ через SSH). Фолбэк без egress: админ-приложение качает один раз, кэширует, стримит через sftp.
 4. Проверка `sha256` + подписи → `/opt/citadel/bin/citadel-m1`.
-5. **Генерация серверных ключей** (на хосте или локально с заливкой): self-signed cert + pin (F1), ML-DSA-65 keypair (M7), issuer RSA-2048 (M5), obfs PSK.
+5. **Генерация серверных ключей** (на хосте или локально с заливкой): self-signed cert + pin (F1), ML-DSA-65 keypair (M7), ключ эпохи Layer-2 (M5, генерируется мгновенно и ротируется каждую эпоху), obfs PSK.
 6. Рендер `compose.yml` + entrypoints → `docker compose up -d`.
 7. **Чтение обратно** pin/pubkeys → сборка клиентского бандла (§9).
 
@@ -241,7 +241,7 @@ vault/движка), пока приходят по-русски — их лок
 - **Компактная ссылка/QR `citadel://`** — только **обязательства (хэши)**, полные публичные ключи дотягиваются in-band и проверяются против хэшей (см. 9.3).
 
 ### 9.2 Содержимое бандла
-endpoints (+TCP/443 fallback), **cert pin** (BLAKE3 DER, 32 B), **ML-DSA-65 pub** (1952 B), **obfs PSK** (32 B), `kx_suite`, **issuer endpoint + issuer.pub** (RSA-2048 ≈ 270 B), **issuer TLS-pin** (BLAKE3 DER, 32 B — PQ-TLS канал к издателю, S2.1/A1), **обязательство PQ-идентичности издателя** (`issuer_mldsa`, BLAKE3 ML-DSA pub, 32 B — C9), **client-seed** (Слой-1, 32 B, §10; из него выводится гибридная пара Ed25519+ML-DSA-65), routes/DNS/SNI.
+endpoints (+TCP/443 fallback), **cert pin** (BLAKE3 DER, 32 B), **ML-DSA-65 pub** (1952 B), **obfs PSK** (32 B), `kx_suite`, **issuer endpoint** (ключ эпохи в ссылку не кладётся — он ротируется), **issuer TLS-pin** (BLAKE3 DER, 32 B — PQ-TLS канал к издателю, S2.1/A1), **обязательство PQ-идентичности издателя** (`issuer_mldsa`, BLAKE3 ML-DSA pub, 32 B — C9), **client-seed** (Слой-1, 32 B, §10; из него выводится гибридная пара Ed25519+ML-DSA-65), routes/DNS/SNI.
 
 ### 9.3 QR-ёмкость — узкое место и решение
 ML-DSA pub (1952 B) доминирует. Прикидка сырья ≈ 2.5 КБ; QR version 40 byte-mode даёт ~2953 B только на **низшем** уровне коррекции (хрупко), base64url (×1.33) уже **не влезает**. Ключи высокоэнтропийны — сжатие не помогает.
@@ -256,7 +256,7 @@ ML-DSA pub (1952 B) доминирует. Прикидка сырья ≈ 2.5 К
 
 ## 10. Модель идентичности (двухслойная, Privacy Pass production pattern)
 
-**Противоречие:** blind-RSA токены (M5) **unlinkable** — exit не знает, чей токен, и не может отозвать конкретного юзера. Это максимум приватности, но «отозвать при компрометации» так невозможно. Консьюмерское «создать/отозвать удобно» требует идентичности. Развязка — разнести идентичность и анонимность по слоям.
+**Противоречие:** анонимные токены (M5) **unlinkable** — exit не знает, чей токен, и не может отозвать конкретного юзера. Это максимум приватности, но «отозвать при компрометации» так невозможно. Консьюмерское «создать/отозвать удобно» требует идентичности. Развязка — разнести идентичность и анонимность по слоям.
 
 ### Слой 1 — клиентский «абонемент» (отзываемый; на exit НЕ виден)
 При «создании клиента» генерим 32-байтный seed, из которого детерминированно выводится **гибридная пара Ed25519 + ML-DSA-65** (C9), используемая **только против issuer’а** — на exit она не уходит; `client_id = BLAKE3(ed_pub ‖ mldsa_pub)`. Issuer держит реестр: `client_id → valid_until, status(active|revoked)`. Здесь вся подотчётность.
@@ -287,7 +287,7 @@ ML-DSA pub (1952 B) доминирует. Прикидка сырья ≈ 2.5 К
 - **Поверхности:** GUI «Абоненты» (все платформы, включая мобильные — russh не нужен) и CLI `citadel-token admin <list|add|revoke>` (ops/break-glass с любой машины с мастер-кредами и туннелем; `registry` — оффлайн-правка на самом сервере).
 
 ### Дельты по коду
-- `citadel-token`: **epoch-ключи** (keyring per-epoch RSA, публикация pub текущей+следующей эпохи; epoch_id в сообщении); `verify_token` проверяет окно эпохи.
+- `citadel-token`: **epoch-ключи** (per-epoch скаляр VOPRF; exit проверяет ключами current±prev); предъявление токена проверяется только вместе с контекстом сессии.
 - Issuer: **client-registry** + Ed25519-аутентификация перед blind-signing; `revoke` = флип статуса; **admin-listener** (`Citadel_ADMIN_LISTEN`) — управление реестром по каналу (C7.1).
 - Клиент: `TokenAgent` — фоновый рефреш; `citadel_client::admin` — admin-операции + минт клиентских ссылок (C7.3); FFI/GUI «Абоненты» (C7.4).
 

@@ -88,11 +88,12 @@ CitadelPQVPN — установщик exit-сервера (запускать н
   --role issuer     только издатель: реестр абонентов + выдача токенов + admin-канал
   --role exit       только exit-узел; параметры издателя берутся из его bundle
   --issuer-bundle F файл `KEY=VALUE`, напечатанный установкой издателя (для --role exit)
+  --keysync-seed H  идентичность exit-узла для получения ключа эпохи (обычно из --issuer-bundle)
 
 Одна кража диска не должна давать обе идентичности сразу, поэтому на серьёзной установке
 издателя выносят на отдельную машину. Порядок: сначала `--role issuer` (он напечатает bundle),
 затем на другой машине `--role exit --issuer-bundle …`. Публичный ключ эпохи exit подтягивает
-сам (контейнер `citadel-pubsync`), общий том между машинами не нужен.
+сам (контейнер `citadel-keysync`), общий том между машинами не нужен.
 
 Прочее:
   --host HOST       публичный адрес для ссылки (по умолчанию — автодетект)  [CITADEL_SERVER_HOST]
@@ -113,6 +114,7 @@ while (($#)); do
     --issuer-addr)    CITADEL_ISSUER_ADDR="${2:-}";   shift 2 ;;
     --issuer-pin)     CITADEL_ISSUER_PIN="${2:-}";    shift 2 ;;
     --issuer-mldsa)   CITADEL_ISSUER_MLDSA="${2:-}";  shift 2 ;;
+    --keysync-seed)   CITADEL_KEYSYNC_SEED="${2:-}";  shift 2 ;;
     --obfs-psk)       CITADEL_OBFS_PSK="${2:-}";      shift 2 ;;
     --client-seed)    CITADEL_CLIENT_SEED="${2:-}";   shift 2 ;;
     --admin-seed)     CITADEL_ADMIN_SEED="${2:-}";    shift 2 ;;
@@ -170,7 +172,8 @@ if [[ -n "${CITADEL_ISSUER_BUNDLE:-}" ]]; then
     [[ -z "$k" || "$k" == \#* ]] && continue
     case "$k" in
       CITADEL_ISSUER_ADDR|CITADEL_ISSUER_PIN|CITADEL_ISSUER_MLDSA|CITADEL_OBFS_PSK|\
-      CITADEL_CLIENT_SEED|CITADEL_ADMIN_SEED|CITADEL_ADMIN_PORT|CITADEL_EPOCH_SECS|CITADEL_ISSUER_PORT)
+      CITADEL_CLIENT_SEED|CITADEL_ADMIN_SEED|CITADEL_ADMIN_PORT|CITADEL_EPOCH_SECS|CITADEL_ISSUER_PORT|\
+      CITADEL_KEYSYNC_SEED)
         # уже заданный флаг/env приоритетнее файла (позволяет точечно переопределить)
         [[ -n "${!k:-}" ]] || printf -v "$k" '%s' "$v" ;;
       *) warn "issuer-bundle: неизвестный ключ '$k' пропущен" ;;
@@ -184,6 +187,10 @@ ISSUER_ADDR="${CITADEL_ISSUER_ADDR:-}"     # host:port издателя (тол�
 ISSUER_PIN_IN="${CITADEL_ISSUER_PIN:-}"    # его TLS-pin
 ISSUER_MLDSA_IN="${CITADEL_ISSUER_MLDSA:-}" # обязательство его PQ-идентичности
 PSK_IN="${CITADEL_OBFS_PSK:-}"             # общий obfs-PSK (генерит установка издателя)
+# M-6: идентичность exit-узла для получения СЕКРЕТНОГО ключа эпохи (keysync). Раньше ключ был
+# публичным и синхронизировался без аутентификации — в схеме v2 так нельзя: получивший ключ
+# чеканит токены. Генерит установка издателя, едет в bundle.
+KEYSYNC_SEED_IN="${CITADEL_KEYSYNC_SEED:-}"
 CLIENT_SEED_IN="${CITADEL_CLIENT_SEED:-}"  # seed абонента (ссылку минтит exit-машина)
 ADMIN_SEED_IN="${CITADEL_ADMIN_SEED:-}"    # seed админа (мастер-ссылка)
 if [[ "$ROLE" == exit && "$ISSUER_ON" == 1 ]]; then
@@ -191,7 +198,8 @@ if [[ "$ROLE" == exit && "$ISSUER_ON" == 1 ]]; then
   [[ -n "$ISSUER_ADDR" ]] || die "--role exit: нужен --issuer-addr host:port (или --issuer-bundle)"
   [[ "$ISSUER_ADDR" == *:* ]] || die "--issuer-addr: ожидается host:port, получено '$ISSUER_ADDR'"
   for spec in "ISSUER_PIN_IN:--issuer-pin" "ISSUER_MLDSA_IN:--issuer-mldsa" "PSK_IN:--obfs-psk" \
-              "CLIENT_SEED_IN:--client-seed" "ADMIN_SEED_IN:--admin-seed"; do
+              "CLIENT_SEED_IN:--client-seed" "ADMIN_SEED_IN:--admin-seed" \
+              "KEYSYNC_SEED_IN:--keysync-seed"; do
     var="${spec%%:*}"; flag="${spec##*:}"
     [[ -n "${!var}" ]] || die "--role exit: нужен $flag (или --issuer-bundle с ним)"
     hex64 "${!var}" || die "$flag: ожидается 64 hex-символа"
@@ -340,6 +348,7 @@ if [[ -f "$DIR/keys/obfs.psk" && "${CITADEL_KEEP_KEYS:-0}" != 1 ]]; then
         "$DIR/keys/"exit.pin "$DIR/keys/"exit-cert.der "$DIR/keys/"exit-key.der \
         "$DIR/keys/"exit-mldsa.seed "$DIR/keys/"exit.mldsa "$DIR/keys/"exit2.pin "$DIR/keys/"exit2.mldsa \
         "$DIR/keys/"issuer-tls.crt "$DIR/keys/"issuer-tls.key "$DIR/keys/"issuer-tls.pin \
+        "$DIR/keys/"issuer.key "$DIR"/keys/issuer-*.key "$DIR/keys/"keysync.seed \
         "$DIR/keys/"issuer.pub "$DIR"/keys/issuer-*.pub 2>/dev/null || true
 fi
 
@@ -358,6 +367,19 @@ PSK="$(cat "$PSK_FILE")"
 
 CLIENT_SEED=""; CLIENT_PUB=""
 ADMIN_SEED=""; ADMIN_PUB=""
+# M-6: идентичность keysync — ею exit-узел (на ДРУГОЙ машине) забирает секретный ключ эпохи.
+# Живёт на машине издателя, уезжает в bundle. Издатель знает только её id, не seed.
+KEYSYNC_SEED="$KEYSYNC_SEED_IN"; KEYSYNC_ID=""
+if [[ "$ISSUER_ON" == 1 && "$ROLE" != exit ]]; then
+  KEYSYNC_FILE="$DIR/keys/keysync.seed"
+  if [[ ! -f "$KEYSYNC_FILE" ]]; then
+    head -c 32 /dev/urandom | od -An -tx1 | tr -d ' \n' > "$KEYSYNC_FILE"
+    chmod 600 "$KEYSYNC_FILE"
+  fi
+  KEYSYNC_SEED="$(cat "$KEYSYNC_FILE")"
+  KEYSYNC_ID="$(Citadel_CLIENT_SEED="$KEYSYNC_SEED" "$DIR/bin/citadel-token" pubkey)" \
+    || die "не удалось вывести id keysync-идентичности (citadel-token pubkey)"
+fi
 if [[ "$ROLE" == exit && "$ISSUER_ON" == 1 ]]; then
   # Раздельный деплой: seed'ы сгенерированы на машине ИЗДАТЕЛЯ (там же они зарегистрированы в
   # реестре и в admin_id). Здесь они нужны ровно для одного — собрать ссылки, потому что только у
@@ -420,10 +442,10 @@ COPY bin/citadel-m1 /usr/local/bin/citadel-m1
 COPY bin/citadel-token /usr/local/bin/citadel-token
 COPY etc/entrypoint-exit.sh /usr/local/bin/entrypoint-exit.sh
 COPY etc/entrypoint-issuer.sh /usr/local/bin/entrypoint-issuer.sh
-COPY etc/entrypoint-pubsync.sh /usr/local/bin/entrypoint-pubsync.sh
+COPY etc/entrypoint-keysync.sh /usr/local/bin/entrypoint-keysync.sh
 RUN chmod +x /usr/local/bin/citadel-m1 /usr/local/bin/citadel-token \
         /usr/local/bin/entrypoint-exit.sh /usr/local/bin/entrypoint-issuer.sh \
-        /usr/local/bin/entrypoint-pubsync.sh
+        /usr/local/bin/entrypoint-keysync.sh
 EOF
 
 # entrypoint exit-узла. При ISSUER_ON — требует epoch-токен и включает ML-DSA (M7).
@@ -459,7 +481,8 @@ EOF
   if [[ "$ISSUER_ON" == 1 ]]; then
     cat <<EOF
 # C5.4b: exit требует анонимный epoch-токен текущей эпохи (отзыв по времени, M6).
-export Citadel_ISSUER_PUB=/shared/issuer.pub
+# M-6: схема токенов v2 (VOPRF) — ключ эпохи СЕКРЕТЕН, файл issuer.key (0640, группа exit'а).
+export Citadel_ISSUER_KEY=/shared/issuer.key
 export Citadel_EPOCH_SECS=$EPOCH_SECS
 # M7 PQ-auth: гибрид Ed25519 + ML-DSA-65 (квантово-стойкая подпись сервера); pub → /shared/exit.mldsa.
 export Citadel_MLDSA=1
@@ -492,22 +515,25 @@ EOF
 } > "$DIR/etc/entrypoint-exit.sh"
 chmod +x "$DIR/etc/entrypoint-exit.sh"
 
-# entrypoint pubsync-сайдкара (P1, раздельный деплой): держит публичный ключ ТЕКУЩЕЙ эпохи в томе
-# exit'а. При установке «всё на одном сервере» не задействуется — там ключ пишет сам издатель.
-cat > "$DIR/etc/entrypoint-pubsync.sh" <<EOF
+# entrypoint keysync-сайдкара (P1, раздельный деплой): держит ключ ТЕКУЩЕЙ эпохи в томе exit'а.
+# При установке «всё на одном сервере» не задействуется — там ключ пишет сам издатель.
+# M-6: ключ эпохи секретен, поэтому сайдкар доказывает издателю свою keysync-идентичность
+# (seed приехал в bundle; издатель знает только его id).
+cat > "$DIR/etc/entrypoint-keysync.sh" <<EOF
 #!/usr/bin/env bash
 set -e
-export Citadel_TOKEN_ROLE=pubsync
+export Citadel_TOKEN_ROLE=keysync
 export Citadel_TOKEN_DIR=/shared
 export Citadel_TOKEN_ISSUER=$ISSUER_ADDR
 export Citadel_ISSUER_PIN=$ISSUER_PIN_IN
 export Citadel_ISSUER_MLDSA=$ISSUER_MLDSA_IN
+export Citadel_KEYSYNC_SEED=$KEYSYNC_SEED_IN
 export Citadel_EPOCH_SECS=$EPOCH_SECS
 export Citadel_OBFS_PSK=\$(cat /shared/obfs.psk)
-echo "[citadel-pubsync] слежу за ключом эпохи у издателя $ISSUER_ADDR (эпоха ${EPOCH_SECS}с)…"
+echo "[citadel-keysync] слежу за ключом эпохи у издателя $ISSUER_ADDR (эпоха ${EPOCH_SECS}с)…"
 exec citadel-token
 EOF
-chmod +x "$DIR/etc/entrypoint-pubsync.sh"
+chmod +x "$DIR/etc/entrypoint-keysync.sh"
 
 # entrypoint издателя (генерируется всегда; задействуется только при ISSUER_ON).
 # Реестр (/shared/registry) НЕ удаляем — admin-revoke переживает рестарт (bootstrap лишь досевает).
@@ -523,9 +549,13 @@ export Citadel_ADMIN_LISTEN=0.0.0.0:$ADMIN_PORT
 export Citadel_EPOCH_SECS=$EPOCH_SECS
 export Citadel_TOKEN_LEASE_SECS=$LEASE_SECS   # задача 4/B: single-session (0=выкл; см. CITADEL_LEASE_SECS)
 export Citadel_REGISTER_PUBS="$CLIENT_PUB"   # client_id админа (issuer НЕ получает seed)
-rm -f /shared/issuer.pub /shared/issuer-*.pub /shared/tokens
+# M-6/P1: кому отдавать секретный ключ эпохи по сети (роль keysync у exit-машины). При установке
+# «всё на одном сервере» ключ читается с общего тома и раздача по сети не нужна — но id всё равно
+# задан, чтобы `--role issuer` и `--role all` вели себя одинаково.
+export Citadel_KEYSYNC_ID=$KEYSYNC_ID
+rm -f /shared/issuer.key /shared/issuer-*.key /shared/issuer.pub /shared/issuer-*.pub /shared/tokens
 # M-4 (аудит-4): привилегии издателя режет compose (cap_drop: ALL + read_only + no-new-privileges).
-# Смена uid здесь не делается — том общий с exit'ом (и с pubsync при раздельной установке), и
+# Смена uid здесь не делается — том общий с exit'ом (и с keysync при раздельной установке), и
 # переразметка владения затронула бы три роли сразу. Вне докера есть Citadel_DROP_UID.
 echo "[citadel-issuer] Layer-1 registry + слепая выдача epoch-токенов (epoch=${EPOCH_SECS}s, :7000) + admin-канал :$ADMIN_PORT…"
 exec citadel-token
@@ -555,13 +585,17 @@ cat <<EOF
     restart: unless-stopped
     environment:
       Citadel_OBFS_PSK: "$PSK"         # S2.1/A1-остаток: obfs-обёртка token-/admin-каналов (probe-resistance)
+    # M-6: ключ эпохи — секрет (0640 на общем томе). Группа файла обязана совпасть с той, в которую
+    # садится exit после сброса привилегий, иначе он не прочитает ключ и откажет всем токенам.
+    # Через chown это не сделать: у издателя cap_drop ALL (M-4), CAP_CHOWN нет.
+    user: "0:65534"
     ports:
       - "$ISSUER_PORT:7000/tcp"        # клиент фетчит epoch-токены сюда (Layer-1)$(
       if [[ "$ROLE" == issuer ]]; then printf '\n      - "%s:%s/tcp"   # admin-канал: НУЖЕН только exit-машине — закрой его firewall\x27ом для всех остальных' "$ADMIN_PORT" "$ADMIN_PORT"; fi)
     volumes:
       - "$DIR/keys:/shared"
-    healthcheck:                       # готов, когда RSA-ключ эпохи сгенерирован и issuer.pub опубликован
-      test: ["CMD-SHELL", "test -f /shared/issuer.pub"]
+    healthcheck:                       # готов, когда ключ эпохи сгенерирован и issuer.key лежит на томе
+      test: ["CMD-SHELL", "test -f /shared/issuer.key"]
       interval: 2s
       timeout: 2s
       retries: 30
@@ -596,17 +630,17 @@ EOF
 if [[ "$ISSUER_ON" == 1 && "$ROLE" == all ]]; then
 cat <<EOF
     depends_on:
-      issuer: { condition: service_healthy }   # нужен issuer.pub для верификации токенов
+      issuer: { condition: service_healthy }   # нужен issuer.key для верификации токенов
 EOF
 fi
 # P1: при раздельном деплое ключ эпохи на exit-машину приносит сайдкар (общего тома с издателем
 # нет, а ключ ротируется каждую эпоху).
 if [[ "$ISSUER_ON" == 1 && "$ROLE" == exit ]]; then
 cat <<EOF
-  pubsync:
+  keysync:
     image: citadel-exit:$VERSION
-    container_name: citadel-pubsync
-    entrypoint: ["/usr/local/bin/entrypoint-pubsync.sh"]
+    container_name: citadel-keysync
+    entrypoint: ["/usr/local/bin/entrypoint-keysync.sh"]
     read_only: true
     tmpfs: ["/tmp"]
     security_opt: ["no-new-privileges:true"]
@@ -646,18 +680,18 @@ if [[ "$ISSUER_ON" == 1 && "$ROLE" == exit ]]; then
   ISSUER_TLS_PIN="$ISSUER_PIN_IN"
   ISSUER_MLDSA="$ISSUER_MLDSA_IN"
   log "жду ML-DSA pub exit'а и первую синхронизацию ключа эпохи с издателем $ISSUER_ADDR…"
-  for _ in $(seq 1 90); do [[ -s "$DIR/keys/exit.mldsa" && -s "$DIR/keys/issuer.pub" ]] && break; sleep 1; done
+  for _ in $(seq 1 90); do [[ -s "$DIR/keys/exit.mldsa" && -s "$DIR/keys/issuer.key" ]] && break; sleep 1; done
   [[ -s "$DIR/keys/exit.mldsa" ]] || die "exit не опубликовал ML-DSA pub (exit.mldsa) за 90с"
-  [[ -s "$DIR/keys/issuer.pub" ]] || {
-    docker compose -f "$DIR/etc/compose.yml" logs --tail 30 pubsync || true
+  [[ -s "$DIR/keys/issuer.key" ]] || {
+    docker compose -f "$DIR/etc/compose.yml" logs --tail 30 keysync || true
     die "не удалось получить ключ эпохи у издателя $ISSUER_ADDR за 90с — проверь: порт $ISSUER_TOKEN_PORT открыт с этой машины, obfs-PSK/pin/обязательство из bundle те самые (лог выше)"
   }
   MLDSA_ARGS=(--mldsa-pub "$DIR/keys/exit.mldsa")
-  log "ключ эпохи получен от издателя ✓ (дальше сайдкар citadel-pubsync держит его свежим)"
+  log "ключ эпохи получен от издателя ✓ (дальше сайдкар citadel-keysync держит его свежим)"
 elif [[ "$ISSUER_ON" == 1 ]]; then
-  log "жду издателя (issuer.pub, issuer-tls.pin, issuer-mldsa.pin) и ML-DSA pub exit'а…"
-  for _ in $(seq 1 90); do [[ -s "$DIR/keys/issuer.pub" && -s "$DIR/keys/issuer-tls.pin" && -s "$DIR/keys/issuer-mldsa.pin" && -s "$DIR/keys/exit.mldsa" ]] && break; sleep 1; done
-  [[ -s "$DIR/keys/issuer.pub" ]] || { docker compose -f "$DIR/etc/compose.yml" logs --tail 40 issuer || true; die "издатель не опубликовал issuer.pub за 90с"; }
+  log "жду издателя (issuer.key, issuer-tls.pin, issuer-mldsa.pin) и ML-DSA pub exit'а…"
+  for _ in $(seq 1 90); do [[ -s "$DIR/keys/issuer.key" && -s "$DIR/keys/issuer-tls.pin" && -s "$DIR/keys/issuer-mldsa.pin" && -s "$DIR/keys/exit.mldsa" ]] && break; sleep 1; done
+  [[ -s "$DIR/keys/issuer.key" ]] || { docker compose -f "$DIR/etc/compose.yml" logs --tail 40 issuer || true; die "издатель не положил ключ эпохи (issuer.key) за 90с"; }
   [[ -s "$DIR/keys/issuer-tls.pin" ]] || die "издатель не опубликовал issuer-tls.pin (PQ-TLS канал, A1) за 90с"
   [[ -s "$DIR/keys/issuer-mldsa.pin" ]] || die "издатель не опубликовал issuer-mldsa.pin (PQ-аутентификация издателя) за 90с"
   [[ -s "$DIR/keys/exit.mldsa" ]] || die "exit не опубликовал ML-DSA pub (exit.mldsa) за 90с"
@@ -686,6 +720,7 @@ CITADEL_CLIENT_SEED=$CLIENT_SEED
 CITADEL_ADMIN_SEED=$ADMIN_SEED
 CITADEL_ADMIN_PORT=$ADMIN_PORT
 CITADEL_EPOCH_SECS=$EPOCH_SECS
+CITADEL_KEYSYNC_SEED=$KEYSYNC_SEED
 EOF
   cat <<EOF
 
@@ -768,7 +803,7 @@ cat <<EOF
   • $TCP_PORT/tcp  — obfs-fallback, когда UDP режут      → ОТКРЫТЬ
 $(if [[ "$ROLE" == exit ]]; then cat <<PORTS
   • издатель — на ОТДЕЛЬНОЙ машине ($ISSUER_ADDR): порт открывается там, здесь не нужен.
-    Ключ эпохи подтягивает сайдкар citadel-pubsync (исходящее соединение к издателю).
+    Ключ эпохи подтягивает сайдкар citadel-keysync (исходящее соединение к издателю).
   • admin-канал ($ADMIN_PORT/tcp) слушает издатель; этой машине его открывать не нужно.
 PORTS
 else cat <<PORTS

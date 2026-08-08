@@ -31,7 +31,7 @@ docker compose -f docker/compose.yml logs --no-log-prefix exit | grep -E "F2:|F7
 echo "===== EXIT (хвост) ====="
 docker compose -f docker/compose.yml logs --no-log-prefix exit | tail -n 6 || true
 echo "===== ISSUER (M5 split — слепое подписание; C7 admin-канал) ====="
-docker compose -f docker/compose.yml logs --no-log-prefix issuer | grep -E "ключ сгенерирован|слепое подписание|подписано вслепую|admin" | tail -n 10 || true
+docker compose -f docker/compose.yml logs --no-log-prefix issuer | grep -E "ключ сгенерирован|слепая выдача|выдано вслепую|keysync|admin" | tail -n 10 || true
 echo "===== CLIENT ====="
 docker compose -f docker/compose.yml logs --no-log-prefix client | sed -n '/ТЕСТ 1/,/Готово/p' || true
 

@@ -64,7 +64,7 @@
 | I3 | DNS-leak (запросы мимо туннеля) | (1)(5) | A2/A4 | DNS только через туннель + fail-closed (drop прочего :53) + DoH | ✅ **F6** |
 | I4 | Утечка SNI хендшейка туннеля | (3) | A2 | Обфускация L1 скрывает весь хендшейк → SNI на проводе нет | ✅ M3 (ECH — для mimicry-режима, future) |
 | I5 | Корреляция по размеру/таймингу | (B) | A2 | Padding/шейпинг (PHASE0-OBFS §7) | 🟡 **размер:** bucketed padding `{256/512/1024/1280}` (default on); **тайминг:** slotted-пейсинг + chaff (`TYPE_PAD`, DAITA-стиль) в коде, env-gated `Citadel_PACING` (default off) |
-| I6 | Провайдер связывает сессию с личностью/оплатой | (C) | A4 | **M4/M5: unlinkable blind-RSA токены + issuer↔exit split** (издатель подписывает вслепую в отдельном процессе, не видит токен) + no-logs | ✅ M4/M5 (exit видит трафик, но не личность; издатель видит оплату, но не токен) |
+| I6 | Провайдер связывает сессию с личностью/оплатой | (C) | A4 | **M4/M5: unlinkable токены (VOPRF, v2 — до 2026-08 blind RSA) + issuer↔exit split** (издатель подписывает вслепую в отдельном процессе, не видит токен) + no-logs | ✅ M4/M5 (exit видит трафик, но не личность; издатель видит оплату, но не токен) |
 
 ### D — Denial of service
 | # | Угроза | Поток | Митигация | Статус |
@@ -106,7 +106,7 @@
 - ✅ **M3:** обфускация L1 под QUIC — закрыла **F3** (probe-resistance + client-auth по PSK) и **F5** (анти-DPI); попутно D4 (probe-флуд) и I2 (классификация как VPN).
 - ✅ **F4:** сброс привилегий до nobody после настройки сети (E2) — data-path работает без root.
 - ✅ **F6:** DNS-leak protection (резолвер только через туннель + fail-closed) + DoH через туннель (I3); SNI хендшейка скрыт obfs (I4).
-- ✅ **M4:** per-user unlinkable аутентификация (blind RSA, RFC 9474) — закрыла S2 (client-auth) и I6 (провайдер не связывает сессию с личностью); токен на control-стриме + double-spend учёт.
+- ✅ **M4:** per-user unlinkable аутентификация (VOPRF 2HashDH над ristretto255, стиль RFC 9497; до 2026-08 — blind RSA RFC 9474, снята по M-6/M-10 аудита-4) — закрыла S2 (client-auth) и I6 (провайдер не связывает сессию с личностью). На control-стриме предъявляется не токен, а `nonce ‖ MAC` над контекстом сессии (TLS-exporter + pin), поэтому перехваченное предъявление не работает в чужой сессии; double-spend учитывается по nonce.
 - ✅ **I5 (размер):** bucketed padding DATA на проводе `{256/512/1024/1280}` — `Citadel_obfs::pad_len_for` + политика в `ObfsUdpSocket` (default `Bucket(DEFAULT_BUCKETS)`); распределение длин схлопнуто в ≤4 значения. Покрыто тестами (инвариант «любая длина → бакет» + сквозной seal/open).
 - ✅ **I5 (тайминг):** slotted-пейсинг + chaff в DAITA-стиле (как Mullvad 2024) — фоновый pacer выпускает пакеты по слот-сетке (квантует межпакетные интервалы), в паузы подмешивает dummy (`TYPE_PAD`, политики Off/Adaptive-WTF-PAD/Always). Bounded-очередь (дроп при переполнении = потеря UDP). Env-gated `Citadel_PACING` (default off — торгует латентностью). Покрыто юнит- (chaff-решение, парсер) + интеграционным loopback-тестом (pacer реально шлёт данные+chaff). **Не прогнано в Docker-туннеле** (нет CAP_NET_ADMIN локально).
 - ✅ **F7:** per-client rate-limit на exit — token bucket по байтам в `pump` (входящее от клиента, `Citadel_quic::ratelimit`), env `Citadel_RATE_LIMIT`/`Citadel_RATE_BURST`. Превышение → дроп датаграммы (QUIC ретрансмитит). Проверено Docker-демо (ТЕСТ 9): preload-флуд режется (~88% loss + лог дропов), ping/HTTP не затронуты.

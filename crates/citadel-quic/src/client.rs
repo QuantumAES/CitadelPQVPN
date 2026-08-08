@@ -14,7 +14,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
-use anyhow::{anyhow, Result};
+use anyhow::{anyhow, Context, Result};
 use rand::RngCore;
 
 use citadel_masque::{capsule, datagram, ip};
@@ -512,9 +512,20 @@ async fn client_request_address(
     }
 
     // ── Шаг 2: сервер доказан — предъявляем токен и просим адрес. ──
+    //
+    // M-6: на провод уходит не сам токен, а **предъявление, привязанное к этой сессии**:
+    // `nonce ‖ MAC_y(домен ‖ TLS-exporter)`. Секрет `y` остаётся на устройстве, поэтому
+    // перехваченный кадр не работает ни в чьей чужой сессии (в прежней схеме blind RSA на провод
+    // уходила сама подпись — bearer, и это было неисправимо).
+    let redeem = match token.is_empty() {
+        true => Vec::new(), // токены выключены на сервере — предъявлять нечего
+        false => citadel_token::Token::from_bytes(token)
+            .context("сохранённый токен непригоден (устаревший формат? перезапросите у издателя)")?
+            .redeem(&citadel_token::redeem_context(&exporter)),
+    };
     let req = capsule::AssignedV4 { request_id: 1, addr: [0, 0, 0, 0], prefix: 0 };
-    let mut out = citadel_masque::varint::to_vec(token.len() as u64);
-    out.extend_from_slice(token);
+    let mut out = citadel_masque::varint::to_vec(redeem.len() as u64);
+    out.extend_from_slice(&redeem);
     out.extend_from_slice(&capsule::encode_address_request_v4(&req));
     let buf = tunnel.control_client(&out).await?;
 
@@ -522,7 +533,46 @@ async fn client_request_address(
     if t != capsule::ADDRESS_ASSIGN {
         return Err(anyhow!("ожидался ADDRESS_ASSIGN, получен type={t}"));
     }
-    capsule::decode_assigned_v4(val).ok_or_else(|| anyhow!("битое тело ADDRESS_ASSIGN"))
+    let assigned =
+        capsule::decode_assigned_v4(val).ok_or_else(|| anyhow!("битое тело ADDRESS_ASSIGN"))?;
+    validate_assignment(&assigned)?;
+    Ok(assigned)
+}
+
+/// H-4 (остаток): проверить назначенные сервером адрес и префикс.
+///
+/// Это **единственное**, что сервер вообще может сказать клиенту по control-плоскости (4 байта
+/// адреса и 1 байт префикса), и до сих пор оно принималось как есть. Между тем префикс задаёт, что
+/// клиент считает «своей подсетью» — то есть какие адреса пойдут в туннель и с каких он готов
+/// принимать (F8 сверяет dst с назначенным). Недобросовестный exit, выдав `10.7.0.5/8`, втягивал бы
+/// в туннель весь `10.0.0.0/8` абонента вместе с его домашней/корпоративной сетью, а `/0` — вообще
+/// всё. Граница привилегий (`vpnd::valid`, `citadel-helper`) пропускает любой префикс `0..=32`:
+/// её задача — не дать инъекцию в `ip`/`netsh`, а не судить о разумности значения.
+///
+/// Правило: адрес обязан быть приватным (RFC 1918 / CGNAT RFC 6598 — exit по построению NAT'ит,
+/// `Citadel_NAT_SRC`), префикс — в `12..=30`. `/31` и `/32` отсекаются как «сеть без пригодных
+/// адресов», `<12` — как заведомо чрезмерный захват.
+fn validate_assignment(a: &capsule::AssignedV4) -> Result<()> {
+    let [b0, b1, ..] = a.addr;
+    let private = b0 == 10
+        || (b0 == 172 && (16..=31).contains(&b1))
+        || (b0 == 192 && b1 == 168)
+        || (b0 == 100 && (64..=127).contains(&b1)); // CGNAT
+    if !private {
+        return Err(anyhow!(
+            "сервер назначил неприватный адрес {}.{}.{}.{} — отказ (адрес туннеля обязан быть \
+             из RFC1918/CGNAT: exit NAT'ит трафик наружу)",
+            a.addr[0], a.addr[1], a.addr[2], a.addr[3]
+        ));
+    }
+    if !(12..=30).contains(&a.prefix) {
+        return Err(anyhow!(
+            "сервер назначил префикс /{} — отказ (допустимо /12../30; более широкий втянул бы в \
+             туннель чужие подсети абонента, /31 и /32 не дают пригодных адресов)",
+            a.prefix
+        ));
+    }
+    Ok(())
 }
 
 /// Разобрать ответ шага 1: `varint(pub_len)‖ML-DSA-pub‖varint(sig_len)‖ML-DSA-sig`.
@@ -621,6 +671,27 @@ mod resolve_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// H-4 (остаток): недобросовестный exit не может ни выдать клиенту чужой (публичный) адрес,
+    /// ни расширить «свою подсеть» до размеров, втягивающих в туннель домашнюю сеть абонента.
+    #[test]
+    fn assignment_from_server_is_validated() {
+        let mk = |addr: [u8; 4], prefix| capsule::AssignedV4 { request_id: 1, addr, prefix };
+        // штатные назначения
+        assert!(validate_assignment(&mk([10, 7, 0, 5], 16)).is_ok());
+        assert!(validate_assignment(&mk([172, 16, 0, 2], 24)).is_ok());
+        assert!(validate_assignment(&mk([192, 168, 9, 3], 30)).is_ok());
+        assert!(validate_assignment(&mk([100, 64, 0, 7], 12)).is_ok()); // CGNAT
+        // адрес обязан быть приватным: exit NAT'ит, публичный адрес на TUN — либо ошибка, либо
+        // попытка заставить клиента считать своим чужой диапазон
+        for a in [[8, 8, 8, 8], [1, 1, 1, 1], [172, 32, 0, 1], [100, 128, 0, 1], [192, 169, 0, 1]] {
+            assert!(validate_assignment(&mk(a, 24)).is_err(), "адрес {a:?} не приватный");
+        }
+        // префикс: /8 втянул бы весь 10/8 абонента, /0 — вообще всё; /31 и /32 бесполезны
+        for p in [0, 8, 11, 31, 32, 33, 255] {
+            assert!(validate_assignment(&mk([10, 7, 0, 5], p)).is_err(), "префикс /{p}");
+        }
+    }
 
     /// S0.1/H2: без pin — отказ (fail-closed), кроме явного insecure-флага; Pinned/Waiting — ок.
     #[test]

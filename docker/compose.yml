@@ -2,7 +2,7 @@ name: citadel-pq
 
 services:
   # Издатель (биллинг, M5 split): long-running TCP-сервис слепого подписания токенов.
-  # Держит sk; публикует issuer.pub в общий том; клиент получает токены интерактивно.
+  # Держит ключ эпохи; кладёт issuer.key в общий том; клиент получает токены интерактивно.
   issuer:
     build:
       context: .
@@ -14,15 +14,20 @@ services:
     tmpfs: ["/tmp"]
     # M-4: издателю не нужна НИ ОДНА capability — он слушает порты >1024, не трогает сеть ядра и
     # работает только со своим томом. Ни одной не оставляем. Это процесс, который разбирает ВЕСЬ
-    # недоверенный сетевой ввод и держит все ключи (RSA-sk эпохи, TLS-приватник, ML-DSA-seed,
+    # недоверенный сетевой ввод и держит все ключи (ключ эпохи Layer-2, TLS-приватник, ML-DSA-seed,
     # реестр, PSK), — раньше он шёл с полным дефолтным набором docker.
     cap_drop: ["ALL"]
+    # M-6: ключ эпохи стал секретом и лежит на общем томе с правами 0640. Группа файла = та, в
+    # которую садится exit после сброса привилегий (F4, nobody/nogroup), — иначе он его не
+    # прочитает. Выставить её через chown издатель не может: после M-4 у него cap_drop ALL, то
+    # есть нет CAP_CHOWN. Поэтому он сразу работает с этой группой, и файл рождается правильным.
+    user: "0:65534"
     security_opt: ["no-new-privileges:true"]
     volumes: ["pinshare:/shared"]
     networks: ["Citadelnet"]
     restart: unless-stopped
-    healthcheck:                       # готов, когда RSA-ключ сгенерирован и issuer.pub опубликован
-      test: ["CMD-SHELL", "test -f /shared/issuer.pub"]
+    healthcheck:                       # готов, когда ключ эпохи сгенерирован и issuer.key лежит на томе
+      test: ["CMD-SHELL", "test -f /shared/issuer.key"]
       interval: 2s
       timeout: 2s
       retries: 20
@@ -32,7 +37,7 @@ services:
     image: citadel-pq:latest
     container_name: citadel-exit
     depends_on:
-      issuer: { condition: service_healthy }   # нужен issuer.pub для верификации токенов
+      issuer: { condition: service_healthy }   # нужен issuer.key для верификации токенов
     entrypoint: ["/usr/local/bin/entrypoint-exit.sh"]
     read_only: true                    # S1.5: неизменяемый rootfs (пишем только в /shared + tmpfs)
     tmpfs: ["/tmp", "/run"]             # /run — xtables.lock (iptables); /tmp — runtime-scratch
@@ -43,7 +48,7 @@ services:
     security_opt: ["no-new-privileges:true"]
     devices: ["/dev/net/tun:/dev/net/tun"]
     sysctls: ["net.ipv4.ip_forward=1"]
-    volumes: ["pinshare:/shared"]      # exit пишет pin (F1), читает issuer.pub (M4/M5)
+    volumes: ["pinshare:/shared"]      # exit пишет pin (F1), читает issuer.key (M4/M5)
     networks: ["Citadelnet"]
 
   # Второй exit (M5 multi-server): идентичен exit, свой self-signed cert/pin → exit2.pin.

@@ -1,22 +1,29 @@
-//! CitadelPQVPN — анонимные токены на blind RSA (RFC 9474), стиль Privacy Pass.
+//! CitadelPQVPN — анонимные токены Layer-2, стиль Privacy Pass. Схема **v2: VOPRF (2HashDH) над
+//! ristretto255** (M-6/аудит-4; прежняя — blind RSA-2048, RFC 9474 — снята вместе с крейтом `rsa`
+//! и его незакрываемым RUSTSEC-2023-0071, см. M-10). Сама криптография — в [`voprf`], здесь —
+//! протокол выдачи по сети и то, что от него нужно exit'у.
 //!
-//! Свойство **unlinkability**: издатель подписывает *ослеплённое* сообщение и не видит
-//! сам токен → даже если издатель и есть провайдер (exit), он не может связать выданный
-//! токен с предъявленным при подключении. Закрывает приватностный риск A4 (SPEC §8, F-M4).
+//! Свойство **unlinkability** сохранено и остаётся информационно-теоретическим: издатель видит
+//! только равномерно случайный ослеплённый элемент, поэтому даже он сам (он же провайдер exit'а,
+//! он же противник с квантовым компьютером задним числом) не может связать выдачу с предъявлением.
+//! Закрывает приватностный риск A4 (SPEC §8, F-M4).
 //!
-//! Токен на проводе: `nonce(32) ‖ msg_randomizer(32) ‖ signature(|RSA|)`.
+//! Что изменилось по существу:
 //!
-//! Роли разделены (M5, issuer↔exit split): `client_blind`/`client_finalize` (клиент держит nonce
-//! и секреты ослепления) ↔ `issuer_blind_sign` (издатель держит только sk, подписывает вслепую).
-//! По сети ходят лишь `blind_msg` и `blind_sig`. `issue_batch` (всё в одном процессе) оставлен
-//! для тестов/локального демо.
+//!  * токен перестал быть bearer-строкой. У клиента остаётся секрет `y`, который **не уходит на
+//!    провод**; при подключении предъявляется `nonce ‖ MAC_y(контекст сессии)` — украденное
+//!    предъявление бесполезно в чужой сессии (остаток H-2, в blind RSA недостижимый);
+//!  * материал эпохи стал **секретом** (`issuer-<epoch>.key`, 0600): проверка теперь приватная,
+//!    и exit получает ключ либо с общего тома, либо аутентифицированным keysync'ом (P1);
+//!  * ротация ключа эпохи перестала стоить ~10 секунд RSA-keygen.
+//!
+//! Роли по-прежнему разделены (M5, issuer↔exit split): клиент ослепляет и финализирует, издатель
+//! вычисляет вслепую. По сети ходят только ослеплённый элемент и ответ с DLEQ-доказательством.
 
 use anyhow::{anyhow, bail, Context, Result};
-use blind_rsa_signatures::{
-    BlindSignature, KeyPair, MessageRandomizer, Options, PublicKey, Secret, SecretKey, Signature,
-};
-use rand::RngCore;
 use std::io::{self, Read, Write};
+
+pub use voprf::{BlindState, EpochKey, Token};
 
 /// **No-logs (приватность серверных ролей).** Издатель и admin-канал по умолчанию НЕ пишут в лог
 /// ничего, что связывает абонента, его адрес и время: ни `client_id`, ни IP пира, ни факт выдачи.
@@ -41,12 +48,12 @@ macro_rules! dlog {
 }
 
 pub mod admin; // C7.1: admin-плоскость (реестр по PQ-TLS: гибридная подпись + EKM channel binding)
+pub mod voprf; // M-6: Layer-2 v2 — анонимные токены на VOPRF (2HashDH, ristretto255) вместо blind RSA
 pub mod pqid; // PQ-удостоверение сторон: гибрид Ed25519 + ML-DSA-65 из одного seed (анти-CRQC auth)
 pub mod pqtls; // S2.1/A1: PQ-TLS + pin канал к издателю (анти-MITM, анти-деанон client_id)
 pub mod obfs_stream; // S2.1/A1 (остаток): синхронная obfs-обёртка issuer-канала (probe-resistance, анти-DPI)
 
-pub const NONCE_LEN: usize = 32;
-pub const RAND_LEN: usize = 32;
+pub const NONCE_LEN: usize = voprf::NONCE_LEN;
 
 /// C5.1: номер текущей эпохи = unix-время / длина эпохи (сек). Токены Layer-2 скоупятся на эпоху —
 /// exit проверяет их ТОЛЬКО ключом текущей (± прошлой, grace) эпохи, поэтому токен «гаснет» к концу
@@ -60,16 +67,47 @@ pub fn current_epoch(epoch_secs: u64) -> u64 {
     now / epoch_secs.max(1) // max(1): защита от деления на ноль при кривом конфиге
 }
 
-/// C5.1: имя файла pub издателя для эпохи. Issuer публикует `issuer-<epoch>.pub`; exit читает
-/// current(±prev). Старые pub'ы остаются на диске для grace, но exit их уже не запрашивает.
-pub fn epoch_pub_name(epoch: u64) -> String {
-    format!("issuer-{epoch}.pub")
+/// C5.1: имя файла ключа эпохи. Issuer публикует `issuer-<epoch>.key`; exit читает current(±prev).
+/// Прежние ключи остаются на диске для grace, но exit их уже не запрашивает.
+///
+/// **Расширение сменилось с `.pub` на `.key` не косметически:** в схеме v2 это СЕКРЕТ (32 Б
+/// скаляра), а не публичный ключ. Имя обязано это кричать — файл `issuer-*.pub` в мире, где его
+/// содержимое стало приватным, рано или поздно кто-нибудь скопирует «как публичный».
+pub fn epoch_key_name(epoch: u64) -> String {
+    format!("issuer-{epoch}.key")
 }
 
-/// C5.1: проверить токен против нескольких pub'ов издателя (эпохи current±prev — grace на границе
-/// эпохи и при скью часов issuer↔exit). Возвращает nonce при успехе под ЛЮБЫМ pub; иначе None.
-pub fn verify_token_multi(pubs: &[Vec<u8>], token: &[u8]) -> Option<[u8; NONCE_LEN]> {
-    pubs.iter().find_map(|pk| verify_token(pk, token))
+/// Домен контекста предъявления (входит в MAC — см. [`voprf::Token::redeem`]).
+const REDEEM_DOMAIN: &[u8] = b"CitadelPQVPN/token/v2/redeem";
+
+/// Контекст, к которому привязано предъявление токена: `домен ‖ TLS-exporter`.
+///
+/// Обе стороны считают его независимо и **никогда не передают по сети**. `exporter` (RFC 5705)
+/// выводится из секретов ЭТОГО хендшейка с ЭТИМ сертификатом, поэтому он уникален для конкретной
+/// сессии: у двух плеч релея он разный, и снятое предъявление в чужое соединение не переносится.
+/// Это ровно та привязка, которую аудит-4 назвал недостижимой в blind RSA (§H-2, «❌ НЕ исправлено»).
+///
+/// **Почему в контексте нет `cert_pin`**, хотя ML-DSA-привязка рядом его включает. У сервера pin
+/// есть всегда, а у клиента он появляется только при активном пиннинге: в беспиновом dev-режиме
+/// (`Citadel_INSECURE_NO_PIN`, L-5) клиент подставляет нули — и контексты сторон разошлись бы,
+/// давая «невалидный токен» на ровном месте. Пользы это не добавляет: привязка к узлу и так
+/// обеспечена — pin проверяется на TLS-слое (fail-closed), а сам exporter зависит от сертификата
+/// сервера. Лучше одна величина, которую обе стороны заведомо считают одинаково.
+pub fn redeem_context(exporter: &[u8]) -> Vec<u8> {
+    let mut ctx = Vec::with_capacity(REDEEM_DOMAIN.len() + exporter.len());
+    ctx.extend_from_slice(REDEEM_DOMAIN);
+    ctx.extend_from_slice(exporter);
+    ctx
+}
+
+/// C5.1: проверить предъявление против нескольких ключей эпохи (current±prev — grace на границе
+/// эпохи и при скью часов issuer↔exit). Возвращает nonce при успехе под ЛЮБЫМ ключом; иначе None.
+pub fn verify_redemption_multi(
+    keys: &[EpochKey],
+    redeem: &[u8],
+    ctx: &[u8],
+) -> Option<[u8; NONCE_LEN]> {
+    keys.iter().find_map(|k| k.verify_redemption(redeem, ctx))
 }
 
 // ===================== Layer-1 «абонемент» (C5.2): Ed25519 client-id =====================
@@ -163,35 +201,39 @@ fn connect_authenticated_issuer(
     Ok((conn, ekm, challenge))
 }
 
-/// Публичный ключ ТЕКУЩЕЙ эпохи у издателя — для exit-узла, стоящего на ОТДЕЛЬНОЙ машине.
+/// Ключ ТЕКУЩЕЙ эпохи у издателя — для exit-узла, стоящего на ОТДЕЛЬНОЙ машине (`citadel-token
+/// keysync`). Когда exit и издатель живут на одном сервере, exit читает `issuer-<epoch>.key` прямо
+/// с общего тома.
 ///
-/// Когда exit и издатель живут на одном сервере, exit читает `issuer-<epoch>.pub` прямо с общего
-/// тома. При раздельном деплое общего тома нет, а ключ ротируется каждую эпоху — поэтому exit
-/// подтягивает его сам (`citadel-token pubsync`). Аутентификация exit'а здесь не нужна: ключ
-/// публичен (издатель отдаёт его каждому авторизованному абоненту), а до этого кадра доходит
-/// только тот, кто знает obfs-PSK и прошёл PQ-TLS с пиннингом. Подлинность ИЗДАТЕЛЯ проверяется
-/// полностью — иначе exit принял бы ключ подставного и стал бы верить чужим токенам.
-pub fn fetch_epoch_pub(
+/// **M-6: канал стал двусторонне аутентифицированным.** В схеме v1 отдавался публичный RSA-ключ, и
+/// спросить его мог любой, кто знает obfs-PSK и pin (то есть любой абонент — PSK лежит в каждой
+/// ссылке, H-3). В схеме v2 это секрет эпохи: получивший его чеканит токены. Поэтому exit
+/// доказывает владение keysync-seed'ом (гибрид Ed25519 + ML-DSA-65, домен [`pqid::DOMAIN_KEYSYNC`],
+/// привязка к сессии через EKM), а издатель сверяет его id с настроенным `Citadel_KEYSYNC_ID`.
+/// Подлинность ИЗДАТЕЛЯ проверяется как и раньше — иначе exit принял бы ключ подставного и стал бы
+/// верить чужим токенам.
+pub fn fetch_epoch_key(
     issuer_addr: &str,
     issuer_pin: &[u8; 32],
     issuer_mldsa: &[u8; 32],
+    keysync_seed: &[u8; 32],
     retries: u32,
     obfs_psk: Option<[u8; 32]>,
 ) -> Result<Vec<u8>> {
-    let (mut conn, _ekm, _challenge) =
+    let (mut conn, ekm, challenge) =
         connect_authenticated_issuer(issuer_addr, issuer_pin, issuer_mldsa, retries, obfs_psk)?;
-    write_frame(&mut conn, &pqid::build_epoch_pub_request()?)?;
-    let pk = read_frame(&mut conn).context("издатель не отдал ключ эпохи")?;
-    if pk.is_empty() {
-        bail!("издатель вернул пустой ключ эпохи");
-    }
-    Ok(pk)
+    write_frame(&mut conn, &pqid::build_keysync_request(keysync_seed, &challenge, &ekm)?)?;
+    let key = read_frame(&mut conn)
+        .context("издатель не отдал ключ эпохи (keysync-идентичность не принята?)")?;
+    // Разбираем сразу: мусор/чужой формат должен упасть здесь, а не при первой проверке токена.
+    EpochKey::from_secret(&key).context("ключ эпохи от издателя")?;
+    Ok(key)
 }
 
 /// C5.3: клиентская сторона issuance по сети (sync). Проходит Layer-1 (`seed` доказывает владение
-/// «абонементом»), получает ТЕКУЩИЙ epoch-pub издателя, добывает `count` токенов
-/// (blind→sign→finalize). Издатель токены НЕ видит (unlinkable). `retries` — попытки коннекта
-/// (издатель мог ещё генерить RSA-ключ). Протокол: challenge → pub‖sig → issuer_pub → {blind→sig}×N.
+/// «абонементом»), получает публичный элемент `K` ТЕКУЩЕЙ эпохи, добывает `count` токенов
+/// (blind→evaluate→finalize). Издатель токены НЕ видит (unlinkable). `retries` — попытки коннекта.
+/// Протокол: challenge → hello‖sig → K(32) → {blinded(32) → evaluated(32)‖DLEQ(64)}×N.
 ///
 /// S2.1/A1: весь обмен идёт по **PQ-TLS с пиннингом** серта издателя (`issuer_pin`). Это закрывает
 /// (a) MITM-кражу токенов (подстановку чужих `blind_msg`), (b) деанон `client_id` в открытом виде,
@@ -218,124 +260,59 @@ pub fn fetch_tokens(
     let auth = pqid::build_auth(seed, pqid::DOMAIN_CLIENT, &challenge, &ekm)?;
     write_frame(&mut conn, &auth)?;
 
-    // Текущий (epoch) pub издателя для ослепления. Если Layer-1 не прошёл, издатель закрыл
-    // соединение → read_frame вернёт Err (не «авторизован»).
-    let issuer_pub = read_frame(&mut conn).context("Layer-1: издатель не выдал pub (не авторизован?)")?;
+    // Публичный элемент K текущей эпохи — под ним проверяется DLEQ каждой выдачи. Если Layer-1 не
+    // прошёл, издатель закрыл соединение → read_frame вернёт Err (не «авторизован»).
+    let issuer_public =
+        read_frame(&mut conn).context("Layer-1: издатель не выдал ключ эпохи (не авторизован?)")?;
+    // Разбираем сразу: негодный элемент — это сломанный/подставной издатель, и узнать об этом лучше
+    // здесь, чем после цикла выдачи (иначе квота абонента тратится впустую, а причина всплывает
+    // только на finalize).
+    voprf::parse_public_element(&issuer_public).context("публичный элемент эпохи от издателя")?;
 
     let mut tokens = Vec::with_capacity(count);
     for _ in 0..count {
-        let (blind_msg, st) = client_blind(&issuer_pub)?;
-        write_frame(&mut conn, &blind_msg)?;
-        let blind_sig = read_frame(&mut conn)?;
-        tokens.push(client_finalize(&issuer_pub, &blind_sig, &st)?);
+        let st = BlindState::new()?;
+        write_frame(&mut conn, &st.blinded_element())?;
+        let resp = read_frame(&mut conn)?;
+        // Ответ издателя: `evaluated(32) ‖ DLEQ(64)`. Длина фиксирована — разбираем по границе,
+        // а не «сколько дали»: иначе издатель управлял бы раскладкой полей.
+        if resp.len() != voprf::ELEMENT_LEN + voprf::PROOF_LEN {
+            bail!(
+                "издатель прислал {} Б вместо {} (несовместимая версия?)",
+                resp.len(),
+                voprf::ELEMENT_LEN + voprf::PROOF_LEN
+            );
+        }
+        let (evaluated, proof) = resp.split_at(voprf::ELEMENT_LEN);
+        tokens.push(st.finalize(&issuer_public, evaluated, proof)?.to_bytes());
     }
     Ok(tokens)
 }
 
 // ===================== интерактивный issuance по ролям (M5, issuer↔exit split) =====================
-// Разделение: КЛИЕНТ держит nonce + секреты ослепления и делает finalize; ИЗДАТЕЛЬ держит только
-// секретный ключ и подписывает ослеплённое сообщение ВСЛЕПУЮ (не видит nonce/токен) → unlinkability,
-// даже если издатель (биллинг) и exit сговорятся. По сети ходят только blind_msg и blind_sig.
+// Разделение: КЛИЕНТ держит nonce и множитель ослепления и делает finalize; ИЗДАТЕЛЬ держит только
+// ключ эпохи и вычисляет ВСЛЕПУЮ (не видит ни nonce, ни токен) → unlinkability, даже если издатель
+// (биллинг) и exit сговорятся. По сети ходят только ослеплённый элемент и ответ с DLEQ.
+// Сами примитивы — в [`voprf`]; здесь остались лишь удобные обёртки для тестов и локального демо.
 
-/// Сгенерировать ключевую пару издателя → (pk_der, sk_der). pk публикуется (exit-верификатор),
-/// sk держит только издатель.
-pub fn issuer_keypair(bits: usize) -> Result<(Vec<u8>, Vec<u8>)> {
-    let mut rng = rand::thread_rng();
-    let kp = KeyPair::generate(&mut rng, bits)?;
-    Ok((kp.pk.to_der()?, kp.sk.to_der()?))
-}
-
-/// Состояние клиента между blind и finalize (секреты ослепления; НЕ покидает клиента).
-pub struct BlindState {
-    nonce: [u8; NONCE_LEN],
-    secret: Secret,
-    randomizer: MessageRandomizer,
-}
-
-/// Роль клиента (шаг 1): сгенерировать nonce + ослеплённое сообщение для издателя.
-/// Возвращает (`blind_msg` на отправку издателю, состояние для finalize). Издатель nonce НЕ увидит.
-pub fn client_blind(pk_der: &[u8]) -> Result<(Vec<u8>, BlindState)> {
-    let opts = Options::default();
-    let pk = PublicKey::from_der(pk_der)?;
-    let mut rng = rand::thread_rng();
-    let mut nonce = [0u8; NONCE_LEN];
-    rng.fill_bytes(&mut nonce);
-    let br = pk.blind(&mut rng, nonce, true, &opts)?;
-    let randomizer = br.msg_randomizer.ok_or_else(|| anyhow!("нет msg_randomizer"))?;
-    Ok((br.blind_msg.0, BlindState { nonce, secret: br.secret, randomizer }))
-}
-
-/// Роль издателя: подписать ослеплённое сообщение ВСЛЕПУЮ. Видит только `blind_msg`, не токен.
-pub fn issuer_blind_sign(sk_der: &[u8], blind_msg: &[u8]) -> Result<Vec<u8>> {
-    let opts = Options::default();
-    let sk = SecretKey::from_der(sk_der)?;
-    let mut rng = rand::thread_rng();
-    Ok(sk.blind_sign(&mut rng, blind_msg, &opts)?.0)
-}
-
-/// Роль клиента (шаг 2): снять ослепление → готовый токен `nonce‖randomizer‖sig`.
-pub fn client_finalize(pk_der: &[u8], blind_sig: &[u8], st: &BlindState) -> Result<Vec<u8>> {
-    let opts = Options::default();
-    let pk = PublicKey::from_der(pk_der)?;
-    let sig = pk.finalize(
-        &BlindSignature(blind_sig.to_vec()),
-        &st.secret,
-        Some(st.randomizer),
-        st.nonce,
-        &opts,
-    )?;
-    let mut t = Vec::with_capacity(NONCE_LEN + RAND_LEN + sig.len());
-    t.extend_from_slice(&st.nonce);
-    t.extend_from_slice(st.randomizer.as_ref());
-    t.extend_from_slice(&sig);
-    Ok(t)
-}
-
-pub struct Issued {
-    pub pk_der: Vec<u8>,
-    pub tokens: Vec<Vec<u8>>,
-}
-
-/// Выпуск `count` токенов и публичного ключа издателя (DER).
-pub fn issue_batch(count: usize, bits: usize) -> Result<Issued> {
-    let opts = Options::default();
-    let mut rng = rand::thread_rng();
-    let kp = KeyPair::generate(&mut rng, bits)?;
+/// Выпуск `count` токенов «в одном процессе» (все три роли сразу) — для тестов, бенчмарков и
+/// офлайн-демо. В проде роли разнесены (`fetch_tokens` ↔ издатель).
+pub fn issue_batch(count: usize) -> Result<Issued> {
+    let key = EpochKey::generate()?;
+    let public = key.public_bytes();
     let mut tokens = Vec::with_capacity(count);
     for _ in 0..count {
-        let mut nonce = [0u8; NONCE_LEN];
-        rng.fill_bytes(&mut nonce);
-        // blinding (роль клиента): издатель не увидит nonce
-        let br = kp.pk.blind(&mut rng, nonce, true, &opts)?;
-        // signing (роль издателя): видит только br.blind_msg
-        let blind_sig = kp.sk.blind_sign(&mut rng, &br.blind_msg, &opts)?;
-        // finalize (роль клиента): получаем готовую подпись
-        let sig = kp.pk.finalize(&blind_sig, &br.secret, br.msg_randomizer, nonce, &opts)?;
-        let randomizer = br.msg_randomizer.ok_or_else(|| anyhow!("нет msg_randomizer"))?;
-        let mut t = Vec::with_capacity(NONCE_LEN + RAND_LEN + sig.len());
-        t.extend_from_slice(&nonce);
-        t.extend_from_slice(randomizer.as_ref());
-        t.extend_from_slice(&sig);
-        tokens.push(t);
+        let st = BlindState::new()?; // роль клиента: ослепление
+        let (evaluated, proof) = key.evaluate(&st.blinded_element())?; // роль издателя (вслепую)
+        tokens.push(st.finalize(&public, &evaluated, &proof)?.to_bytes()); // роль клиента: finalize
     }
-    Ok(Issued { pk_der: kp.pk.to_der()?, tokens })
+    Ok(Issued { epoch_key: key.secret_bytes().to_vec(), tokens })
 }
 
-/// Проверка токена под публичным ключом издателя. Возвращает nonce (для учёта double-spend).
-pub fn verify_token(pk_der: &[u8], token: &[u8]) -> Option<[u8; NONCE_LEN]> {
-    if token.len() <= NONCE_LEN + RAND_LEN {
-        return None;
-    }
-    let opts = Options::default();
-    let pk = PublicKey::from_der(pk_der).ok()?;
-    let mut nonce = [0u8; NONCE_LEN];
-    nonce.copy_from_slice(&token[..NONCE_LEN]);
-    let mut rand = [0u8; RAND_LEN];
-    rand.copy_from_slice(&token[NONCE_LEN..NONCE_LEN + RAND_LEN]);
-    let sig = Signature::new(token[NONCE_LEN + RAND_LEN..].to_vec());
-    let mr = MessageRandomizer::new(rand);
-    sig.verify(&pk, Some(mr), nonce, &opts).ok()?;
-    Some(nonce)
+/// Результат [`issue_batch`]: секрет эпохи (им проверяет exit) и выпущенные токены.
+pub struct Issued {
+    pub epoch_key: Vec<u8>,
+    pub tokens: Vec<Vec<u8>>,
 }
 
 #[cfg(test)]
@@ -368,26 +345,49 @@ mod tests {
     /// проходит под своим ключом и в grace-наборе [prev, cur].
     #[test]
     fn epoch_scoping_cross_key_rejected() {
-        let a = issue_batch(1, 2048).unwrap();
-        let b = issue_batch(1, 2048).unwrap();
-        let tok = &a.tokens[0];
-        assert!(verify_token(&b.pk_der, tok).is_none(), "ключ чужой эпохи не должен принять");
-        assert!(verify_token(&a.pk_der, tok).is_some());
-        assert!(verify_token_multi(std::slice::from_ref(&b.pk_der), tok).is_none());
-        assert!(verify_token_multi(&[b.pk_der.clone(), a.pk_der.clone()], tok).is_some()); // grace prev+cur
-        assert!(verify_token_multi(&[], tok).is_none());
+        let ctx = redeem_context(b"exporter");
+        let a = issue_batch(1).unwrap();
+        let b = issue_batch(1).unwrap();
+        let (ka, kb) = (
+            EpochKey::from_secret(&a.epoch_key).unwrap(),
+            EpochKey::from_secret(&b.epoch_key).unwrap(),
+        );
+        let redeem = Token::from_bytes(&a.tokens[0]).unwrap().redeem(&ctx);
+        assert!(kb.verify_redemption(&redeem, &ctx).is_none(), "ключ чужой эпохи не должен принять");
+        assert!(ka.verify_redemption(&redeem, &ctx).is_some());
+        assert!(verify_redemption_multi(std::slice::from_ref(&kb), &redeem, &ctx).is_none());
+        assert!(verify_redemption_multi(&[kb, ka], &redeem, &ctx).is_some()); // grace prev+cur
+        assert!(verify_redemption_multi(&[], &redeem, &ctx).is_none());
+    }
+
+    /// Остаток H-2 на уровне всей схемы: токен, добытый честно, действителен ТОЛЬКО в той сессии,
+    /// контекст которой он подписал. Перехвативший предъявление релей не подключится своей.
+    #[test]
+    fn redemption_bound_to_session_exporter() {
+        let issued = issue_batch(1).unwrap();
+        let key = EpochKey::from_secret(&issued.epoch_key).unwrap();
+        let token = Token::from_bytes(&issued.tokens[0]).unwrap();
+        let redeem = token.redeem(&redeem_context(b"exporter-session-1"));
+        assert!(key.verify_redemption(&redeem, &redeem_context(b"exporter-session-1")).is_some());
+        assert!(
+            key.verify_redemption(&redeem, &redeem_context(b"exporter-session-2")).is_none(),
+            "другая сессия — другой exporter, предъявление не переносится"
+        );
+        // домен контекста входит в MAC: голый exporter не сходится с контекстом
+        assert!(key.verify_redemption(&redeem, b"exporter-session-1").is_none());
     }
 
     /// C5.3 + S2.1/A1 + PQ: полный клиентский протокол `fetch_tokens` против in-process issuer
     /// поверх PQ-TLS. Проверяет, что (а) издатель доказывает подлинность ML-DSA-подписью привязки,
     /// (б) абонент авторизуется ГИБРИДНОЙ подписью и опознаётся по `BLAKE3(ed_pub‖mldsa_pub)`,
-    /// (в) добытые токены валидны под issuer pub.
+    /// (в) добытые токены проходят проверку ключом эпохи.
     #[test]
     fn fetch_tokens_layer1_roundtrip() {
         use std::net::TcpListener;
         let seed = [0x33u8; 32];
         let client_id = pqid::id_from_seed(&seed).unwrap();
-        let (issuer_pk, issuer_sk) = issuer_keypair(2048).unwrap();
+        let epoch_key = EpochKey::generate().unwrap();
+        let epoch_public = epoch_key.public_bytes();
 
         // S2.1/A1: издатель поднимает постоянный TLS-серт; клиент пиннит его pin.
         let dir = std::env::temp_dir().join(format!("citadel-fetch-{}", std::process::id()));
@@ -402,7 +402,6 @@ mod tests {
 
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap().to_string();
-        let issuer_pk_srv = issuer_pk.clone();
         let srv = std::thread::spawn(move || {
             let (tcp, _) = listener.accept().unwrap();
             let mut conn = pqtls::accept_tls(tcp, scfg, None).unwrap();
@@ -412,27 +411,30 @@ mod tests {
             let auth = read_frame(&mut conn).unwrap();
             let got = pqid::verify_auth(&auth, pqid::DOMAIN_CLIENT, &challenge, &ekm).unwrap();
             assert_eq!(got, client_id, "зарегистрированный абонент");
-            write_frame(&mut conn, &issuer_pk_srv).unwrap(); // текущий epoch-pub
-            while let Ok(blind_msg) = read_frame(&mut conn) {
-                let sig = issuer_blind_sign(&issuer_sk, &blind_msg).unwrap();
-                write_frame(&mut conn, &sig).unwrap();
+            write_frame(&mut conn, &epoch_public).unwrap(); // публичный элемент текущей эпохи
+            while let Ok(blinded) = read_frame(&mut conn) {
+                let (e, proof) = epoch_key.evaluate(&blinded).unwrap();
+                write_frame(&mut conn, &[e, proof].concat()).unwrap();
             }
+            epoch_key
         });
         let tokens = fetch_tokens(&addr, &issuer_pin, &issuer_mldsa, &seed, 3, 3, None).unwrap();
         assert_eq!(tokens.len(), 3);
+        let key = srv.join().unwrap();
+        let ctx = redeem_context(b"e");
         for t in &tokens {
-            assert!(verify_token(&issuer_pk, t).is_some(), "токен валиден под issuer pub");
+            let redeem = Token::from_bytes(t).unwrap().redeem(&ctx);
+            assert!(key.verify_redemption(&redeem, &ctx).is_some(), "токен валиден под ключом эпохи");
         }
-        srv.join().unwrap();
         let _ = std::fs::remove_dir_all(dir);
     }
 
-    /// P1 (раздельный деплой): exit-узел на ДРУГОЙ машине забирает публичный ключ эпохи без
-    /// собственной идентичности — и получает ровно тот ключ, под которым потом сходятся токены.
+    /// P1 (раздельный деплой): exit-узел на ДРУГОЙ машине забирает ключ эпохи, доказав СВОЮ
+    /// keysync-идентичность (M-6: ключ стал секретом, безымянный запрос больше не проходит).
     #[test]
-    fn fetch_epoch_pub_serves_exit_on_separate_host() {
+    fn fetch_epoch_key_serves_authenticated_exit() {
         use std::net::TcpListener;
-        let dir = std::env::temp_dir().join(format!("citadel-pubsync-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("citadel-keysync-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let dir = dir.to_str().unwrap();
         let identity = pqtls::IssuerIdentity::load_or_generate(dir).unwrap();
@@ -440,11 +442,13 @@ mod tests {
         let scfg = identity.server_config().unwrap();
         let pq = pqid::IssuerPqIdentity::load_or_generate(dir).unwrap();
         let issuer_mldsa = pq.commitment();
-        let (issuer_pk, issuer_sk) = issuer_keypair(2048).unwrap();
+        let keysync_seed = [0x5eu8; 32];
+        let keysync_id = pqid::id_from_seed(&keysync_seed).unwrap();
+        let epoch_key = EpochKey::generate().unwrap();
+        let secret = epoch_key.secret_bytes();
 
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap().to_string();
-        let pk_srv = issuer_pk.clone();
         let srv = std::thread::spawn(move || {
             let (tcp, _) = listener.accept().unwrap();
             let mut conn = pqtls::accept_tls(tcp, scfg, None).unwrap();
@@ -452,27 +456,36 @@ mod tests {
             let challenge = [0x31u8; 32];
             write_frame(&mut conn, &pq.hello(&challenge, &issuer_pin, &ekm).unwrap()).unwrap();
             let frame = read_frame(&mut conn).unwrap();
-            assert_eq!(pqid::parse_client_frame(&frame).unwrap(), pqid::ClientFrame::EpochPub);
-            write_frame(&mut conn, &pk_srv).unwrap();
+            let pqid::ClientFrame::KeySync(auth) = pqid::parse_client_frame(&frame).unwrap() else {
+                panic!("ожидался keysync-кадр");
+            };
+            let got =
+                pqid::verify_hybrid(auth, pqid::DOMAIN_KEYSYNC, &challenge, &ekm).unwrap();
+            assert_eq!(got, keysync_id, "издатель узнаёт СВОЙ exit-узел");
+            write_frame(&mut conn, &secret).unwrap();
         });
 
-        let got = fetch_epoch_pub(&addr, &issuer_pin, &issuer_mldsa, 3, None).unwrap();
-        assert_eq!(got, issuer_pk, "exit получил ключ ТЕКУЩЕЙ эпохи");
-        // и он действительно проверяет токены этой эпохи
-        let (bm, st) = client_blind(&got).unwrap();
-        let bs = issuer_blind_sign(&issuer_sk, &bm).unwrap();
-        let token = client_finalize(&got, &bs, &st).unwrap();
-        assert!(verify_token(&got, &token).is_some());
+        let got =
+            fetch_epoch_key(&addr, &issuer_pin, &issuer_mldsa, &keysync_seed, 3, None).unwrap();
         srv.join().unwrap();
+        // и этим ключом exit действительно проверяет токены эпохи
+        let restored = EpochKey::from_secret(&got).unwrap();
+        let st = BlindState::new().unwrap();
+        let (e, proof) = restored.evaluate(&st.blinded_element()).unwrap();
+        let token = st.finalize(&restored.public_bytes(), &e, &proof).unwrap();
+        let ctx = redeem_context(b"exp");
+        assert!(restored.verify_redemption(&token.redeem(&ctx), &ctx).is_some());
         let _ = std::fs::remove_dir_all(dir);
     }
 
     /// Подставной издатель не снабдит exit ключом: обязательство из конфига не сойдётся, и
     /// синхронизация упадёт ДО того, как ключ попадёт на диск (иначе exit верил бы чужим токенам).
+    /// Дополнительно проверяем, что keysync-кадр самозванцу НЕ уходит (в нём — id exit-узла).
     #[test]
-    fn fetch_epoch_pub_rejects_foreign_issuer_identity() {
+    fn fetch_epoch_key_rejects_foreign_issuer_identity() {
         use std::net::TcpListener;
-        let dir = std::env::temp_dir().join(format!("citadel-pubsync-mitm-{}", std::process::id()));
+        use std::sync::{atomic::{AtomicBool, Ordering}, Arc};
+        let dir = std::env::temp_dir().join(format!("citadel-keysync-mitm-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let dir = dir.to_str().unwrap();
         let identity = pqtls::IssuerIdentity::load_or_generate(dir).unwrap();
@@ -482,16 +495,22 @@ mod tests {
 
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap().to_string();
+        let saw_frame = Arc::new(AtomicBool::new(false));
+        let flag = saw_frame.clone();
         let srv = std::thread::spawn(move || {
             let (tcp, _) = listener.accept().unwrap();
             let Ok(mut conn) = pqtls::accept_tls(tcp, scfg, None) else { return };
             let Ok(ekm) = pqtls::handshake_server(&mut conn) else { return };
             let _ = write_frame(&mut conn, &pq.hello(&[0x41u8; 32], &issuer_pin, &ekm).unwrap());
+            if read_frame(&mut conn).is_ok() {
+                flag.store(true, Ordering::SeqCst);
+            }
         });
         let foreign = pqid::issuer_commitment(&pqid::mldsa_pub_from_seed(&[0x99u8; 32]).unwrap());
-        let err = fetch_epoch_pub(&addr, &issuer_pin, &foreign, 1, None).unwrap_err();
+        let err = fetch_epoch_key(&addr, &issuer_pin, &foreign, &[0x5eu8; 32], 1, None).unwrap_err();
         assert!(format!("{err:#}").contains("PQ-аутентификация издателя"), "err: {err:#}");
         srv.join().unwrap();
+        assert!(!saw_frame.load(Ordering::SeqCst), "keysync-идентичность не должна уйти самозванцу");
         let _ = std::fs::remove_dir_all(dir);
     }
 
@@ -539,84 +558,51 @@ mod tests {
 
     #[test]
     fn issue_and_verify() {
-        let issued = issue_batch(3, 2048).unwrap();
+        let issued = issue_batch(3).unwrap();
+        let key = EpochKey::from_secret(&issued.epoch_key).unwrap();
         assert_eq!(issued.tokens.len(), 3);
+        let ctx = redeem_context(b"exp");
         // все валидны, nonce различны
         let mut seen = std::collections::HashSet::new();
         for t in &issued.tokens {
-            let nonce = verify_token(&issued.pk_der, t).expect("валидный токен");
+            let redeem = Token::from_bytes(t).unwrap().redeem(&ctx);
+            let nonce = key.verify_redemption(&redeem, &ctx).expect("валидный токен");
             assert!(seen.insert(nonce), "nonce должны быть уникальны");
         }
     }
 
     #[test]
-    fn tampered_token_rejected() {
-        let issued = issue_batch(1, 2048).unwrap();
-        let mut t = issued.tokens[0].clone();
-        let last = t.len() - 1;
-        t[last] ^= 0x01; // портим подпись
-        assert!(verify_token(&issued.pk_der, &t).is_none());
+    fn tampered_and_forged_tokens_rejected() {
+        let issued = issue_batch(1).unwrap();
+        let key = EpochKey::from_secret(&issued.epoch_key).unwrap();
+        let ctx = redeem_context(b"exp");
+        let mut redeem = Token::from_bytes(&issued.tokens[0]).unwrap().redeem(&ctx);
+        let last = redeem.len() - 1;
+        redeem[last] ^= 0x01; // портим MAC
+        assert!(key.verify_redemption(&redeem, &ctx).is_none());
+        // выдуманный «токен» без выдачи
+        let forged = vec![0x42u8; voprf::REDEEM_LEN];
+        assert!(key.verify_redemption(&forged, &ctx).is_none());
     }
 
-    #[test]
-    fn forged_token_rejected() {
-        let issued = issue_batch(1, 2048).unwrap();
-        let forged = vec![0x42u8; NONCE_LEN + RAND_LEN + 256];
-        assert!(verify_token(&issued.pk_der, &forged).is_none());
-    }
-
-    /// M5 split: клиент (blind→finalize) ↔ издатель (только blind_sign) → валидный токен.
-    /// Издатель видит лишь blind_msg; по сети ходят только blind_msg и blind_sig.
+    /// M5 split: клиент (blind→finalize) ↔ издатель (только evaluate) → валидный токен.
+    /// Издатель видит лишь ослеплённый элемент; по сети ходят только он и ответ с DLEQ.
     #[test]
     fn split_issuance_roundtrip() {
-        let (pk, sk) = issuer_keypair(2048).unwrap();
-        let (blind_msg, st) = client_blind(&pk).unwrap(); // клиент
-        let blind_sig = issuer_blind_sign(&sk, &blind_msg).unwrap(); // издатель (вслепую)
-        let token = client_finalize(&pk, &blind_sig, &st).unwrap(); // клиент
-        let nonce = verify_token(&pk, &token).expect("split-токен валиден"); // exit
-        // защита от подделки: blind_sig под другим ключом не финализируется в валидный токен
-        let (pk2, sk2) = issuer_keypair(2048).unwrap();
-        let (bm2, st2) = client_blind(&pk2).unwrap();
-        let bsig2 = issuer_blind_sign(&sk2, &bm2).unwrap();
-        let tok2 = client_finalize(&pk2, &bsig2, &st2).unwrap();
-        assert_ne!(nonce, verify_token(&pk2, &tok2).unwrap(), "nonce разных токенов различны");
-        assert!(verify_token(&pk, &tok2).is_none(), "токен чужого издателя отвергнут");
-    }
+        let key = EpochKey::generate().unwrap();
+        let st = BlindState::new().unwrap(); // клиент
+        let (evaluated, proof) = key.evaluate(&st.blinded_element()).unwrap(); // издатель (вслепую)
+        let token = st.finalize(&key.public_bytes(), &evaluated, &proof).unwrap(); // клиент
+        let ctx = redeem_context(b"exp");
+        let nonce = key.verify_redemption(&token.redeem(&ctx), &ctx).expect("split-токен валиден");
 
-    // robustness/fuzz (M6): verify_token не паникует ни на каком токене/ключе (анти-DoS на malformed).
-    fn xs(seed: &mut u64) -> u64 {
-        let mut x = *seed;
-        x ^= x << 13;
-        x ^= x >> 7;
-        x ^= x << 17;
-        *seed = x;
-        x
-    }
-
-    #[test]
-    fn fuzz_verify_token_no_panic() {
-        let issued = issue_batch(1, 2048).unwrap();
-        let pk = &issued.pk_der;
-        let valid = &issued.tokens[0];
-        let mut s = 0xfeed_face_dead_c0deu64;
-        // случайные токены под валидным ключом (RSA-verify в debug медленный → умеренно итераций)
-        for _ in 0..1_000 {
-            let len = (xs(&mut s) % 600) as usize;
-            let b: Vec<u8> = (0..len).map(|_| (xs(&mut s) >> 33) as u8).collect();
-            assert!(verify_token(pk, &b).is_none() || !b.is_empty()); // главное — без паники
-        }
-        // mutated валидный токен (флип байта)
-        for _ in 0..1_000 {
-            let mut m = valid.clone();
-            let i = (xs(&mut s) as usize) % m.len();
-            m[i] ^= (xs(&mut s) as u8) | 1;
-            let _ = verify_token(pk, &m);
-        }
-        // malformed pk_der тоже не должен ронять верификатор
-        for _ in 0..300 {
-            let len = (xs(&mut s) % 400) as usize;
-            let bad_pk: Vec<u8> = (0..len).map(|_| (xs(&mut s) >> 33) as u8).collect();
-            let _ = verify_token(&bad_pk, valid);
-        }
+        // токен другой эпохи не проходит под этим ключом
+        let key2 = EpochKey::generate().unwrap();
+        let st2 = BlindState::new().unwrap();
+        let (e2, p2) = key2.evaluate(&st2.blinded_element()).unwrap();
+        let tok2 = st2.finalize(&key2.public_bytes(), &e2, &p2).unwrap();
+        let redeem2 = tok2.redeem(&ctx);
+        assert_ne!(nonce, key2.verify_redemption(&redeem2, &ctx).unwrap(), "nonce различны");
+        assert!(key.verify_redemption(&redeem2, &ctx).is_none(), "токен чужого издателя отвергнут");
     }
 }

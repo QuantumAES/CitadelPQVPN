@@ -1,17 +1,21 @@
 //! citadel-token — роли анонимного issuance (M5, issuer↔exit split).
 //!
 //! Режим (env `Citadel_TOKEN_ROLE` или arg[1]):
-//!   `issuer` — сгенерировать ключ, опубликовать issuer.pub, слушать TCP и подписывать ВСЛЕПУЮ
-//!              (издатель видит только blind_msg, не токен). sk остаётся в процессе.
-//!   `client` — подключиться к издателю, интерактивно получить N токенов (blind→sign→finalize),
-//!              записать в файл. Издатель не может связать выданное с предъявленным на exit.
-//!   `batch`  — (legacy) выпустить N токенов в одном процессе → файл (для локального демо/тестов).
+//!   `issuer`  — сгенерировать ключ эпохи, положить его в `issuer-<epoch>.key` (0600), слушать TCP
+//!               и вычислять ВСЛЕПУЮ (издатель видит только ослеплённый элемент, не токен).
+//!   `client`  — подключиться к издателю, интерактивно получить N токенов (blind→evaluate→
+//!               finalize), записать в файл. Издатель не связывает выданное с предъявленным.
+//!   `keysync` — exit-узел на ОТДЕЛЬНОЙ машине забирает ключ текущей эпохи (P1), доказав свою
+//!               keysync-идентичность. Раньше назывался `pubsync` и ходил без аутентификации —
+//!               в схеме v2 (M-6) ключ эпохи секретен, см. `citadel_token::fetch_epoch_key`.
+//!   `batch`   — (legacy) выпустить N токенов в одном процессе → файл (для локального демо/тестов).
 //!
 //! CLI-подкоманды (arg[1], вне env-роли): `registry` — оффлайн-правка Layer-1 реестра на сервере
 //! (C5.5); `admin` — те же операции ПО СЕТЕВОМУ admin-каналу (PQ-TLS+pin, домен+EKM; C7.5) — путь
 //! GUI, обычно через туннель к ADMIN_VIP.
 //!
-//! Сетевой формат: кадр `u32(len, BE) ‖ payload`; запрос — blind_msg, ответ — blind_sig.
+//! Сетевой формат: кадр `u32(len, BE) ‖ payload`; запрос — ослеплённый элемент (32 Б), ответ —
+//! `evaluated(32) ‖ DLEQ(64)`.
 
 use std::collections::HashMap;
 use std::io::Write;
@@ -537,19 +541,25 @@ fn main() -> Result<()> {
     match role.as_str() {
         "issuer" | "serve" => run_issuer(),
         "client" | "fetch" => run_client_fetch(),
-        "pubsync" => run_pubsync(),
+        "keysync" => run_keysync(),
+        // M-6: `pubsync` тянул ПУБЛИЧНЫЙ ключ эпохи без аутентификации. Молча принять старое имя
+        // значило бы оставить exit без ключа (или, хуже, с чужим) — отказ с объяснением честнее.
+        "pubsync" => Err(anyhow::anyhow!(
+            "роль `pubsync` заменена на `keysync`: ключ эпохи стал секретом (схема токенов v2, M-6). \
+             Нужен Citadel_KEYSYNC_SEED, выданный установкой издателя (поле KEYSYNC_SEED в бандле)"
+        )),
         "pubkey" => run_pubkey(),
         "batch" => run_batch(),
         other => Err(anyhow::anyhow!(
-            "Citadel_TOKEN_ROLE должен быть issuer|client|pubsync|pubkey|batch (или arg[1]=registry), а не {other:?}"
+            "Citadel_TOKEN_ROLE должен быть issuer|client|keysync|pubkey|batch (или arg[1]=registry), а не {other:?}"
         )),
     }
 }
 
-/// C5.1: ключ издателя на ТЕКУЩУЮ эпоху (`(epoch, pk_der, sk_der)`) под Mutex — фоновая ротация
-/// меняет его при смене эпохи. Токены становятся epoch-scoped: exit примет их только ключом
-/// текущей±прошлой эпохи → «гаснут» к концу эпохи (отзыв по времени, M6).
-type EpochKey = (u64, Vec<u8>, Vec<u8>);
+/// C5.1: ключ издателя на ТЕКУЩУЮ эпоху (`(epoch, key)`) под Mutex — фоновая ротация меняет его
+/// при смене эпохи. Токены epoch-scoped: exit примет их только ключом текущей±прошлой эпохи →
+/// «гаснут» к концу эпохи (отзыв по времени, M6).
+type EpochState = (u64, Arc<citadel_token::EpochKey>);
 
 /// S2.4/A6: счётчик выданных токенов `client_id → (эпоха, число)` (анти-фарминг, per-epoch).
 type QuotaMap = HashMap<[u8; 32], (u64, u32)>;
@@ -560,19 +570,82 @@ type QuotaMap = HashMap<[u8; 32], (u64, u32)>;
 /// который видит его при Layer-1).
 type LeaseMap = HashMap<[u8; 32], u64>;
 
-/// Опубликовать pub эпохи (`issuer-<epoch>.pub`) + `issuer.pub` (= current, back-compat не-epoch exit).
-fn publish_epoch_pub(dir: &str, epoch: u64, pk: &[u8]) -> Result<()> {
-    std::fs::write(format!("{dir}/{}", citadel_token::epoch_pub_name(epoch)), pk)
-        .with_context(|| format!("публикация pub эпохи {epoch}"))?;
-    std::fs::write(format!("{dir}/issuer.pub"), pk).context("issuer.pub (back-compat = current)")?;
+/// Положить ключ эпохи (`issuer-<epoch>.key`) + `issuer.key` (= current) на общий том — оттуда его
+/// читает exit, стоящий на ТОЙ ЖЕ машине.
+///
+/// **Права важнее, чем кажется (M-6).** В схеме v1 здесь лежал публичный RSA-ключ, и режим 0644 был
+/// безобиден. В v2 это секрет эпохи: кто его прочитал — тот чеканит токены. Но и «просто 0600»
+/// нельзя: exit сбрасывает привилегии до `nobody` (F4, `citadel-m1:drop_privileges`) и читает файл
+/// уже под ними, поэтому файл, доступный только владельцу-издателю, оставил бы exit без ключа —
+/// то есть без проверки токенов вообще.
+///
+/// Компромисс: `0640`, группа — `Citadel_KEY_GID` (по умолчанию 65534 = та, в которую садится
+/// exit). Прочитать может издатель и exit, но не произвольный пользователь хоста. Если сменить
+/// группу не удалось (издатель уже не root), остаётся `0600` и **громкое предупреждение** —
+/// молчаливый откат к 0644 был бы худшим из вариантов.
+///
+/// Пишем во временный файл и переименовываем: между `write` и `set_permissions` иначе существует
+/// окно, в котором секрет лежит с правами по umask, а exit читает каталог в цикле.
+fn publish_epoch_key(dir: &str, epoch: u64, key: &[u8]) -> Result<()> {
+    for name in [citadel_token::epoch_key_name(epoch), "issuer.key".into()] {
+        let path = format!("{dir}/{name}");
+        let tmp = format!("{path}.tmp");
+        std::fs::write(&tmp, key).with_context(|| format!("публикация ключа эпохи {epoch}"))?;
+        restrict_epoch_key(&tmp);
+        std::fs::rename(&tmp, &path).with_context(|| format!("публикация ключа эпохи {epoch}"))?;
+    }
     Ok(())
 }
 
-/// Издатель (биллинг): держит sk текущей эпохи, слепо подписывает по TCP; ротирует ключ по эпохам.
+/// Права на файл ключа эпохи: `0640`, группа = `Citadel_KEY_GID` (см. [`publish_epoch_key`]).
+///
+/// Штатный путь — **издатель уже работает с нужной группой** (в compose это `user: "0:65534"`, та
+/// же группа, в которую садится exit): тогда файл рождается с ней и менять владельца не нужно.
+/// Это существенно: после M-4 у контейнера издателя `cap_drop: ALL`, то есть `CAP_CHOWN` у него
+/// нет и `chown` заведомо не пройдёт. `chown` остаётся запасным путём для запуска вне докера.
+fn restrict_epoch_key(path: &str) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = |m| std::fs::set_permissions(path, std::fs::Permissions::from_mode(m));
+        let _ = mode(0o600);
+        let gid: libc::gid_t =
+            std::env::var("Citadel_KEY_GID").ok().and_then(|s| s.parse().ok()).unwrap_or(65534);
+        // SAFETY: getegid без побочных эффектов.
+        let own_gid = unsafe { libc::getegid() };
+        let ok = own_gid == gid || {
+            match std::ffi::CString::new(path) {
+                // SAFETY: путь — валидная C-строка; uid -1 = «не менять владельца».
+                Ok(c) => (unsafe { libc::chown(c.as_ptr(), u32::MAX, gid) }) == 0,
+                Err(_) => false,
+            }
+        };
+        if ok {
+            let _ = mode(0o640);
+        } else {
+            static WARNED: AtomicBool = AtomicBool::new(false);
+            if !WARNED.swap(true, Ordering::Relaxed) {
+                eprintln!(
+                    "[issuer] ВНИМАНИЕ: ключ эпохи остаётся 0600 — группа {gid} не выставлена \
+                     (своя gid={own_gid}, chown: {}). exit на этой же машине его НЕ прочитает и \
+                     будет отказывать всем токенам. Запустите издателя с этой группой \
+                     (в compose: user: \"0:{gid}\") либо согласуйте Citadel_KEY_GID с \
+                     Citadel_DROP_GID exit'а.",
+                    std::io::Error::last_os_error()
+                );
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = path;
+}
+
+/// Издатель (биллинг): держит ключ текущей эпохи, вычисляет вслепую по TCP; ротирует по эпохам.
 fn run_issuer() -> Result<()> {
     // M-4: root издателю не нужен — роняем привилегии ДО создания файлов и открытия сокетов.
+    // NB: при заданном `Citadel_DROP_UID` издатель теряет право сменить группу файла ключа эпохи —
+    // см. предупреждение в `restrict_epoch_key`; в докере привилегии режет compose, а не setuid.
     drop_privileges()?;
-    let bits = 2048;
     let epoch_secs: u64 =
         std::env::var("Citadel_EPOCH_SECS").ok().and_then(|s| s.parse().ok()).unwrap_or(3600);
     let dir = token_dir();
@@ -637,14 +710,16 @@ fn run_issuer() -> Result<()> {
     }
 
     let e = citadel_token::current_epoch(epoch_secs);
-    eprintln!("[issuer] эпоха {e} (длина {epoch_secs}с); генерирую ключ (RSA-{bits}, ~10с)…");
-    let (pk, sk) = citadel_token::issuer_keypair(bits)?;
-    publish_epoch_pub(&dir, e, &pk)?;
-    eprintln!("[issuer] эпоха {e}: pub опубликован → {dir} (sk остаётся в процессе)");
-    let state: Arc<Mutex<EpochKey>> = Arc::new(Mutex::new((e, pk, sk)));
+    let key = citadel_token::EpochKey::generate()?;
+    publish_epoch_key(&dir, e, &key.secret_bytes())?;
+    eprintln!(
+        "[issuer] эпоха {e} (длина {epoch_secs}с): ключ сгенерирован и положен в {dir} (0640, секрет)"
+    );
+    let state: Arc<Mutex<EpochState>> = Arc::new(Mutex::new((e, Arc::new(key))));
 
-    // Фоновая ротация: при смене эпохи генерим новый ключ и публикуем (keygen ВНЕ лока, чтобы
-    // не блокировать подписание; прошлый pub оставляем на диске для grace на exit).
+    // Фоновая ротация: при смене эпохи генерим новый ключ и публикуем (прошлый ключ оставляем на
+    // диске для grace на exit'е). В схеме v2 генерация — микросекунды (был RSA-keygen ~10 с), так
+    // что отдельная забота «не держать лок во время keygen» больше не нужна.
     {
         let state = state.clone();
         let dir = dir.clone();
@@ -655,14 +730,14 @@ fn run_issuer() -> Result<()> {
                 continue;
             }
             eprintln!("[issuer] эпоха сменилась → {ce}; ротация ключа…");
-            match citadel_token::issuer_keypair(bits) {
-                Ok((npk, nsk)) => {
-                    if publish_epoch_pub(&dir, ce, &npk).is_ok() {
-                        *state.lock().unwrap() = (ce, npk, nsk);
-                        eprintln!("[issuer] эпоха {ce}: ключ ротирован, pub опубликован");
+            match citadel_token::EpochKey::generate() {
+                Ok(nk) => {
+                    if publish_epoch_key(&dir, ce, &nk.secret_bytes()).is_ok() {
+                        *state.lock().unwrap() = (ce, Arc::new(nk));
+                        eprintln!("[issuer] эпоха {ce}: ключ ротирован и опубликован");
                     }
                 }
-                Err(err) => eprintln!("[issuer] keygen при ротации не удался: {err}"),
+                Err(err) => eprintln!("[issuer] генерация ключа при ротации не удалась: {err}"),
             }
         });
     }
@@ -688,8 +763,19 @@ fn run_issuer() -> Result<()> {
     let listen = std::env::var("Citadel_TOKEN_LISTEN").unwrap_or_else(|_| "0.0.0.0:7000".into());
     let listener = TcpListener::bind(&listen).with_context(|| format!("bind {listen}"))?;
     eprintln!(
-        "[issuer] слепое подписание на {listen} (blind RSA-{bits}, epoch-scoped, PQ-TLS+pin, \
+        "[issuer] слепая выдача на {listen} (VOPRF ristretto255, epoch-scoped, PQ-TLS+pin, \
          гибридная PQ-аутентификация сторон)"
+    );
+    // M-6: keysync — раздача ключа эпохи exit-узлу на ДРУГОЙ машине. Ключ секретен, поэтому без
+    // настроенного id канал закрыт (fail-closed): при раздельном деплое установщик кладёт сюда id,
+    // при совмещённом — раздачи по сети просто нет, exit читает файл с тома.
+    let keysync_id = parse_hex32(std::env::var("Citadel_KEYSYNC_ID").ok().as_ref(), "Citadel_KEYSYNC_ID").ok();
+    eprintln!(
+        "[issuer] keysync (ключ эпохи по сети для отдельного exit'а): {}",
+        match &keysync_id {
+            Some(id) => format!("для id {}…", &hex::encode(id)[..12]),
+            None => "выкл (Citadel_KEYSYNC_ID не задан — совмещённый деплой)".into(),
+        }
     );
     // H-1: гейт pre-auth соединений + таймауты/дедлайн хендшейка (см. модуль выше).
     let gate = Gate::new(MAX_PREAUTH, MAX_PREAUTH_PER_IP);
@@ -702,7 +788,7 @@ fn run_issuer() -> Result<()> {
     accept_loop(listener, "выдача токенов", gate, move |stream, pass, ctl| {
         if let Err(e) = serve_client(
             stream, pass, ctl, scfg.clone(), &pq, &cert_pin, &state, &dir, &quota, max_per_epoch,
-            &lease, lease_secs, obfs_psk,
+            &lease, lease_secs, obfs_psk, keysync_id.as_ref(),
         ) {
             citadel_token::dlog!("[issuer] соединение завершено: {e}");
         }
@@ -760,13 +846,14 @@ fn serve_client(
     scfg: Arc<rustls::ServerConfig>,
     pq: &citadel_token::pqid::IssuerPqIdentity,
     cert_pin: &[u8; 32],
-    state: &Mutex<EpochKey>,
+    state: &Mutex<EpochState>,
     dir: &str,
     quota: &Mutex<QuotaMap>,
     max_per_epoch: u32,
     lease: &Mutex<LeaseMap>,
     lease_secs: u64,
     obfs_psk: Option<[u8; 32]>,
+    keysync_id: Option<&[u8; 32]>,
 ) -> Result<()> {
     let peer = tcp.peer_addr().ok();
     // S2.1/A1: поднять PQ-TLS поверх TCP ДО любого обмена — Layer-1 и слепая выдача идут в шифре
@@ -783,13 +870,29 @@ fn serve_client(
     // Первый кадр клиента типизирован: абонент аутентифицируется, exit-узел просит ключ эпохи.
     let frame = read_frame(&mut conn)?;
     let auth = match citadel_token::pqid::parse_client_frame(&frame)? {
-        citadel_token::pqid::ClientFrame::EpochPub => {
-            // Раздельный деплой: exit на другой машине подтягивает публичный ключ эпохи (общего
-            // тома /shared у него нет). Ключ публичен; личность спрашивать не за чем, а канал уже
-            // отфильтрован obfs-PSK и PQ-TLS с пиннингом. Отдаём и закрываем.
-            let cur_pub = state.lock().unwrap().1.clone();
-            write_frame(&mut conn, &cur_pub)?;
-            citadel_token::dlog!("[issuer] отдан публичный ключ эпохи (pubsync exit-узла)");
+        citadel_token::pqid::ClientFrame::KeySync(auth) => {
+            // Раздельный деплой (P1): exit на другой машине подтягивает ключ эпохи — общего тома
+            // /shared у него нет. M-6: ключ СЕКРЕТЕН, поэтому здесь полноценная аутентификация, а
+            // не «раз дошёл — держи»: доказательство владения keysync-seed'ом в своём домене плюс
+            // сверка id с настроенным. Не настроен id — канал закрыт (fail-closed).
+            let Some(expect) = keysync_id else {
+                anyhow::bail!("keysync запрошен, но Citadel_KEYSYNC_ID не настроен — отказ");
+            };
+            let id = citadel_token::pqid::verify_hybrid(
+                auth,
+                citadel_token::pqid::DOMAIN_KEYSYNC,
+                &challenge,
+                &ekm,
+            )
+            .context("keysync: аутентификация exit-узла")?;
+            if &id != expect {
+                anyhow::bail!("keysync: чужая идентичность — отказ");
+            }
+            ctl.authenticated();
+            drop(pass);
+            let cur = state.lock().unwrap().1.clone();
+            write_frame(&mut conn, &cur.secret_bytes())?;
+            citadel_token::dlog!("[issuer] отдан ключ эпохи (keysync exit-узла)");
             return Ok(());
         }
         citadel_token::pqid::ClientFrame::Auth(a) => a,
@@ -822,19 +925,23 @@ fn serve_client(
         );
         return Ok(());
     }
-    // C5.3: отдаём клиенту ТЕКУЩИЙ epoch-pub (клиент ослепляет под актуальным ключом).
-    let cur_pub = state.lock().unwrap().1.clone();
-    write_frame(&mut conn, &cur_pub)?;
+    // C5.3: отдаём клиенту публичный элемент K ТЕКУЩЕЙ эпохи — под ним он проверит DLEQ каждой
+    // выдачи (и заметит, если издатель применит не тот ключ).
+    let cur = state.lock().unwrap().1.clone();
+    write_frame(&mut conn, &cur.public_bytes())?;
 
     let mut n = 0u32;
     // клиент закрыл соединение → read_frame вернёт Err → выходим из цикла
-    while let Ok(blind_msg) = read_frame(&mut conn) {
+    while let Ok(blinded) = read_frame(&mut conn) {
         // S2.4/A6: квота токенов на client_id за эпоху. Без неё один «абонемент» чеканил бы
         // неограниченно токенов → раздача безлимиту фрирайдеров за эпоху (epoch+double-spend
         // режут повтор ОДНОГО токена, но не число разных). Счётчик per-(client_id, эпоха),
         // сбрасывается со сменой эпохи. In-RAM (как spent-set exit'а): рестарт обнуляет, но
         // квота epoch-bounded. Достигнут потолок → прекращаем выдачу этому клиенту в эту эпоху.
-        let cur_epoch = state.lock().unwrap().0;
+        let (cur_epoch, key) = {
+            let s = state.lock().unwrap();
+            (s.0, s.1.clone())
+        };
         if !quota_grant(&mut quota.lock().unwrap(), client_id, cur_epoch, max_per_epoch) {
             citadel_token::dlog!(
                 "[issuer] квота исчерпана: {}… уже получил {max_per_epoch} токен(ов) в эпоху {cur_epoch} — стоп",
@@ -842,13 +949,14 @@ fn serve_client(
             );
             break;
         }
-        // sk текущей эпохи (клонируем, чтобы не держать лок во время RSA-подписи)
-        let sk = state.lock().unwrap().2.clone();
-        let blind_sig = citadel_token::issuer_blind_sign(&sk, &blind_msg)?;
-        write_frame(&mut conn, &blind_sig)?;
+        // Слепое вычисление под ключом ТЕКУЩЕЙ эпохи + DLEQ. Ключ мог смениться между выдачами
+        // (ротация в фоне) — тогда клиент получит элемент под новым K и, не сойдясь с прежним,
+        // явно откажется; это лучше, чем молча выданный токен, который exit не примет.
+        let (evaluated, proof) = key.evaluate(&blinded)?;
+        write_frame(&mut conn, &[evaluated, proof].concat())?;
         n += 1;
     }
-    citadel_token::dlog!("[issuer] клиент {peer:?}: подписано вслепую {n} токен(ов)");
+    citadel_token::dlog!("[issuer] клиент {peer:?}: выдано вслепую {n} токен(ов)");
     Ok(())
 }
 
@@ -878,9 +986,9 @@ fn run_client_fetch() -> Result<()> {
     let dir = token_dir();
     // S2.1/A1-остаток: obfs-обёртка канала (probe-resistance) — PSK из env, обязан совпасть с issuer.
     let obfs_psk = obfs_psk_from_env();
-    eprintln!("[client] Layer-1 issuance у издателя {issuer} ({count} токенов, PQ-TLS+pin{}, blind epoch-scoped)…",
+    eprintln!("[client] Layer-1 issuance у издателя {issuer} ({count} токенов, PQ-TLS+pin{}, VOPRF epoch-scoped)…",
         if obfs_psk.is_some() { "+obfs" } else { "" });
-    // C5.3: весь протокол (Layer-1 auth + получение текущего epoch-pub + слепая выдача) — в citadel_token.
+    // C5.3: весь протокол (Layer-1 auth + получение K текущей эпохи + слепая выдача) — в citadel_token.
     let tokens =
         citadel_token::fetch_tokens(&issuer, &issuer_pin, &issuer_mldsa, &seed, count, 20, obfs_psk)?;
 
@@ -904,21 +1012,25 @@ fn run_pubkey() -> Result<()> {
     Ok(())
 }
 
-/// **pubsync** — синхронизация публичного ключа эпохи для exit-узла на ОТДЕЛЬНОЙ машине (P1).
+/// **keysync** — синхронизация ключа эпохи для exit-узла на ОТДЕЛЬНОЙ машине (P1). Бывший
+/// `pubsync`; переименован вместе со сменой схемы токенов (M-6), потому что синхронизируется теперь
+/// **секрет**, а не публичный ключ.
 ///
-/// Когда exit и издатель стоят на одном сервере, exit читает `issuer-<epoch>.pub` с общего тома.
+/// Когда exit и издатель стоят на одном сервере, exit читает `issuer-<epoch>.key` с общего тома.
 /// При раздельном деплое общего тома нет, а ключ ротируется каждую эпоху — этот режим и закрывает
 /// разрыв: раз в интервал подтягивает текущий ключ у издателя (obfs + PQ-TLS с пиннингом +
-/// проверка ML-DSA-идентичности издателя) и кладёт его туда, откуда exit читает.
+/// проверка ML-DSA-идентичности издателя + **своя** keysync-идентичность) и кладёт его туда,
+/// откуда exit читает.
 ///
 /// Живёт рядом с exit'ом (отдельный контейнер того же compose), а не внутри exit-процесса: у того
 /// сброшены привилегии и он намеренно ничего не тянет из сети сам.
 ///
 /// Env: `Citadel_TOKEN_ISSUER` (host:port), `Citadel_ISSUER_PIN`, `Citadel_ISSUER_MLDSA`,
-///      `Citadel_TOKEN_DIR` (куда писать), `Citadel_EPOCH_SECS` (та же длина эпохи, что у издателя),
-///      `Citadel_OBFS_PSK`, `Citadel_PUBSYNC_INTERVAL` (сек; по умолчанию — восьмая часть эпохи,
-///      но не реже минуты и не чаще раза в 15 с).
-fn run_pubsync() -> Result<()> {
+///      `Citadel_KEYSYNC_SEED` (32 Б hex — выдаёт установка издателя), `Citadel_TOKEN_DIR`,
+///      `Citadel_EPOCH_SECS` (та же длина эпохи, что у издателя), `Citadel_OBFS_PSK`,
+///      `Citadel_KEYSYNC_INTERVAL` (сек; по умолчанию — восьмая часть эпохи, но не реже минуты и
+///      не чаще раза в 15 с).
+fn run_keysync() -> Result<()> {
     let issuer = std::env::var("Citadel_TOKEN_ISSUER").context("Citadel_TOKEN_ISSUER не задан")?;
     let issuer_pin = parse_hex32(
         std::env::var("Citadel_ISSUER_PIN").ok().as_ref(),
@@ -928,38 +1040,49 @@ fn run_pubsync() -> Result<()> {
         std::env::var("Citadel_ISSUER_MLDSA").ok().as_ref(),
         "Citadel_ISSUER_MLDSA (обязательство PQ-идентичности издателя, 64 hex)",
     )?;
+    let keysync_seed = parse_hex32(
+        std::env::var("Citadel_KEYSYNC_SEED").ok().as_ref(),
+        "Citadel_KEYSYNC_SEED (идентичность exit-узла для получения ключа эпохи, 64 hex)",
+    )?;
     let dir = token_dir();
     let epoch_secs: u64 =
         std::env::var("Citadel_EPOCH_SECS").ok().and_then(|s| s.parse().ok()).unwrap_or(3600);
-    let interval = std::env::var("Citadel_PUBSYNC_INTERVAL")
+    let interval = std::env::var("Citadel_KEYSYNC_INTERVAL")
         .ok()
         .and_then(|s| s.parse::<u64>().ok())
         .unwrap_or_else(|| (epoch_secs / 8).clamp(15, 60));
     let obfs_psk = obfs_psk_from_env();
     eprintln!(
-        "[pubsync] издатель {issuer}, каталог {dir}, эпоха {epoch_secs}с, опрос раз в {interval}с{}",
+        "[keysync] издатель {issuer}, каталог {dir}, эпоха {epoch_secs}с, опрос раз в {interval}с{}",
         if obfs_psk.is_some() { " (obfs)" } else { "" }
     );
 
-    let mut last: Option<(u64, Vec<u8>)> = None;
+    let mut last: Option<u64> = None;
     loop {
         let epoch = citadel_token::current_epoch(epoch_secs);
         // Уже есть ключ ЭТОЙ эпохи — не дёргаем издателя лишний раз (сеть + его accept-петля).
-        let need = !matches!(&last, Some((e, _)) if *e == epoch);
-        if need {
-            match citadel_token::fetch_epoch_pub(&issuer, &issuer_pin, &issuer_mldsa, 3, obfs_psk) {
-                Ok(pk) => {
-                    if let Err(e) = publish_epoch_pub(&dir, epoch, &pk) {
-                        eprintln!("[pubsync] ключ эпохи {epoch} получен, но не записан: {e:#}");
+        if last != Some(epoch) {
+            match citadel_token::fetch_epoch_key(
+                &issuer,
+                &issuer_pin,
+                &issuer_mldsa,
+                &keysync_seed,
+                3,
+                obfs_psk,
+            ) {
+                Ok(key) => {
+                    if let Err(e) = publish_epoch_key(&dir, epoch, &key) {
+                        eprintln!("[keysync] ключ эпохи {epoch} получен, но не записан: {e:#}");
                     } else {
-                        eprintln!("[pubsync] ключ эпохи {epoch} обновлён ({} Б)", pk.len());
-                        last = Some((epoch, pk));
+                        // no-logs и гигиена секрета: длину ключа не печатаем, сам ключ — тем более.
+                        eprintln!("[keysync] ключ эпохи {epoch} обновлён");
+                        last = Some(epoch);
                     }
                 }
                 // Издатель недоступен — не фатально: exit продолжает работать на ключе прошлой
                 // эпохи (grace current±prev), а мы повторим через интервал. Валиться нельзя:
                 // рестарт-петля контейнера ничего не чинит, а логи забивает.
-                Err(e) => eprintln!("[pubsync] не удалось получить ключ эпохи {epoch}: {e:#}"),
+                Err(e) => eprintln!("[keysync] не удалось получить ключ эпохи {epoch}: {e:#}"),
             }
         }
         std::thread::sleep(std::time::Duration::from_secs(interval.max(5)));
@@ -967,17 +1090,23 @@ fn run_pubsync() -> Result<()> {
 }
 
 /// Legacy: выпуск пачки токенов в одном процессе → файлы (локальное демо/тесты, без сети).
+///
+/// **Токены здесь не привязаны к сессии** (контекст предъявления известен только в момент
+/// подключения), поэтому файл содержит `nonce‖y` — материал, из которого клиент считает
+/// предъявление сам. Режим офлайновый и остаётся демонстрационным.
 fn run_batch() -> Result<()> {
     let count = token_count();
     let dir = token_dir();
-    eprintln!("[issuer:batch] выпускаю {count} токенов (blind RSA-2048) → {dir}");
-    let issued = citadel_token::issue_batch(count, 2048)?;
-    std::fs::write(format!("{dir}/issuer.pub"), &issued.pk_der).context("запись issuer.pub")?;
+    eprintln!("[issuer:batch] выпускаю {count} токенов (VOPRF ristretto255) → {dir}");
+    let issued = citadel_token::issue_batch(count)?;
+    let key_path = format!("{dir}/issuer.key");
+    std::fs::write(&key_path, &issued.epoch_key).context("запись issuer.key")?;
+    restrict_epoch_key(&key_path);
     let mut f = std::fs::File::create(format!("{dir}/tokens")).context("запись tokens")?;
     for t in &issued.tokens {
         writeln!(f, "{}", hex::encode(t))?;
     }
-    eprintln!("[issuer:batch] готово: issuer.pub + {} токенов", issued.tokens.len());
+    eprintln!("[issuer:batch] готово: issuer.key + {} токенов", issued.tokens.len());
     Ok(())
 }
 

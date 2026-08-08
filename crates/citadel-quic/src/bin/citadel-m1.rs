@@ -136,13 +136,13 @@ fn open_tun() -> Result<Arc<Tun>> {
     Ok(tun)
 }
 
-/// L1-obfs PSK из env `Citadel_OBFS_PSK` (делегирует в `config::parse_obfs_psk`).
+/// L1-obfs PSK из env `Citadel_OBFS_PSK` (делегирует в `config::env_obfs_psk`).
 /// Используется серверной и probe-ролями; клиентский путь берёт `ClientConfig::obfs_psk`.
-fn obfs_psk() -> Option<[u8; 32]> {
-    std::env::var("Citadel_OBFS_PSK")
-        .ok()
-        .as_deref()
-        .and_then(citadel_quic::config::parse_obfs_psk)
+///
+/// M-7: негодное значение — ошибка, а не «obfs выключен». Иначе опечатка в PSK поднимала бы
+/// сервер БЕЗ L1-слоя, и это выглядело бы как штатный запуск.
+fn obfs_psk() -> Result<Option<[u8; 32]>> {
+    citadel_quic::config::env_obfs_psk()
 }
 
 /// F4: сброс привилегий до nobody (def 65534) после привилегированной настройки сети.
@@ -315,9 +315,13 @@ fn read_pin_for(host: &str) -> PinMode {
 //   C0.4 — host_of/connect_server/try_quic_connect/client_request_address → client.
 // В бинаре остаются серверная роль, probe/auth-probe и Linux NetConfigurator (ip/iptables/DNS).
 
-/// C5.1: как exit проверяет анонимный токен. `Epoch` читает pub'ы текущей±прошлой эпохи из dir и
-/// верифицирует под ними (токен «гаснет» к концу эпохи → отзыв по времени, M6). `Legacy` — единый
-/// pub (не-epoch, back-compat). `Disabled` — токены выключены (`Citadel_ISSUER_PUB` не задан).
+/// C5.1: как exit проверяет анонимный токен. `Epoch` читает ключи текущей±прошлой эпохи из dir
+/// (токен «гаснет» к концу эпохи → отзыв по времени, M6). `Legacy` — единый ключ (не-epoch).
+/// `Disabled` — токены выключены (`Citadel_ISSUER_KEY` не задан).
+///
+/// **M-6:** ключ эпохи стал секретом (схема v2, VOPRF), а переменная — `Citadel_ISSUER_KEY`.
+/// Старое имя `Citadel_ISSUER_PUB` намеренно не работает молча: тихо проигнорировать его значило
+/// бы «токены выключены» — то есть exit, пускающий кого угодно, при внешне исправном конфиге.
 enum IssuerAuth {
     Disabled,
     Legacy(Vec<u8>),
@@ -325,46 +329,68 @@ enum IssuerAuth {
 }
 
 impl IssuerAuth {
-    fn from_env() -> Self {
-        let Ok(pub_path) = std::env::var("Citadel_ISSUER_PUB") else {
-            return IssuerAuth::Disabled;
+    fn from_env() -> Result<Self> {
+        let key_path = match std::env::var("Citadel_ISSUER_KEY") {
+            Ok(p) => p,
+            Err(_) => {
+                if std::env::var_os("Citadel_ISSUER_PUB").is_some() {
+                    return Err(anyhow!(
+                        "Citadel_ISSUER_PUB больше не поддерживается: ключ эпохи стал секретом \
+                         (схема токенов v2, M-6). Переименуйте переменную в Citadel_ISSUER_KEY и \
+                         укажите путь к issuer.key — иначе exit молча перестал бы требовать токены"
+                    ));
+                }
+                return Ok(IssuerAuth::Disabled);
+            }
         };
-        match std::env::var("Citadel_EPOCH_SECS").ok().and_then(|s| s.parse::<u64>().ok()) {
+        Ok(match std::env::var("Citadel_EPOCH_SECS").ok().and_then(|s| s.parse::<u64>().ok()) {
             Some(epoch_secs) => {
-                let dir = std::path::Path::new(&pub_path)
+                let dir = std::path::Path::new(&key_path)
                     .parent()
                     .map(|p| p.to_string_lossy().into_owned())
                     .unwrap_or_else(|| ".".into());
                 IssuerAuth::Epoch { dir, epoch_secs }
             }
-            None => match std::fs::read(&pub_path) {
-                Ok(pk) => IssuerAuth::Legacy(pk),
-                Err(_) => IssuerAuth::Disabled,
+            None => match std::fs::read(&key_path) {
+                Ok(k) => IssuerAuth::Legacy(k),
+                Err(e) => {
+                    // Fail-closed: путь задан, а файла нет — это ошибка конфигурации, а не «токены
+                    // не нужны». Прежний код в этом случае возвращал Disabled (M-1 того же рода).
+                    return Err(anyhow!("Citadel_ISSUER_KEY={key_path}: {e}"));
+                }
             },
-        }
+        })
     }
 
     fn enabled(&self) -> bool {
         !matches!(self, IssuerAuth::Disabled)
     }
 
-    /// Проверить токен → `(nonce для double-spend, epoch-бакет для prune)` или None (невалид/чужая
-    /// эпоха). Legacy → бакет `0` (не истекает, не чистится); Epoch → текущая эпоха (C5: бакеты старше
-    /// current-1 можно чистить — токен той эпохи всё равно не пройдёт verify под current±prev ключами).
-    fn verify(&self, token: &[u8]) -> Option<([u8; 32], u64)> {
+    /// Проверить предъявление токена → `(nonce для double-spend, epoch-бакет для prune)` или None
+    /// (невалид/чужая эпоха/чужая сессия). Legacy → бакет `0` (не истекает, не чистится); Epoch →
+    /// текущая эпоха (C5: бакеты старше current-1 можно чистить — токен той эпохи всё равно не
+    /// пройдёт проверку под current±prev ключами).
+    ///
+    /// `ctx` — контекст ЭТОЙ сессии (`citadel_token::redeem_context`): без него предъявление не
+    /// проверяется вовсе, поэтому привязка к сессии не может быть «забыта» на вызывающей стороне.
+    fn verify(&self, redeem: &[u8], ctx: &[u8]) -> Option<([u8; 32], u64)> {
         match self {
             IssuerAuth::Disabled => None,
-            IssuerAuth::Legacy(pk) => citadel_token::verify_token(pk, token).map(|n| (n, 0)),
+            IssuerAuth::Legacy(raw) => citadel_token::EpochKey::from_secret(raw)
+                .ok()?
+                .verify_redemption(redeem, ctx)
+                .map(|n| (n, 0)),
             IssuerAuth::Epoch { dir, epoch_secs } => {
                 let e = citadel_token::current_epoch(*epoch_secs);
                 // current + prev (grace на границе эпохи / скью часов); старее — не принимаем.
-                let pubs: Vec<Vec<u8>> = [e, e.wrapping_sub(1)]
+                let keys: Vec<citadel_token::EpochKey> = [e, e.wrapping_sub(1)]
                     .iter()
                     .filter_map(|ep| {
-                        std::fs::read(format!("{dir}/{}", citadel_token::epoch_pub_name(*ep))).ok()
+                        std::fs::read(format!("{dir}/{}", citadel_token::epoch_key_name(*ep))).ok()
                     })
+                    .filter_map(|raw| citadel_token::EpochKey::from_secret(&raw).ok())
                     .collect();
-                citadel_token::verify_token_multi(&pubs, token).map(|n| (n, e))
+                citadel_token::verify_redemption_multi(&keys, redeem, ctx).map(|n| (n, e))
             }
         }
     }
@@ -450,9 +476,12 @@ async fn server_assign_address(
             let token = &body[n..tok_end];
             let rest = &body[tok_end..];
 
-            // F-M4/C5.1: per-user auth анонимным epoch-scoped токеном (если издатель задан)
+            // F-M4/C5.1: per-user auth анонимным epoch-scoped токеном (если издатель задан).
+            // M-6: предъявление проверяется В КОНТЕКСТЕ ЭТОЙ сессии (TLS-exporter), поэтому
+            // перехваченное на другом плече релея сюда не подойдёт (остаток H-2).
             if issuer.enabled() {
-                match issuer.verify(token) {
+                let ctx = citadel_token::redeem_context(&exporter);
+                match issuer.verify(token, &ctx) {
                     Some((tn, epoch)) => {
                         if !spend_token(spent, tn, epoch) {
                             return Err(anyhow!("токен уже использован (double-spend)"));
@@ -567,7 +596,7 @@ async fn run_server(tun: Arc<Tun>) -> Result<()> {
     }
     // S0.3/H1: клон серверного QUIC-конфига (тот же серт/pin!) для endpoint'ов поверх obfs-TCP.
     let tcp_server_cfg = cfg.clone();
-    let ep = match obfs_psk() {
+    let ep = match obfs_psk()? {
         Some(psk) => {
             eprintln!("[Citadel-m1:server] obfs L1 включён (probe-resistance + анти-DPI)");
             citadel_quic::server_endpoint_obfs(listen, cfg, psk)?
@@ -576,9 +605,9 @@ async fn run_server(tun: Arc<Tun>) -> Result<()> {
     };
     eprintln!("[Citadel-m1:server] слушаю {listen} (KX=X25519MLKEM768)");
 
-    let issuer_auth = Arc::new(IssuerAuth::from_env());
+    let issuer_auth = Arc::new(IssuerAuth::from_env()?);
     if issuer_auth.enabled() {
-        eprintln!("[Citadel-m1:server] per-user epoch-токены включены (C5.1)");
+        eprintln!("[Citadel-m1:server] per-user epoch-токены включены (C5.1, VOPRF v2)");
     }
     // C5: spent-токены по epoch-бакетам (prune старых эпох → без утечки памяти на долгом exit).
     let spent: Arc<Mutex<HashMap<u64, HashSet<[u8; 32]>>>> = Arc::new(Mutex::new(HashMap::new()));
@@ -626,7 +655,7 @@ async fn run_server(tun: Arc<Tun>) -> Result<()> {
 
     // TCP-fallback listener (M4): bind ДО сброса привилегий (порт <1024). Только при obfs PSK
     // (obfs-over-TCP использует тот же L1). Включается env `Citadel_TCP_LISTEN` (напр. 0.0.0.0:443).
-    let tcp_listener = match (std::env::var("Citadel_TCP_LISTEN"), obfs_psk()) {
+    let tcp_listener = match (std::env::var("Citadel_TCP_LISTEN"), obfs_psk()?) {
         (Ok(a), Some(_)) => {
             let l = tokio::net::TcpListener::bind(&a)
                 .await
@@ -641,7 +670,7 @@ async fn run_server(tun: Arc<Tun>) -> Result<()> {
 
     // TCP-fallback acceptor (S0.3/H1): каждый accept'нутый obfs-TCP стрим → свой quinn-Endpoint
     // (single-conn); клиент делает обычный PQ-QUIC хендшейк поверх TCP. Та же крипта/pin/токены.
-    if let (Some(listener), Some(psk)) = (tcp_listener, obfs_psk()) {
+    if let (Some(listener), Some(psk)) = (tcp_listener, obfs_psk()?) {
         let tun = tun.clone();
         let issuer_auth = issuer_auth.clone();
         let spent = spent.clone();
@@ -888,7 +917,7 @@ async fn run_auth_probe() -> Result<()> {
         .await?
         .next()
         .ok_or_else(|| anyhow!("не разрешился {connect}"))?;
-    let ep = match obfs_psk() {
+    let ep = match obfs_psk()? {
         Some(p) => citadel_quic::client_endpoint_obfs(p)?,
         None => quinn::Endpoint::client("0.0.0.0:0".parse()?)?,
     };
@@ -901,7 +930,7 @@ async fn run_auth_probe() -> Result<()> {
         .map_err(|_| anyhow!("таймаут"))??;
     eprintln!("[auth-probe] транспорт ОК (obfs+PQ+pin); предъявляю ПОДДЕЛЬНЫЙ токен…");
 
-    let mut forged = vec![0u8; citadel_token::NONCE_LEN + citadel_token::RAND_LEN + 256];
+    let mut forged = vec![0u8; citadel_token::voprf::REDEEM_LEN];
     rand::thread_rng().fill_bytes(&mut forged);
     let req = capsule::encode_address_request_v4(&capsule::AssignedV4 { request_id: 1, addr: [0, 0, 0, 0], prefix: 0 });
 

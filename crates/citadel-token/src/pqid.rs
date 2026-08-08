@@ -45,6 +45,10 @@ pub const DOMAIN_CLIENT: &[u8] = b"CitadelPQVPN/pqid/client/v1";
 pub const DOMAIN_ADMIN: &[u8] = b"CitadelPQVPN/pqid/admin/v1";
 /// Домен подписи ИЗДАТЕЛЯ (доказательство подлинности сервера обоих каналов).
 pub const DOMAIN_ISSUER: &[u8] = b"CitadelPQVPN/pqid/issuer/v1";
+/// Домен подписи exit-узла, забирающего ключ эпохи (M-6: `citadel-token keysync`). Отдельный домен
+/// нужен, чтобы seed абонента нельзя было предъявить как keysync-идентичность (и наоборот): подпись
+/// одного домена в другом не проверится, даже если seed утечёт.
+pub const DOMAIN_KEYSYNC: &[u8] = b"CitadelPQVPN/pqid/keysync/v1";
 
 /// Гибридная пара ключей, выведенная из seed. Секрет (`seed`) не хранится: ключи выводятся заново
 /// на каждую подпись — так seed не залёживается копиями в памяти дольше вызова.
@@ -214,22 +218,33 @@ pub struct HybridAuth {
 /// Первый кадр, который шлёт подключившаяся сторона после `IssuerHello`.
 ///
 /// Типизирован, потому что к издателю ходят ДВА разных потребителя: абонент/админ (доказывают
-/// владение seed) и **exit-узел, которому нужен лишь публичный ключ текущей эпохи** — чтобы
-/// проверять токены, когда exit и издатель стоят на РАЗНЫХ машинах и общего тома `/shared` нет.
-/// Ключ эпохи публичен по построению (издатель отдаёт его каждому авторизованному абоненту), и
-/// собственной идентичности для его получения не требуется; канал при этом остаётся за obfs-PSK и
-/// PQ-TLS с пиннингом, то есть посторонний до этого кадра не доходит.
+/// владение seed) и **exit-узел, которому нужен ключ текущей эпохи** — чтобы проверять токены,
+/// когда exit и издатель стоят на РАЗНЫХ машинах и общего тома `/shared` нет.
+///
+/// **M-6:** раньше вторым кадром был `EpochPub` — запрос БЕЗ аутентификации, потому что ключ эпохи
+/// был публичным (RSA-pub). В схеме v2 (VOPRF) ключ эпохи — секрет: тот, кто его получил, чеканит
+/// токены. Поэтому запрос требует собственной идентичности `keysync` (тот же гибрид Ed25519 +
+/// ML-DSA-65, но со СВОИМ доменом — абонентским seed'ом ключ не вытянуть, и наоборот).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ClientFrame {
     /// Аутентификация владельца seed (абонент на `:7000` или админ на admin-канале).
     Auth(HybridAuth),
-    /// «Дай публичный ключ текущей эпохи» — запрос exit-узла (см. `citadel-token pubsync`).
-    EpochPub,
+    /// «Дай ключ текущей эпохи» — запрос exit-узла (см. `citadel-token keysync`), с доказательством
+    /// владения keysync-идентичностью.
+    KeySync(HybridAuth),
 }
 
-/// Собрать кадр-запрос публичного ключа эпохи.
-pub fn build_epoch_pub_request() -> Result<Vec<u8>> {
-    to_cbor(&ClientFrame::EpochPub)
+/// Собрать кадр-запрос ключа эпохи (exit-узел доказывает свою keysync-идентичность).
+pub fn build_keysync_request(
+    seed: &[u8; SEED_LEN],
+    challenge: &[u8],
+    ekm: &[u8],
+) -> Result<Vec<u8>> {
+    let raw = build_auth(seed, DOMAIN_KEYSYNC, challenge, ekm)?;
+    match parse_client_frame(&raw)? {
+        ClientFrame::Auth(a) => to_cbor(&ClientFrame::KeySync(a)),
+        ClientFrame::KeySync(_) => unreachable!("build_auth возвращает Auth"),
+    }
 }
 
 /// Разобрать первый кадр клиента (сервер решает, что делать дальше).
@@ -323,7 +338,7 @@ pub fn build_auth(
 pub fn verify_auth(raw: &[u8], domain: &[u8], challenge: &[u8], ekm: &[u8]) -> Result<[u8; 32]> {
     match parse_client_frame(raw)? {
         ClientFrame::Auth(auth) => verify_hybrid(auth, domain, challenge, ekm),
-        ClientFrame::EpochPub => bail!("на этом канале доступна только аутентификация"),
+        ClientFrame::KeySync(_) => bail!("на этом канале доступна только аутентификация"),
     }
 }
 
@@ -476,14 +491,33 @@ mod tests {
         assert!(verify_hello(&raw, &commitment, &[0x22u8; 32], EKM).is_err());
     }
 
-    /// Запрос публичного ключа эпохи (кадр exit-узла) не проходит там, где требуется
-    /// аутентификация: иначе он открывал бы admin-канал и Layer-1 «пустым» кадром.
+    /// Запрос ключа эпохи (кадр exit-узла) не проходит там, где требуется аутентификация абонента
+    /// или админа: иначе keysync-идентичность открывала бы admin-канал и Layer-1.
+    ///
+    /// M-6: и обратно — **абонентский seed не годится в keysync**. Домены разные, подпись одного в
+    /// другом не проверяется, поэтому утечка ссылки абонента не даёт секрет эпохи (а он теперь
+    /// позволяет чеканить токены).
     #[test]
-    fn epoch_pub_request_is_not_authentication() {
-        let raw = build_epoch_pub_request().unwrap();
-        assert!(verify_auth(&raw, DOMAIN_CLIENT, &[0u8; 32], EKM).is_err());
-        assert!(verify_auth(&raw, DOMAIN_ADMIN, &[0u8; 32], EKM).is_err());
-        assert_eq!(parse_client_frame(&raw).unwrap(), ClientFrame::EpochPub);
+    fn keysync_request_is_domain_separated() {
+        let seed = [0x5eu8; SEED_LEN];
+        let challenge = [0u8; 32];
+        let raw = build_keysync_request(&seed, &challenge, EKM).unwrap();
+        assert!(verify_auth(&raw, DOMAIN_CLIENT, &challenge, EKM).is_err());
+        assert!(verify_auth(&raw, DOMAIN_ADMIN, &challenge, EKM).is_err());
+        let ClientFrame::KeySync(auth) = parse_client_frame(&raw).unwrap() else {
+            panic!("ожидался keysync-кадр");
+        };
+        assert_eq!(
+            verify_hybrid(auth.clone(), DOMAIN_KEYSYNC, &challenge, EKM).unwrap(),
+            id_from_seed(&seed).unwrap(),
+            "издатель опознаёт exit по keysync-id"
+        );
+        // тот же кадр под чужим доменом не проходит
+        assert!(verify_hybrid(auth, DOMAIN_CLIENT, &challenge, EKM).is_err());
+        // и наоборот: абонентский auth-кадр не сойдёт за keysync
+        let as_client = build_auth(&seed, DOMAIN_CLIENT, &challenge, EKM).unwrap();
+        let ClientFrame::Auth(a) = parse_client_frame(&as_client).unwrap() else { unreachable!() };
+        assert!(verify_hybrid(a, DOMAIN_KEYSYNC, &challenge, EKM).is_err());
     }
 
     /// Мусор на входе не роняет верификаторы (кадры приходят из сети до всякой аутентификации).

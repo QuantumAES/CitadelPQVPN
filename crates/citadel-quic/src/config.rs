@@ -162,20 +162,44 @@ pub fn parse_pin(s: &str) -> Option<[u8; 32]> {
     hex::decode(s.trim()).ok().and_then(|v| v.try_into().ok())
 }
 
-/// obfs PSK из строки: 64 hex = 32 байта напрямую, иначе BLAKE3-derive по контексту.
+/// obfs PSK из строки: **только** 64 hex = 32 байта. Иначе `None` (fail-closed).
+///
+/// M-7 (аудит-4). Раньше любая другая строка превращалась в PSK через
+/// `blake3::derive_key(…, v)` — один проход, без соли и без work-factor. Оператор, задавший
+/// `--obfs-psk` парольной фразой, получал секрет, который офлайн-перебор вскрывает на скорости
+/// миллиардов кандидатов в секунду; а этот PSK — общий на весь деплой (H-3) и лежит в каждой
+/// ссылке, то есть цена его компрометации максимальна: он же probe-resistance, он же гейт
+/// pre-auth поверхности exit'а и издателя.
+///
+/// Штатный путь (установщик и docker-стенд генерируют 32 байта из `/dev/urandom`) не затронут:
+/// там ровно 64 hex. Ручной ввод фразы теперь отвергается — вызывающая сторона обязана сказать
+/// об этом внятно, а не молча работать на слабом секрете.
 pub fn parse_obfs_psk(v: &str) -> Option<[u8; 32]> {
     let v = v.trim();
-    if v.is_empty() {
+    if v.len() != 64 {
         return None;
     }
-    if v.len() == 64 {
-        if let Ok(bytes) = hex::decode(v) {
-            if let Ok(a) = bytes.try_into() {
-                return Some(a);
-            }
-        }
+    hex::decode(v).ok()?.try_into().ok()
+}
+
+/// PSK из `Citadel_OBFS_PSK` с **fail-closed** разбором (M-7).
+///
+/// Отсутствует или пуст — obfs выключен, это штатная конфигурация. А вот заданное, но негодное
+/// значение — ошибка запуска: после ужесточения [`parse_obfs_psk`] «тихий None» означал бы
+/// молча выключенный L1-слой при внешне настроенном PSK (и рассинхрон с другой стороной, которая
+/// свой PSK разобрала). Ровно тот класс дефекта, что M-1 и `Citadel_ISSUER_PUB`.
+pub fn env_obfs_psk() -> Result<Option<[u8; 32]>> {
+    let Ok(raw) = std::env::var("Citadel_OBFS_PSK") else { return Ok(None) };
+    if raw.trim().is_empty() {
+        return Ok(None);
     }
-    Some(blake3::derive_key("CitadelPQVPN/obfs/v1/psk", v.as_bytes()))
+    parse_obfs_psk(&raw).map(Some).ok_or_else(|| {
+        anyhow::anyhow!(
+            "Citadel_OBFS_PSK: ожидаются ровно 64 hex-символа (32 байта). Парольные фразы больше \
+             не принимаются: они выводились в ключ одним проходом BLAKE3, без соли и work-factor, \
+             и вскрывались офлайн-перебором (M-7). Сгенерируйте: head -c 32 /dev/urandom | xxd -p -c 32"
+        )
+    })
 }
 
 /// S1.2/M1: `dns` обязан быть одним IP (иначе — инъекция в `/etc/resolv.conf` через root-helper).
@@ -265,10 +289,7 @@ impl ClientConfig {
         Ok(Self {
             servers,
             server_name: std::env::var("Citadel_SERVER_NAME").unwrap_or_else(|_| "Citadel.exit".into()),
-            obfs_psk: std::env::var("Citadel_OBFS_PSK")
-                .ok()
-                .as_deref()
-                .and_then(parse_obfs_psk),
+            obfs_psk: env_obfs_psk()?,
             kx_suite: std::env::var("Citadel_KX").unwrap_or_default(),
             tcp_port: std::env::var("Citadel_TCP_PORT").unwrap_or_else(|_| "443".into()),
             routes,
@@ -400,17 +421,38 @@ mod tests {
         assert_eq!(parse_pin(&hex::encode([0u8; 31])), None); // не 32 байта
     }
 
+    /// M-7: PSK принимается ТОЛЬКО как 64 hex. Парольная фраза больше не выводится в ключ —
+    /// раньше это был BLAKE3 в один проход, без соли и work-factor, то есть офлайн-перебор по
+    /// словарю против секрета, общего на весь деплой и лежащего в каждой ссылке.
     #[test]
-    fn obfs_psk_hex_vs_derive() {
-        assert_eq!(parse_obfs_psk(""), None);
-        assert_eq!(parse_obfs_psk("   "), None);
-        // 64 hex → 32 байта напрямую
+    fn obfs_psk_accepts_only_hex32() {
         assert_eq!(parse_obfs_psk(&hex::encode([7u8; 32])), Some([7u8; 32]));
-        // короткая строка → детерминированный BLAKE3-derive по фиксированному контексту
-        assert_eq!(
-            parse_obfs_psk("hunter2"),
-            Some(blake3::derive_key("CitadelPQVPN/obfs/v1/psk", b"hunter2"))
-        );
+        assert_eq!(parse_obfs_psk(&format!("  {}  ", hex::encode([7u8; 32]))), Some([7u8; 32]));
+        for bad in ["", "   ", "hunter2", "correct horse battery staple"] {
+            assert_eq!(parse_obfs_psk(bad), None, "фраза {bad:?} не должна становиться ключом");
+        }
+        assert_eq!(parse_obfs_psk(&hex::encode([7u8; 31])), None, "62 hex — не 32 байта");
+        assert_eq!(parse_obfs_psk(&"z".repeat(64)), None, "64 символа, но не hex");
+    }
+
+    /// …и негодное значение переменной — это ОШИБКА запуска, а не «obfs выключен»: иначе опечатка
+    /// в PSK молча снимала бы весь L1-слой при внешне настроенном конфиге.
+    #[test]
+    fn env_obfs_psk_is_fail_closed() {
+        // SAFETY (тест): переменная трогается в одном месте и восстанавливается сразу же.
+        let restore = std::env::var("Citadel_OBFS_PSK").ok();
+        std::env::set_var("Citadel_OBFS_PSK", "hunter2");
+        let err = env_obfs_psk().unwrap_err();
+        assert!(format!("{err:#}").contains("64 hex"), "err: {err:#}");
+        std::env::set_var("Citadel_OBFS_PSK", hex::encode([9u8; 32]));
+        assert_eq!(env_obfs_psk().unwrap(), Some([9u8; 32]));
+        std::env::set_var("Citadel_OBFS_PSK", "");
+        assert_eq!(env_obfs_psk().unwrap(), None, "пусто = obfs не настроен, это штатно");
+        std::env::remove_var("Citadel_OBFS_PSK");
+        assert_eq!(env_obfs_psk().unwrap(), None);
+        if let Some(v) = restore {
+            std::env::set_var("Citadel_OBFS_PSK", v);
+        }
     }
 
     #[test]

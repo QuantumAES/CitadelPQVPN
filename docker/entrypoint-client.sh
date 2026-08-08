@@ -436,31 +436,49 @@ fi
 
 echo
 echo "===================================================================="
-echo "  ТЕСТ 23 (P1) — раздельный деплой: exit-узел получает ключ эпохи ПО СЕТИ (pubsync)"
+echo "  ТЕСТ 23 (P1) — раздельный деплой: exit-узел получает ключ эпохи ПО СЕТИ (keysync)"
 echo "===================================================================="
 # Когда издатель стоит на другой машине, общего тома нет, а ключ эпохи ротируется каждый час —
 # exit подтягивает его сам, по тому же obfs+PQ-TLS каналу с проверкой PQ-идентичности издателя.
+# M-6: ключ эпохи стал СЕКРЕТОМ, поэтому exit ещё и доказывает СВОЮ keysync-идентичность.
 # Здесь это гоняется «как на отдельной машине»: свой пустой каталог, только сетевой путь.
-SYNCDIR=/tmp/pubsync; rm -rf "$SYNCDIR"; mkdir -p "$SYNCDIR"
-Citadel_TOKEN_ROLE=pubsync Citadel_TOKEN_DIR="$SYNCDIR" Citadel_TOKEN_ISSUER="$ISSUER_IP:7000" \
+KEYSYNC_SEED=$(printf 'ec%.0s' {1..32})   # тот же демо-seed, что знает issuer-entrypoint ('ec'×32 — обязан быть валидным hex)
+SYNCDIR=/tmp/keysync; rm -rf "$SYNCDIR"; mkdir -p "$SYNCDIR"
+Citadel_TOKEN_ROLE=keysync Citadel_TOKEN_DIR="$SYNCDIR" Citadel_TOKEN_ISSUER="$ISSUER_IP:7000" \
   Citadel_ISSUER_PIN=$ISSUER_PIN Citadel_ISSUER_MLDSA=$ISSUER_MLDSA Citadel_OBFS_PSK=$(cat /shared/obfs.psk) \
-  Citadel_EPOCH_SECS=3600 Citadel_PUBSYNC_INTERVAL=5 timeout 20 citadel-token >/tmp/pubsync.log 2>&1 || true
-if [ -s "$SYNCDIR/issuer.pub" ] && cmp -s "$SYNCDIR/issuer.pub" /shared/issuer.pub; then
+  Citadel_KEYSYNC_SEED=$KEYSYNC_SEED \
+  Citadel_EPOCH_SECS=3600 Citadel_KEYSYNC_INTERVAL=5 timeout 20 citadel-token >/tmp/keysync.log 2>&1 || true
+if [ -s "$SYNCDIR/issuer.key" ] && cmp -s "$SYNCDIR/issuer.key" /shared/issuer.key; then
     echo "  OK ✔ ключ эпохи получен по сети и совпал с ключом издателя (exit может стоять отдельно)"
 else
-    echo "  [!] pubsync не принёс ключ эпохи ✗"; tail -3 /tmp/pubsync.log
+    echo "  [!] keysync не принёс ключ эпохи ✗"; tail -3 /tmp/keysync.log
 fi
-# Негатив: чужое обязательство PQ-идентичности издателя → синхронизация обязана отказать,
+# Негатив 1: чужое обязательство PQ-идентичности издателя → синхронизация обязана отказать,
 # иначе подставной издатель навязал бы exit'у свой ключ и тот верил бы чужим токенам.
 rm -rf "$SYNCDIR"; mkdir -p "$SYNCDIR"
-Citadel_TOKEN_ROLE=pubsync Citadel_TOKEN_DIR="$SYNCDIR" Citadel_TOKEN_ISSUER="$ISSUER_IP:7000" \
+Citadel_TOKEN_ROLE=keysync Citadel_TOKEN_DIR="$SYNCDIR" Citadel_TOKEN_ISSUER="$ISSUER_IP:7000" \
   Citadel_ISSUER_PIN=$ISSUER_PIN Citadel_ISSUER_MLDSA=$(printf 'ab%.0s' {1..32}) \
-  Citadel_OBFS_PSK=$(cat /shared/obfs.psk) Citadel_EPOCH_SECS=3600 Citadel_PUBSYNC_INTERVAL=5 \
-  timeout 15 citadel-token >/tmp/pubsync-mitm.log 2>&1 || true
-if [ -s "$SYNCDIR/issuer.pub" ]; then
+  Citadel_KEYSYNC_SEED=$KEYSYNC_SEED \
+  Citadel_OBFS_PSK=$(cat /shared/obfs.psk) Citadel_EPOCH_SECS=3600 Citadel_KEYSYNC_INTERVAL=5 \
+  timeout 15 citadel-token >/tmp/keysync-mitm.log 2>&1 || true
+if [ -s "$SYNCDIR/issuer.key" ]; then
     echo "  [!] ключ принят от «издателя» с чужой PQ-идентичностью ✗"
 else
     echo "  OK ✔ чужая PQ-идентичность издателя отклонена — ключ на диск не попал"
+fi
+# Негатив 2 (M-6, главное): СЕКРЕТ эпохи не отдаётся тому, кто не доказал keysync-идентичность.
+# Абонентский seed (он есть у каждого владельца ссылки) здесь не годится — другой домен подписи;
+# иначе любой абонент забирал бы ключ и чеканил токены сам.
+rm -rf "$SYNCDIR"; mkdir -p "$SYNCDIR"
+Citadel_TOKEN_ROLE=keysync Citadel_TOKEN_DIR="$SYNCDIR" Citadel_TOKEN_ISSUER="$ISSUER_IP:7000" \
+  Citadel_ISSUER_PIN=$ISSUER_PIN Citadel_ISSUER_MLDSA=$ISSUER_MLDSA \
+  Citadel_KEYSYNC_SEED=$(printf 'c5%.0s' {1..32}) \
+  Citadel_OBFS_PSK=$(cat /shared/obfs.psk) Citadel_EPOCH_SECS=3600 Citadel_KEYSYNC_INTERVAL=5 \
+  timeout 15 citadel-token >/tmp/keysync-foreign.log 2>&1 || true
+if [ -s "$SYNCDIR/issuer.key" ]; then
+    echo "  [!] секрет эпохи выдан по ЧУЖОЙ идентичности ✗ (любой абонент смог бы чеканить токены)"
+else
+    echo "  OK ✔ чужая keysync-идентичность отклонена — секрет эпохи не выдан"
 fi
 
 echo

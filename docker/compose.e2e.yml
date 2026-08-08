@@ -15,7 +15,7 @@ services:
     devices: ["/dev/net/tun:/dev/net/tun"]
     sysctls: ["net.ipv4.ip_forward=1"]
     environment:
-      Citadel_OBFS_PSK: "citadel-e2e-psk"
+      Citadel_OBFS_PSK: "e2e0000000000000000000000000000000000000000000000000000000000000"   # M-7: только 64 hex (стенд, не секрет)
     ports:
       - "4433:4433/udp"       # PQ-QUIC
       - "443:443/tcp"         # obfs-over-TCP fallback (M4)

@@ -8,7 +8,7 @@ cd "$(dirname "$0")/.."
 ROOT="$PWD"
 export PATH="$ROOT/.venv/bin:$PATH"   # cmake для aws-lc-rs (сборка бинаря/linkgen)
 
-PSK="citadel-e2e-psk"
+PSK="e2e0000000000000000000000000000000000000000000000000000000000000"   # M-7: PSK принимается только как 64 hex (стенд, не секрет)
 VM_HOST="${VM_HOST:-10.0.2.2}"
 ROUTES="${ROUTES:-1.1.1.1/32 1.0.0.1/32}"
 

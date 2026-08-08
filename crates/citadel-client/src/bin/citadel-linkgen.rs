@@ -3,7 +3,7 @@
 //! installer-скриптом (C4/C5.4b) для выдачи админской ссылки после развёртывания.
 //!
 //! ```text
-//! citadel-linkgen --servers "1.2.3.4:4433" --psk <hex64|passphrase> --pin <hex64> \
+//! citadel-linkgen --servers "1.2.3.4:4433" --psk <hex64> --pin <hex64> \
 //!   [--kx all] [--tcp-port 443] [--routes "1.1.1.1/32 1.0.0.1/32"] \
 //!   [--dns 1.1.1.1] [--server-name citadel.exit] [--qr link.svg] \
 //!   [--issuer host:7000] [--issuer-pin <hex64>] [--issuer-mldsa <hex64>] [--client-seed <hex64>] \
@@ -13,7 +13,7 @@
 //! опц. `--admin-port` (дефолт 7001) делают ссылку МАСТЕР-ссылкой (управление реестром абонентов по
 //! туннелю, см. citadel-token::admin). Клиентские ссылки эти флаги НЕ несут — иначе абонент получил
 //! бы admin-права. v3-формат: ссылки без admin-полей читаются старым клиентом как v2 (serde default).
-//! `--psk` — passphrase (BLAKE3-derive, как на exit) или 64-hex; `--pin` — hex из exit.pin.
+//! `--psk` — 64-hex (ровно 32 байта, как на exit; M-7 — фразы не принимаются); `--pin` — hex из exit.pin.
 //! C5.4b двухслойная идентичность: `--issuer` (host:port издателя) + `--issuer-pin` (hex из
 //! issuer-tls.pin, S2.1/A1 — клиент пиннит PQ-TLS канал) + `--client-seed` (hex64,
 //! приватный Ed25519 «абонента») → GUI авто-фетчит epoch-токен перед коннектом. Пара к выдаче —
@@ -60,7 +60,17 @@ fn main() {
         kx_suite: get("--kx").unwrap_or_else(|| "pq".into()),
         cert_pin: get("--pin").as_deref().and_then(parse_pin),
         mldsa_pub, // M7 PQ-auth: Some → ссылка несёт H(pub); None → token-less по ML-DSA
-        obfs_psk: get("--psk").as_deref().and_then(parse_obfs_psk),
+        // M-7: PSK принимается только как 64 hex. Раньше сюда годилась любая строка (BLAKE3 в
+        // один проход), и ссылка молча уносила слабый ключ; теперь негодное значение — отказ.
+        obfs_psk: get("--psk").map(|v| {
+            parse_obfs_psk(&v).unwrap_or_else(|| {
+                eprintln!(
+                    "--psk: ожидаются ровно 64 hex-символа (32 байта). Парольные фразы больше не \
+                     принимаются: они выводились в ключ одним проходом BLAKE3 (M-7)"
+                );
+                std::process::exit(1);
+            })
+        }),
         tcp_port: Some(get("--tcp-port").unwrap_or_else(|| "443".into())),
         // C5.4b Layer-1: issuer host:port + client_seed (hex64 → [u8;32], та же кодировка, что pin).
         issuer: get("--issuer"),

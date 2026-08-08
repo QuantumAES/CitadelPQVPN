@@ -20,11 +20,14 @@ services:
     container_name: citadel-cli-issuer
     entrypoint: ["/usr/local/bin/entrypoint-issuer.sh"]
     environment: *ports
+    # M-6: работает с группой exit'а — ключ эпохи (секрет, 0640) иначе не прочитается тем, кто
+    # сбросил привилегии до nobody. См. пояснение в docker/compose.yml.
+    user: "0:65534"
     volumes: ["clishare:/shared"]
     networks: ["clinet"]
     restart: unless-stopped
     healthcheck:
-      test: ["CMD-SHELL", "test -f /shared/issuer.pub"]
+      test: ["CMD-SHELL", "test -f /shared/issuer.key"]
       interval: 2s
       timeout: 2s
       retries: 30

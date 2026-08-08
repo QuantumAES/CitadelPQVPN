@@ -23,7 +23,7 @@ PASSWD=testpassword123
 SEED=$(printf 'c5%.0s' $(seq 1 32))   # тот же seed, что issuer регистрирует в реестре (Layer-1)
 
 echo "[client-cli] жду артефакты exit/issuer в /shared…"
-for f in /shared/exit.pin /shared/obfs.psk /shared/issuer.pub /shared/issuer-tls.pin /shared/issuer-mldsa.pin /shared/exit.mldsa; do
+for f in /shared/exit.pin /shared/obfs.psk /shared/issuer.key /shared/issuer-tls.pin /shared/issuer-mldsa.pin /shared/exit.mldsa; do
     for _ in $(seq 1 90); do [ -s "$f" ] && break; sleep 1; done
     [ -s "$f" ] || echo "  [!] нет $f — часть тестов упадёт"
 done
