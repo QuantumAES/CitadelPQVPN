@@ -36,6 +36,8 @@ const Map<String, String> langEs = {
   'err_service_unavailable_hint': 'comprueba que esté instalado y en ejecución',
   'err_no_vpn_permission': 'Sin permiso de VPN',
   'err_no_vpn_permission_hint': 'permite la conexión en el diálogo del sistema',
+  'err_activation_failed': 'No se pudo activar el enlace',
+  'err_activation_failed_hint': 'pida un enlace nuevo al administrador: el enlace inicial se activa una sola vez y por tiempo limitado',
 
   'switch_title': '¿Cambiar de conexión?',
   'switch_body': 'Ahora está conectado «{current}». ¿Desconectarlo y conectar a «{name}»?',
@@ -199,6 +201,9 @@ const Map<String, String> langEs = {
   'issued_title_named': 'Acceso emitido: {label}',
   'copy_link': 'Copiar el enlace',
   'link_copied': 'Enlace copiado',
+  'verify_code_title': 'Código de verificación',
+  'verify_code_note': 'Dicte este código al abonado por separado del enlace (de viva voz, en persona). Él verá el mismo código al importar: así se detecta la manipulación durante la entrega.',
+  'activate_note': 'El enlace debe activarse antes de {when} y solo en un dispositivo: tras la activación, una copia no sirve de nada.',
   'issued_note': 'Entrega el enlace al suscriptor ahora (QR o canal seguro). '
       'No se puede volver a obtener: el secreto del suscriptor no se guarda en este dispositivo.',
   'revoke_title': '¿Revocar el acceso?',

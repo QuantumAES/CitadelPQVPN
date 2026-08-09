@@ -36,6 +36,8 @@ const Map<String, String> langCs = {
   'err_service_unavailable_hint': 'ověřte, že je nainstalovaná a spuštěná',
   'err_no_vpn_permission': 'Chybí oprávnění k VPN',
   'err_no_vpn_permission_hint': 'povolte připojení v systémovém dialogu',
+  'err_activation_failed': 'Odkaz se nepodařilo aktivovat',
+  'err_activation_failed_hint': 'požádejte správce o nový odkaz: první odkaz se aktivuje jednou a jen omezenou dobu',
 
   'switch_title': 'Přepnout připojení?',
   'switch_body': 'Nyní je připojeno „{current}“. Odpojit je a připojit se k „{name}“?',
@@ -198,6 +200,9 @@ const Map<String, String> langCs = {
   'issued_title_named': 'Přístup vydán: {label}',
   'copy_link': 'Zkopírovat odkaz',
   'link_copied': 'Odkaz zkopírován',
+  'verify_code_title': 'Ověřovací kód',
+  'verify_code_note': 'Nadiktujte tento kód účastníkovi zvlášť od odkazu (hlasem, osobně). Při importu uvidí stejný kód — tak se pozná podvržení odkazu při doručení.',
+  'activate_note': 'Odkaz je nutné aktivovat do {when} a pouze na jednom zařízení: po aktivaci je kopie k ničemu.',
   'issued_note': 'Předejte odkaz účastníkovi hned (QR kód nebo zabezpečený kanál). '
       'Znovu jej získat nelze: tajemství účastníka se v tomto zařízení neukládá.',
   'revoke_title': 'Odvolat přístup?',

@@ -200,6 +200,38 @@ class _SubscribersPageState extends State<SubscribersPage> {
                 const SizedBox(height: 16),
                 Center(child: QrView(qr: qr, dimension: 260)),
               ],
+              // M-9: код сверки — единственное, что ловит подмену ссылки при доставке, поэтому
+              // он показан крупно и рядом сказано, что диктовать его надо ОТДЕЛЬНО от ссылки.
+              if (issued.verifyCode.isNotEmpty) ...[
+                const SizedBox(height: 16),
+                Text(
+                  t('verify_code_title'),
+                  style: Theme.of(sheetCtx).textTheme.labelLarge,
+                  textAlign: TextAlign.center,
+                ),
+                SelectableText(
+                  issued.verifyCode,
+                  textAlign: TextAlign.center,
+                  style: Theme.of(sheetCtx).textTheme.headlineSmall?.copyWith(
+                        fontFamily: 'monospace',
+                        letterSpacing: 2,
+                      ),
+                ),
+                const SizedBox(height: 4),
+                Text(
+                  t('verify_code_note'),
+                  style: Theme.of(sheetCtx).textTheme.bodySmall,
+                  textAlign: TextAlign.center,
+                ),
+              ],
+              if (issued.activateUntilUnix > 0) ...[
+                const SizedBox(height: 12),
+                Text(
+                  t('activate_note', {'when': _fmtWhen(issued.activateUntilUnix)}),
+                  style: Theme.of(sheetCtx).textTheme.bodySmall,
+                  textAlign: TextAlign.center,
+                ),
+              ],
               const SizedBox(height: 16),
               FilledButton.icon(
                 onPressed: () {
@@ -221,6 +253,14 @@ class _SubscribersPageState extends State<SubscribersPage> {
         ),
       ),
     );
+  }
+
+  /// Момент времени для человека: «до 10.08 12:34». Локаль не подключаем — формат числовой и
+  /// одинаково читается на всех девяти языках интерфейса.
+  static String _fmtWhen(int unix) {
+    final d = DateTime.fromMillisecondsSinceEpoch(unix * 1000).toLocal();
+    String two(int v) => v.toString().padLeft(2, '0');
+    return '${two(d.day)}.${two(d.month)} ${two(d.hour)}:${two(d.minute)}';
   }
 
   // ─────────────────────────── отзыв ───────────────────────────

@@ -41,10 +41,26 @@ class IssuedLinkDto {
   final String clientIdHex;
   final String uri;
 
-  const IssuedLinkDto({required this.clientIdHex, required this.uri});
+  /// M-9: код сверки — короткий отпечаток ссылки. Называется абоненту ОТДЕЛЬНО от самой ссылки
+  /// (голосом, при встрече): он ловит подмену при доставке, чего сама ссылка поймать не может.
+  final String verifyCode;
+
+  /// M-9: до какого момента (unix) ссылку нужно активировать. Позже — она мертва.
+  final PlatformInt64 activateUntilUnix;
+
+  const IssuedLinkDto({
+    required this.clientIdHex,
+    required this.uri,
+    required this.verifyCode,
+    required this.activateUntilUnix,
+  });
 
   @override
-  int get hashCode => clientIdHex.hashCode ^ uri.hashCode;
+  int get hashCode =>
+      clientIdHex.hashCode ^
+      uri.hashCode ^
+      verifyCode.hashCode ^
+      activateUntilUnix.hashCode;
 
   @override
   bool operator ==(Object other) =>
@@ -52,7 +68,9 @@ class IssuedLinkDto {
       other is IssuedLinkDto &&
           runtimeType == other.runtimeType &&
           clientIdHex == other.clientIdHex &&
-          uri == other.uri;
+          uri == other.uri &&
+          verifyCode == other.verifyCode &&
+          activateUntilUnix == other.activateUntilUnix;
 }
 
 /// Абонент Layer-1 реестра для UI: серверная запись + локальная метка админа.

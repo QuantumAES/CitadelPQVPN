@@ -259,11 +259,30 @@ class AppState extends ChangeNotifier {
 
   // ─────────────────────────── vpn ───────────────────────────
 
-  void connectProfile(String id) {
+  Future<void> connectProfile(String id) async {
+    // M-9: первичная ссылка активируется на ЭТОМ устройстве до первого подключения — после чего
+    // её копия (скриншот QR, пересылка в мессенджере, бэкап) больше ничего не даёт. Операция
+    // идемпотентна, поэтому зовём её на каждое подключение: второй раз она ничего не делает.
+    if (!await _activate(id)) return;
     if (Platform.isAndroid) {
       _androidConnect(profileId: id);
     } else {
       _listen(vpnConnectProfile(id: id), profileId: id);
+    }
+  }
+
+  /// Активация профиля перед подключением. `false` — подключаться нельзя (ссылка просрочена, уже
+  /// активирована на другом устройстве, издатель недоступен): причина уже показана пользователю.
+  Future<bool> _activate(String id) async {
+    try {
+      await vpnActivateProfile(id: id);
+      return true;
+    } catch (e) {
+      // Причина активации — человеческая («ссылка просрочена», «уже активирована на другом
+      // устройстве»), поэтому показываем её как заголовок отказа, а не прячем в журнал.
+      _setError('err_activation_failed', 'err_activation_failed_hint', '$e');
+      notifyListeners();
+      return false;
     }
   }
 
@@ -279,6 +298,7 @@ class AppState extends ChangeNotifier {
     } catch (_) {
       // vault недоступен — деградируем на пробный коннект по сырой ссылке
     }
+    if (id != null && !await _activate(id)) return; // M-9: см. connectProfile
     if (Platform.isAndroid) {
       _androidConnect(profileId: id, link: id == null ? uri : null);
     } else if (id != null) {

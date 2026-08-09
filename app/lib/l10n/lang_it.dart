@@ -36,6 +36,8 @@ const Map<String, String> langIt = {
   'err_service_unavailable_hint': 'verifica che sia installato e in esecuzione',
   'err_no_vpn_permission': 'Permesso VPN negato',
   'err_no_vpn_permission_hint': 'consenti la connessione nella finestra di sistema',
+  'err_activation_failed': 'Impossibile attivare il link',
+  'err_activation_failed_hint': 'chiedi un nuovo link all’amministratore: il link iniziale si attiva una sola volta e per un tempo limitato',
 
   'switch_title': 'Cambiare connessione?',
   'switch_body': 'Ora è connesso «{current}». Disconnetterlo e connettersi a «{name}»?',
@@ -199,6 +201,9 @@ const Map<String, String> langIt = {
   'issued_title_named': 'Accesso rilasciato: {label}',
   'copy_link': 'Copia il link',
   'link_copied': 'Link copiato',
+  'verify_code_title': 'Codice di verifica',
+  'verify_code_note': 'Comunica questo codice all’abbonato separatamente dal link (a voce, di persona). Vedrà lo stesso codice all’importazione: così si intercetta una manomissione durante la consegna.',
+  'activate_note': 'Il link va attivato entro {when} e su un solo dispositivo: dopo l’attivazione una copia è inutile.',
   'issued_note': 'Consegna subito il link all’abbonato (QR o canale sicuro). '
       'Non è possibile recuperarlo di nuovo: il segreto dell’abbonato non è conservato su questo dispositivo.',
   'revoke_title': 'Revocare l’accesso?',

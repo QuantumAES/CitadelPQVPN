@@ -37,13 +37,74 @@ pub const ADMIN_VIP: &str = "10.7.0.1";
 /// поэтому issuer никогда не примет одну подпись вместо другой (даже при совпадении ключей).
 pub use crate::pqid::DOMAIN_ADMIN as AUTH_DOMAIN;
 
-/// Запись Layer-1 реестра (`<pub_hex> <valid_until_unix> <status>`) — общая для issuer'а,
-/// admin-клиента и CLI.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+/// Запись Layer-1 реестра — общая для issuer'а, admin-клиента и CLI.
+///
+/// Формат строки: `<pub_hex> <valid_until_unix> <status> [k=v,k=v]`. Четвёртое поле появилось в
+/// M-9 (одноразовые ссылки) и **необязательно**: строки, написанные до него (и руками оператора),
+/// читаются как раньше. Ключи:
+///   * `enroll=<unix>` — запись ждёт **активации** до этого момента (`0` — без срока);
+///   * `dev=<hex64>`   — активирована в это устройство (после активации, вместе со `status=consumed`);
+///   * `linkh=<hex64>` — отпечаток ссылки, заверенный при выдаче (M-9: сверяется при активации).
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RegistryEntry {
     pub client_id: [u8; 32],
     pub valid_until: u64,
     pub status: String,
+    /// M-9: до какого момента запись можно активировать (`Some(0)` — без срока). `None` — запись
+    /// обычная (многоразовая ссылка, поведение до M-9).
+    #[serde(default)]
+    pub enroll_until: Option<u64>,
+    /// M-9: устройство, в которое активирована первичная ссылка.
+    #[serde(default)]
+    pub device: Option<[u8; 32]>,
+    /// M-9: отпечаток ссылки (хэш канонической формы), заверенный издателем при выдаче.
+    #[serde(default)]
+    pub link_hash: Option<[u8; 32]>,
+}
+
+/// Статус записи, при котором Layer-1 пускает абонента (остальные — отказ).
+pub const STATUS_ACTIVE: &str = "active";
+/// M-9: первичная ссылка отработала — активирована на устройстве и больше никого не пускает.
+pub const STATUS_CONSUMED: &str = "consumed";
+
+impl RegistryEntry {
+    /// Строка реестра. Флаги пишутся только когда есть что писать — файл, который админ читает
+    /// глазами и правит руками, не должен обрастать `enroll=0,dev=,linkh=` на каждой строке.
+    pub fn to_line(&self) -> String {
+        let mut flags: Vec<String> = Vec::new();
+        if let Some(u) = self.enroll_until {
+            flags.push(format!("enroll={u}"));
+        }
+        if let Some(d) = self.device {
+            flags.push(format!("dev={}", hex::encode(d)));
+        }
+        if let Some(h) = self.link_hash {
+            flags.push(format!("linkh={}", hex::encode(h)));
+        }
+        let mut line = format!("{} {} {}", hex::encode(self.client_id), self.valid_until, self.status);
+        if !flags.is_empty() {
+            line.push(' ');
+            line.push_str(&flags.join(","));
+        }
+        line.push('\n');
+        line
+    }
+}
+
+/// Разбор поля флагов (`k=v,k=v`). Незнакомые ключи игнорируются: реестр правят руками, и
+/// неизвестный флаг не повод потерять всю запись.
+fn parse_flags(raw: Option<&str>) -> (Option<u64>, Option<[u8; 32]>, Option<[u8; 32]>) {
+    let (mut enroll, mut dev, mut linkh) = (None, None, None);
+    for kv in raw.unwrap_or("").split(',') {
+        let Some((k, v)) = kv.split_once('=') else { continue };
+        match k.trim() {
+            "enroll" => enroll = v.trim().parse::<u64>().ok(),
+            "dev" => dev = hex::decode(v.trim()).ok().and_then(|b| b.try_into().ok()),
+            "linkh" => linkh = hex::decode(v.trim()).ok().and_then(|b| b.try_into().ok()),
+            _ => {}
+        }
+    }
+    (enroll, dev, linkh)
 }
 
 /// Команда админа (CBOR-кадр после успешного auth).
@@ -53,7 +114,19 @@ pub enum AdminRequest {
     List,
     /// Зарегистрировать/обновить абонента (upsert + «разотзыв», как CLI `registry add`).
     /// `valid_until == 0` → серверный дефолт (+365 дней).
-    Add { client_id: [u8; 32], valid_until: u64 },
+    ///
+    /// M-9: `enroll_until` делает выдаваемую ссылку ОДНОРАЗОВОЙ (окно активации, unix; `0` — без
+    /// срока), `link_hash` — заверяемый отпечаток ссылки, который издатель сверит при активации.
+    /// Оба поля `#[serde(default)]`: старый админ-клиент шлёт кадр без них и получает прежнее
+    /// поведение (многоразовая запись).
+    Add {
+        client_id: [u8; 32],
+        valid_until: u64,
+        #[serde(default)]
+        enroll_until: Option<u64>,
+        #[serde(default)]
+        link_hash: Option<[u8; 32]>,
+    },
     /// Отозвать абонента (`status=revoked`; действует ≤ длины эпохи).
     Revoke { client_id: [u8; 32] },
 }
@@ -76,10 +149,14 @@ pub fn parse_registry(content: &str) -> Vec<RegistryEntry> {
             let mut it = line.split_whitespace();
             let (p, vu, st) = (it.next()?, it.next()?, it.next()?);
             let client_id: [u8; 32] = hex::decode(p).ok()?.try_into().ok()?;
+            let (enroll_until, device, link_hash) = parse_flags(it.next());
             Some(RegistryEntry {
                 client_id,
                 valid_until: vu.parse().ok()?,
                 status: st.to_string(),
+                enroll_until,
+                device,
+                link_hash,
             })
         })
         .collect()
@@ -89,13 +166,39 @@ pub fn parse_registry(content: &str) -> Vec<RegistryEntry> {
 /// «разотзыв»); иначе добавляем. Прочие строки сохраняются, дубликаты pub схлопываются, пустые
 /// строки убираются. Чистая логика (тестируемо, без I/O).
 pub fn registry_apply_add(existing: &str, pk: &[u8; 32], valid_until: u64) -> String {
+    registry_apply_add_full(existing, pk, valid_until, None, None)
+}
+
+/// M-9: тот же upsert, но с параметрами первичной ссылки — сроком активации и заверенным
+/// отпечатком. `enroll_until = Some(t)` делает запись ОДНОРАЗОВОЙ: до `t` её можно активировать на
+/// одном устройстве, после чего она становится `consumed` и никого не пускает.
+///
+/// Повторный `add` того же id **перезаписывает** запись целиком, в том числе снимает `consumed`.
+/// Это осознанно: `add` — явная команда админа («выдай/продли/разотзови»), и другого способа
+/// перевыпустить доступ на то же имя у него нет. Случайно так не сделаешь: id придётся указать.
+pub fn registry_apply_add_full(
+    existing: &str,
+    pk: &[u8; 32],
+    valid_until: u64,
+    enroll_until: Option<u64>,
+    link_hash: Option<[u8; 32]>,
+) -> String {
     let hexpk = hex::encode(pk);
+    let fresh = RegistryEntry {
+        client_id: *pk,
+        valid_until,
+        status: STATUS_ACTIVE.into(),
+        enroll_until,
+        device: None,
+        link_hash,
+    }
+    .to_line();
     let mut out = String::new();
     let mut done = false;
     for line in existing.lines() {
         if line.split_whitespace().next() == Some(hexpk.as_str()) {
             if !done {
-                out.push_str(&format!("{hexpk} {valid_until} active\n"));
+                out.push_str(&fresh);
                 done = true;
             }
         } else if !line.trim().is_empty() {
@@ -104,9 +207,77 @@ pub fn registry_apply_add(existing: &str, pk: &[u8; 32], valid_until: u64) -> St
         }
     }
     if !done {
-        out.push_str(&format!("{hexpk} {valid_until} active\n"));
+        out.push_str(&fresh);
     }
     out
+}
+
+/// M-9: **активация первичной ссылки**. Запись `bootstrap` становится `consumed` и получает
+/// `dev=<device>`, а рядом заводится запись самого устройства с тем же сроком подписки.
+///
+/// Идемпотентность обязательна: клиент мог сохранить свой seed, отправить запрос и потерять ответ
+/// (обрыв связи, убитый процесс). Повтор с ТЕМ ЖЕ устройством — успех и ничего не меняет; повтор с
+/// ДРУГИМ — отказ, ради которого всё и затевалось (украденная ссылка после активации мертва).
+///
+/// `link_hash` — отпечаток ссылки, который предъявил клиент. Если издатель запомнил свой при
+/// выдаче, они обязаны совпасть: расхождение означает, что ссылку по дороге подменили (адрес
+/// exit'а, pin, PSK — что угодно), и активировать её нельзя.
+pub fn registry_apply_enroll(
+    existing: &str,
+    bootstrap: &[u8; 32],
+    device: &[u8; 32],
+    link_hash: Option<[u8; 32]>,
+    now: u64,
+) -> Result<String> {
+    let entries = parse_registry(existing);
+    let e = entries
+        .iter()
+        .find(|e| &e.client_id == bootstrap)
+        .ok_or_else(|| anyhow!("активация: запись не найдена"))?;
+    let Some(deadline) = e.enroll_until else {
+        bail!("активация: ссылка не первичная (запись не помечена как одноразовая)");
+    };
+    if bootstrap == device {
+        bail!("активация: устройство обязано иметь СВОЮ идентичность, а не идентичность ссылки");
+    }
+    // Уже активирована: тем же устройством — идемпотентный успех, другим — отказ.
+    if e.status == STATUS_CONSUMED || e.device.is_some() {
+        return match e.device {
+            Some(d) if &d == device => Ok(existing.to_string()),
+            _ => bail!("активация: ссылка уже активирована на другом устройстве"),
+        };
+    }
+    if e.status != STATUS_ACTIVE {
+        bail!("активация: запись не активна (status={})", e.status);
+    }
+    if deadline > 0 && now >= deadline {
+        bail!("активация: окно активации истекло");
+    }
+    // Заверение M-9: то, что абонент держит в руках, обязано быть тем, что выдал админ.
+    match (e.link_hash, link_hash) {
+        (Some(want), Some(got)) if want != got => {
+            bail!("активация: отпечаток ссылки не совпал — ссылку подменили при доставке")
+        }
+        (Some(_), None) => bail!("активация: клиент не предъявил отпечаток заверенной ссылки"),
+        _ => {}
+    }
+    let consumed = RegistryEntry {
+        status: STATUS_CONSUMED.into(),
+        device: Some(*device),
+        ..e.clone()
+    };
+    let mut out = String::new();
+    let hexpk = hex::encode(bootstrap);
+    for line in existing.lines() {
+        if line.split_whitespace().next() == Some(hexpk.as_str()) {
+            out.push_str(&consumed.to_line());
+        } else if !line.trim().is_empty() {
+            out.push_str(line);
+            out.push('\n');
+        }
+    }
+    // Устройство наследует срок подписки исходной записи; одноразовым оно уже не помечается.
+    Ok(registry_apply_add_full(&out, device, e.valid_until, None, None))
 }
 
 /// Отзыв: у строки pub статус → `revoked` (valid_until сохраняется). Если pub нет — ошибка
@@ -116,11 +287,17 @@ pub fn registry_apply_revoke(existing: &str, pk: &[u8; 32]) -> Result<String> {
     let mut out = String::new();
     let mut found = false;
     for line in existing.lines() {
-        let mut it = line.split_whitespace();
-        if it.next() == Some(hexpk.as_str()) {
+        if line.split_whitespace().next() == Some(hexpk.as_str()) {
             if !found {
-                let vu = it.next().unwrap_or("0");
-                out.push_str(&format!("{hexpk} {vu} revoked\n"));
+                // Флаги M-9 (`enroll`/`dev`/`linkh`) при отзыве СОХРАНЯЮТСЯ: иначе отозванная
+                // первичная ссылка теряла бы отметку «уже активирована», и повторный `add`
+                // воскрешал бы её как свежую одноразовую — то есть отзыв ослаблял бы контроль.
+                let mut e = parse_registry(line).pop().unwrap_or(RegistryEntry {
+                    client_id: *pk,
+                    ..Default::default()
+                });
+                e.status = "revoked".into();
+                out.push_str(&e.to_line());
                 found = true;
             }
         } else if !line.trim().is_empty() {
@@ -276,12 +453,20 @@ impl AdminServer {
         let cur = std::fs::read_to_string(&path).unwrap_or_default();
         match req {
             AdminRequest::List => Ok(AdminResponse::Entries(parse_registry(&cur))),
-            AdminRequest::Add { client_id, valid_until } => {
+            AdminRequest::Add { client_id, valid_until, enroll_until, link_hash } => {
                 let vu = if valid_until == 0 { now_unix() + 365 * 24 * 3600 } else { valid_until };
                 if vu <= now_unix() {
                     bail!("valid_until в прошлом — запись была бы мёртвой");
                 }
-                atomic_write(&path, &registry_apply_add(&cur, &client_id, vu))?;
+                // M-9: окно активации в прошлом = ссылка, мёртвая с рождения. Ловим здесь, а не
+                // «потом на устройстве абонента», где причина уже не видна.
+                if matches!(enroll_until, Some(t) if t > 0 && t <= now_unix()) {
+                    bail!("окно активации в прошлом — такая ссылка не активируется никогда");
+                }
+                atomic_write(
+                    &path,
+                    &registry_apply_add_full(&cur, &client_id, vu, enroll_until, link_hash),
+                )?;
                 // Мутация уже записана в сам реестр (он и есть audit-trail). В stderr дублируем
                 // только под Citadel_DEBUG_LOG: иначе docker-лог накапливал бы «кто и когда выдан».
                 crate::dlog!("[admin] add {}… active до {vu}", &hex::encode(client_id)[..12]);
@@ -382,7 +567,29 @@ impl AdminClient {
 
     /// Зарегистрировать/обновить абонента. `valid_until == 0` → серверный дефолт (+365d).
     pub fn add(&mut self, client_id: [u8; 32], valid_until: u64) -> Result<()> {
-        self.expect_ok(&AdminRequest::Add { client_id, valid_until })
+        self.expect_ok(&AdminRequest::Add {
+            client_id,
+            valid_until,
+            enroll_until: None,
+            link_hash: None,
+        })
+    }
+
+    /// M-9: выдать ОДНОРАЗОВУЮ ссылку — запись помечается окном активации и заверенным
+    /// отпечатком. `enroll_until` — до какого момента (unix) ссылку можно активировать.
+    pub fn add_enrollable(
+        &mut self,
+        client_id: [u8; 32],
+        valid_until: u64,
+        enroll_until: u64,
+        link_hash: [u8; 32],
+    ) -> Result<()> {
+        self.expect_ok(&AdminRequest::Add {
+            client_id,
+            valid_until,
+            enroll_until: Some(enroll_until),
+            link_hash: Some(link_hash),
+        })
     }
 
     /// Отозвать абонента.
@@ -439,7 +646,99 @@ mod tests {
         let ha = hex::encode(a);
         let txt = format!("{ha} 123 active\nмусор\nshort 1 active\n\n{ha} notnum active\n");
         let got = parse_registry(&txt);
-        assert_eq!(got, vec![RegistryEntry { client_id: a, valid_until: 123, status: "active".into() }]);
+        assert_eq!(
+            got,
+            vec![RegistryEntry {
+                client_id: a,
+                valid_until: 123,
+                status: "active".into(),
+                ..Default::default()
+            }]
+        );
+    }
+
+    /// M-9: активация — главный инвариант одноразовости. Первая активация переносит подписку на
+    /// устройство и гасит запись ссылки; повтор ТЕМ ЖЕ устройством идемпотентен, ДРУГИМ — отказ.
+    #[test]
+    fn enroll_binds_link_to_first_device_only() {
+        let boot = [0xB0u8; 32];
+        let dev1 = [0xD1u8; 32];
+        let dev2 = [0xD2u8; 32];
+        let hash = [0x9Au8; 32];
+        let start = registry_apply_add_full("", &boot, 2_000, Some(1_500), Some(hash));
+        assert!(start.contains("enroll=1500"), "запись помечена одноразовой: {start}");
+
+        let after = registry_apply_enroll(&start, &boot, &dev1, Some(hash), 1_000).unwrap();
+        let e: Vec<_> = parse_registry(&after);
+        let b = e.iter().find(|x| x.client_id == boot).unwrap();
+        assert_eq!(b.status, STATUS_CONSUMED, "ссылка отработала");
+        assert_eq!(b.device, Some(dev1), "видно, в какое устройство активирована");
+        let d = e.iter().find(|x| x.client_id == dev1).unwrap();
+        assert_eq!((d.status.as_str(), d.valid_until), (STATUS_ACTIVE, 2_000), "подписка переехала");
+        assert!(d.enroll_until.is_none(), "устройственная запись уже не одноразовая");
+
+        // Идемпотентность: тот же device — успех, реестр не меняется.
+        let again = registry_apply_enroll(&after, &boot, &dev1, Some(hash), 1_100).unwrap();
+        assert_eq!(again, after, "повтор той же активации ничего не меняет");
+        // Второе устройство — отказ (ровно то, ради чего одноразовость и вводилась).
+        let err = registry_apply_enroll(&after, &boot, &dev2, Some(hash), 1_100).unwrap_err();
+        assert!(format!("{err:#}").contains("другом устройстве"), "err: {err:#}");
+    }
+
+    /// M-9: срок, заверение и «не первичная запись» — три причины отказа, которые обязаны
+    /// различаться: за ними стоят разные действия человека.
+    #[test]
+    fn enroll_refuses_expired_tampered_and_plain_entries() {
+        let boot = [0xB0u8; 32];
+        let dev = [0xD1u8; 32];
+        let hash = [0x9Au8; 32];
+        let one_time = registry_apply_add_full("", &boot, 9_000, Some(1_500), Some(hash));
+
+        // окно активации истекло
+        let err = registry_apply_enroll(&one_time, &boot, &dev, Some(hash), 1_600).unwrap_err();
+        assert!(format!("{err:#}").contains("окно активации"), "err: {err:#}");
+        // отпечаток не совпал → ссылку подменили по дороге
+        let err = registry_apply_enroll(&one_time, &boot, &dev, Some([0xEEu8; 32]), 1_000).unwrap_err();
+        assert!(format!("{err:#}").contains("отпечаток"), "err: {err:#}");
+        // клиент вовсе не предъявил отпечаток, хотя издатель его заверял
+        let err = registry_apply_enroll(&one_time, &boot, &dev, None, 1_000).unwrap_err();
+        assert!(format!("{err:#}").contains("не предъявил"), "err: {err:#}");
+        // обычная (многоразовая) запись активации не подлежит
+        let plain = registry_apply_add("", &boot, 9_000);
+        let err = registry_apply_enroll(&plain, &boot, &dev, Some(hash), 1_000).unwrap_err();
+        assert!(format!("{err:#}").contains("не первичная"), "err: {err:#}");
+        // устройство обязано иметь СВОЮ идентичность
+        let err = registry_apply_enroll(&one_time, &boot, &boot, Some(hash), 1_000).unwrap_err();
+        assert!(format!("{err:#}").contains("СВОЮ идентичность"), "err: {err:#}");
+    }
+
+    /// Флаги M-9 переживают отзыв и чтение-запись реестра: иначе `revoke` стирал бы отметку
+    /// «уже активирована», и повторный `add` воскрешал бы ссылку как свежую одноразовую.
+    #[test]
+    fn flags_survive_revoke_roundtrip() {
+        let boot = [0xB0u8; 32];
+        let dev = [0xD1u8; 32];
+        let hash = [0x9Au8; 32];
+        let reg = registry_apply_add_full("", &boot, 2_000, Some(1_500), Some(hash));
+        let reg = registry_apply_enroll(&reg, &boot, &dev, Some(hash), 1_000).unwrap();
+        let reg = registry_apply_revoke(&reg, &boot).unwrap();
+        let e = parse_registry(&reg);
+        let b = e.iter().find(|x| x.client_id == boot).unwrap();
+        assert_eq!(b.status, "revoked");
+        assert_eq!(b.device, Some(dev), "отметка активации сохранена");
+        assert_eq!(b.link_hash, Some(hash), "заверенный отпечаток сохранён");
+        assert_eq!(b.enroll_until, Some(1_500));
+    }
+
+    /// Строки без флагов (написанные до M-9 или руками оператора) читаются как раньше.
+    #[test]
+    fn legacy_lines_parse_without_flags() {
+        let a = [0x11u8; 32];
+        let e = parse_registry(&format!("{} 42 active\n", hex::encode(a)));
+        assert_eq!(e.len(), 1);
+        assert!(e[0].enroll_until.is_none() && e[0].device.is_none() && e[0].link_hash.is_none());
+        // и обратно: запись без флагов не обрастает мусором
+        assert_eq!(e[0].to_line(), format!("{} 42 active\n", hex::encode(a)));
     }
 
     // ── auth: чистые негативы без TLS ──
@@ -474,7 +773,12 @@ mod tests {
     fn wire_cbor_roundtrip() {
         let reqs = [
             AdminRequest::List,
-            AdminRequest::Add { client_id: [7u8; 32], valid_until: 0 },
+            AdminRequest::Add {
+                client_id: [7u8; 32],
+                valid_until: 0,
+                enroll_until: None,
+                link_hash: None,
+            },
             AdminRequest::Revoke { client_id: [8u8; 32] },
         ];
         for r in &reqs {
@@ -490,6 +794,7 @@ mod tests {
                 client_id: [9u8; 32],
                 valid_until: 1,
                 status: "active".into(),
+                ..Default::default()
             }]),
         ];
         for r in &resps {

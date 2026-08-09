@@ -22,7 +22,13 @@ use serde::{Deserialize, Serialize};
 /// НЕ совместимы с обновлённым сервером ни в какой части — их читать бессмысленно (см.
 /// `MIN_READ_VERSION`): человеку нужен понятный отказ «перевыпустите ссылку», а не отказ Layer-1
 /// «client_id не активен» на живом сервере.
-pub const BUNDLE_VERSION: u8 = 4;
+/// v5 (M-9/аудит-4): добавлены `exp` (окно активации первичной ссылки) и `enroll` (признак
+/// «первичная, подлежит активации на одном устройстве»). Оба поля `#[serde(default)]`, а
+/// `MIN_READ_VERSION` намеренно оставлен на 4: уже розданные v4-ссылки продолжают работать как
+/// раньше — многоразовыми и бессрочными. Сделать конкретную ссылку одноразовой можно только
+/// перевыпуском, и это честнее, чем сломать всю абонентскую базу одним обновлением. Подделать
+/// «понижение» v5→v4 бесполезно: одноразовость и срок держит РЕЕСТР издателя, а не поле в ссылке.
+pub const BUNDLE_VERSION: u8 = 5;
 
 /// Минимальная версия формата, которую ещё разбираем. NB (задача 2, уточнено 2026-07-20): это НЕ
 /// канал совместимости кред между поколениями сервера — инвалидация «старых ссылок при обновлении
@@ -35,6 +41,15 @@ const MIN_READ_VERSION: u8 = 4;
 
 /// Дефолтный порт admin-канала (за туннелем), если в ссылке `admin_port` не задан.
 pub const DEFAULT_ADMIN_PORT: &str = "7001";
+
+/// M-9: домен канонической формы ссылки (см. [`CredentialLink::canonical`]). Меняется вместе с
+/// набором полей канона — иначе ссылка, заверенная по старым правилам, «подтвердилась» бы по новым.
+const CANON_DOMAIN: &[u8] = b"CitadelPQVPN/link/v5/canon";
+
+/// M-9: окно активации первичной ссылки по умолчанию — 24 часа. Продуктовое решение (2026-08-09):
+/// ссылка живёт ровно сутки с момента выдачи, дальше её нужно перевыпустить. Достаточно, чтобы
+/// человек дошёл до установки приложения, и мало, чтобы забытая в переписке ссылка чего-то стоила.
+pub const DEFAULT_ACTIVATION_SECS: u64 = 24 * 3600;
 
 /// Что человеку делать с несовместимой версией. Номер формата сам по себе не говорит ничего:
 /// «слишком старая» лечится перевыпуском ссылки у администратора, «слишком новая» — обновлением
@@ -101,6 +116,12 @@ pub struct CredentialBundle {
     pub routes: String,
     /// DNS-резолвер (F6); `None` → не настраивать.
     pub dns: Option<String>,
+    /// v5 (M-9): окно активации первичной ссылки (unix). См. [`CredentialLink::exp`].
+    #[serde(default)]
+    pub exp: Option<u64>,
+    /// v5 (M-9): ссылка первичная — активируется на одном устройстве. См. [`CredentialLink::enroll`].
+    #[serde(default)]
+    pub enroll: bool,
 }
 
 impl Drop for CredentialBundle {
@@ -255,6 +276,18 @@ pub struct CredentialLink {
     pub admin_port: Option<String>,
     pub routes: String,
     pub dns: Option<String>,
+    /// v5 (M-9): до какого момента (unix) первичную ссылку можно **активировать**. Это НЕ срок
+    /// подписки (`valid_until` в реестре): подписка живёт своей жизнью, а здесь — окно, в которое
+    /// ссылка вообще может превратиться в рабочий доступ. `None` — окна нет (v4-поведение).
+    /// Проверяется и клиентом (внятный отказ до сети), и издателем (собственно enforcement).
+    #[serde(default)]
+    pub exp: Option<u64>,
+    /// v5 (M-9): ссылка **первичная** — предъявитель обязан активировать её на своём устройстве,
+    /// после чего она превращается в устройство-специфичный материал и сама становится мёртвой.
+    /// Флаг — подсказка клиенту (показать «активируется на одном устройстве»); принуждение живёт
+    /// в реестре издателя, поэтому снятие флага в подменённой ссылке ничего не даёт.
+    #[serde(default)]
+    pub enroll: bool,
 }
 
 impl Drop for CredentialLink {
@@ -294,6 +327,8 @@ impl CredentialLink {
             admin_port: b.admin_port.clone(),
             routes: b.routes.clone(),
             dns: b.dns.clone(),
+            exp: b.exp,
+            enroll: b.enroll,
         }
     }
 
@@ -354,6 +389,82 @@ impl CredentialLink {
     /// C7.2: порт admin-канала (за туннелем), дефолт [`DEFAULT_ADMIN_PORT`].
     pub fn admin_port(&self) -> String {
         self.admin_port.clone().unwrap_or_else(|| DEFAULT_ADMIN_PORT.to_string())
+    }
+
+    /// M-9: **каноническая форма ссылки** — то, что заверяет издатель.
+    ///
+    /// Байты никуда не передаются: и админ (при выдаче), и абонент (при активации) считают от неё
+    /// хэш ([`link_hash`](Self::link_hash)) и сравнивают его с тем, что запомнил издатель. Поэтому
+    /// поля включаются ВСЕ, от которых зависит доверие: адреса, pin'ы, обязательства, PSK, срок и
+    /// признак первичности. Подменённая при доставке ссылка — хоть целиком, хоть одним полем —
+    /// даёт другой хэш, и активация обрывается ДО того, как абонент чем-то воспользуется.
+    ///
+    /// Секретный `client_seed` в канон не входит **как секрет**: вместо него — выводимый из него
+    /// публичный `client_id`. Так издатель (который seed не видел и видеть не должен) считает ту же
+    /// величину, что и клиент. Каждое поле длино-префиксовано — иначе «сдвиг» содержимого между
+    /// соседними полями давал бы одинаковый хэш для разных ссылок.
+    ///
+    /// `None` — в ссылке нет Layer-1 идентичности (`client_seed`), заверять нечего.
+    pub fn canonical(&self) -> Option<Vec<u8>> {
+        let client_id = citadel_token::pqid::id_from_seed(self.client_seed.as_ref()?).ok()?;
+        let mut c = Vec::with_capacity(512);
+        let mut put = |b: &[u8]| {
+            c.extend_from_slice(&(b.len() as u32).to_be_bytes());
+            c.extend_from_slice(b);
+        };
+        put(CANON_DOMAIN);
+        put(&[self.version]);
+        put(&(self.servers.len() as u32).to_be_bytes());
+        for srv in &self.servers {
+            put(srv.as_bytes());
+        }
+        put(self.server_name.as_bytes());
+        put(self.kx_suite.as_bytes());
+        for opt in [&self.cert_pin, &self.mldsa_commit, &self.obfs_psk, &self.issuer_commit,
+                    &self.issuer_pin, &self.issuer_mldsa] {
+            put(opt.as_ref().map_or(&[][..], |v| &v[..]));
+        }
+        put(self.tcp_port.as_deref().unwrap_or("").as_bytes());
+        put(self.issuer.as_deref().unwrap_or("").as_bytes());
+        put(&client_id);
+        put(self.routes.as_bytes());
+        put(self.dns.as_deref().unwrap_or("").as_bytes());
+        put(&self.exp.unwrap_or(0).to_be_bytes());
+        put(&[u8::from(self.enroll)]);
+        // admin-поля: сам seed в канон не идёт (он есть только у мастер-ссылки и остаётся её
+        // секретом), но его НАЛИЧИЕ и порт — идут: иначе клиентскую ссылку можно было бы дополнить
+        // admin-полями, не сломав заверение.
+        put(&[u8::from(self.admin_seed.is_some())]);
+        put(self.admin_port.as_deref().unwrap_or("").as_bytes());
+        Some(c)
+    }
+
+    /// M-9: хэш канонической формы — «отпечаток ссылки». Издатель запоминает его при выдаче
+    /// (по admin-каналу) и сверяет при активации; расхождение = ссылку подменили по дороге.
+    pub fn link_hash(&self) -> Option<[u8; 32]> {
+        self.canonical().as_deref().map(sha256)
+    }
+
+    /// M-9: **код сверки** — тот же отпечаток в виде, который человек продиктует по телефону.
+    /// 30 бит (6 символов алфавита Кроуфорда без похожих букв) двумя группами: этого хватает,
+    /// чтобы поймать подмену при доставке, и мало, чтобы кто-то стал переписывать его целиком.
+    ///
+    /// Зачем он нужен помимо заверения издателем: заверение ловит **подмену полей** genuine-ссылки,
+    /// но не ловит ссылку, подменённую ЦЕЛИКОМ (у неё и издатель свой — он честно заверит своё).
+    /// Единственное лекарство от этого — сверка по другому каналу, а сверять 300 байт base64
+    /// человек не станет. Отсюда короткий код: админ видит его при выдаче, абонент — при импорте.
+    pub fn verify_code(&self) -> Option<String> {
+        const A: &[u8] = b"0123456789ABCDEFGHJKMNPQRSTVWXYZ"; // Crockford base32: без I, L, O, U
+        let h = self.link_hash()?;
+        let bits = u64::from(h[0]) << 22 | u64::from(h[1]) << 14 | u64::from(h[2]) << 6 | u64::from(h[3]) >> 2;
+        let s: String = (0..6).map(|i| A[((bits >> (25 - 5 * i)) & 31) as usize] as char).collect();
+        Some(format!("{}-{}", &s[..3], &s[3..]))
+    }
+
+    /// M-9: просрочено ли окно активации первичной ссылки. `None`/`0` в `exp` — окна нет.
+    /// Это ответ клиента «до сети»; настоящий запрет — у издателя (реестр), см. `enroll`.
+    pub fn activation_expired(&self, now_unix: u64) -> bool {
+        matches!(self.exp, Some(e) if e > 0 && now_unix >= e)
     }
 
     /// Сгенерировать QR компактной ссылки как **SVG** (EC=M). UI рисует напрямую; декод
@@ -433,6 +544,8 @@ mod tests {
             admin_port: Some("7001".into()),
             routes: "1.1.1.1/32 0.0.0.0/0".into(),
             dns: Some("1.1.1.1".into()),
+            exp: None,
+            enroll: false,
         }
     }
 
@@ -464,9 +577,97 @@ mod tests {
             admin_port: None,
             routes: String::new(),
             dns: None,
+            exp: None,
+            enroll: false,
         };
         let back = CredentialBundle::from_cbor(&b.to_cbor().unwrap()).unwrap();
         assert_eq!(b, back);
+    }
+
+    /// M-9: отпечаток ссылки — то, что издатель заверяет при выдаче и сверяет при активации.
+    /// Он обязан меняться от ЛЮБОГО поля доверия: подменённый адрес exit'а, pin, PSK или срок —
+    /// это другая ссылка, и активировать её нельзя.
+    #[test]
+    fn link_hash_covers_every_trust_field() {
+        let base = CredentialLink::from_bundle(&sample());
+        let h0 = base.link_hash().expect("есть client_seed");
+        let mut changed: Vec<(&str, CredentialLink)> = Vec::new();
+        let mut v = base.clone();
+        v.servers = vec!["evil.example:4433".into()];
+        changed.push(("адрес exit", v));
+        let mut v = base.clone();
+        v.cert_pin = Some([0xEE; 32]);
+        changed.push(("cert-pin", v));
+        let mut v = base.clone();
+        v.obfs_psk = Some([0xEE; 32]);
+        changed.push(("obfs-PSK", v));
+        let mut v = base.clone();
+        v.issuer = Some("evil.example:7000".into());
+        changed.push(("адрес издателя", v));
+        let mut v = base.clone();
+        v.issuer_pin = Some([0xEE; 32]);
+        changed.push(("issuer-pin", v));
+        let mut v = base.clone();
+        v.issuer_mldsa = Some([0xEE; 32]);
+        changed.push(("PQ-обязательство издателя", v));
+        let mut v = base.clone();
+        v.routes = "10.0.0.0/8".into();
+        changed.push(("маршруты", v));
+        let mut v = base.clone();
+        v.dns = Some("9.9.9.9".into());
+        changed.push(("DNS", v));
+        let mut v = base.clone();
+        v.exp = Some(42);
+        changed.push(("срок активации", v));
+        let mut v = base.clone();
+        v.enroll = !base.enroll;
+        changed.push(("признак первичной", v));
+        let mut v = base.clone();
+        v.client_seed = Some([0xEE; 32]);
+        changed.push(("client_seed (через client_id)", v));
+        let mut v = base.clone();
+        v.admin_port = Some("9999".into());
+        changed.push(("admin-порт", v));
+        for (what, l) in changed {
+            assert_ne!(l.link_hash().unwrap(), h0, "подмена поля «{what}» не изменила отпечаток");
+        }
+        // ...и не меняется от косметики, которая на доверие не влияет
+        let same = base.clone();
+        assert_eq!(same.link_hash().unwrap(), h0, "та же ссылка — тот же отпечаток");
+        // Ссылка без Layer-1 идентичности заверять нечего.
+        let mut no_seed = base.clone();
+        no_seed.client_seed = None;
+        assert!(no_seed.link_hash().is_none() && no_seed.verify_code().is_none());
+    }
+
+    /// Код сверки: стабилен, читаем человеком и различает разные ссылки. Его диктуют голосом,
+    /// поэтому в алфавите нет пар, которые путают на слух и на глаз (I/L/O/U исключены).
+    #[test]
+    fn verify_code_is_human_and_distinguishing() {
+        let a = CredentialLink::from_bundle(&sample());
+        let code = a.verify_code().unwrap();
+        assert_eq!(code.len(), 7, "6 символов и дефис: {code}");
+        assert_eq!(code.as_bytes()[3], b'-');
+        assert!(code.chars().all(|c| c == '-' || "0123456789ABCDEFGHJKMNPQRSTVWXYZ".contains(c)), "{code}");
+        assert_eq!(a.verify_code().unwrap(), code, "код стабилен");
+        let mut b = a.clone();
+        b.servers = vec!["other.example:4433".into()];
+        assert_ne!(b.verify_code().unwrap(), code, "другая ссылка — другой код");
+    }
+
+    /// M-9: срок активации живёт в ссылке и читается обратно; `None`/`0` означают «без срока»
+    /// (так выпускаются ссылки самой установки — ими оператор заводит своё устройство).
+    #[test]
+    fn activation_window_roundtrips_through_uri() {
+        let mut b = sample();
+        b.exp = Some(1_700_000_000);
+        b.enroll = true;
+        let link = CredentialLink::from_bundle(&b);
+        let back = CredentialLink::from_uri(&link.to_uri().unwrap()).unwrap();
+        assert_eq!(back.exp, Some(1_700_000_000));
+        assert!(back.enroll);
+        assert!(back.activation_expired(1_700_000_001));
+        assert!(!back.activation_expired(1_699_999_999));
     }
 
     #[test]

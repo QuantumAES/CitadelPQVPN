@@ -132,6 +132,10 @@ fn cmd_status() -> Result<()> {
 }
 
 fn cmd_connect(name: Option<String>) -> Result<()> {
+    // Хранилище открывается РОВНО ОДИН раз за команду: каждый вызов `with_vault` спрашивает
+    // мастер-пароль, и три вопроса подряд на одно «citadel-cli connect» — это не безопасность, а
+    // раздражение. Поэтому выбор профиля, активация (M-9) и подстановка ключа устройства идут
+    // внутри одного захода.
     let (uri, label) = with_vault(|v| {
         let profiles = v.list();
         if profiles.is_empty() {
@@ -145,7 +149,41 @@ fn cmd_connect(name: Option<String>) -> Result<()> {
                 bail!("укажите профиль: {}", names.join(", "));
             }
         };
-        Ok((p.uri.clone(), p.name.clone()))
+        // M-9: первичная ссылка активируется на ЭТОМ устройстве до первого подключения. Делает это
+        // консоль, а не демон: ключ надо положить в хранилище, а хранилище есть только у
+        // пользователя (демон и движок живут за границей привилегий и его не видят).
+        let (id, sid, mid) = (p.id.clone(), p.id.clone(), p.id.clone());
+        // Обоим callback'ам нужен `&mut Vault`, но выполняются они строго по очереди — делим
+        // владение RefCell'ом, а не второй копией хранилища в памяти.
+        let cell = std::cell::RefCell::new(&mut *v);
+        let outcome = citadel_client::activate_profile_blocking(
+            &p,
+            |seed| cell.borrow_mut().set_device_seed(&sid, seed),
+            || cell.borrow_mut().mark_enrolled(&mid),
+        )
+        .context("активация ссылки")?;
+        if outcome == citadel_client::Activation::Activated {
+            println!("Ссылка активирована на этом устройстве (повторно использовать её нельзя).");
+        }
+        // Демону уходит ссылка с ТЕМ ключом, которым положено представляться издателю: после
+        // активации — устройственным. Подменить поле в ссылке проще и безопаснее, чем расширять
+        // IPC ещё одним секретом, а движок про активацию так и не знает.
+        let fresh = cell
+            .borrow()
+            .list()
+            .into_iter()
+            .find(|x| x.id == id)
+            .unwrap_or_else(|| p.clone());
+        let link = citadel_client::CredentialLink::from_uri(&fresh.uri)?;
+        let uri = match citadel_client::effective_seed(&fresh, &link) {
+            Some(seed) if Some(seed) != link.client_seed => {
+                let mut l = citadel_client::CredentialLink::from_uri(&fresh.uri)?;
+                l.client_seed = Some(seed);
+                l.to_uri()?
+            }
+            _ => fresh.uri.clone(),
+        };
+        Ok((uri, fresh.name.clone()))
     })?;
 
     let st = Settings::load();

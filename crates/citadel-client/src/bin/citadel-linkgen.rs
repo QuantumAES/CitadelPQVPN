@@ -4,6 +4,7 @@
 //!
 //! ```text
 //! citadel-linkgen --servers "1.2.3.4:4433" --psk <hex64> --pin <hex64> \
+//!   [--activate-secs 86400] \
 //!   [--kx all] [--tcp-port 443] [--routes "1.1.1.1/32 1.0.0.1/32"] \
 //!   [--dns 1.1.1.1] [--server-name citadel.exit] [--qr link.svg] \
 //!   [--issuer host:7000] [--issuer-pin <hex64>] [--issuer-mldsa <hex64>] [--client-seed <hex64>] \
@@ -86,7 +87,19 @@ fn main() {
         admin_port: get("--admin-port"),
         routes: get("--routes").unwrap_or_default(),
         dns: get("--dns"),
+        // M-9: окно активации первичной ссылки. `--activate-secs N` делает ссылку ОДНОРАЗОВОЙ:
+        // она годна N секунд и активируется на одном устройстве. Без флага ссылка прежняя
+        // (многоразовая) — так печатаются ссылки самой установки, которыми оператор заводит своё
+        // устройство и админ-доступ; абонентские ссылки выдаёт admin-плоскость, и там окно есть
+        // всегда (см. `citadel_client::admin::admin_issue`).
+        exp: get("--activate-secs")
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .filter(|s| *s > 0)
+            .map(|s| now_unix() + s),
+        enroll: false, // выставится ниже, если задан --activate-secs
     };
+    let mut bundle = bundle;
+    bundle.enroll = bundle.exp.is_some();
 
     let link = CredentialLink::from_bundle(&bundle);
     let uri = link.to_uri().expect("to_uri");
@@ -120,8 +133,27 @@ fn main() {
         if bundle.admin_seed.is_some() { format!("МАСТЕР (порт {})", bundle.admin_port.as_deref().unwrap_or("7001")) } else { "нет".into() },
         bundle.routes,
     );
+    // M-9: код сверки — короткий отпечаток ссылки, который называют абоненту по другому каналу
+    // (голосом), а он сверяет его при импорте. Ловит подмену ссылки при доставке — единственное,
+    // чего не может поймать никакая проверка ВНУТРИ самой ссылки.
+    if let (Some(code), Some(h)) = (link.verify_code(), link.link_hash()) {
+        eprintln!("[linkgen] код сверки: {code}   (продиктуй абоненту отдельно от самой ссылки)");
+        eprintln!("[linkgen] отпечаток ссылки: {}", hex::encode(h));
+    }
+    if let Some(until) = bundle.exp {
+        eprintln!(
+            "[linkgen] ⚠ ОДНОРАЗОВАЯ ссылка: активировать до {until} (unix), на ОДНОМ устройстве;              после активации копия ссылки бесполезна"
+        );
+    }
     if let Some(qr) = get("--qr") {
         std::fs::write(&qr, link.to_qr_svg().expect("qr")).expect("write qr");
         eprintln!("[linkgen] QR-SVG → {qr}");
     }
+}
+
+fn now_unix() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
 }

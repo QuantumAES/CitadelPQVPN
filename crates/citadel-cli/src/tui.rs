@@ -482,9 +482,18 @@ fn do_connect(app: &mut App) {
         app.fail("Профиль не выбран");
         return;
     };
+    // M-9: первичная ссылка активируется на этом устройстве до первого подключения. Делаем это
+    // здесь (в TUI, у которого есть хранилище), а демону отдаём ссылку с устройственным ключом.
+    let link = match activate_in_tui(app, &p) {
+        Ok(l) => l,
+        Err(e) => {
+            app.fail(format!("{e:#}"));
+            return;
+        }
+    };
     let st = &app.settings;
     let req = ConnectReq {
-        link: p.uri.clone(),
+        link,
         killswitch: st.killswitch,
         split_mode: st.dest_mode.clone(),
         split_dests: st.dests.clone(),
@@ -493,6 +502,40 @@ fn do_connect(app: &mut App) {
     match app.client.connect_session(req) {
         Ok(()) => app.note(format!("Подключение к «{}»…", sanitize_text(&p.name, 64))),
         Err(e) => app.fail(format!("{e}")),
+    }
+}
+
+/// M-9: активировать профиль (если требуется) и вернуть ссылку с рабочим Layer-1 ключом.
+/// Хранилище открыто (TUI без него не работает), поэтому ключ устройства сохраняется сразу.
+fn activate_in_tui(app: &mut App, p: &Profile) -> anyhow::Result<String> {
+    let id = p.id.clone();
+    let (sid, mid) = (id.clone(), id.clone());
+    let outcome = {
+        let v = app.vault.as_mut().ok_or_else(|| anyhow::anyhow!("хранилище заперто"))?;
+        // Обоим callback'ам нужен `&mut Vault`, но выполняются они строго по очереди (сохранить
+        // ключ → сеть → подтвердить), поэтому владение делится RefCell'ом, а не клонированием
+        // хранилища: второй копии секретов в памяти нам не нужно.
+        let v = std::cell::RefCell::new(v);
+        citadel_client::activate_profile_blocking(
+            p,
+            |seed| v.borrow_mut().set_device_seed(&sid, seed),
+            || v.borrow_mut().mark_enrolled(&mid),
+        )?
+    };
+    if outcome == citadel_client::Activation::Activated {
+        app.note("Ссылка активирована на этом устройстве".to_string());
+        app.profiles = app.vault.as_ref().map(|v| v.list()).unwrap_or_default();
+    }
+    // Ссылка для демона: с ключом устройства, если активация подтверждена.
+    let fresh = app.profiles.iter().find(|x| x.id == id).cloned().unwrap_or_else(|| p.clone());
+    let link = citadel_client::CredentialLink::from_uri(&fresh.uri)?;
+    match citadel_client::effective_seed(&fresh, &link) {
+        Some(seed) if Some(seed) != link.client_seed => {
+            let mut l = citadel_client::CredentialLink::from_uri(&fresh.uri)?;
+            l.client_seed = Some(seed);
+            Ok(l.to_uri()?)
+        }
+        _ => Ok(fresh.uri.clone()),
     }
 }
 

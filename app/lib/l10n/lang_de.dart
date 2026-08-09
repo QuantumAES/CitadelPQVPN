@@ -36,6 +36,8 @@ const Map<String, String> langDe = {
   'err_service_unavailable_hint': 'Prüfen Sie, ob er installiert ist und läuft',
   'err_no_vpn_permission': 'Keine VPN-Berechtigung',
   'err_no_vpn_permission_hint': 'Erlauben Sie die Verbindung im Systemdialog',
+  'err_activation_failed': 'Der Link konnte nicht aktiviert werden',
+  'err_activation_failed_hint': 'bitten Sie den Administrator um einen neuen Link: ein Erstlink wird einmal und nur begrenzte Zeit aktiviert',
 
   'switch_title': 'Verbindung wechseln?',
   'switch_body': 'Aktuell ist „{current}“ verbunden. Trennen und mit „{name}“ verbinden?',
@@ -201,6 +203,9 @@ const Map<String, String> langDe = {
   'issued_title_named': 'Zugang ausgestellt: {label}',
   'copy_link': 'Link kopieren',
   'link_copied': 'Link kopiert',
+  'verify_code_title': 'Prüfcode',
+  'verify_code_note': 'Nennen Sie diesen Code getrennt vom Link (mündlich, persönlich). Beim Import sieht der Abonnent denselben Code — so wird eine Manipulation bei der Zustellung erkannt.',
+  'activate_note': 'Der Link muss bis {when} und nur auf einem Gerät aktiviert werden: nach der Aktivierung ist eine Kopie wertlos.',
   'issued_note': 'Übergeben Sie den Link jetzt an den Teilnehmer (QR-Code oder sicherer Kanal). '
       'Ein erneutes Abrufen ist nicht möglich: das Geheimnis des Teilnehmers wird auf diesem Gerät nicht gespeichert.',
   'revoke_title': 'Zugang widerrufen?',

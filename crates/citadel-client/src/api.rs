@@ -106,6 +106,8 @@ mod tests {
             admin_port: None,
             routes: String::new(),
             dns: None,
+            exp: None,
+            enroll: false,
         }
     }
 

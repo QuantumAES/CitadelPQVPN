@@ -283,8 +283,17 @@ pub fn fetch_tokens(
     let auth = pqid::build_auth(seed, pqid::DOMAIN_CLIENT, &challenge, &ekm)?;
     write_frame(&mut conn, &auth)?;
 
-    // Публичный элемент K текущей эпохи — под ним проверяется DLEQ каждой выдачи. Если Layer-1 не
-    // прошёл, издатель закрыл соединение → read_frame вернёт Err (не «авторизован»).
+    // M-9: гейт выдачи — что издатель думает о нашей записи реестра. Кадр приходит ДО ключа эпохи,
+    // поэтому отказ виден с внятной причиной, а не как «издатель молча закрыл соединение».
+    match parse_gate_frame(
+        &read_frame(&mut conn).context("Layer-1: издатель не ответил (не авторизован?)")?,
+    )? {
+        Gate::Allow => {}
+        Gate::Enroll { until } => return Err(EnrollmentRequired { until }.into()),
+        Gate::Refuse(code) => bail!("{}", refusal_text(code)),
+    }
+
+    // Публичный элемент K текущей эпохи — под ним проверяется DLEQ каждой выдачи.
     let issuer_public =
         read_frame(&mut conn).context("Layer-1: издатель не выдал ключ эпохи (не авторизован?)")?;
     // Разбираем сразу: негодный элемент — это сломанный/подставной издатель, и узнать об этом лучше
@@ -327,6 +336,59 @@ pub fn fetch_tokens(
         tokens.push(st.finalize(&issuer_public, evaluated, proof)?.to_bytes());
     }
     Ok(Grant { tokens, data_psk: epoch.data_psk, epoch: epoch.epoch, epoch_secs: epoch.epoch_secs })
+}
+
+/// M-9: **активация первичной ссылки** — превращение её в устройство-специфичный доступ.
+///
+/// Абонент аутентифицируется ключом ИЗ ССЫЛКИ (`bootstrap_seed`), а предъявляет НОВУЮ идентичность
+/// (`device_seed`), которую он только что создал у себя и никому не отдаёт. Издатель переносит
+/// подписку на неё, а запись ссылки гасит: с этого момента та же ссылка на другом устройстве не
+/// работает — в этом весь смысл (украденная/пересланная ссылка после активации ничего не стоит).
+///
+/// Операция **идемпотентна**: повтор с тем же `device_seed` — успех. Так и должно быть: клиент мог
+/// сохранить свой ключ, отправить запрос и не получить ответ (обрыв, убитый процесс), и второй
+/// заход обязан довести дело до конца, а не запереть человека снаружи навсегда.
+///
+/// `link_hash` — отпечаток ссылки ([`CredentialLink::link_hash`] на стороне клиента). Издатель
+/// сверяет его с заверенным при выдаче: не совпало — ссылку подменили по дороге, активации нет.
+///
+/// Возвращает `Ok(true)` — активировано (или уже было), `Ok(false)` — издатель активации не
+/// требует (запись обычная, многоразовая ссылка).
+#[allow(clippy::too_many_arguments)]
+pub fn enroll_device(
+    issuer_addr: &str,
+    issuer_pin: &[u8; 32],
+    issuer_mldsa: &[u8; 32],
+    bootstrap_seed: &[u8; 32],
+    device_seed: &[u8; 32],
+    link_hash: &[u8; 32],
+    retries: u32,
+    obfs_psk: Option<[u8; 32]>,
+) -> Result<bool> {
+    let (mut conn, ekm, challenge) = connect_authenticated_issuer(
+        issuer_addr,
+        issuer_pin,
+        issuer_mldsa,
+        retries,
+        obfs_psk,
+        citadel_protect::Route::Bypass, // активация идёт до первого туннеля — он ещё не поднят
+    )?;
+    let auth = pqid::build_auth(bootstrap_seed, pqid::DOMAIN_CLIENT, &challenge, &ekm)?;
+    write_frame(&mut conn, &auth)?;
+    match parse_gate_frame(&read_frame(&mut conn).context("издатель не ответил на Layer-1")?)? {
+        // Издатель активации не ждёт: ссылка обычная (или уже активирована ЭТИМ устройством —
+        // тогда мы и аутентифицировались как устройство). Молча соглашаемся.
+        Gate::Allow => return Ok(false),
+        Gate::Refuse(code) => bail!("{}", refusal_text(code)),
+        Gate::Enroll { .. } => {}
+    }
+    let bootstrap_id = pqid::id_from_seed(bootstrap_seed)?;
+    write_frame(&mut conn, &build_enroll_frame(device_seed, &bootstrap_id, link_hash, &ekm)?)?;
+    match parse_gate_frame(&read_frame(&mut conn).context("издатель не ответил на активацию")?)? {
+        Gate::Allow => Ok(true),
+        Gate::Refuse(code) => bail!("{}", refusal_text(code)),
+        Gate::Enroll { .. } => bail!("издатель снова просит активацию — несовместимая версия?"),
+    }
 }
 
 /// Что абонент получает у издателя за один заход: токены Layer-2, ключ L1 текущей эпохи (H-3) и
@@ -396,6 +458,128 @@ struct EpochInfo {
     epoch_secs: u64,
 }
 
+// ─────────────────────── M-9: гейт выдачи (одноразовые ссылки, активация) ───────────────────────
+// Сразу после Layer-1 издатель говорит абоненту, что с его записью реестра не так — ДО того, как
+// начнётся выдача. Раньше в этом месте соединение просто закрывалось, и любой отказ выглядел
+// одинаково («издатель не выдал ключ эпохи»), хотя причины разные и действия человека тоже:
+// перевыпустить ссылку, взять новую, подождать. Кадр отправляется ПОСЛЕ проверки подписи, поэтому
+// новым оракулом он не является: чтобы его увидеть, нужно владеть seed'ом абонента.
+
+/// Причины отказа в выдаче (передаётся кодом, а не текстом: текст от сетевого пира в интерфейсе —
+/// отдельный класс проблем, см. L-15).
+pub const REFUSE_INACTIVE: u8 = 1;
+/// Первичная ссылка уже активирована на другом устройстве (M-9, одноразовость).
+pub const REFUSE_CONSUMED: u8 = 2;
+/// Окно активации первичной ссылки истекло.
+pub const REFUSE_EXPIRED: u8 = 3;
+/// Отпечаток предъявленной ссылки не совпал с заверенным при выдаче — подмена при доставке.
+pub const REFUSE_LINK_MISMATCH: u8 = 4;
+/// Прочий отказ активации (несогласованное состояние записи).
+pub const REFUSE_ENROLL: u8 = 5;
+
+/// Человеческое объяснение кода отказа. Живёт на стороне КЛИЕНТА (по сети едет только код),
+/// поэтому текст под нашим контролем и локализуется в UI по этому же смыслу.
+pub fn refusal_text(code: u8) -> &'static str {
+    match code {
+        REFUSE_INACTIVE => "доступ не активен: ссылка отозвана или срок подписки истёк",
+        REFUSE_CONSUMED => "эта ссылка уже активирована на другом устройстве — запросите новую",
+        REFUSE_EXPIRED => "срок действия ссылки истёк (её нужно было активировать раньше)",
+        REFUSE_LINK_MISMATCH => "ссылка не совпала с выданной — возможно, её подменили при доставке",
+        _ => "издатель отклонил активацию",
+    }
+}
+
+/// Что издатель сообщает абоненту сразу после Layer-1.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Gate {
+    /// Обычный абонент — можно выдавать.
+    Allow,
+    /// M-9: первичная ссылка, требуется активация (до `until`; `0` — без срока).
+    Enroll { until: u64 },
+    /// Отказ с причиной (см. `REFUSE_*`).
+    Refuse(u8),
+}
+
+/// Ошибка «нужна активация» — отдельным типом, чтобы вызывающий (владелец хранилища) распознал её
+/// `downcast`'ом и запустил активацию, а не показал человеку сетевую ошибку.
+#[derive(Debug, Clone, Copy)]
+pub struct EnrollmentRequired {
+    pub until: u64,
+}
+
+impl std::fmt::Display for EnrollmentRequired {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "ссылка первичная: требуется активация на этом устройстве")
+    }
+}
+impl std::error::Error for EnrollmentRequired {}
+
+/// Сборка кадра гейта (сторона издателя).
+pub fn build_gate_frame(g: Gate) -> Vec<u8> {
+    match g {
+        Gate::Allow => vec![0x00],
+        Gate::Enroll { until } => {
+            let mut v = vec![0x01];
+            v.extend_from_slice(&until.to_be_bytes());
+            v
+        }
+        Gate::Refuse(code) => vec![0x02, code],
+    }
+}
+
+/// Разбор кадра гейта (сторона абонента). Формат фиксирован — иначе отказ.
+pub fn parse_gate_frame(f: &[u8]) -> Result<Gate> {
+    match f {
+        [0x00] => Ok(Gate::Allow),
+        [0x01, rest @ ..] if rest.len() == 8 => Ok(Gate::Enroll {
+            until: u64::from_be_bytes(rest.try_into().expect("длина проверена")),
+        }),
+        [0x02, code] => Ok(Gate::Refuse(*code)),
+        _ => bail!("непонятный кадр гейта выдачи ({} Б) — несовместимая версия?", f.len()),
+    }
+}
+
+/// M-9: кадр активации (абонент → издатель): отпечаток ссылки ‖ гибридная подпись УСТРОЙСТВА.
+///
+/// Подписывает новая (устройственная) идентичность в домене [`pqid::DOMAIN_ENROLL`], а в
+/// подписываемое сообщение входят id первичной ссылки и отпечаток — поэтому кадр нельзя ни
+/// переставить в чужую активацию, ни предъявить как Layer-1. Кто активируется, издатель знает из
+/// уже аутентифицированной сессии; здесь доказывается владение НОВЫМ ключом.
+pub fn build_enroll_frame(
+    device_seed: &[u8; 32],
+    bootstrap_id: &[u8; 32],
+    link_hash: &[u8; 32],
+    ekm: &[u8],
+) -> Result<Vec<u8>> {
+    let mut challenge = Vec::with_capacity(64);
+    challenge.extend_from_slice(bootstrap_id);
+    challenge.extend_from_slice(link_hash);
+    let auth = pqid::build_auth(device_seed, pqid::DOMAIN_ENROLL, &challenge, ekm)?;
+    let mut out = Vec::with_capacity(32 + auth.len());
+    out.extend_from_slice(link_hash);
+    out.extend_from_slice(&auth);
+    Ok(out)
+}
+
+/// Разбор кадра активации (сторона издателя) → `(device_id, link_hash)`.
+pub fn verify_enroll_frame(
+    frame: &[u8],
+    bootstrap_id: &[u8; 32],
+    ekm: &[u8],
+) -> Result<([u8; 32], [u8; 32])> {
+    if frame.len() <= 32 {
+        bail!("кадр активации короче ожидаемого ({} Б)", frame.len());
+    }
+    let (h, auth) = frame.split_at(32);
+    let link_hash: [u8; 32] = h.try_into().expect("длина проверена");
+    let mut challenge = Vec::with_capacity(64);
+    challenge.extend_from_slice(bootstrap_id);
+    challenge.extend_from_slice(&link_hash);
+    let device_id = pqid::verify_auth(auth, pqid::DOMAIN_ENROLL, &challenge, ekm)
+        .context("активация: подпись устройства")?;
+    Ok((device_id, link_hash))
+}
+
 /// Нижняя и верхняя границы длины эпохи, которые клиент готов принять от издателя. Минимум —
 /// чтобы e2e-стенды могли гонять ротацию за секунды; максимум — чтобы «эпоха» осталась сроком
 /// годности, а не вечностью (отзыв абонента действует не дольше эпохи, H-3).
@@ -459,6 +643,14 @@ pub struct Issued {
 mod tests {
     use citadel_protect::Route;
     use super::*;
+
+    /// Текущее unix-время для тестов (в самом крейте его нет: время нужно ролям, а не протоколу).
+    fn test_now() -> u64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0)
+    }
 
     #[test]
     fn ed25519_layer1_roundtrip() {
@@ -590,6 +782,8 @@ mod tests {
             let auth = read_frame(&mut conn).unwrap();
             let got = pqid::verify_auth(&auth, pqid::DOMAIN_CLIENT, &challenge, &ekm).unwrap();
             assert_eq!(got, client_id, "зарегистрированный абонент");
+            // M-9: гейт выдачи — «обычный абонент, активация не нужна».
+            write_frame(&mut conn, &build_gate_frame(Gate::Allow)).unwrap();
             write_frame(&mut conn, &epoch_public).unwrap(); // публичный элемент текущей эпохи
             // H-3 + §7.1: следом кадр эпохи; здесь ротация L1 выключена, но границы эпохи есть.
             write_frame(&mut conn, &build_epoch_frame(None, 3600)).unwrap();
@@ -613,6 +807,122 @@ mod tests {
             assert!(key.verify_redemption(&redeem, &ctx).is_some(), "токен валиден под ключом эпохи");
         }
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// M-9 сквозной путь по проводу: издатель говорит «нужна активация», клиент создаёт свой ключ
+    /// и предъявляет его, издатель переносит подписку и гасит запись ссылки. Проверяется вся
+    /// цепочка целиком — кадры, домены подписи, привязка к сессии и запись реестра.
+    #[test]
+    fn enroll_over_the_wire_moves_subscription_to_device() {
+        use std::net::TcpListener;
+        let boot_seed = [0x21u8; 32];
+        let boot_id = pqid::id_from_seed(&boot_seed).unwrap();
+        let dev_seed = [0x22u8; 32];
+        let dev_id = pqid::id_from_seed(&dev_seed).unwrap();
+        let link_hash = [0x33u8; 32];
+
+        let dir = std::env::temp_dir().join(format!("citadel-enroll-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let dirs = dir.to_str().unwrap().to_string();
+        let identity = pqtls::IssuerIdentity::load_or_generate(&dirs).unwrap();
+        let issuer_pin = identity.pin;
+        let scfg = identity.server_config().unwrap();
+        let pq = pqid::IssuerPqIdentity::load_or_generate(&dirs).unwrap();
+        let issuer_mldsa = pq.commitment();
+        // Реестр: одноразовая запись с окном активации и заверенным отпечатком.
+        let registry = admin::registry_apply_add_full(
+            "",
+            &boot_id,
+            test_now() + 3600,
+            Some(test_now() + 600),
+            Some(link_hash),
+        );
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        let srv = std::thread::spawn(move || -> String {
+            let (tcp, _) = listener.accept().unwrap();
+            let mut conn = pqtls::accept_tls(tcp, scfg, None).unwrap();
+            let ekm = pqtls::handshake_server(&mut conn).unwrap();
+            let challenge = [0x44u8; 32];
+            write_frame(&mut conn, &pq.hello(&challenge, &issuer_pin, &ekm).unwrap()).unwrap();
+            let auth = read_frame(&mut conn).unwrap();
+            let who = pqid::verify_auth(&auth, pqid::DOMAIN_CLIENT, &challenge, &ekm).unwrap();
+            assert_eq!(who, boot_id, "пришёл владелец ссылки");
+            write_frame(&mut conn, &build_gate_frame(Gate::Enroll { until: test_now() + 600 }))
+                .unwrap();
+            let frame = read_frame(&mut conn).unwrap();
+            let (device, got_hash) = verify_enroll_frame(&frame, &boot_id, &ekm).unwrap();
+            let next =
+                admin::registry_apply_enroll(&registry, &boot_id, &device, Some(got_hash), test_now())
+                    .unwrap();
+            write_frame(&mut conn, &build_gate_frame(Gate::Allow)).unwrap();
+            next
+        });
+
+        let done = enroll_device(
+            &addr,
+            &issuer_pin,
+            &issuer_mldsa,
+            &boot_seed,
+            &dev_seed,
+            &link_hash,
+            2,
+            None,
+        )
+        .unwrap();
+        assert!(done, "активация состоялась");
+
+        let reg = srv.join().unwrap();
+        let entries = admin::parse_registry(&reg);
+        let b = entries.iter().find(|e| e.client_id == boot_id).unwrap();
+        assert_eq!(b.status, admin::STATUS_CONSUMED, "ссылка отработала и больше не пускает");
+        assert_eq!(b.device, Some(dev_id));
+        let d = entries.iter().find(|e| e.client_id == dev_id).unwrap();
+        assert_eq!(d.status, admin::STATUS_ACTIVE, "подписка на устройстве");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Кадр активации нельзя переиграть: подпись домена активации не проходит как Layer-1 (и
+    /// наоборот), а привязка к сессии (EKM) не даёт перенести его в другое соединение.
+    #[test]
+    fn enroll_frame_is_domain_and_session_bound() {
+        let dev = [0x51u8; 32];
+        let boot = pqid::id_from_seed(&[0x52u8; 32]).unwrap();
+        let hash = [0x53u8; 32];
+        let ekm = [0x54u8; pqtls::EKM_LEN];
+        let frame = build_enroll_frame(&dev, &boot, &hash, &ekm).unwrap();
+        let (id, got) = verify_enroll_frame(&frame, &boot, &ekm).unwrap();
+        assert_eq!((id, got), (pqid::id_from_seed(&dev).unwrap(), hash));
+
+        // чужая сессия (другой EKM) — отказ
+        assert!(verify_enroll_frame(&frame, &boot, &[0x99u8; pqtls::EKM_LEN]).is_err());
+        // подставленная другая ссылка (bootstrap-id не тот) — отказ
+        assert!(verify_enroll_frame(&frame, &[0u8; 32], &ekm).is_err());
+        // подменённый отпечаток внутри кадра — подпись перестаёт сходиться
+        let mut tampered = frame.clone();
+        tampered[0] ^= 1;
+        assert!(verify_enroll_frame(&tampered, &boot, &ekm).is_err());
+        // кадр активации, предъявленный как Layer-1 (домен другой) — отказ
+        assert!(pqid::verify_auth(&frame[32..], pqid::DOMAIN_CLIENT, &[boot, hash].concat(), &ekm)
+            .is_err());
+    }
+
+    /// Гейт выдачи: сборка/разбор всех трёх исходов и отказ на мусоре.
+    #[test]
+    fn gate_frame_roundtrip() {
+        assert_eq!(parse_gate_frame(&build_gate_frame(Gate::Allow)).unwrap(), Gate::Allow);
+        let e = Gate::Enroll { until: 1_700_000_000 };
+        assert_eq!(parse_gate_frame(&build_gate_frame(e)).unwrap(), e);
+        let r = Gate::Refuse(REFUSE_CONSUMED);
+        assert_eq!(parse_gate_frame(&build_gate_frame(r)).unwrap(), r);
+        assert!(parse_gate_frame(&[]).is_err());
+        assert!(parse_gate_frame(&[0x01, 0, 0]).is_err(), "обрезанный срок — отказ");
+        assert!(parse_gate_frame(&[0x07]).is_err());
+        // у каждого кода отказа есть человеческий текст (и он не пустой)
+        for c in [REFUSE_INACTIVE, REFUSE_CONSUMED, REFUSE_EXPIRED, REFUSE_LINK_MISMATCH, REFUSE_ENROLL] {
+            assert!(!refusal_text(c).is_empty());
+        }
     }
 
     /// P1 (раздельный деплой): exit-узел на ДРУГОЙ машине забирает ключ эпохи, доказав СВОЮ

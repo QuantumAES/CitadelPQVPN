@@ -40,6 +40,11 @@ pub struct SubscriberDto {
 pub struct IssuedLinkDto {
     pub client_id_hex: String,
     pub uri: String,
+    /// M-9: код сверки — короткий отпечаток ссылки. Называется абоненту ОТДЕЛЬНО от самой ссылки
+    /// (голосом, при встрече): он ловит подмену при доставке, чего сама ссылка поймать не может.
+    pub verify_code: String,
+    /// M-9: до какого момента (unix) ссылку нужно активировать. Позже — она мертва.
+    pub activate_until_unix: i64,
 }
 
 /// Список абонентов реестра сервера admin-профиля (по туннелю), с локальными метками.
@@ -78,7 +83,12 @@ pub async fn admin_issue_subscriber(
     // Метка — best-effort ПОСЛЕ успешной регистрации (реестр — источник истины; провал записи
     // метки не должен ронять выдачу — ссылка уже зарегистрирована и обязана дойти до UI).
     let _ = with_vault(|v| v.add_issued(&issued.client_id_hex, &label, vu));
-    Ok(IssuedLinkDto { client_id_hex: issued.client_id_hex, uri: issued.uri })
+    Ok(IssuedLinkDto {
+        client_id_hex: issued.client_id_hex,
+        uri: issued.uri,
+        verify_code: issued.verify_code,
+        activate_until_unix: issued.activate_until as i64,
+    })
 }
 
 /// Отозвать абонента по client_id (status=revoked; действует ≤ длины эпохи). Отзыв собственного

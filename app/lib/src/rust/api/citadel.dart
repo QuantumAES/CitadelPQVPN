@@ -6,7 +6,7 @@
 import '../frb_generated.dart';
 import 'package:flutter_rust_bridge/flutter_rust_bridge_for_generated.dart';
 
-// These functions are ignored because they are not marked as `pub`: `android_start`, `debug_flag_file`, `dto_to_split`, `first_line`, `guarded_parse_link`, `idle`, `io_kind_in_chain`, `is_not_found`, `is_permission_denied`, `killswitch_file`, `language_file`, `link_from`, `load_split_config`, `off`, `pacing_file`, `parse_split`, `profile_to_dto`, `profile_uri`, `read_error`, `rt`, `screenshot_block_file`, `serialize_split`, `spawn_controller`, `split_file`, `start_connect`, `state_dto`, `to_dto`, `traffic_meter_file`, `update_android_status`, `update_last_exit`, `valid_lang`, `vault_error`, `vault_path`, `vpn_state_str`, `with_vault`, `write_error`, `xdg_store_path`
+// These functions are ignored because they are not marked as `pub`: `android_start`, `debug_flag_file`, `device_seed_of`, `dto_to_split`, `first_line`, `guarded_parse_link`, `idle`, `io_kind_in_chain`, `is_not_found`, `is_permission_denied`, `killswitch_file`, `language_file`, `link_from`, `load_split_config`, `off`, `pacing_file`, `parse_split`, `profile_to_dto`, `profile_uri`, `read_error`, `rt`, `screenshot_block_file`, `serialize_split`, `spawn_controller`, `split_file`, `start_connect`, `state_dto`, `to_dto`, `traffic_meter_file`, `update_android_status`, `update_last_exit`, `valid_lang`, `vault_error`, `vault_path`, `vpn_state_str`, `with_vault`, `write_error`, `xdg_store_path`
 // These types are ignored because they are neither used by any `pub` functions nor (for structs and enums) marked `#[frb(unignore)]`: `AndroidStatus`, `AndroidTunProvider`
 // These function are ignored because they are on traits that is not defined in current crate (put an empty `#[frb]` on it to unignore): `clone`, `configure`
 
@@ -84,6 +84,15 @@ SplitTunnelDto splitConfig() =>
 /// первый успешный вызов фиксирует путь (повторные молча игнорируются).
 void setDataDir({required String dir}) =>
     RustLib.instance.api.crateApiCitadelSetDataDir(dir: dir);
+
+/// M-9: активировать профиль (одноразовая ссылка → устройственный доступ). Идемпотентна.
+///
+/// Возвращает `true`, если активация действительно произошла (или уже была подтверждена ранее);
+/// `false` — издатель активации не требует (многоразовая ссылка старого образца). Ошибка —
+/// просроченная ссылка, «уже активирована на другом устройстве», недоступный издатель: текст
+/// показывается человеку как есть, он объясняет, что делать.
+Future<bool> vpnActivateProfile({required String id}) =>
+    RustLib.instance.api.crateApiCitadelVpnActivateProfile(id: id);
 
 /// Существует ли файл хранилища (UI: разблокировать vs первый запуск).
 bool vaultExists() => RustLib.instance.api.crateApiCitadelVaultExists();

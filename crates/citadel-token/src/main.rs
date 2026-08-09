@@ -378,14 +378,67 @@ fn registry_path(dir: &str) -> String {
 ///
 /// PQ-трек: `client_id` — уже не «Ed25519 pub абонента», а `BLAKE3(ed_pub ‖ mldsa_pub)` его
 /// гибридной идентичности ([`citadel_token::pqid`]); длина и формат файла те же.
-fn registry_allows(dir: &str, client_id: &[u8], now: u64) -> bool {
+/// M-9: что делать с записью реестра этого абонента. Отдельно от [`registry_allows`], потому что
+/// решений стало три (пустить / потребовать активацию / отказать с причиной), а не два.
+fn registry_gate(dir: &str, client_id: &[u8; 32], now: u64) -> citadel_token::Gate {
+    use citadel_token::admin::{STATUS_ACTIVE, STATUS_CONSUMED};
+    use citadel_token::{Gate, REFUSE_CONSUMED, REFUSE_EXPIRED, REFUSE_INACTIVE};
     let Ok(content) = std::fs::read_to_string(registry_path(dir)) else {
-        return false; // нет реестра → никто не авторизован (secure default)
+        return Gate::Refuse(REFUSE_INACTIVE); // нет реестра → никто не авторизован (secure default)
     };
-    citadel_token::admin::parse_registry(&content)
-        .iter()
-        .find(|e| e.client_id[..] == *client_id)
-        .is_some_and(|e| e.status == "active" && now < e.valid_until)
+    let entries = citadel_token::admin::parse_registry(&content);
+    let Some(e) = entries.iter().find(|e| &e.client_id == client_id) else {
+        return Gate::Refuse(REFUSE_INACTIVE);
+    };
+    if e.status == STATUS_CONSUMED || (e.device.is_some() && e.enroll_until.is_some()) {
+        return Gate::Refuse(REFUSE_CONSUMED); // первичная ссылка уже сработала на другом устройстве
+    }
+    if e.status != STATUS_ACTIVE || now >= e.valid_until {
+        return Gate::Refuse(REFUSE_INACTIVE);
+    }
+    match e.enroll_until {
+        Some(t) if t > 0 && now >= t => Gate::Refuse(REFUSE_EXPIRED),
+        Some(t) => Gate::Enroll { until: t },
+        None => Gate::Allow,
+    }
+}
+
+/// M-9: применить активацию к реестру. Возвращает id устройства либо `(код отказа, причина)` —
+/// код уходит абоненту, причина остаётся в логе издателя (текст по сети не гоняем, L-15).
+fn apply_enrollment(
+    dir: &str,
+    bootstrap: &[u8; 32],
+    frame: &[u8],
+    ekm: &[u8],
+) -> std::result::Result<[u8; 32], (u8, String)> {
+    let (device_id, link_hash) = citadel_token::verify_enroll_frame(frame, bootstrap, ekm)
+        .map_err(|e| (citadel_token::REFUSE_ENROLL, format!("{e:#}")))?;
+    let path = registry_path(dir);
+    let cur = std::fs::read_to_string(&path).unwrap_or_default();
+    let next = citadel_token::admin::registry_apply_enroll(
+        &cur,
+        bootstrap,
+        &device_id,
+        Some(link_hash),
+        now_unix(),
+    )
+    .map_err(|e| {
+        let why = format!("{e:#}");
+        // Разные причины — разные действия человека, поэтому и коды разные.
+        let code = if why.contains("отпечаток") {
+            citadel_token::REFUSE_LINK_MISMATCH
+        } else if why.contains("другом устройстве") {
+            citadel_token::REFUSE_CONSUMED
+        } else if why.contains("окно активации") {
+            citadel_token::REFUSE_EXPIRED
+        } else {
+            citadel_token::REFUSE_ENROLL
+        };
+        (code, why)
+    })?;
+    citadel_token::admin::atomic_write(&path, &next)
+        .map_err(|e| (citadel_token::REFUSE_ENROLL, format!("запись реестра: {e:#}")))?;
+    Ok(device_id)
 }
 
 /// Bootstrap реестра Layer-1 из env (демо + installer, C5.4b):
@@ -652,9 +705,10 @@ fn main() -> Result<()> {
              Нужен Citadel_KEYSYNC_SEED, выданный установкой издателя (поле KEYSYNC_SEED в бандле)"
         )),
         "pubkey" => run_pubkey(),
+        "enroll" => run_enroll(),
         "batch" => run_batch(),
         other => Err(anyhow::anyhow!(
-            "Citadel_TOKEN_ROLE должен быть issuer|client|keysync|pubkey|batch (или arg[1]=registry), а не {other:?}"
+            "Citadel_TOKEN_ROLE должен быть issuer|client|enroll|keysync|pubkey|batch (или arg[1]=registry), а не {other:?}"
         )),
     }
 }
@@ -1027,8 +1081,13 @@ fn serve_client(
         &ekm,
     )
     .context("Layer-1: аутентификация абонента")?;
-    if !registry_allows(dir, &client_id, now_unix()) {
-        anyhow::bail!("Layer-1: client_id не активен/истёк/отозван — отказ");
+    // M-9: решение по записи реестра — пускать, требовать активацию или отказать с причиной.
+    let gate = registry_gate(dir, &client_id, now_unix());
+    if let citadel_token::Gate::Refuse(code) = gate {
+        // Причину сообщаем ПОСЛЕ проверки подписи: увидеть её может только владелец seed'а, то
+        // есть тот, кому она и адресована. Слот pre-auth при этом НЕ освобождаем (H-1).
+        let _ = write_frame(&mut conn, &citadel_token::build_gate_frame(gate));
+        anyhow::bail!("Layer-1: отказ по реестру (код {code})");
     }
     // H-1: право на выдачу доказано (подпись сошлась И запись реестра активна) — освобождаем слот
     // pre-auth и снимаем жёсткий дедлайн. Отозванный абонент с валидной подписью слот НЕ удерживает:
@@ -1047,6 +1106,27 @@ fn serve_client(
             &hex::encode(client_id)[..12]
         );
         return Ok(());
+    }
+    // M-9: гейт выдачи. `Enroll` — первичная ссылка: прежде чем что-то выдавать, абонент обязан
+    // предъявить СВОЮ (устройственную) идентичность, и подписка переезжает на неё. После этого та
+    // же ссылка на другом устройстве не работает — ради этого всё и затевалось.
+    write_frame(&mut conn, &citadel_token::build_gate_frame(gate))?;
+    if let citadel_token::Gate::Enroll { .. } = gate {
+        let frame = read_frame(&mut conn).context("абонент не прислал кадр активации")?;
+        match apply_enrollment(dir, &client_id, &frame, &ekm) {
+            Ok(device_id) => {
+                write_frame(&mut conn, &citadel_token::build_gate_frame(citadel_token::Gate::Allow))?;
+                citadel_token::dlog!(
+                    "[issuer] активация: {}… → устройство {}…",
+                    &hex::encode(client_id)[..12],
+                    &hex::encode(device_id)[..12]
+                );
+            }
+            Err((code, why)) => {
+                let _ = write_frame(&mut conn, &citadel_token::build_gate_frame(citadel_token::Gate::Refuse(code)));
+                anyhow::bail!("активация отклонена: {why}");
+            }
+        }
     }
     // C5.3: отдаём клиенту публичный элемент K ТЕКУЩЕЙ эпохи — под ним он проверит DLEQ каждой
     // выдачи (и заметит, если издатель применит не тот ключ).
@@ -1088,6 +1168,48 @@ fn serve_client(
         n += 1;
     }
     citadel_token::dlog!("[issuer] клиент {peer:?}: выдано вслепую {n} токен(ов)");
+    Ok(())
+}
+
+/// M-9 (роль `enroll`): активировать первичную ссылку на этом «устройстве».
+///
+/// Стендовая и ops-роль: в GUI/консольном клиенте активация встроена в подключение (ключ надо
+/// класть в хранилище, а оно есть только у них). Здесь ключ устройства задаётся явно
+/// (`Citadel_DEVICE_SEED`) — так активацию можно прогнать в харнесе и повторить руками.
+fn run_enroll() -> Result<()> {
+    let issuer = std::env::var("Citadel_TOKEN_ISSUER").context("Citadel_TOKEN_ISSUER не задан")?;
+    let hex32 = |name: &str| -> Result<[u8; 32]> {
+        std::env::var(name)
+            .ok()
+            .and_then(|s| hex::decode(s.trim()).ok())
+            .and_then(|v| v.try_into().ok())
+            .with_context(|| format!("{name} (32 байта hex) обязателен"))
+    };
+    let bootstrap = hex32("Citadel_CLIENT_SEED")?;
+    guard_weak_seed("Citadel_CLIENT_SEED", &bootstrap)?;
+    let device = hex32("Citadel_DEVICE_SEED")?;
+    guard_weak_seed("Citadel_DEVICE_SEED", &device)?;
+    let issuer_pin = hex32("Citadel_ISSUER_PIN")?;
+    let issuer_mldsa = hex32("Citadel_ISSUER_MLDSA")?;
+    // Отпечаток заверенной ссылки: у стенда ссылки как объекта нет, поэтому он передаётся явно.
+    // Издатель сверит его с тем, что запомнил при выдаче — расхождение и есть «подменили ссылку».
+    let link_hash = hex32("Citadel_LINK_HASH").unwrap_or([0u8; 32]);
+    let obfs_psk = obfs_psk_from_env();
+    let done = citadel_token::enroll_device(
+        &issuer,
+        &issuer_pin,
+        &issuer_mldsa,
+        &bootstrap,
+        &device,
+        &link_hash,
+        20,
+        obfs_psk,
+    )?;
+    if done {
+        eprintln!("[enroll] ссылка активирована: подписка переехала на ключ устройства");
+    } else {
+        eprintln!("[enroll] активация не требуется — ссылка многоразовая");
+    }
     Ok(())
 }
 

@@ -41,12 +41,19 @@ impl From<RegistryEntry> for SubscriberEntry {
     }
 }
 
-/// Результат выдачи нового абонента: его client_id (hex) и готовая клиентская `citadel://`-ссылка.
+/// Результат выдачи нового абонента: его client_id (hex), готовая клиентская `citadel://`-ссылка,
+/// код сверки и срок, до которого её нужно активировать (M-9).
 #[derive(Clone, Debug)]
 pub struct IssuedLink {
     pub client_id_hex: String,
     /// Клиентская ссылка (БЕЗ admin-полей) — раздать абоненту (QR/копирование).
     pub uri: String,
+    /// M-9: код сверки — короткий отпечаток ссылки. Админ называет его абоненту по ДРУГОМУ каналу
+    /// (голосом, при встрече), абонент видит тот же код при импорте. Ловит подмену ссылки при
+    /// доставке — то, что не ловит никакая проверка внутри самой ссылки.
+    pub verify_code: String,
+    /// M-9: до какого момента (unix) ссылку можно активировать; после — она мертва.
+    pub activate_until: u64,
 }
 
 /// Свежий client-seed из CSPRNG (aws-lc-rs, тот же бэкенд, что vault/движок).
@@ -126,7 +133,24 @@ pub fn parse_valid_until(s: &str, now: u64) -> Result<u64> {
 
 /// Собрать КЛИЕНТСКУЮ ссылку из мастер-ссылки: тот же exit/pin/obfs/issuer, но со СВЕЖИМ
 /// `client_seed` и БЕЗ admin-полей (абонент не получает admin-прав). Чистая функция (без сети).
-pub fn build_subscriber_link(master_uri: &str, client_seed: &[u8; 32]) -> Result<String> {
+///
+/// M-9: ссылка выпускается **первичной** — с окном активации `activate_until` (unix) и признаком
+/// `enroll`. Многоразовых бессрочных ссылок клиентский путь больше не выпускает: именно
+/// бессрочность и предъявительский характер аудит назвал сутью находки.
+pub fn build_subscriber_link(
+    master_uri: &str,
+    client_seed: &[u8; 32],
+    activate_until: u64,
+) -> Result<String> {
+    build_subscriber_link_full(master_uri, client_seed, activate_until)?.to_uri()
+}
+
+/// То же, но возвращает саму ссылку — из неё считаются отпечаток и код сверки (M-9).
+fn build_subscriber_link_full(
+    master_uri: &str,
+    client_seed: &[u8; 32],
+    activate_until: u64,
+) -> Result<CredentialLink> {
     let mut link = CredentialLink::from_uri(master_uri).context("разбор мастер-ссылки")?;
     // затираем admin-seed мастера в этой копии ДО сброса поля (не оставляем секрет в памяти)
     if let Some(mut s) = link.admin_seed.take() {
@@ -134,7 +158,9 @@ pub fn build_subscriber_link(master_uri: &str, client_seed: &[u8; 32]) -> Result
     }
     link.admin_port = None;
     link.client_seed = Some(*client_seed);
-    link.to_uri()
+    link.exp = Some(activate_until);
+    link.enroll = true;
+    Ok(link)
 }
 
 // ─────────────────────────── async-операции (spawn_blocking) ───────────────────────────
@@ -156,6 +182,7 @@ async fn list_at(
     .context("admin-list задача паникнула")?
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn add_at(
     addr: String,
     pin: [u8; 32],
@@ -164,10 +191,15 @@ async fn add_at(
     obfs_psk: Option<[u8; 32]>,
     client_id: [u8; 32],
     valid_until: u64,
+    // M-9: `Some((окно активации, отпечаток ссылки))` — запись становится одноразовой и заверенной.
+    enroll: Option<(u64, [u8; 32])>,
 ) -> Result<()> {
     tokio::task::spawn_blocking(move || -> Result<()> {
         let mut c = AdminClient::connect(&addr, &pin, &mldsa, &seed, obfs_psk)?;
-        c.add(client_id, valid_until)
+        match enroll {
+            Some((until, hash)) => c.add_enrollable(client_id, valid_until, until, hash),
+            None => c.add(client_id, valid_until),
+        }
     })
     .await
     .context("admin-add задача паникнула")?
@@ -207,17 +239,53 @@ pub async fn admin_revoke(master_uri: String, client_id_hex: String) -> Result<(
 /// Ссылка строится ДО регистрации (валидация мастер-ссылки) — при ошибке сборки в реестр ничего
 /// не пишем.
 pub async fn admin_issue(master_uri: String, valid_until: u64) -> Result<IssuedLink> {
+    admin_issue_until(master_uri, valid_until, 0).await
+}
+
+/// M-9: выдача с явным окном активации. `activate_secs == 0` → [`DEFAULT_ACTIVATION_SECS`] (24 ч).
+///
+/// Порядок шагов важен: ссылка и её отпечаток считаются ЛОКАЛЬНО, и только потом запись уходит в
+/// реестр — вместе с отпечатком. Так издатель заверяет ровно то, что админ действительно выдал, и
+/// при активации ловит подменённую по дороге ссылку. Ошибка сборки ссылки — в реестр ничего не
+/// пишем (иначе остались бы «висячие» записи без выданной ссылки).
+pub async fn admin_issue_until(
+    master_uri: String,
+    valid_until: u64,
+    activate_secs: u64,
+) -> Result<IssuedLink> {
     let (pin, mldsa, seed, obfs_psk) = admin_auth(&master_uri)?;
     let addr = admin_addr(&master_uri)?;
     let mut client_seed = random_seed()?;
     // PQ: client_id — идентификатор ГИБРИДНОЙ идентичности (BLAKE3(ed_pub‖mldsa_pub)), тот же,
     // что выведет издатель из auth-кадра абонента. Регистрируем именно его.
     let client_id = citadel_token::pqid::id_from_seed(&client_seed)?;
-    let uri = build_subscriber_link(&master_uri, &client_seed);
+    let secs = if activate_secs == 0 { crate::creds::DEFAULT_ACTIVATION_SECS } else { activate_secs };
+    let activate_until = now_unix() + secs;
+    let built = build_subscriber_link_full(&master_uri, &client_seed, activate_until);
     client_seed.zeroize(); // seed уже в ссылке; локальную копию затираем
-    let uri = uri?;
-    add_at(addr, pin, mldsa, seed, obfs_psk, client_id, valid_until).await?;
-    Ok(IssuedLink { client_id_hex: hex::encode(client_id), uri })
+    let link = built?;
+    let uri = link.to_uri()?;
+    let link_hash = link.link_hash().ok_or_else(|| anyhow!("не посчитать отпечаток ссылки"))?;
+    let verify_code = link.verify_code().unwrap_or_default();
+    add_at(
+        addr,
+        pin,
+        mldsa,
+        seed,
+        obfs_psk,
+        client_id,
+        valid_until,
+        Some((activate_until, link_hash)),
+    )
+    .await?;
+    Ok(IssuedLink { client_id_hex: hex::encode(client_id), uri, verify_code, activate_until })
+}
+
+fn now_unix() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
 }
 
 #[cfg(test)]
@@ -248,6 +316,8 @@ mod tests {
             admin_port: Some("7001".into()),
             routes: "0.0.0.0/0".into(),
             dns: Some("1.1.1.1".into()),
+            exp: None,
+            enroll: false,
         }
     }
 
@@ -261,7 +331,8 @@ mod tests {
     fn subscriber_link_strips_admin_and_swaps_seed() {
         let uri = master_uri([0x77; 32]);
         let new_seed = [0xAB; 32];
-        let client_uri = build_subscriber_link(&uri, &new_seed).unwrap();
+        let until = now_unix() + crate::creds::DEFAULT_ACTIVATION_SECS;
+        let client_uri = build_subscriber_link(&uri, &new_seed, until).unwrap();
         let client = CredentialLink::from_uri(&client_uri).unwrap();
         assert!(!client.is_admin(), "клиентская ссылка без admin-прав");
         assert_eq!(client.admin_seed, None);
@@ -284,7 +355,7 @@ mod tests {
         assert_eq!(seed, [0x51; 32]);
         assert_eq!(obfs, Some([3u8; 32]), "obfs_psk наследуется из мастер-ссылки (A1-остаток)");
         // клиентская ссылка (без admin) → admin_auth отказывает
-        let client_uri = build_subscriber_link(&uri, &[9u8; 32]).unwrap();
+        let client_uri = build_subscriber_link(&uri, &[9u8; 32], now_unix() + 3600).unwrap();
         assert!(admin_auth(&client_uri).is_err());
     }
 
@@ -349,9 +420,13 @@ mod tests {
         // issue: сгенерить seed, собрать ссылку, зарегистрировать client_id
         let mut client_seed = random_seed().unwrap();
         let client_id = citadel_token::pqid::id_from_seed(&client_seed).unwrap();
-        let client_uri = build_subscriber_link(&uri, &client_seed).unwrap();
+        let until = now_unix() + 3600;
+        let client_uri = build_subscriber_link(&uri, &client_seed, until).unwrap();
         client_seed.zeroize();
-        add_at(addr.clone(), pin, mldsa, admin_seed, None, client_id, 0).await.unwrap();
+        let hash = CredentialLink::from_uri(&client_uri).unwrap().link_hash().unwrap();
+        add_at(addr.clone(), pin, mldsa, admin_seed, None, client_id, 0, Some((until, hash)))
+            .await
+            .unwrap();
         assert!(CredentialLink::from_uri(&client_uri).unwrap().client_seed.is_some());
 
         // list: абонент active с дефолтным сроком (+365д)

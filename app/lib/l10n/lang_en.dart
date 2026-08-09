@@ -36,6 +36,8 @@ const Map<String, String> langEn = {
   'err_service_unavailable_hint': 'check that it is installed and running',
   'err_no_vpn_permission': 'VPN permission denied',
   'err_no_vpn_permission_hint': 'allow the connection in the system dialog',
+  'err_activation_failed': 'The link could not be activated',
+  'err_activation_failed_hint': 'ask the administrator for a new link: a first-use link activates once and only for a limited time',
 
   'switch_title': 'Switch connection?',
   'switch_body': '“{current}” is currently connected. Disconnect it and connect to “{name}”?',
@@ -199,6 +201,9 @@ const Map<String, String> langEn = {
   'issued_title_named': 'Access issued: {label}',
   'copy_link': 'Copy link',
   'link_copied': 'Link copied',
+  'verify_code_title': 'Verification code',
+  'verify_code_note': 'Read this code to the subscriber separately from the link (by voice, in person). They will see the same code on import — that is how link tampering in delivery is caught.',
+  'activate_note': 'The link must be activated before {when}, on one device only: once activated, a copy of the link is useless.',
   'issued_note': 'Hand the link to the subscriber now (QR or a secure channel). '
       'It cannot be retrieved again: the subscriber’s secret is not stored on this device.',
   'revoke_title': 'Revoke access?',

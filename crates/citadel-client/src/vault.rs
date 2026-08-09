@@ -134,6 +134,21 @@ pub struct Profile {
     pub created: u64,
     /// Последний exit, к которому реально подключались (для UI «недавние»).
     pub last_exit: Option<String>,
+    /// M-9: **устройственный** Layer-1 ключ, рождённый на этом устройстве при активации первичной
+    /// ссылки. С момента активации подключения идут им, а ключ из ссылки больше не используется
+    /// (издатель его и не примет — запись `consumed`). `None` — профиль из многоразовой ссылки
+    /// (поведение до M-9) либо активация ещё не проходила.
+    ///
+    /// Хранится ЗДЕСЬ, а не в подменённой ссылке, ровно по одной причине: ссылка обязана остаться
+    /// нетронутой до подтверждения активации издателем. Иначе оборванная на полпути активация
+    /// (потеряли ответ, сел телефон) оставляла бы устройство без обоих ключей — с новым, которого
+    /// сервер не знает, и без старого, который мы бы уже затёрли.
+    #[serde(default, with = "serde_bytes")]
+    pub device_seed: Option<[u8; 32]>,
+    /// M-9: издатель подтвердил активацию (`device_seed` — рабочий ключ). Пока `false`, ключ уже
+    /// создан и сохранён, но подписка на нём ещё не числится, и Layer-1 идёт ключом из ссылки.
+    #[serde(default)]
+    pub enrolled: bool,
 }
 
 /// C7.3: локальная метка выданного админом абонента. Живёт ТОЛЬКО в vault админа (на сервере —
@@ -417,6 +432,8 @@ impl Vault {
             uri: uri.to_string(),
             created: now_unix(),
             last_exit: None,
+            device_seed: None,
+            enrolled: false,
         };
         self.data.profiles.push(p.clone());
         self.save()?;
@@ -464,6 +481,36 @@ impl Vault {
         }
         let p = self.data.profiles.remove(from);
         self.data.profiles.insert(to, p);
+        self.save()
+    }
+
+    /// M-9: сохранить устройственный ключ ДО обращения к издателю (ключ рождён, но подписка на
+    /// нём ещё не числится). Порядок именно такой: сначала на диск, потом в сеть — иначе успешная
+    /// у издателя активация с потерянным ответом оставила бы устройство без доступа навсегда.
+    pub fn set_device_seed(&mut self, id: &str, seed: &[u8; 32]) -> Result<()> {
+        let p = self
+            .data
+            .profiles
+            .iter_mut()
+            .find(|p| p.id == id)
+            .ok_or_else(|| anyhow!("профиль не найден: {id}"))?;
+        p.device_seed = Some(*seed);
+        p.enrolled = false;
+        self.save()
+    }
+
+    /// M-9: издатель подтвердил активацию — с этого момента Layer-1 идёт устройственным ключом.
+    pub fn mark_enrolled(&mut self, id: &str) -> Result<()> {
+        let p = self
+            .data
+            .profiles
+            .iter_mut()
+            .find(|p| p.id == id)
+            .ok_or_else(|| anyhow!("профиль не найден: {id}"))?;
+        if p.device_seed.is_none() {
+            bail!("нечего подтверждать: устройственный ключ не создан");
+        }
+        p.enrolled = true;
         self.save()
     }
 
@@ -742,6 +789,8 @@ mod tests {
             admin_port: None,
             routes: String::new(),
             dns: None,
+            exp: None,
+            enroll: false,
         };
         CredentialLink::from_bundle(&b).to_uri().unwrap()
     }
@@ -934,6 +983,8 @@ mod tests {
             uri: uri.clone(),
             created: 1,
             last_exit: None,
+            device_seed: None,
+            enrolled: false,
         });
         write_legacy_v1(&path, pass, &data);
         assert_eq!(std::fs::read(&path).unwrap()[4], VERSION_PBKDF2, "исходно v1");

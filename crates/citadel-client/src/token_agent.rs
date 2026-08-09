@@ -398,8 +398,20 @@ fn topup_delay(epoch_secs: u64) -> Duration {
 /// Общая точка для всех трёх клиентов (GUI, консольный движок, тесты): раньше каждый собирал своё
 /// замыкание с фетчем — и любое изменение политики выдачи приходилось повторять трижды.
 pub fn install(controller: &Arc<VpnController>, link: &crate::creds::CredentialLink) -> bool {
+    install_with_seed(controller, link, link.client_seed)
+}
+
+/// То же, но с явным Layer-1 ключом. M-9: после активации профиля абонент представляется
+/// **устройственным** ключом, а не тем, что лежит в ссылке (его издатель уже не примет — запись
+/// `consumed`). Выбор ключа делает владелец хранилища ([`crate::enroll::effective_seed`]), потому
+/// что только он знает состояние активации; движок получает готовое значение.
+pub fn install_with_seed(
+    controller: &Arc<VpnController>,
+    link: &crate::creds::CredentialLink,
+    layer1_seed: Option<[u8; 32]>,
+) -> bool {
     let (Some(issuer), Some(pin), Some(mldsa), Some(seed)) =
-        (link.issuer.as_deref(), link.issuer_pin, link.issuer_mldsa, link.client_seed)
+        (link.issuer.as_deref(), link.issuer_pin, link.issuer_mldsa, layer1_seed)
     else {
         return false;
     };
@@ -531,6 +543,8 @@ mod tests {
                 let _ = write_frame(&mut conn, &pq.hello(&challenge, &issuer_pin, &ekm).unwrap());
                 let Ok(auth) = read_frame(&mut conn) else { return };
                 pqid::verify_auth(&auth, pqid::DOMAIN_CLIENT, &challenge, &ekm).unwrap();
+                // M-9: гейт выдачи — обычный абонент (активация не требуется).
+                let _ = write_frame(&mut conn, &citadel_token::build_gate_frame(citadel_token::Gate::Allow));
                 let _ = write_frame(&mut conn, &epoch_key.public_bytes());
                 // Ротация L1 включена (0x01) + границы эпохи: ровно то, что клиент кладёт в кошелёк.
                 let _ = write_frame(&mut conn, &citadel_token::build_epoch_frame(Some([7u8; 32]), 3600));
@@ -678,6 +692,8 @@ mod tests {
             admin_port: None,
             routes: String::new(),
             dns: None,
+            exp: None,
+            enroll: false,
         }
         .to_client_config();
         let out = super::with_token(cfg, None, None, None, None).await.unwrap();
@@ -707,6 +723,8 @@ mod tests {
             admin_port: None,
             routes: String::new(),
             dns: None,
+            exp: None,
+            enroll: false,
         }
         .to_client_config();
         let seed = [9u8; 32];
@@ -742,6 +760,8 @@ mod tests {
             admin_port: None,
             routes: String::new(),
             dns: None,
+            exp: None,
+            enroll: false,
         };
         let c = Arc::new(VpnController::new());
         assert!(!install(&c, &link), "без Layer-1 — не ставим");

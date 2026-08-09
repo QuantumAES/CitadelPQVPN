@@ -36,6 +36,8 @@ const Map<String, String> langFr = {
   'err_service_unavailable_hint': 'vérifiez qu’il est installé et démarré',
   'err_no_vpn_permission': 'Autorisation VPN refusée',
   'err_no_vpn_permission_hint': 'autorisez la connexion dans la boîte de dialogue du système',
+  'err_activation_failed': 'Impossible d’activer le lien',
+  'err_activation_failed_hint': 'demandez un nouveau lien à l’administrateur : un lien initial s’active une seule fois et pendant une durée limitée',
 
   'switch_title': 'Changer de connexion ?',
   'switch_body': '« {current} » est actuellement connecté. Le déconnecter et se connecter à « {name} » ?',
@@ -200,6 +202,9 @@ const Map<String, String> langFr = {
   'issued_title_named': 'Accès délivré : {label}',
   'copy_link': 'Copier le lien',
   'link_copied': 'Lien copié',
+  'verify_code_title': 'Code de vérification',
+  'verify_code_note': 'Communiquez ce code séparément du lien (de vive voix, en personne). L’abonné verra le même code à l’import : c’est ainsi qu’une falsification lors de la remise est détectée.',
+  'activate_note': 'Le lien doit être activé avant {when}, sur un seul appareil : une fois activé, une copie ne sert à rien.',
   'issued_note': 'Transmettez le lien à l’abonné maintenant (QR code ou canal sécurisé). '
       'Il est impossible de le récupérer ensuite : le secret de l’abonné n’est pas conservé sur cet appareil.',
   'revoke_title': 'Révoquer l’accès ?',

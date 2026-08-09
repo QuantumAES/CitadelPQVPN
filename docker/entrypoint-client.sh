@@ -489,6 +489,77 @@ fi
 
 echo
 echo "===================================================================="
+echo "  ТЕСТ 24 (M-9) — ОДНОРАЗОВАЯ ссылка: активируется на одном устройстве, копия мертва"
+echo "===================================================================="
+# Выдаём «первичную» запись: окно активации + заверенный отпечаток ссылки. Адрес издателя берём
+# ЧИСЛОМ ($ISSUER_IP): тест идёт при поднятом туннеле, и DNS-имя контейнера через протолкнутый
+# резолвер (F6) уже не разрешается — ровно как в ТЕСТЕ 20.
+BOOT_SEED=$(printf 'e1%.0s' {1..32})
+DEV_SEED=$(printf 'e2%.0s' {1..32})
+DEV2_SEED=$(printf 'e3%.0s' {1..32})
+BOOT_PUB=$(Citadel_CLIENT_SEED=$BOOT_SEED citadel-token pubkey)
+LINK_HASH=$(printf 'a7%.0s' {1..32})
+# Реестр правим напрямую на общем томе (роль админа тут — сам стенд): одноразовая запись.
+printf '%s %s active enroll=%s,linkh=%s\n' "$BOOT_PUB" "$(( $(date +%s) + 3600 ))" \
+    "$(( $(date +%s) + 600 ))" "$LINK_HASH" >> /shared/registry
+rm -rf /tmp/t24; mkdir -p /tmp/t24
+# 24a: пока не активировано — токенов не дают (гейт требует активации)
+Citadel_TOKEN_ROLE=client Citadel_TOKEN_ISSUER=$ISSUER_IP:7000 Citadel_ISSUER_PIN=$ISSUER_PIN \
+    Citadel_ISSUER_MLDSA=$ISSUER_MLDSA Citadel_TOKEN_DIR=/tmp/t24 Citadel_TOKEN_COUNT=1 \
+    Citadel_CLIENT_SEED=$BOOT_SEED timeout 15 citadel-token >/tmp/t24/a 2>&1 || true
+if [ ! -s /tmp/t24/tokens ] && grep -q "активац" /tmp/t24/a; then
+    echo "  OK ✔ до активации токены не выдаются — издатель требует активировать ссылку"
+else
+    echo "  [!] первичная ссылка выдала токены без активации ✗"; tail -2 /tmp/t24/a
+fi
+# 24b: активация на «устройстве 1» — подписка переезжает на его ключ
+Citadel_TOKEN_ROLE=enroll Citadel_TOKEN_ISSUER=$ISSUER_IP:7000 Citadel_ISSUER_PIN=$ISSUER_PIN \
+    Citadel_ISSUER_MLDSA=$ISSUER_MLDSA Citadel_CLIENT_SEED=$BOOT_SEED \
+    Citadel_DEVICE_SEED=$DEV_SEED Citadel_LINK_HASH=$LINK_HASH \
+    timeout 15 citadel-token >/tmp/t24/b 2>&1 || true
+DEV_PUB=$(Citadel_CLIENT_SEED=$DEV_SEED citadel-token pubkey)
+rm -f /tmp/t24/tokens
+Citadel_TOKEN_ROLE=client Citadel_TOKEN_ISSUER=$ISSUER_IP:7000 Citadel_ISSUER_PIN=$ISSUER_PIN \
+    Citadel_ISSUER_MLDSA=$ISSUER_MLDSA Citadel_TOKEN_DIR=/tmp/t24 Citadel_TOKEN_COUNT=1 \
+    Citadel_CLIENT_SEED=$DEV_SEED timeout 15 citadel-token >/tmp/t24/c 2>&1 || true
+if grep -q "ссылка активирована" /tmp/t24/b && [ -s /tmp/t24/tokens ]; then
+    echo "  OK ✔ активация прошла: устройство получило подписку и токены"
+else
+    echo "  [!] активация не прошла ✗"; tail -2 /tmp/t24/b
+fi
+# 24c: ГЛАВНОЕ — та же ссылка на ВТОРОМ устройстве больше не работает
+Citadel_TOKEN_ROLE=enroll Citadel_TOKEN_ISSUER=$ISSUER_IP:7000 Citadel_ISSUER_PIN=$ISSUER_PIN \
+    Citadel_ISSUER_MLDSA=$ISSUER_MLDSA Citadel_CLIENT_SEED=$BOOT_SEED \
+    Citadel_DEVICE_SEED=$DEV2_SEED Citadel_LINK_HASH=$LINK_HASH \
+    timeout 15 citadel-token >/tmp/t24/d 2>&1 || true
+rm -f /tmp/t24/tokens
+Citadel_TOKEN_ROLE=client Citadel_TOKEN_ISSUER=$ISSUER_IP:7000 Citadel_ISSUER_PIN=$ISSUER_PIN \
+    Citadel_ISSUER_MLDSA=$ISSUER_MLDSA Citadel_TOKEN_DIR=/tmp/t24 Citadel_TOKEN_COUNT=1 \
+    Citadel_CLIENT_SEED=$DEV2_SEED timeout 15 citadel-token >/tmp/t24/e 2>&1 || true
+# NB: ищем ИМЕННО отказ — слово «активирована» есть и в нём («уже активирована на другом
+# устройстве»), поэтому проверять его отсутствие нельзя.
+if grep -q "уже активирована на другом" /tmp/t24/d && [ ! -s /tmp/t24/tokens ]; then
+    echo "  OK ✔ второе устройство по той же ссылке отвергнуто (украденная копия бесполезна)"
+else
+    echo "  [!] вторая активация по той же ссылке прошла ✗"; tail -2 /tmp/t24/d
+fi
+# 24d: заверение — подменённый отпечаток ссылки не активируется
+BOOT2_SEED=$(printf 'e4%.0s' {1..32})
+BOOT2_PUB=$(Citadel_CLIENT_SEED=$BOOT2_SEED citadel-token pubkey)
+printf '%s %s active enroll=%s,linkh=%s\n' "$BOOT2_PUB" "$(( $(date +%s) + 3600 ))" \
+    "$(( $(date +%s) + 600 ))" "$LINK_HASH" >> /shared/registry
+Citadel_TOKEN_ROLE=enroll Citadel_TOKEN_ISSUER=$ISSUER_IP:7000 Citadel_ISSUER_PIN=$ISSUER_PIN \
+    Citadel_ISSUER_MLDSA=$ISSUER_MLDSA Citadel_CLIENT_SEED=$BOOT2_SEED \
+    Citadel_DEVICE_SEED=$DEV2_SEED Citadel_LINK_HASH=$(printf 'bb%.0s' {1..32}) \
+    timeout 15 citadel-token >/tmp/t24/f 2>&1 || true
+if grep -qE "подменили|не совпал" /tmp/t24/f; then
+    echo "  OK ✔ подменённая при доставке ссылка не активируется (заверение издателем)"
+else
+    echo "  [!] ссылка с чужим отпечатком активировалась ✗"; tail -2 /tmp/t24/f
+fi
+
+echo
+echo "===================================================================="
 echo "  Готово. M1-M7 + STRIDE F1-F7: pinning, egress, obfs L1, drop-priv, DNS-leak, rate-limit,"
 echo "  миграция, TCP-fallback, split-issuance, multi-server, crypto-agility, PQ-auth, commitment-fetch,"
 echo "  admin-plane по туннелю (C7: add/revoke, домен-auth, порт снаружи закрыт),"

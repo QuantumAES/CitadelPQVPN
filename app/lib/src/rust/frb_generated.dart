@@ -69,7 +69,7 @@ class RustLib extends BaseEntrypoint<RustLibApi, RustLibApiImpl, RustLibWire> {
   String get codegenVersion => '2.12.0';
 
   @override
-  int get rustContentHash => -1739883254;
+  int get rustContentHash => -112728141;
 
   static const kDefaultExternalLibraryLoaderConfig =
       ExternalLibraryLoaderConfig(
@@ -206,6 +206,8 @@ abstract class RustLibApi extends BaseApi {
   void crateApiCitadelVaultRename({required String id, required String name});
 
   Future<void> crateApiCitadelVaultUnlock({required String passphrase});
+
+  Future<bool> crateApiCitadelVpnActivateProfile({required String id});
 
   Stream<VpnEventDto> crateApiCitadelVpnConnect({required String link});
 
@@ -1550,6 +1552,34 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
       const TaskConstMeta(debugName: "vault_unlock", argNames: ["passphrase"]);
 
   @override
+  Future<bool> crateApiCitadelVpnActivateProfile({required String id}) {
+    return handler.executeNormal(
+      NormalTask(
+        callFfi: (port_) {
+          final serializer = SseSerializer(generalizedFrbRustBinding);
+          sse_encode_String(id, serializer);
+          pdeCallFfi(
+            generalizedFrbRustBinding,
+            serializer,
+            funcId: 53,
+            port: port_,
+          );
+        },
+        codec: SseCodec(
+          decodeSuccessData: sse_decode_bool,
+          decodeErrorData: sse_decode_AnyhowException,
+        ),
+        constMeta: kCrateApiCitadelVpnActivateProfileConstMeta,
+        argValues: [id],
+        apiImpl: this,
+      ),
+    );
+  }
+
+  TaskConstMeta get kCrateApiCitadelVpnActivateProfileConstMeta =>
+      const TaskConstMeta(debugName: "vpn_activate_profile", argNames: ["id"]);
+
+  @override
   Stream<VpnEventDto> crateApiCitadelVpnConnect({required String link}) {
     final sink = RustStreamSink<VpnEventDto>();
     unawaited(
@@ -1562,7 +1592,7 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
             pdeCallFfi(
               generalizedFrbRustBinding,
               serializer,
-              funcId: 53,
+              funcId: 54,
               port: port_,
             );
           },
@@ -1595,7 +1625,7 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
             pdeCallFfi(
               generalizedFrbRustBinding,
               serializer,
-              funcId: 54,
+              funcId: 55,
               port: port_,
             );
           },
@@ -1624,7 +1654,7 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
       SyncTask(
         callFfi: () {
           final serializer = SseSerializer(generalizedFrbRustBinding);
-          return pdeCallFfi(generalizedFrbRustBinding, serializer, funcId: 55)!;
+          return pdeCallFfi(generalizedFrbRustBinding, serializer, funcId: 56)!;
         },
         codec: SseCodec(
           decodeSuccessData: sse_decode_unit,
@@ -1724,11 +1754,13 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
   IssuedLinkDto dco_decode_issued_link_dto(dynamic raw) {
     // Codec=Dco (DartCObject based), see doc to use other codecs
     final arr = raw as List<dynamic>;
-    if (arr.length != 2)
-      throw Exception('unexpected arr length: expect 2 but see ${arr.length}');
+    if (arr.length != 4)
+      throw Exception('unexpected arr length: expect 4 but see ${arr.length}');
     return IssuedLinkDto(
       clientIdHex: dco_decode_String(arr[0]),
       uri: dco_decode_String(arr[1]),
+      verifyCode: dco_decode_String(arr[2]),
+      activateUntilUnix: dco_decode_i_64(arr[3]),
     );
   }
 
@@ -1974,7 +2006,14 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
     // Codec=Sse (Serialization based), see doc to use other codecs
     var var_clientIdHex = sse_decode_String(deserializer);
     var var_uri = sse_decode_String(deserializer);
-    return IssuedLinkDto(clientIdHex: var_clientIdHex, uri: var_uri);
+    var var_verifyCode = sse_decode_String(deserializer);
+    var var_activateUntilUnix = sse_decode_i_64(deserializer);
+    return IssuedLinkDto(
+      clientIdHex: var_clientIdHex,
+      uri: var_uri,
+      verifyCode: var_verifyCode,
+      activateUntilUnix: var_activateUntilUnix,
+    );
   }
 
   @protected
@@ -2285,6 +2324,8 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
     // Codec=Sse (Serialization based), see doc to use other codecs
     sse_encode_String(self.clientIdHex, serializer);
     sse_encode_String(self.uri, serializer);
+    sse_encode_String(self.verifyCode, serializer);
+    sse_encode_i_64(self.activateUntilUnix, serializer);
   }
 
   @protected

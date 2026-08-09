@@ -625,6 +625,46 @@ fn profile_to_dto(p: &Profile) -> ProfileDto {
 
 /// Ссылка сохранённого профиля из vault (общая для connect/diag/admin-путей).
 /// Ошибка — если vault заблокирован или профиль не найден. Секрет не покидает Rust-ядро.
+/// M-9: устройственный Layer-1 ключ профиля, если активация подтверждена. Хранилище может быть
+/// заперто (пользователь закрыл замок при живой сессии) — тогда `None`, и Layer-1 пойдёт ключом из
+/// ссылки; сервер такой ключ уже не примет, зато человек увидит внятную причину, а не тишину.
+pub(crate) fn device_seed_of(profile_id: &str) -> Option<[u8; 32]> {
+    with_vault(|v| {
+        Ok(v.list().into_iter().find(|p| p.id == profile_id).and_then(|p| {
+            if p.enrolled {
+                p.device_seed
+            } else {
+                None
+            }
+        }))
+    })
+    .ok()
+    .flatten()
+}
+
+/// M-9: активировать профиль (одноразовая ссылка → устройственный доступ). Идемпотентна.
+///
+/// Возвращает `true`, если активация действительно произошла (или уже была подтверждена ранее);
+/// `false` — издатель активации не требует (многоразовая ссылка старого образца). Ошибка —
+/// просроченная ссылка, «уже активирована на другом устройстве», недоступный издатель: текст
+/// показывается человеку как есть, он объясняет, что делать.
+pub async fn vpn_activate_profile(id: String) -> Result<bool> {
+    // Хранилище берётся ТОЛЬКО на время чтения профиля и двух коротких записей — держать его
+    // замок через сетевой обмен с издателем (секунды таймаутов) нельзя ни по отзывчивости
+    // интерфейса, ни по типам (std-мьютекс через `.await`).
+    let profile = with_vault(|v| {
+        v.list().into_iter().find(|p| p.id == id).ok_or_else(|| anyhow!("профиль не найден"))
+    })?;
+    let (sid, mid) = (id.clone(), id.clone());
+    let done = citadel_client::activate_profile(
+        &profile,
+        |seed| with_vault(|v| v.set_device_seed(&sid, seed)),
+        || with_vault(|v| v.mark_enrolled(&mid)),
+    )
+    .await?;
+    Ok(done == citadel_client::Activation::Activated)
+}
+
 pub(crate) fn profile_uri(id: &str) -> Result<String> {
     let g = VAULT.lock().unwrap();
     let v = g.as_ref().ok_or_else(|| anyhow!("хранилище заблокировано"))?;
@@ -988,6 +1028,9 @@ fn update_android_status(ev: &VpnEvent, generation: u64) -> bool {
 fn spawn_controller(
     uri: &str,
     provider: Arc<dyn TunProvider>,
+    // M-9: Layer-1 ключ, которым представляться издателю. `None` → из ссылки (профиль не
+    // активирован либо ссылка многоразовая); `Some` → устройственный ключ активированного профиля.
+    layer1_seed: Option<[u8; 32]>,
 ) -> Result<tokio::sync::broadcast::Receiver<VpnEvent>> {
     // C5.4b: разбираем ссылку целиком — из неё issuer+client_seed для авто-фетча Layer-1 токена.
     let link = CredentialLink::from_uri(uri)?;
@@ -1012,7 +1055,8 @@ fn spawn_controller(
     // мобильные, самые частые) издателю больше не видны, а видимая ему дозаправка приходит с
     // адреса exit'а. Ошибки фетча логируются внутри кошелька полной цепочкой `{e:#}` — диагноз
     // «issuer недоступен / pin / obfs / осиротевший kill-switch» виден в лог-панели ядра.
-    if !citadel_client::token_agent::install(&controller, &link) {
+    let seed = layer1_seed.or(link.client_seed);
+    if !citadel_client::token_agent::install_with_seed(&controller, &link, seed) {
         eprintln!("[token] Layer-1 не настроен в ссылке — идём к exit'у без токена");
     }
     // Подписка ДО begin() (первый Connecting буферизуется в broadcast до старта форвард-задачи).
@@ -1032,7 +1076,11 @@ fn start_connect(uri: &str, profile_id: Option<String>, sink: StreamSink<VpnEven
     let provider: Arc<dyn TunProvider> = Arc::new(WindowsTunProvider::default());
     #[cfg(not(windows))]
     let provider: Arc<dyn TunProvider> = Arc::new(GuiTunProvider::default());
-    let mut rx = spawn_controller(uri, provider)?;
+    // M-9: сохранённый профиль мог быть активирован на этом устройстве — тогда Layer-1 идёт
+    // устройственным ключом. Сама активация делается отдельным шагом (`activate`), потому что
+    // требует хранилища и сети; здесь только выбираем ключ.
+    let seed = profile_id.as_deref().and_then(device_seed_of);
+    let mut rx = spawn_controller(uri, provider, seed)?;
     rt().spawn(async move {
         while let Ok(ev) = rx.recv().await {
             update_last_exit(&profile_id, &ev);
@@ -1095,7 +1143,9 @@ impl TunProvider for AndroidTunProvider {
 /// нюанс 2) и шлёт в swap-able [`ANDROID_SINK`]. Поколение [`ANDROID_GEN`] глушит задачу прошлой
 /// сессии. Останов — [`android_stop_session`].
 fn android_start(uri: &str, profile_id: Option<String>, sink: StreamSink<VpnEventDto>) -> Result<()> {
-    let mut rx = spawn_controller(uri, Arc::new(AndroidTunProvider))?; // парсит ссылку (может упасть)
+    // M-9: как и на десктопе — активированный профиль ходит своим устройственным ключом.
+    let seed = profile_id.as_deref().and_then(device_seed_of);
+    let mut rx = spawn_controller(uri, Arc::new(AndroidTunProvider), seed)?; // парсит ссылку (может упасть)
     let generation = ANDROID_GEN.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
     {
         let mut st = ANDROID_STATUS.lock().unwrap();
