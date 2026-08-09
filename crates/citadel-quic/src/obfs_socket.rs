@@ -209,6 +209,16 @@ fn pacing_from_env() -> Pacing {
     parse_pacing(&std::env::var("Citadel_PACING").unwrap_or_default())
 }
 
+/// M-8 (остаток): политика шейпинга для клиентского эндпоинта. `Some(профиль)` — настройка
+/// пользователя (GUI-тумблер «маскировка таймингов» → `ClientConfig::pacing`); `None` — как
+/// раньше, из `Citadel_PACING` (сервер, консольные роли, стенды).
+pub fn pacing_profile(profile: Option<&str>) -> Pacing {
+    match profile {
+        Some(p) => parse_pacing(p),
+        None => pacing_from_env(),
+    }
+}
+
 /// C3/аудит-3: анти-реплей для obfs-приёма. Дубликат `nonce_pkt` (12 случайных байт, уникальных у
 /// каждого легит-пакета) = реплей — молча дропаем (анти replay-probing: цензор реплеит перехваченный
 /// пакет и смотрит, ответит ли сервер → фингерпринт). Двух-поколенное окно (~последних `[cap, 2·cap]`
@@ -588,11 +598,10 @@ fn build_endpoint(
     std_sock: std::net::UdpSocket,
     server_config: Option<quinn::ServerConfig>,
     psk: PskSource,
+    pacing: Pacing,
 ) -> Result<quinn::Endpoint> {
     // Android: исключить исходящий сокет движка из собственного туннеля (анти-петля).
     // На desktop/сервере протектор не установлен → no-op. Должно быть ДО connect.
-    crate::protect::protect_socket(crate::protect::handle_of(&std_sock));
-    let pacing = pacing_from_env();
     let sock = Arc::new(ObfsUdpSocket::new(std_sock, psk, pacing)?);
     // Pacer спавним только при включённом пейсинге; держит Weak → не мешает дропу сокета.
     if matches!(pacing, Pacing::Slotted { .. }) {
@@ -632,13 +641,15 @@ pub fn server_endpoint_obfs(
     server_config: quinn::ServerConfig,
     psk: PskSource,
 ) -> Result<quinn::Endpoint> {
-    build_endpoint(std::net::UdpSocket::bind(listen)?, Some(server_config), psk)
+    // Сервер шейпит по своему `Citadel_PACING`: клиентский тумблер маскирует только ОТПРАВКУ
+    // абонента, ответное направление — забота оператора exit'а (M-8, §17.2).
+    build_endpoint(std::net::UdpSocket::bind(listen)?, Some(server_config), psk, pacing_from_env())
 }
 
 /// КЛИЕНТ: ключ всегда один — тот, что он получил у издателя на текущую эпоху (или бутстрапный
 /// в token-less деплое). Перебирать эпохи клиенту незачем: он знает, чем говорит.
-pub fn client_endpoint_obfs(psk: [u8; 32]) -> Result<quinn::Endpoint> {
-    build_endpoint(std::net::UdpSocket::bind("0.0.0.0:0")?, None, PskSource::Fixed(psk))
+pub fn client_endpoint_obfs(psk: [u8; 32], pacing: Pacing) -> Result<quinn::Endpoint> {
+    build_endpoint(std::net::UdpSocket::bind("0.0.0.0:0")?, None, PskSource::Fixed(psk), pacing)
 }
 
 #[cfg(test)]
@@ -677,6 +688,17 @@ mod tests {
         // Adaptive → в окне да, вне окна нет
         assert!(chaff_decision(Chaff::Adaptive { window: w }, true, Duration::from_millis(100)));
         assert!(!chaff_decision(Chaff::Adaptive { window: w }, true, Duration::from_millis(600)));
+    }
+
+    /// M-8: явный профиль клиента (GUI-тумблер) обязан побеждать env — иначе тумблер «маскировка
+    /// таймингов» ничего не значил бы на машине, где оператор когда-то выставил `Citadel_PACING`.
+    #[test]
+    fn explicit_profile_wins_over_env() {
+        assert!(matches!(pacing_profile(Some("off")), Pacing::None));
+        match pacing_profile(Some("on")) {
+            Pacing::Slotted { burst, .. } => assert_eq!(burst, 32),
+            Pacing::None => panic!("явный профиль `on` обязан включать шейпинг"),
+        }
     }
 
     #[test]

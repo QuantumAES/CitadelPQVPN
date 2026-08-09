@@ -182,15 +182,18 @@ fn connect_authenticated_issuer(
     issuer_mldsa: &[u8; 32],
     retries: u32,
     obfs_psk: Option<[u8; 32]>,
+    route: citadel_protect::Route,
 ) -> Result<(pqtls::ClientTlsStream, [u8; pqtls::EKM_LEN], Vec<u8>)> {
     let mut tcp = None;
     for _ in 0..retries.max(1) {
-        // Анти-петля (Android) + таймаут: сокет помечается «мимо туннеля» ДО connect. Клиент
-        // ходит к издателю за свежим Layer-1 токеном на КАЖДЫЙ establish, в том числе при
-        // реконнекте — незащищённый сокет здесь либо заворачивается в собственный туннель, либо
-        // (при системном always-on с блокировкой без VPN) вообще не выпускается ОС, и реконнект
-        // не может добыть токен. На сервере/desktop протектор не установлен → обычный connect.
-        match citadel_protect::connect_tcp_str(issuer_addr, ISSUER_CONNECT_TIMEOUT) {
+        // Анти-петля (Android) + таймаут: при `Route::Bypass` сокет помечается «мимо туннеля» ДО
+        // connect. Клиент ходит к издателю в том числе при опущенном туннеле (перед establish) —
+        // незащищённый сокет там либо заворачивается в собственный туннель, либо (при системном
+        // always-on с блокировкой без VPN) вообще не выпускается ОС, и реконнект не может добыть
+        // токен. На сервере/desktop протектор не установлен → обычный connect.
+        // §7.1(в): фоновая дозаправка при ПОДНЯТОМ туннеле идёт `Route::Tunnel` — сознательно
+        // внутрь туннеля, чтобы издателю был виден адрес exit'а, а не абонента.
+        match citadel_protect::connect_tcp_str_route(issuer_addr, ISSUER_CONNECT_TIMEOUT, route) {
             Ok(c) => {
                 tcp = Some(c);
                 break;
@@ -231,8 +234,15 @@ pub fn fetch_epoch_key(
     retries: u32,
     obfs_psk: Option<[u8; 32]>,
 ) -> Result<Vec<u8>> {
-    let (mut conn, ekm, challenge) =
-        connect_authenticated_issuer(issuer_addr, issuer_pin, issuer_mldsa, retries, obfs_psk)?;
+    // Exit ходит к издателю со своей машины — туннеля у него нет, маршрут всегда прямой.
+    let (mut conn, ekm, challenge) = connect_authenticated_issuer(
+        issuer_addr,
+        issuer_pin,
+        issuer_mldsa,
+        retries,
+        obfs_psk,
+        citadel_protect::Route::Bypass,
+    )?;
     write_frame(&mut conn, &pqid::build_keysync_request(keysync_seed, &challenge, &ekm)?)?;
     let key = read_frame(&mut conn)
         .context("издатель не отдал ключ эпохи (keysync-идентичность не принята?)")?;
@@ -255,6 +265,7 @@ pub fn fetch_epoch_key(
 /// доказывает подлинность ML-DSA-подписью, привязанной к этой TLS-сессии, а клиент сверяет её с
 /// 32-байтным обязательством `issuer_mldsa` из ссылки — и только потом предъявляет свою
 /// идентичность. Абонент, в свою очередь, подписывает челлендж ГИБРИДНО (Ed25519 + ML-DSA-65).
+#[allow(clippy::too_many_arguments)]
 pub fn fetch_tokens(
     issuer_addr: &str,
     issuer_pin: &[u8; 32],
@@ -263,9 +274,10 @@ pub fn fetch_tokens(
     count: usize,
     retries: u32,
     obfs_psk: Option<[u8; 32]>,
+    route: citadel_protect::Route,
 ) -> Result<Grant> {
     let (mut conn, ekm, challenge) =
-        connect_authenticated_issuer(issuer_addr, issuer_pin, issuer_mldsa, retries, obfs_psk)?;
+        connect_authenticated_issuer(issuer_addr, issuer_pin, issuer_mldsa, retries, obfs_psk, route)?;
 
     // Layer-1: гибридная подпись челленджа (Ed25519 + ML-DSA-65, привязка к сессии через EKM).
     let auth = pqid::build_auth(seed, pqid::DOMAIN_CLIENT, &challenge, &ekm)?;
@@ -280,16 +292,28 @@ pub fn fetch_tokens(
     // только на finalize).
     voprf::parse_public_element(&issuer_public).context("публичный элемент эпохи от издателя")?;
 
-    // H-3: ключ L1-обфускации текущей эпохи (или явное «ротации нет»).
-    let data_psk = parse_epoch_obfs_frame(
-        &read_frame(&mut conn).context("издатель не прислал L1-ключ эпохи (старая версия?)")?,
+    // H-3: ключ L1-обфускации текущей эпохи (или явное «ротации нет») + §7.1: границы эпохи, по
+    // которым клиент понимает, до какого момента годна взятая пачка.
+    let epoch = parse_epoch_frame(
+        &read_frame(&mut conn).context("издатель не прислал L1-кадр эпохи (старая версия?)")?,
     )?;
 
     let mut tokens = Vec::with_capacity(count);
-    for _ in 0..count {
+    for i in 0..count {
         let st = BlindState::new()?;
         write_frame(&mut conn, &st.blinded_element())?;
-        let resp = read_frame(&mut conn)?;
+        // Частичная пачка — норма, а не сбой (§7.1: клиент берёт токены пачкой). Издатель молча
+        // закрывает выдачу, когда упёрлась квота эпохи (A6), и тогда `read_frame` возвращает Err.
+        // Отдать то, что уже получено, лучше, чем потерять всю пачку: с пустыми руками клиент не
+        // подключится вовсе, а с двумя токенами из восьми — подключится и переживёт реконнект.
+        let resp = match read_frame(&mut conn) {
+            Ok(r) => r,
+            Err(e) if i > 0 => {
+                dlog!("[token] пачка оборвалась на {i}-м токене ({e}) — берём что есть");
+                break;
+            }
+            Err(e) => return Err(e).context("издатель не ответил на первый ослеплённый элемент"),
+        };
         // Ответ издателя: `evaluated(32) ‖ DLEQ(64)`. Длина фиксирована — разбираем по границе,
         // а не «сколько дали»: иначе издатель управлял бы раскладкой полей.
         if resp.len() != voprf::ELEMENT_LEN + voprf::PROOF_LEN {
@@ -302,30 +326,107 @@ pub fn fetch_tokens(
         let (evaluated, proof) = resp.split_at(voprf::ELEMENT_LEN);
         tokens.push(st.finalize(&issuer_public, evaluated, proof)?.to_bytes());
     }
-    Ok(Grant { tokens, data_psk })
+    Ok(Grant { tokens, data_psk: epoch.data_psk, epoch: epoch.epoch, epoch_secs: epoch.epoch_secs })
 }
 
-/// Что абонент получает у издателя за один заход: токены Layer-2 и — с H-3 — ключ L1 текущей
-/// эпохи для канала данных.
+/// Что абонент получает у издателя за один заход: токены Layer-2, ключ L1 текущей эпохи (H-3) и
+/// границы самой эпохи (§7.1) — чтобы пачку можно было хранить ровно столько, сколько она годна.
 #[derive(Debug, Clone)]
 pub struct Grant {
     pub tokens: Vec<Vec<u8>>,
     /// `Some` — этим ключом заворачивать транспорт к exit'у (ротация H-3 включена);
     /// `None` — ротации нет, канал данных живёт на бутстрапном PSK из ссылки.
     pub data_psk: Option<[u8; 32]>,
+    /// Номер эпохи, под ключом которой выданы токены (по часам ИЗДАТЕЛЯ).
+    pub epoch: u64,
+    /// Длина эпохи в секундах — из неё клиент считает `current_epoch` теми же часами, что издатель.
+    pub epoch_secs: u64,
 }
 
-/// H-3: разбор кадра с ключом L1 эпохи. Формат фиксирован (`0x00` | `0x01 ‖ psk(32)`), поэтому
-/// любое отклонение — это несовместимый или подставной издатель, и лучше отказаться сразу, чем
-/// молча уйти на «ротации нет» и получить необъяснимо не поднимающийся туннель.
-fn parse_epoch_obfs_frame(f: &[u8]) -> Result<Option<[u8; 32]>> {
+/// H-3 + §7.1: разбор кадра эпохи. Формат (v2, заход 7):
+///
+/// ```text
+/// 0x02 ‖ epoch(u64 BE) ‖ epoch_secs(u64 BE) ‖ has_psk(0x00|0x01) [‖ psk(32)]
+/// ```
+///
+/// **Почему в кадре появились номер и длина эпохи.** Без них клиент не знает, до какого момента
+/// годна взятая пачка токенов, и обязан идти к издателю перед КАЖДЫМ establish — а это ровно тот
+/// паттерн, который §7.1 называет худшим из возможных для корреляции «выдача ⇒ сессия». Величины
+/// не секретны: длина эпохи одинакова для всех абонентов, номер выводится из времени.
+///
+/// Формат фиксирован, поэтому любое отклонение — несовместимый или подставной издатель: лучше
+/// отказаться сразу, чем молча уйти на «ротации нет» и получить необъяснимо не поднимающийся
+/// туннель. Кадры v1 (`0x00` / `0x01 ‖ psk`) сознательно НЕ принимаются: заходы 4–7 выходят одним
+/// согласованным релизом, а тихая совместимость означала бы клиента, который считает эпоху сам и
+/// расходится с издателем.
+fn parse_epoch_frame(f: &[u8]) -> Result<EpochInfo> {
+    let bad = |why: &str| anyhow!("L1-кадр эпохи от издателя: {why} ({} Б)", f.len());
     match f {
-        [0x00] => Ok(None),
-        [0x01, rest @ ..] if rest.len() == 32 => {
-            Ok(Some(rest.try_into().expect("длина проверена")))
+        [0x02, rest @ ..] if rest.len() == 17 || rest.len() == 49 => {
+            let epoch = u64::from_be_bytes(rest[0..8].try_into().expect("длина проверена"));
+            let epoch_secs = u64::from_be_bytes(rest[8..16].try_into().expect("длина проверена"));
+            // Границы вменяемости: длина эпохи задаёт и срок годности пачки, и срок действия
+            // ключа L1. Кривое значение (0, сутки, u64::MAX) превратило бы «кэш на эпоху» в
+            // «кэш навсегда», поэтому оно отвергается на границе разбора, а не «клампится» —
+            // расхождение с издателем всё равно сломало бы проверку токена на exit'е.
+            if !(MIN_EPOCH_SECS..=MAX_EPOCH_SECS).contains(&epoch_secs) {
+                return Err(bad(&format!(
+                    "длина эпохи {epoch_secs}с вне допустимого {MIN_EPOCH_SECS}..{MAX_EPOCH_SECS}"
+                )));
+            }
+            let data_psk = match &rest[16..] {
+                [0x00] => None,
+                [0x01, psk @ ..] if psk.len() == 32 => {
+                    Some(psk.try_into().expect("длина проверена"))
+                }
+                _ => return Err(bad("непонятный признак ключа L1")),
+            };
+            Ok(EpochInfo { data_psk, epoch, epoch_secs })
         }
-        _ => bail!("издатель прислал непонятный L1-кадр ({} Б) — несовместимая версия?", f.len()),
+        [0x00] | [0x01, ..] => Err(bad("издатель старой версии (кадр v1 без границ эпохи)")),
+        _ => Err(bad("непонятный формат — несовместимая версия?")),
     }
+}
+
+/// Разобранный кадр эпохи (см. [`parse_epoch_frame`]).
+#[derive(Debug)]
+struct EpochInfo {
+    data_psk: Option<[u8; 32]>,
+    epoch: u64,
+    epoch_secs: u64,
+}
+
+/// Нижняя и верхняя границы длины эпохи, которые клиент готов принять от издателя. Минимум —
+/// чтобы e2e-стенды могли гонять ротацию за секунды; максимум — чтобы «эпоха» осталась сроком
+/// годности, а не вечностью (отзыв абонента действует не дольше эпохи, H-3).
+pub const MIN_EPOCH_SECS: u64 = 5;
+pub const MAX_EPOCH_SECS: u64 = 86_400;
+
+/// H-3: вывод ключа L1 эпохи из мастер-секрета. Реэкспорт из `citadel-obfs` — чтобы обе стороны
+/// кадра эпохи (издатель, что его строит, и клиент, что его проверяет) брали функцию из одного
+/// места, а не сходились на ней случайно.
+pub use citadel_obfs::psk_epoch;
+
+/// Сборка кадра эпохи (сторона издателя). Держится рядом с разбором намеренно: формат, у которого
+/// две реализации в разных крейтах, расходится на первой же правке.
+///
+/// Кадр отправляется ВСЕГДА, даже когда ротация L1 не настроена (`master = None`): иначе клиент не
+/// смог бы отличить «сервер старый» от «сервер новый, но ротации нет» — а различать их приходится
+/// ровно тогда, когда что-то пошло не так, и гадать на длине ответа не хочется.
+pub fn build_epoch_frame(master: Option<[u8; 32]>, epoch_secs: u64) -> Vec<u8> {
+    let epoch = current_epoch(epoch_secs);
+    let mut v = Vec::with_capacity(50);
+    v.push(0x02);
+    v.extend_from_slice(&epoch.to_be_bytes());
+    v.extend_from_slice(&epoch_secs.to_be_bytes());
+    match master {
+        None => v.push(0x00),
+        Some(m) => {
+            v.push(0x01);
+            v.extend_from_slice(&citadel_obfs::psk_epoch(&m, epoch));
+        }
+    }
+    v
 }
 
 // ===================== интерактивный issuance по ролям (M5, issuer↔exit split) =====================
@@ -356,6 +457,7 @@ pub struct Issued {
 
 #[cfg(test)]
 mod tests {
+    use citadel_protect::Route;
     use super::*;
 
     #[test]
@@ -371,6 +473,44 @@ mod tests {
         bad[0] ^= 1;
         assert!(!ed25519_verify(&pk, msg, &bad)); // подделанная подпись
         assert_eq!(pk, ed25519_pub_from_seed(&seed).unwrap()); // детерминизм seed→pub
+    }
+
+    /// §7.1: кадр эпохи — разбор строгий. Он приносит клиенту срок годности пачки токенов,
+    /// поэтому «почти правильный» кадр опаснее сломанного: пачка жила бы не столько, сколько надо.
+    #[test]
+    fn epoch_frame_roundtrip_and_strict_parse() {
+        // Ротация выключена: границы эпохи есть, ключа L1 нет.
+        let f = build_epoch_frame(None, 3600);
+        let got = parse_epoch_frame(&f).unwrap();
+        assert_eq!((got.epoch, got.epoch_secs), (current_epoch(3600), 3600));
+        assert!(got.data_psk.is_none());
+
+        // Ротация включена: ключ выводится из мастера тем же KDF, что у exit'а.
+        let master = [0xA5u8; 32];
+        let got = parse_epoch_frame(&build_epoch_frame(Some(master), 60)).unwrap();
+        assert_eq!(got.epoch_secs, 60);
+        assert_eq!(got.data_psk, Some(psk_epoch(&master, current_epoch(60))));
+
+        // Кадры v1 (заход 6) больше не принимаются: клиент, считающий эпоху сам, обязан получить
+        // её границы, а не догадываться.
+        assert!(parse_epoch_frame(&[0x00]).unwrap_err().to_string().contains("старой версии"));
+        assert!(parse_epoch_frame(&[&[0x01u8][..], &[7u8; 32][..]].concat()).is_err());
+        // Мусор, обрезки и «почти v2».
+        assert!(parse_epoch_frame(&[]).is_err());
+        assert!(parse_epoch_frame(&[0x02]).is_err());
+        assert!(parse_epoch_frame(&[0x02, 0, 0, 0, 0, 0, 0, 0, 0]).is_err());
+        // Длина эпохи вне допустимого — отказ, а не «клампим»: расхождение с издателем всё равно
+        // сломало бы проверку токена на exit'е, а «эпоха на год» превратила бы кэш в вечный.
+        let mut bad = build_epoch_frame(None, 3600);
+        bad[9..17].copy_from_slice(&0u64.to_be_bytes());
+        assert!(parse_epoch_frame(&bad).unwrap_err().to_string().contains("вне допустимого"));
+        let mut bad = build_epoch_frame(None, 3600);
+        bad[9..17].copy_from_slice(&(MAX_EPOCH_SECS + 1).to_be_bytes());
+        assert!(parse_epoch_frame(&bad).is_err());
+        // Признак ключа L1 испорчен → отказ (а не «молча без ротации»).
+        let mut bad = build_epoch_frame(Some(master), 3600);
+        bad[17] = 0x05;
+        assert!(parse_epoch_frame(&bad).is_err());
     }
 
     #[test]
@@ -451,17 +591,21 @@ mod tests {
             let got = pqid::verify_auth(&auth, pqid::DOMAIN_CLIENT, &challenge, &ekm).unwrap();
             assert_eq!(got, client_id, "зарегистрированный абонент");
             write_frame(&mut conn, &epoch_public).unwrap(); // публичный элемент текущей эпохи
-            // H-3: следом кадр L1-ключа эпохи; здесь ротация выключена → «нет» (0x00)
-            write_frame(&mut conn, &[0x00]).unwrap();
+            // H-3 + §7.1: следом кадр эпохи; здесь ротация L1 выключена, но границы эпохи есть.
+            write_frame(&mut conn, &build_epoch_frame(None, 3600)).unwrap();
             while let Ok(blinded) = read_frame(&mut conn) {
                 let (e, proof) = epoch_key.evaluate(&blinded).unwrap();
                 write_frame(&mut conn, &[e, proof].concat()).unwrap();
             }
             epoch_key
         });
-        let grant = fetch_tokens(&addr, &issuer_pin, &issuer_mldsa, &seed, 3, 3, None).unwrap();
+        let grant =
+            fetch_tokens(&addr, &issuer_pin, &issuer_mldsa, &seed, 3, 3, None, Route::Bypass)
+                .unwrap();
         assert_eq!(grant.tokens.len(), 3);
         assert!(grant.data_psk.is_none(), "издатель сказал «ротации нет» — клиент это и увидел");
+        assert_eq!(grant.epoch_secs, 3600, "длина эпохи приехала клиенту (§7.1: срок годности пачки)");
+        assert_eq!(grant.epoch, current_epoch(3600), "номер эпохи — тот же, что считает издатель");
         let key = srv.join().unwrap();
         let ctx = redeem_context(b"e");
         for t in &grant.tokens {
@@ -588,7 +732,8 @@ mod tests {
 
         // «Другой» издатель в ссылке (обязательство не совпадает с предъявленным ML-DSA pub)
         let foreign = pqid::issuer_commitment(&pqid::mldsa_pub_from_seed(&[0xABu8; 32]).unwrap());
-        let err = fetch_tokens(&addr, &issuer_pin, &foreign, &[0x44u8; 32], 1, 1, None).unwrap_err();
+        let err = fetch_tokens(&addr, &issuer_pin, &foreign, &[0x44u8; 32], 1, 1, None, Route::Bypass)
+            .unwrap_err();
         assert!(format!("{err:#}").contains("PQ-аутентификация издателя"), "err: {err:#}");
         srv.join().unwrap();
         assert!(

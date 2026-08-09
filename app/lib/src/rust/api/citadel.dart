@@ -6,7 +6,7 @@
 import '../frb_generated.dart';
 import 'package:flutter_rust_bridge/flutter_rust_bridge_for_generated.dart';
 
-// These functions are ignored because they are not marked as `pub`: `android_start`, `debug_flag_file`, `dto_to_split`, `first_line`, `guarded_parse_link`, `idle`, `io_kind_in_chain`, `is_not_found`, `is_permission_denied`, `killswitch_file`, `language_file`, `link_from`, `load_split_config`, `off`, `parse_split`, `profile_to_dto`, `profile_uri`, `read_error`, `rt`, `screenshot_block_file`, `serialize_split`, `spawn_controller`, `split_file`, `start_connect`, `state_dto`, `to_dto`, `traffic_meter_file`, `update_android_status`, `update_last_exit`, `valid_lang`, `vault_error`, `vault_path`, `vpn_state_str`, `with_vault`, `write_error`, `xdg_store_path`
+// These functions are ignored because they are not marked as `pub`: `android_start`, `debug_flag_file`, `dto_to_split`, `first_line`, `guarded_parse_link`, `idle`, `io_kind_in_chain`, `is_not_found`, `is_permission_denied`, `killswitch_file`, `language_file`, `link_from`, `load_split_config`, `off`, `pacing_file`, `parse_split`, `profile_to_dto`, `profile_uri`, `read_error`, `rt`, `screenshot_block_file`, `serialize_split`, `spawn_controller`, `split_file`, `start_connect`, `state_dto`, `to_dto`, `traffic_meter_file`, `update_android_status`, `update_last_exit`, `valid_lang`, `vault_error`, `vault_path`, `vpn_state_str`, `with_vault`, `write_error`, `xdg_store_path`
 // These types are ignored because they are neither used by any `pub` functions nor (for structs and enums) marked `#[frb(unignore)]`: `AndroidStatus`, `AndroidTunProvider`
 // These function are ignored because they are on traits that is not defined in current crate (put an empty `#[frb]` on it to unignore): `clone`, `configure`
 
@@ -57,6 +57,13 @@ void setTrafficMeter({required bool on_}) =>
 /// → **дефолт false** (выключено).
 bool trafficMeterEnabled() =>
     RustLib.instance.api.crateApiCitadelTrafficMeterEnabled();
+
+/// Сохранить настройку маскировки таймингов (GUI-тумблер). Применяется со СЛЕДУЮЩЕГО подключения.
+void setPacing({required bool on_}) =>
+    RustLib.instance.api.crateApiCitadelSetPacing(on_: on_);
+
+/// Сохранённое состояние маскировки таймингов (инициализация тумблера); файла нет → выключено.
+bool pacingEnabled() => RustLib.instance.api.crateApiCitadelPacingEnabled();
 
 /// Снимок счётчиков трафика туннеля (монотонных за время жизни процесса) для расчёта СКОРОСТИ:
 /// UI делит дельту между двумя опросами на прошедшее время. Итогов за сессию тут нет намеренно —

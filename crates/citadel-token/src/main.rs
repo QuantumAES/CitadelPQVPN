@@ -954,26 +954,6 @@ fn lease_grant(map: &mut LeaseMap, client_id: [u8; 32], now: u64, lease_secs: u6
     }
 }
 
-/// H-3: кадр с ключом L1 текущей эпохи для абонента.
-///
-/// `0x00` — ротация не настроена (`Citadel_OBFS_MASTER` пуст): канал данных живёт на бутстрапном
-/// PSK из ссылки, как раньше. `0x01 ‖ psk(32)` — ключ текущей эпохи.
-///
-/// Кадр отправляется ВСЕГДА, даже когда ротации нет: иначе клиент не смог бы отличить «сервер
-/// старый» от «сервер новый, но ротация выключена» — а различать их придётся ровно в тот момент,
-/// когда что-то пошло не так, и гадать на длине ответа не хочется.
-fn epoch_obfs_frame(master: Option<[u8; 32]>, epoch_secs: u64) -> Vec<u8> {
-    match master {
-        None => vec![0x00],
-        Some(m) => {
-            let mut v = Vec::with_capacity(33);
-            v.push(0x01);
-            v.extend_from_slice(&citadel_obfs::psk_epoch(&m, citadel_token::current_epoch(epoch_secs)));
-            v
-        }
-    }
-}
-
 #[allow(clippy::too_many_arguments)]
 fn serve_client(
     tcp: TcpStream,
@@ -1076,9 +1056,10 @@ fn serve_client(
     // ни в одной ссылке, поэтому получить его может ТОЛЬКО прошедший Layer-1 абонент — и ровно на
     // одну эпоху. Отсюда два свойства, которых не было: отзыв абонента гасит и L1-доступ (≤ эпохи),
     // а утёкшая ссылка перестаёт быть бессрочным классификатором трафика деплоя.
-    // Кадр всегда есть (протокол фиксирован): `0x00` = ротация не настроена (token-less/legacy —
-    // канал данных живёт на бутстрапном PSK из ссылки), `0x01 ‖ psk(32)` = ключ эпохи.
-    write_frame(&mut conn, &epoch_obfs_frame(obfs_master, epoch_secs))?;
+    // Кадр всегда есть (протокол фиксирован); §7.1: в нём же — номер и длина эпохи, из которых
+    // абонент понимает, до какого момента годна взятая пачка токенов и когда идти за новой (без
+    // этого он обязан спрашивать издателя перед каждым establish — худший паттерн для корреляции).
+    write_frame(&mut conn, &citadel_token::build_epoch_frame(obfs_master, epoch_secs))?;
 
     let mut n = 0u32;
     // клиент закрыл соединение → read_frame вернёт Err → выходим из цикла
@@ -1140,8 +1121,17 @@ fn run_client_fetch() -> Result<()> {
     eprintln!("[client] Layer-1 issuance у издателя {issuer} ({count} токенов, PQ-TLS+pin{}, VOPRF epoch-scoped)…",
         if obfs_psk.is_some() { "+obfs" } else { "" });
     // C5.3: весь протокол (Layer-1 auth + получение K текущей эпохи + слепая выдача) — в citadel_token.
-    let grant =
-        citadel_token::fetch_tokens(&issuer, &issuer_pin, &issuer_mldsa, &seed, count, 20, obfs_psk)?;
+    // Роль CLI-стенда: туннеля у процесса нет, маршрут к издателю всегда прямой.
+    let grant = citadel_token::fetch_tokens(
+        &issuer,
+        &issuer_pin,
+        &issuer_mldsa,
+        &seed,
+        count,
+        20,
+        obfs_psk,
+        citadel_protect::Route::Bypass,
+    )?;
 
     let mut f = std::fs::File::create(format!("{dir}/tokens")).context("запись tokens")?;
     for t in &grant.tokens {

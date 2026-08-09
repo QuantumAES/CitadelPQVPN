@@ -750,6 +750,7 @@ mod tests {
             require_pq_auth: false,
             killswitch: false,
             split: Default::default(),
+            pacing: None,
         }
     }
 

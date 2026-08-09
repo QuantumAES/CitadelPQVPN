@@ -74,6 +74,8 @@ const Map<String, String> langEn = {
 
   'traffic_meter_title': 'Show traffic indicator',
   'traffic_meter_sub': 'Current download and upload speed on the connection card',
+  'pacing_title': 'Traffic timing masking',
+  'pacing_sub': 'Even out and pad outgoing traffic (slower, but harder to correlate); from the next session',
   'debug_title': 'Debug mode',
   'debug_sub': 'Core log and connection diagnostics',
   'screenshot_title': 'Block screenshots',

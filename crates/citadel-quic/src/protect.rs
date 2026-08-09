@@ -6,8 +6,9 @@
 //! асинхронный TCP-connect для транспортных путей движка.
 
 pub use citadel_protect::{
-    clear_socket_protector, connect_tcp_str, connect_tcp_timeout, handle_of, protect_socket,
-    protector_active, set_socket_protector, SocketHandle, SocketProtector,
+    clear_socket_protector, connect_tcp_route, connect_tcp_str, connect_tcp_str_route,
+    connect_tcp_timeout, handle_of, protect_socket, protector_active, set_socket_protector, Route,
+    SocketHandle, SocketProtector,
 };
 
 /// Асинхронный TCP-connect с защитой сокета ДО соединения (Android) — obfs-TCP транспорт и

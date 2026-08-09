@@ -74,6 +74,8 @@ const Map<String, String> langEs = {
 
   'traffic_meter_title': 'Mostrar indicador de tráfico',
   'traffic_meter_sub': 'Velocidad actual de recepción y envío en la tarjeta de conexión',
+  'pacing_title': 'Enmascarar los tiempos',
+  'pacing_sub': 'Uniformar y rellenar el tráfico saliente (más lento, pero más difícil de correlacionar); desde la próxima sesión',
   'debug_title': 'Modo de depuración',
   'debug_sub': 'Registro del núcleo y diagnóstico de la conexión',
   'screenshot_title': 'Bloquear capturas de pantalla',

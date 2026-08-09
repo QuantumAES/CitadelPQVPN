@@ -35,7 +35,11 @@ VERSION="${CITADEL_VERSION:-}"
 REPO="${CITADEL_REPO:-QuantumAES/CitadelPQVPN}"
 BASE_URL="${CITADEL_BASE_URL:-https://github.com/$REPO/releases/download}"
 SERVER_HOST="${CITADEL_SERVER_HOST:-}"       # публичный host/IP для ссылки; пусто → автодетект
-UDP_PORT="${CITADEL_UDP_PORT:-4433}"
+# M-8 (аудит-4): портов «по умолчанию» у туннеля и издателя больше нет — пусто означает «выбрать
+# случайный при первой установке и запомнить». Фиксированные 4433/7000 были подписью Citadel: по
+# ним деплой опознавался сканером без единого пакета в туннель. TCP-порт — исключение: 443 не
+# «дефолт», а камуфляж под HTTPS, и он остаётся.
+UDP_PORT="${CITADEL_UDP_PORT:-}"
 TCP_PORT="${CITADEL_TCP_PORT:-443}"
 ROUTES="${CITADEL_ROUTES:-0.0.0.0/0}"        # что гнать в туннель (full-tunnel по умолчанию)
 DNS="${CITADEL_DNS:-1.1.1.1}"                # DNS, проталкиваемый клиенту (через туннель; анти-leak F6)
@@ -44,7 +48,8 @@ LOCAL_BIN="${CITADEL_LOCAL_BIN:-}"           # dir с УЖЕ СОБРАННЫМ�
                                              # локальная установка БЕЗ скачивания релиза (dev/air-gapped;
                                              # подпись НЕ проверяется). Пусто = штатно тянем релиз с GitHub.
 ISSUER_ON="${CITADEL_ISSUER:-1}"             # 1 = двухслойная идентичность (issuer+токены+ML-DSA); 0 = token-less
-ISSUER_PORT="${CITADEL_ISSUER_PORT:-7000}"   # публичный порт издателя (клиент фетчит токены сюда)
+ISSUER_PORT="${CITADEL_ISSUER_PORT:-}"       # публичный порт издателя (клиент фетчит токены сюда);
+                                             # пусто → случайный при первой установке (M-8)
 ADMIN_PORT="${CITADEL_ADMIN_PORT:-7001}"     # C7.2: порт admin-канала — НЕ публикуется наружу (только из туннеля)
 ADMIN_VIP="${CITADEL_ADMIN_VIP:-10.7.0.1}"   # C7.2: admin-VIP = шлюз туннеля (= Citadel_TUN_ADDR exit'а)
 EPOCH_SECS="${CITADEL_EPOCH_SECS:-3600}"     # длина эпохи токенов (exit и issuer ДОЛЖНЫ совпадать)
@@ -81,9 +86,9 @@ CitadelPQVPN — установщик exit-сервера (запускать н
   install-citadel-server.sh [vX.Y.Z] [флаги]
 
 Порты (значение по умолчанию в скобках; каждый флаг дублируется env-переменной):
-  --udp-port    N   (4433)  QUIC/UDP туннеля            [CITADEL_UDP_PORT]
+  --udp-port    N   (случайный) QUIC/UDP туннеля       [CITADEL_UDP_PORT]
   --tcp-port    N   (443)   obfs-over-TCP fallback      [CITADEL_TCP_PORT]
-  --issuer-port N   (7000)  издатель токенов (публичный)[CITADEL_ISSUER_PORT]
+  --issuer-port N   (случайный) издатель токенов (публичный) [CITADEL_ISSUER_PORT]
   --admin-port  N   (7001)  admin-канал, НАРУЖУ НЕ ОТКРЫТ — только из туннеля [CITADEL_ADMIN_PORT]
   --admin-peer  IP  адрес exit-машины, которому разрешён admin-канал (L-14).
                     ОБЯЗАТЕЛЕН при --role issuer (там порт публикуется наружу);
@@ -95,9 +100,11 @@ CitadelPQVPN — установщик exit-сервера (запускать н
   --rate-limit-down N  (= --rate-limit) байт/с вниз; 0 = без лимита [CITADEL_RATE_LIMIT_DOWN]
   --rate-burst-down N  (= --rate-burst) всплеск вниз, байт        [CITADEL_RATE_BURST_DOWN]
 
-Порты по умолчанию узнаваемы (4433/7000 — «подпись» Citadel). На сети, где это важно,
-задавай свои: клиент берёт их из ссылки, менять на нём ничего не нужно. Единственный порт,
-который стоит оставить как есть, — TCP 443: obfs-fallback маскируется под HTTPS.
+Порты туннеля и издателя ВЫБИРАЮТСЯ СЛУЧАЙНО при первой установке (M-8: прежние 4433/7000
+были узнаваемой «подписью» Citadel) и запоминаются в $DIR/etc/ports.env — повторный запуск
+берёт их оттуда, поэтому выданные ссылки не ломаются. Клиент берёт порты из ссылки, менять на
+нём ничего не нужно. Единственный порт с фиксированным значением — TCP 443: obfs-fallback
+маскируется под HTTPS, и это не дефолт, а камуфляж.
 
 Роль установки (P1 — разнести exit и издателя по разным машинам):
   --role all        (умолчание) exit и издатель на ОДНОМ сервере
@@ -249,6 +256,44 @@ if [[ "$ROLE" == issuer ]]; then
   fi
 fi
 
+# ─── 0a-pre. случайные порты вместо «подписи Citadel» (M-8, аудит-4) ───
+# Приоритет: явный флаг/env > уже выбранное прошлой установкой > свежий случайный.
+# Запоминать обязательно: порт уезжает в КАЖДУЮ выданную ссылку, и повторный запуск установщика с
+# новым случайным портом молча оборвал бы всех абонентов (в т.ч. при CITADEL_KEEP_KEYS=1, где
+# ссылки обязаны пережить обновление).
+PORTS_FILE="$DIR/etc/ports.env"
+if [[ -r "$PORTS_FILE" ]]; then
+  while IFS='=' read -r k v; do
+    case "$k" in
+      UDP_PORT)    [[ -n "$UDP_PORT"    ]] || UDP_PORT="$v" ;;
+      ISSUER_PORT) [[ -n "$ISSUER_PORT" ]] || ISSUER_PORT="$v" ;;
+    esac
+  done < "$PORTS_FILE"
+fi
+# Обновление УЖЕ СТОЯЩЕЙ установки, сделанной до M-8 (ports.env ещё нет): порты обязаны остаться
+# прежними — исторические 4433/7000. Иначе `CITADEL_KEEP_KEYS=1`, который существует ровно затем,
+# чтобы выданные ссылки пережили обновление, молча уводил бы сервер на случайный порт, и все
+# абоненты получили бы «ни один exit недоступен». Кто ставил со своими портами — передаёт их тем
+# же флагом, что и раньше.
+if [[ ! -r "$PORTS_FILE" && -f "$DIR/etc/compose.yml" ]]; then
+  [[ -n "$UDP_PORT"    ]] || { UDP_PORT=4433; LEGACY_PORTS=1; }
+  [[ -n "$ISSUER_PORT" ]] || { ISSUER_PORT=7000; LEGACY_PORTS=1; }
+  if [[ "${LEGACY_PORTS:-0}" == 1 ]]; then
+    warn "обновление прежней установки: порты оставлены историческими ($UDP_PORT/udp, $ISSUER_PORT/tcp),"
+    warn "чтобы выданные ссылки продолжали работать. Сменить их (M-8) — --udp-port/--issuer-port + новые ссылки."
+  fi
+fi
+# Диапазон 10000..31999: выше «интересных» сервисных портов и НИЖЕ эфемерного (32768+), иначе
+# сервер соревновался бы за порт с исходящими соединениями самой машины.
+rand_port() { echo $(( 10000 + $(od -An -N2 -tu2 /dev/urandom | tr -d ' ') % 22000 )); }
+PORTS_PICKED=0
+[[ -n "$UDP_PORT"    ]] || { UDP_PORT="$(rand_port)";    PORTS_PICKED=1; }
+[[ -n "$ISSUER_PORT" ]] || { ISSUER_PORT="$(rand_port)"; PORTS_PICKED=1; }
+# Совпали два случайных — переберём (проверка ниже всё равно отвалила бы установку).
+while [[ "$ISSUER_PORT" == "$UDP_PORT" || "$ISSUER_PORT" == "$TCP_PORT" || "$ISSUER_PORT" == "$ADMIN_PORT" ]]; do
+  ISSUER_PORT="$(rand_port)"; PORTS_PICKED=1
+done
+
 # ─── 0a. валидация портов ───
 # Кривой порт обязан отвалиться ЗДЕСЬ, а не через 5 минут установки в невнятной ошибке docker/netsh:
 # `ports: "70000:4433/udp"` compose примет за строку и упадёт уже на `up`, а занятый порт даст
@@ -333,6 +378,20 @@ mkdir -p "$DIR/bin" "$DIR/keys" "$DIR/etc"
 # пустой список ключей → ВСЕ токены «невалидны» (тихо, docker-демо это не ловит — named volume там 0755).
 # 711 даёт traverse без листинга; секреты (obfs.psk/client.seed) остаются 600 и nobody недоступны.
 chmod 711 "$DIR/keys"
+# M-8: запомнить выбранные порты — следующая установка/обновление возьмёт их отсюда, и уже
+# розданные ссылки не «переедут» на новый случайный порт.
+printf 'UDP_PORT=%s\nISSUER_PORT=%s\n' "$UDP_PORT" "$ISSUER_PORT" > "$PORTS_FILE"
+chmod 644 "$PORTS_FILE"
+if [[ "$PORTS_PICKED" == 1 ]]; then
+  # Роль решает, какой из портов этой машине вообще нужен: exit не поднимает издателя, издатель —
+  # туннель. Печатать оба значило бы отправить оператора открывать в firewall лишнее.
+  case "$ROLE" in
+    exit)   log "порт туннеля выбран случайно (M-8: не «подпись Citadel»): QUIC/UDP $UDP_PORT" ;;
+    issuer) log "порт издателя выбран случайно (M-8: не «подпись Citadel»): TCP $ISSUER_PORT" ;;
+    *)      log "порты выбраны случайно (M-8: не «подпись Citadel»): QUIC/UDP $UDP_PORT, издатель TCP $ISSUER_PORT" ;;
+  esac
+  log "запомнены в $PORTS_FILE и попадут в ссылки; открой их в firewall/security-group; свои — --udp-port/--issuer-port"
+fi
 # Q4: citadel-linkgen НЕ кладём на бокс (только tmp) — после установки нет инструмента минта ссылок.
 LINKGEN="$work/citadel-linkgen"
 

@@ -75,6 +75,8 @@ const Map<String, String> langDe = {
 
   'traffic_meter_title': 'Datenrate anzeigen',
   'traffic_meter_sub': 'Aktuelle Empfangs- und Senderate auf der Verbindungskarte',
+  'pacing_title': 'Zeitmuster verschleiern',
+  'pacing_sub': 'Ausgehenden Verkehr glätten und auffüllen (langsamer, aber schwerer zuzuordnen); ab der nächsten Sitzung',
   'debug_title': 'Debug-Modus',
   'debug_sub': 'Kern-Protokoll und Verbindungsdiagnose',
   'screenshot_title': 'Screenshots blockieren',

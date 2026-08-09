@@ -152,6 +152,15 @@ pub struct ClientConfig {
     /// C8.3 split-tunneling (Android): фильтр по приложениям и/или назначениям. Клиентская настройка
     /// (не из ссылки); дефолт `Off`. Desktop-провайдер поле игнорирует (Linux split — позже).
     pub split: SplitTunnel,
+    /// M-8 (остаток): профиль тайминг-шейпинга исходящего UDP-потока — `""`/`off` (дефолт),
+    /// `on` либо `<slot_ms>:<burst>:<off|adaptive|always>` (грамматика та же, что у
+    /// `Citadel_PACING`). `None` — брать из env, как раньше (сервер и консольные роли).
+    ///
+    /// Клиентская настройка, не из ссылки: шейпинг торгует латентностью и трафиком за стойкость
+    /// к корреляции по времени, и решать этот размен должен пользователь, а не тот, кто прислал
+    /// ссылку. Шейпится **исходящее направление клиента**; ответное шейпит exit своим
+    /// `Citadel_PACING` (у оператора), поэтому UI обязан называть это «маскировкой отправки».
+    pub pacing: Option<String>,
 }
 
 impl Drop for ClientConfig {
@@ -340,6 +349,9 @@ impl ClientConfig {
             require_pq_auth: env_flag("Citadel_REQUIRE_PQ_AUTH"),
             killswitch: env_flag("Citadel_KILLSWITCH"),
             split: Default::default(), // C8.3 split-tunnel — только клиентское GUI (Android), не env
+            // M-8: профиль шейпинга у консольных ролей приходит из env (как и раньше) — `None`
+            // означает «спросить `Citadel_PACING`», а не «выключено».
+            pacing: None,
         })
     }
 
@@ -574,6 +586,7 @@ mod tests {
             require_pq_auth: false,
             killswitch: false,
             split: Default::default(),
+            pacing: None,
         };
         assert!(matches!(mk(PinSource::None).pin_for("h"), PinMode::NoPin));
         let p = [3u8; 32];
@@ -602,6 +615,7 @@ mod tests {
             require_pq_auth: false,
             killswitch: false,
             split: Default::default(),
+            pacing: None,
         };
         assert_eq!(cfg.mldsa_for("any"), Some(vec![1, 2, 3]));
     }
@@ -627,6 +641,7 @@ mod tests {
             require_pq_auth,
             killswitch: false,
             split: Default::default(),
+            pacing: None,
         }
     }
 

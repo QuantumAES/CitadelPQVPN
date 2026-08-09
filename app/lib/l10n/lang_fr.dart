@@ -74,6 +74,8 @@ const Map<String, String> langFr = {
 
   'traffic_meter_title': 'Afficher le débit',
   'traffic_meter_sub': 'Débit actuel en réception et en envoi sur la carte de connexion',
+  'pacing_title': 'Masquage du rythme',
+  'pacing_sub': 'Lisser et rembourrer le trafic sortant (plus lent, mais plus difficile à corréler) ; dès la prochaine session',
   'debug_title': 'Mode débogage',
   'debug_sub': 'Journal du cœur et diagnostic de connexion',
   'screenshot_title': 'Bloquer les captures d’écran',

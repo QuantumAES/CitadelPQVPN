@@ -30,7 +30,9 @@ citadel-tun = { path = "../citadel-tun" }   # GuiTunProvider: Tun::from_raw_fd (
 # включая Android (token_agent зовётся из do_android_establish, C5.4). Desktop-таргет ниже добирает
 # rt-multi-thread+macros союзом фич (для citadel-diag/#[tokio::main]). Без этого android-сборка ломалась
 # «cannot find crate tokio» (латентно с C5.3 — под android не собирали).
-tokio = { version = "1", features = ["rt"] }
+# §7.1 (заход 7): кошелёк токенов держит фоновую дозаправку → нужны time (разброс задержки) и
+# sync (подписка на события контроллера, из неё видно «туннель поднят»).
+tokio = { version = "1", features = ["rt", "time", "sync"] }
 
 # SCM_RIGHTS для GuiTunProvider (Linux-desktop). На Android gui_tun компилируется, но не
 # используется (TUN даёт VpnService) — dep нужен, чтобы frb_generated.rs собрался под android.

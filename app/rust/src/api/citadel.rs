@@ -340,6 +340,47 @@ pub fn traffic_meter_enabled() -> bool {
     TRAFFIC_METER.load(Relaxed)
 }
 
+// ─────────────────────── маскировка таймингов (M-8, профиль «высокий риск») ───────────────────
+// Тумблер включает тайминг-шейпинг ИСХОДЯЩЕГО потока (DAITA-стиль: выпуск по слот-сетке + adaptive
+// chaff). До этого профиль существовал только как `Citadel_PACING` — то есть был доступен серверу и
+// консольному клиенту, но не тому, кому он нужен больше всех: пользователю GUI под наблюдением.
+//
+// **Дефолт ВЫКЛЮЧЕН** и это осознанно: шейпинг платит латентностью и лишним трафиком (chaff), а
+// защищает от корреляции по времени — размен, который пользователь должен сделать сам. Ответное
+// направление шейпит exit своим `Citadel_PACING`: клиентский тумблер маскирует ОТПРАВКУ.
+
+static PACING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static PACING_LOADED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+fn pacing_file() -> PathBuf {
+    vault_path().with_file_name("pacing")
+}
+
+/// Сохранить настройку маскировки таймингов (GUI-тумблер). Применяется со СЛЕДУЮЩЕГО подключения.
+#[frb(sync)]
+pub fn set_pacing(on: bool) {
+    use std::sync::atomic::Ordering::Relaxed;
+    PACING.store(on, Relaxed);
+    PACING_LOADED.store(true, Relaxed);
+    let f = pacing_file();
+    if let Some(d) = f.parent() {
+        let _ = std::fs::create_dir_all(d);
+    }
+    let _ = std::fs::write(f, if on { "1" } else { "0" });
+}
+
+/// Сохранённое состояние маскировки таймингов (инициализация тумблера); файла нет → выключено.
+#[frb(sync)]
+pub fn pacing_enabled() -> bool {
+    use std::sync::atomic::Ordering::Relaxed;
+    if !PACING_LOADED.swap(true, Relaxed) {
+        if let Ok(s) = std::fs::read_to_string(pacing_file()) {
+            PACING.store(s.trim() == "1", Relaxed);
+        }
+    }
+    PACING.load(Relaxed)
+}
+
 /// Снимок счётчиков трафика туннеля (монотонных за время жизни процесса) для расчёта СКОРОСТИ:
 /// UI делит дельту между двумя опросами на прошедшее время. Итогов за сессию тут нет намеренно —
 /// накапливать историю пользовательского трафика клиенту незачем.
@@ -953,6 +994,8 @@ fn spawn_controller(
     let mut cfg = link.to_client_config();
     cfg.killswitch = killswitch_enabled(); // C6/M9: kill-switch по GUI-тумблеру (desktop; Android — OS-level)
     cfg.split = load_split_config(); // C8.3: split-tunnel по приложениям/назначениям (Android; desktop игнорит)
+    // M-8: профиль «высокий риск» — шейпинг таймингов исходящего потока по GUI-тумблеру.
+    cfg.pacing = pacing_enabled().then(|| "on".to_string());
     // Остановить прошлую сессию перед новой (анти-double-connect): её loop глушим, иначе он продолжит
     // держать/реконнектить старый туннель параллельно новому. Берём Arc и disconnect() вне лока.
     let prev = ACTIVE.lock().unwrap().take();
@@ -961,42 +1004,16 @@ fn spawn_controller(
     }
     let controller = Arc::new(VpnController::new());
     *ACTIVE.lock().unwrap() = Some(controller.clone());
-    // S2.1/A1 + PQ: Layer-1 фетч требует issuer + issuer_pin (PQ-TLS канал) + issuer_mldsa
-    // (PQ-обязательство издателя) + client_seed. Чего-то нет → refresher не ставим (token-less
+    // S2.1/A1 + PQ: Layer-1 требует issuer + issuer_pin (PQ-TLS канал) + issuer_mldsa
+    // (PQ-обязательство издателя) + client_seed. Чего-то нет → кошелёк не ставим (token-less
     // путь; exit откажет, если требует токен — misconfig виден).
-    if let (Some(iss), Some(pin), Some(mldsa), Some(seed)) =
-        (link.issuer.clone(), link.issuer_pin, link.issuer_mldsa, link.client_seed)
-    {
-        // S2.1/A1-остаток: issuer-канал оборачиваем в obfs тем же PSK, что и туннель (probe-resistance;
-        // None для ссылок без obfs → голый TLS). Обязан совпадать с серверной обёрткой.
-        let obfs_psk = link.obfs_psk;
-        controller.set_token_refresher(Arc::new(move || {
-            let iss = iss.clone();
-            Box::pin(async move {
-                // Ошибку добычи НЕ проглатываем (раньше `.ok()` терял причину → в логе лишь «токен не
-                // задан»): логируем полную цепочку — issuer недоступен? pin? obfs? заблокирован
-                // осиротевшим kill-switch'ем? Виден в лог-панели ядра (нужен диагноз auth-failed).
-                match citadel_client::token_agent::fetch_tokens(
-                    &iss, &pin, &mldsa, &seed, 1, 3, obfs_psk,
-                )
-                .await
-                {
-                    // H-3: тем же заходом приезжает ключ L1 текущей эпохи (канал данных к exit'у).
-                    Ok(mut g) => g.tokens.pop().map(|token| citadel_client::SessionGrant {
-                        token,
-                        data_psk: g.data_psk,
-                    }),
-                    Err(e) => {
-                        eprintln!("[token] Layer-1 фетч у issuer {iss} не удался: {e:#}");
-                        None
-                    }
-                }
-            }) as std::pin::Pin<
-                Box<
-                    dyn std::future::Future<Output = Option<citadel_client::SessionGrant>> + Send,
-                >,
-            >
-        }));
+    // §7.1 (заход 7): вместо «токен у издателя на КАЖДЫЙ establish» — кошелёк: пачка на эпоху в
+    // памяти + фоновая дозаправка со случайной задержкой ЧЕРЕЗ туннель. Реконнекты (в т.ч.
+    // мобильные, самые частые) издателю больше не видны, а видимая ему дозаправка приходит с
+    // адреса exit'а. Ошибки фетча логируются внутри кошелька полной цепочкой `{e:#}` — диагноз
+    // «issuer недоступен / pin / obfs / осиротевший kill-switch» виден в лог-панели ядра.
+    if !citadel_client::token_agent::install(&controller, &link) {
+        eprintln!("[token] Layer-1 не настроен в ссылке — идём к exit'у без токена");
     }
     // Подписка ДО begin() (первый Connecting буферизуется в broadcast до старта форвард-задачи).
     let rx = controller.subscribe();

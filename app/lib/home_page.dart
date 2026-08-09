@@ -405,6 +405,18 @@ class _HomePageState extends State<HomePage> {
                 Navigator.pop(sheetCtx);
               },
             ),
+            // M-8: маскировка таймингов (профиль «высокий риск»). По умолчанию выключена —
+            // платит латентностью и лишним трафиком; включают те, кому важнее анти-корреляция.
+            SwitchListTile(
+              secondary: const Icon(Icons.blur_on_outlined),
+              title: Text(t('pacing_title')),
+              subtitle: Text(t('pacing_sub')),
+              value: s.pacing,
+              onChanged: (_) {
+                s.togglePacing();
+                Navigator.pop(sheetCtx);
+              },
+            ),
             SwitchListTile(
               secondary: const Icon(Icons.bug_report_outlined),
               title: Text(t('debug_title')),

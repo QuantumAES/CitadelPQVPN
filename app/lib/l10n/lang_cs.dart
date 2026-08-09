@@ -74,6 +74,8 @@ const Map<String, String> langCs = {
 
   'traffic_meter_title': 'Zobrazovat ukazatel provozu',
   'traffic_meter_sub': 'Aktuální rychlost příjmu a odesílání na kartě připojení',
+  'pacing_title': 'Maskování časování',
+  'pacing_sub': 'Vyrovnat a doplnit odchozí provoz (pomalejší, ale hůře korelovatelný); od příštího sezení',
   'debug_title': 'Režim ladění',
   'debug_sub': 'Protokol jádra a diagnostika připojení',
   'screenshot_title': 'Blokovat snímky obrazovky',

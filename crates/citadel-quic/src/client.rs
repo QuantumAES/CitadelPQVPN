@@ -424,7 +424,8 @@ pub(crate) async fn try_quic_connect(
     // PSK из ссылки — только запасной путь для деплоя без ротации: если бы им шифровался и канал
     // данных, ротация ничего не значила бы (ключ лежит в каждой ссылке).
     let ep = match cfg.transport_psk() {
-        Some(psk) => crate::client_endpoint_obfs(psk)?,
+        // M-8: профиль шейпинга — из настройки клиента (GUI-тумблер), иначе из env (консольные роли).
+        Some(psk) => crate::client_endpoint_obfs(psk, crate::pacing_profile(cfg.pacing.as_deref()))?,
         None => quinn::Endpoint::client("0.0.0.0:0".parse()?)?,
     };
     eprintln!(

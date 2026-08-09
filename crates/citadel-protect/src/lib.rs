@@ -10,8 +10,12 @@
 //!
 //! **Инвариант (нарушение = петля):** каждый сокет движка к ПУБЛИЧНОМУ адресу (exit по UDP/QUIC,
 //! exit по obfs-TCP, издатель Layer-1, диагностические пробы) обязан пройти через протектор.
-//! Единственное осознанное исключение — admin-плоскость (`citadel_token::admin`): она ходит к
-//! ADMIN_VIP *внутри* туннеля и защищать её нельзя, иначе «Абоненты» перестанут работать.
+//! Осознанных исключений два, и оба выражены типом [`Route`], а не умолчанием:
+//!  * admin-плоскость (`citadel_token::admin`) ходит к ADMIN_VIP *внутри* туннеля — защищать её
+//!    нельзя, иначе «Абоненты» перестанут работать;
+//!  * фоновая дозаправка кошелька токенов при ПОДНЯТОМ туннеле (§7.1(в) аудита-4): она идёт
+//!    сквозь туннель, чтобы издатель видел адрес exit'а, а не абонента. Перед establish и при
+//!    опущенном туннеле — по-прежнему [`Route::Bypass`], иначе токен вообще не добыть.
 //!
 //! Почему «до connect», а не после: (а) с системным always-on VPN + «блокировать без VPN»
 //! (lockdown) незащищённый сокет вообще не имеет права выйти — connect упадёт; (б) TCP выбирает
@@ -75,17 +79,40 @@ pub fn protect_socket(sock: SocketHandle) {
     }
 }
 
+/// Куда именно должен уйти сокет относительно СОБСТВЕННОГО туннеля.
+///
+/// До аудита-4/§7.1 выбора не было: всё, что не admin-плоскость, шло [`Route::Bypass`] — мимо
+/// туннеля. Для транспорта к exit'у это единственный правильный ответ (иначе петля). Но обращение
+/// к **издателю** — другой случай: пока туннель поднят, его выгодно пустить СКВОЗЬ туннель, тогда
+/// издатель видит адрес exit'а, а не абонента (§7.1(в)). Поэтому маршрут стал явным параметром —
+/// чтобы вызывающий выбирал его сознательно, а не наследовал по умолчанию.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Route {
+    /// Мимо туннеля (Android: `VpnService.protect`). Обязателен для транспорта к exit'у.
+    Bypass,
+    /// Сквозь собственный туннель: сокет НЕ защищаем. Осмысленно только при поднятом туннеле —
+    /// иначе на Android с lockdown соединение просто не выпустят, а без lockdown оно уйдёт напрямую.
+    Tunnel,
+}
+
 /// Синхронный TCP-connect с защитой сокета ДО соединения и таймаутом.
 ///
 /// Таймаут здесь не косметика: раньше на этом месте стоял голый `TcpStream::connect`, и
 /// недоступный издатель подвешивал попытку реконнекта на минуты (стек ретраит SYN сам).
 pub fn connect_tcp_timeout(addr: SocketAddr, timeout: Duration) -> io::Result<TcpStream> {
+    connect_tcp_route(addr, timeout, Route::Bypass)
+}
+
+/// То же, но с явным выбором маршрута ([`Route`]).
+pub fn connect_tcp_route(addr: SocketAddr, timeout: Duration, route: Route) -> io::Result<TcpStream> {
     let sock = socket2::Socket::new(
         socket2::Domain::for_address(addr),
         socket2::Type::STREAM,
         Some(socket2::Protocol::TCP),
     )?;
-    protect_socket(handle_of(&sock));
+    if route == Route::Bypass {
+        protect_socket(handle_of(&sock));
+    }
     sock.connect_timeout(&addr.into(), timeout)?;
     Ok(sock.into())
 }
@@ -96,9 +123,18 @@ pub fn connect_tcp_timeout(addr: SocketAddr, timeout: Duration) -> io::Result<Tc
 /// сокет. На Android с включённым lockdown при опущенном туннеле резолв может не пройти; поэтому
 /// адреса издателя/exit'а в ссылке лучше держать литералами (ссылка их и несёт).
 pub fn connect_tcp_str(target: &str, timeout: Duration) -> io::Result<TcpStream> {
+    connect_tcp_str_route(target, timeout, Route::Bypass)
+}
+
+/// То же по `host:port` с явным маршрутом ([`Route`]).
+pub fn connect_tcp_str_route(
+    target: &str,
+    timeout: Duration,
+    route: Route,
+) -> io::Result<TcpStream> {
     let mut last = None;
     for addr in target.to_socket_addrs()? {
-        match connect_tcp_timeout(addr, timeout) {
+        match connect_tcp_route(addr, timeout, route) {
             Ok(s) => return Ok(s),
             Err(e) => last = Some(e),
         }
@@ -174,6 +210,28 @@ mod tests {
         assert_eq!(seen.len(), 1, "протектор вызван ровно один раз");
         assert_eq!(seen[0], handle_of(&s), "защищали тот же сокет, который потом соединили");
         assert_eq!(s.peer_addr().unwrap(), addr, "соединение поднялось после защиты");
+        drop(srv);
+    }
+
+    /// §7.1(в): `Route::Tunnel` — сознательный отказ от защиты. Сокет к издателю, поднятый при
+    /// живом туннеле, обязан уйти В туннель (издатель тогда видит адрес exit'а, а не абонента),
+    /// поэтому протектор на нём не вызывается ни разу — при том же установленном протекторе.
+    #[test]
+    fn tunnel_route_does_not_protect() {
+        let _g = serial();
+        use std::net::TcpListener;
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let srv = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = srv.local_addr().unwrap();
+
+        set_socket_protector(Arc::new(Peeker(seen.clone())));
+        let s = connect_tcp_route(addr, Duration::from_secs(3), Route::Tunnel).unwrap();
+        assert!(seen.lock().unwrap().is_empty(), "Route::Tunnel не должен звать протектор");
+        assert_eq!(s.peer_addr().unwrap(), addr);
+        // ...а Bypass на том же протекторе — должен (иначе тест ничего не доказывал бы).
+        let _s2 = connect_tcp_route(addr, Duration::from_secs(3), Route::Bypass).unwrap();
+        assert_eq!(seen.lock().unwrap().len(), 1);
+        clear_socket_protector();
         drop(srv);
     }
 

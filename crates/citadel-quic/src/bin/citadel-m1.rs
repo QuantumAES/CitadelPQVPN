@@ -1149,7 +1149,7 @@ async fn run_auth_probe() -> Result<()> {
     // (`Citadel_OBFS_EPOCH_FILE`), иначе бутстрапным PSK. Иначе auth-probe стучалась бы в exit
     // ключом, который тот больше не принимает, и «отказ» означал бы не то, что проверяется.
     let ep = match citadel_quic::config::ClientConfig::from_env()?.transport_psk() {
-        Some(p) => citadel_quic::client_endpoint_obfs(p)?,
+        Some(p) => citadel_quic::client_endpoint_obfs(p, citadel_quic::pacing_profile(None))?,
         None => quinn::Endpoint::client("0.0.0.0:0".parse()?)?,
     };
     let cfg = match read_pin_for(citadel_quic::client::host_of(&connect)) {

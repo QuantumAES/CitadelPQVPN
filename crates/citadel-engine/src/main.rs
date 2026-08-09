@@ -86,35 +86,12 @@ async fn run(chan: Arc<Chan>, req: ConnectReq) -> Result<()> {
     let controller = Arc::new(VpnController::new());
 
     // C5.4b: свежий Layer-1 токен на КАЖДЫЙ establish (иначе exit ловит double-spend на реконнекте).
-    // PQ: без обязательства к ML-DSA-идентичности издателя refresher не ставим — фетч всё равно
+    // §7.1 (заход 7): токены берутся ПАЧКОЙ на эпоху и лежат в кошельке, а дозаправка идёт фоном
+    // через сам туннель — издатель больше не видит по обращению на каждый реконнект. Без полного
+    // набора Layer-1 (issuer+pin+ML-DSA-обязательство+seed) кошелёк не ставится: фетч всё равно
     // отказал бы (fail-closed), а так причина видна в логе сразу.
-    if let (Some(iss), Some(pin), Some(mldsa), Some(seed)) =
-        (link.issuer.clone(), link.issuer_pin, link.issuer_mldsa, link.client_seed)
-    {
-        let obfs_psk = link.obfs_psk;
-        controller.set_token_refresher(Arc::new(move || {
-            let iss = iss.clone();
-            Box::pin(async move {
-                match citadel_client::token_agent::fetch_tokens(&iss, &pin, &mldsa, &seed, 1, 3, obfs_psk)
-                    .await
-                {
-                    // H-3: вместе с токеном приезжает ключ L1 текущей эпохи для канала данных.
-                    Ok(mut g) => g.tokens.pop().map(|token| citadel_client::SessionGrant {
-                        token,
-                        data_psk: g.data_psk,
-                    }),
-                    Err(e) => {
-                        eprintln!("[engine] Layer-1 фетч у issuer {iss} не удался: {e:#}");
-                        None
-                    }
-                }
-            }) as std::pin::Pin<
-                Box<
-                    dyn std::future::Future<Output = Option<citadel_client::SessionGrant>>
-                        + Send,
-                >,
-            >
-        }));
+    if !citadel_client::token_agent::install(&controller, &link) {
+        eprintln!("[engine] Layer-1 не настроен в ссылке — идём к exit'у без токена");
     }
 
     // Читатель приватного канала: Stop от демона + ответы на TunSetup (их маршрутизируем провайдеру).

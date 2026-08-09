@@ -184,6 +184,7 @@ impl CredentialBundle {
             require_pq_auth: false,
             killswitch: false, // клиентская настройка (GUI-тумблер), не из ссылки/бандла
             split: Default::default(), // C8.3: клиентская настройка, накатывается FFI-слоем
+            pacing: None, // M-8: профиль шейпинга — клиентская настройка, накатывается FFI-слоем
         }
     }
 }
@@ -404,6 +405,7 @@ impl CredentialLink {
             require_pq_auth: false,
             killswitch: false, // клиентская настройка (GUI-тумблер), не из ссылки/бандла
             split: Default::default(), // C8.3: клиентская настройка, накатывается FFI-слоем
+            pacing: None, // M-8: профиль шейпинга — клиентская настройка, накатывается FFI-слоем
         }
     }
 }
