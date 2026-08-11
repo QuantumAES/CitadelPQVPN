@@ -163,7 +163,20 @@ class AppState extends ChangeNotifier {
 
   StreamSubscription<VpnEventDto>? _sub;
 
-  bool get isBusy => phase == VpnPhase.connecting || phase == VpnPhase.up;
+  /// Жива ли сессия ЯДРА (а не то, что показано на экране). Движок ретраит подключение
+  /// бесконечно — по замыслу: сеть/сервер могут вернуться, и останавливает цикл только человек
+  /// (`VpnController::connect`). Поэтому «можно ли отключить» обязано следовать из наличия
+  /// сессии, а не из фазы: пока признак выводили из `phase`, любая ошибка (а её движок шлёт на
+  /// КАЖДОЙ неудачной итерации) убирала с экрана кнопку «Отключить» — и остановить цикл было
+  /// нечем. На Windows это выглядело хуже всего: окно уходит в трей, а процесс продолжает
+  /// перебирать попытки.
+  bool _sessionLive = false;
+
+  /// Сессия ядра запущена и ещё не остановлена: показываем кнопку «Отключить», даже когда на
+  /// экране висит причина последнего отказа.
+  bool get sessionLive => _sessionLive;
+
+  bool get isBusy => _sessionLive || phase == VpnPhase.connecting || phase == VpnPhase.up;
 
   AppState() {
     // C8.5: применить сохранённую настройку запрета скриншотов. Платформа уже поставила запрет по
@@ -346,8 +359,14 @@ class AppState extends ChangeNotifier {
     exit = transport = cidr = '';
     _clearError();
     since = null;
+    _sessionLive = true; // цикл ядра пошёл — остановить его может только пользователь
     notifyListeners();
-    _sub = stream.listen(_handleEvent, onError: _onStreamError);
+    // onDone: поток закрывается, когда цикл ядра свернулся сам (например, движок остановлен
+    // изнутри). Без снятия признака кнопка «Отключить» осталась бы на экране мёртвой сессии.
+    _sub = stream.listen(_handleEvent, onError: _onStreamError, onDone: () {
+      _sessionLive = false;
+      notifyListeners();
+    });
   }
 
   /// Применить событие сессии к состоянию (общее для первого коннекта и re-attach при перезапуске).
@@ -406,6 +425,9 @@ class AppState extends ChangeNotifier {
         since ??= DateTime.now();
       case 'down':
       case 'idle':
+        // Движок сообщает это состояние, только свернув цикл (`finish_stopped`) — реконнект такого
+        // не шлёт. Значит останавливать больше нечего.
+        _sessionLive = false;
         if (phase != VpnPhase.error) phase = VpnPhase.off;
         since = null;
     }
@@ -421,6 +443,7 @@ class AppState extends ChangeNotifier {
     }
     _sub?.cancel();
     _sub = null;
+    _sessionLive = false;
     phase = VpnPhase.off;
     activeProfileId = null;
     exit = transport = cidr = '';

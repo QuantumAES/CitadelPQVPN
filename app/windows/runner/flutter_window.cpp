@@ -197,8 +197,11 @@ void FlutterWindow::SetupTrayChannel() {
             } else {
               tray_phase_ = TrayPhase::Off;
             }
-            // Пункт «Отключить туннель» в меню имеет смысл, пока сессия жива (up/connecting).
-            tray_connected_ = (tray_phase_ == TrayPhase::Up ||
+            // Пункт «Отключить туннель» в меню имеет смысл, пока сессия жива. Фазы для этого мало:
+            // движок ретраит подключение бесконечно, и каждая неудачная попытка даёт `error` —
+            // раньше пункт при этом пропадал, и свёрнутое в трей приложение нечем было остановить.
+            // Поэтому Dart присылает признак живой сессии отдельным полем.
+            tray_connected_ = (get("live") == "1" || tray_phase_ == TrayPhase::Up ||
                                tray_phase_ == TrayPhase::Connecting);
             const std::string tip = get("tooltip");
             if (!tip.empty()) tray_tip_ = Utf8ToWide(tip);

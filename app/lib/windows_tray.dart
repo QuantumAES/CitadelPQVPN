@@ -66,11 +66,16 @@ class WindowsTray {
   ///   • янтарный — подключение/переподключение;
   ///   • зелёный — туннель активен;
   ///   • красный — ошибка (сессия не поднята).
-  static Future<void> setPhase(String phase, {String? tooltip}) async {
+  /// `live` — жива ли сессия ядра. Отдельный признак, потому что при бесконечном реконнекте фаза
+  /// показывает причину последнего отказа (`error`), но останавливать по-прежнему есть что: без
+  /// него у свёрнутого в трей приложения не оставалось НИ ОДНОГО способа прервать цикл, кроме
+  /// выхода из программы.
+  static Future<void> setPhase(String phase, {String? tooltip, bool live = false}) async {
     if (!supported) return;
     await _ch.invokeMethod('setPhase', <String, String>{
       'phase': phase, // off | connecting | up | error
       'tooltip': tooltip ?? 'CitadelPQVPN',
+      'live': live ? '1' : '0',
     });
   }
 

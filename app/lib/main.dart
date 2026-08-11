@@ -167,7 +167,7 @@ class _CitadelAppState extends State<CitadelApp> with WindowListener {
         ),
       VpnPhase.off => ('off', t('tray_off')),
     };
-    WindowsTray.setPhase(phase, tooltip: tip);
+    WindowsTray.setPhase(phase, tooltip: tip, live: state.isBusy);
   }
 
   void _showFromTray() {

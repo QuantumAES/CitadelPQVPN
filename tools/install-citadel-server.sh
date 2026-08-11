@@ -688,7 +688,11 @@ export Citadel_KEYSYNC_ID=$KEYSYNC_ID
 # exit-машины (до TLS, до слота гейта). Пусто = совмещённая установка, порт наружу не смотрит.
 export Citadel_ADMIN_PEER="$ADMIN_PEER"
 # H-3: мастер L1 — из него абоненту выдаётся ключ текущей эпохи (после Layer-1, ровно на эпоху).
-export Citadel_OBFS_MASTER="${Citadel_OBFS_MASTER:-}"
+# \$ ОБЯЗАТЕЛЕН: этот heredoc — не в кавычках, и без экранирования переменную раскрывал бы САМ
+# установщик (у него её нет — мастер лежит в \$MASTER), зашивая в скрипт `=""`. Тогда издатель
+# молча уходил в legacy «ротации нет», exit при этом принимал ТОЛЬКО ключи эпох, и туннель не
+# поднимался ни по QUIC, ни по obfs-TCP — оба транспорта выглядели как «порт закрыт».
+export Citadel_OBFS_MASTER="\${Citadel_OBFS_MASTER:-}"
 rm -f /shared/issuer.key /shared/issuer-*.key /shared/issuer.pub /shared/issuer-*.pub /shared/tokens
 # M-4 (аудит-4): привилегии издателя режет compose (cap_drop: ALL + read_only + no-new-privileges).
 # Смена uid здесь не делается — том общий с exit'ом (и с keysync при раздельной установке), и
@@ -697,6 +701,21 @@ echo "[citadel-issuer] Layer-1 registry + слепая выдача epoch-ток
 exec citadel-token
 EOF
 chmod +x "$DIR/etc/entrypoint-issuer.sh"
+
+# ─── гейт H-3: обе роли обязаны ПОЛУЧИТЬ мастер L1 из compose ───
+# Мастер в сами скрипты не подставляется намеренно: entrypoint'ы уезжают слоями образа (Dockerfile
+# COPY), а мастер — серверный секрет. Значит единственный корректный вид строки — ссылка на
+# переменную, раскрываемая в контейнере. Если генерация раскроет её сама (heredoc без кавычек), в
+# файл попадёт `=""`, издатель молча уйдёт в legacy «ротации нет», exit останется на ключах эпох —
+# и туннель не поднимется НИ по QUIC, НИ по obfs-TCP, причём оба транспорта будут выглядеть как
+# «порт закрыт/firewall». Такой деплой обязан падать здесь, а не у абонента.
+if [[ -n "$MASTER" ]]; then
+  for f in "$DIR/etc/entrypoint-issuer.sh" "$DIR/etc/entrypoint-exit.sh"; do
+    [[ -f "$f" ]] || continue
+    grep -qF 'Citadel_OBFS_MASTER="${Citadel_OBFS_MASTER:-}"' "$f" \
+      || die "внутренняя ошибка генерации: $(basename "$f") не пробрасывает Citadel_OBFS_MASTER — L1 у издателя и exit'а разойдётся (H-3)"
+  done
+fi
 
 # compose: exit (+ issuer при ISSUER_ON). Образ собираем отдельным `docker build` (ниже) — сервисы
 # только ссылаются на image, поэтому порядок build/start однозначен.
@@ -838,6 +857,20 @@ elif [[ "$ISSUER_ON" == 1 ]]; then
   # PQ: обязательство к ML-DSA-идентичности издателя. Без него клиент откажется и фетчить токены,
   # и открывать admin-канал: pin серта — классическая привязка, против CRQC она не держит.
   ISSUER_MLDSA="$(cat "$DIR/keys/issuer-mldsa.pin")"
+fi
+
+# ─── гейт H-3 (вживую): издатель ДЕЙСТВИТЕЛЬНО раздаёт ключ эпохи ───
+# Статическая проверка выше ловит потерю переменной при генерации, эта — любой другой путь к тому
+# же итогу (правка compose руками, старый контейнер, не перечитавший окружение). Проверяем то, что
+# процесс сам сказал о себе при старте: рассинхрон L1 не виден ни по одному health-признаку —
+# ключи, pin'ы и порты в порядке, а туннель не поднимается вообще.
+if [[ "$ISSUER_ON" == 1 && "$ROLE" != exit && -n "$MASTER" ]]; then
+  ISSUER_L1="$(docker compose -f "$DIR/etc/compose.yml" logs issuer 2>/dev/null | grep -m1 'L1-ключ для абонентов' || true)"
+  case "$ISSUER_L1" in
+    *"ротация по эпохам"*) : ;;   # издатель раздаёт ключ эпохи — exit его и ждёт
+    *) docker compose -f "$DIR/etc/compose.yml" logs --tail 20 issuer || true
+       die "издатель поднялся БЕЗ мастера L1 (${ISSUER_L1:-строка о ключе не найдена}), а exit принимает только ключи эпох — туннель не поднимется ни по QUIC, ни по obfs-TCP (H-3)" ;;
+  esac
 fi
 
 # ─── 7. публичный адрес + citadel:// (секрет) ───

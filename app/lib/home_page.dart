@@ -237,6 +237,7 @@ class _HomePageState extends State<HomePage> {
                     profile: p,
                     active: s.activeProfileId == p.id,
                     phase: s.phase,
+                    busy: s.isBusy,
                     onTap: () => _tapProfile(p),
                     onDelete: () => _deleteProfile(p),
                     onDisconnect: s.disconnect,
@@ -1032,6 +1033,16 @@ class _StatusCard extends StatelessWidget {
         // errorTitle — КЛЮЧ строки (см. AppState._classify): переводим при отрисовке, поэтому
         // смена языка меняет и уже показанный отказ.
         label = t(state.errorTitle.isEmpty ? 'err_server_unreachable' : state.errorTitle);
+        // Движок после отказа НЕ сдаётся — он ждёт и пробует снова, пока его не остановят.
+        // Без этого индикатора экран выглядел как окончательный приговор, хотя попытки идут:
+        // человек закрывал окно (на Windows — в трей) и оставлял цикл работать вслепую.
+        if (state.sessionLive) {
+          lead = SizedBox(
+            height: 22,
+            width: 22,
+            child: CircularProgressIndicator(strokeWidth: 2.4, color: fg),
+          );
+        }
       case VpnPhase.off:
         bg = cs.surfaceContainerHighest;
         fg = cs.onSurfaceVariant;
@@ -1134,6 +1145,7 @@ class _ProfileTile extends StatelessWidget {
     required this.profile,
     required this.active,
     required this.phase,
+    required this.busy,
     required this.onTap,
     required this.onDelete,
     required this.onDisconnect,
@@ -1143,6 +1155,9 @@ class _ProfileTile extends StatelessWidget {
   final ProfileDto profile;
   final bool active;
   final VpnPhase phase;
+  /// Сессия ядра жива (см. `AppState.isBusy`). Отдельно от `phase`: во время бесконечного
+  /// реконнекта фаза показывает причину последнего отказа, но останавливать по-прежнему есть что.
+  final bool busy;
   final VoidCallback onTap;
   final VoidCallback onDelete;
   final VoidCallback onDisconnect;
@@ -1157,7 +1172,9 @@ class _ProfileTile extends StatelessWidget {
     Color dot;
     if (active && phase == VpnPhase.up) {
       dot = Colors.green;
-    } else if (active && phase == VpnPhase.connecting) {
+    } else if (active && busy) {
+      // Не только `connecting`: во время бесконечного реконнекта фаза = отказ последней попытки,
+      // но профиль всё ещё занят сессией — точка обязана это показывать.
       dot = Colors.amber;
     } else {
       dot = cs.outlineVariant;
@@ -1213,7 +1230,7 @@ class _ProfileTile extends StatelessWidget {
             }
           },
           itemBuilder: (_) => [
-            if (active && (phase == VpnPhase.up || phase == VpnPhase.connecting))
+            if (active && busy)
               PopupMenuItem(value: 'disconnect', child: Text(t('disconnect')))
             else
               PopupMenuItem(value: 'connect', child: Text(t('connect'))),
