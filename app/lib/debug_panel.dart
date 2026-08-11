@@ -82,17 +82,42 @@ class _MonoLogViewState extends State<MonoLogView> {
   final _scroll = ScrollController();
   bool _autoscroll = true;
 
+  /// Сколько строк уже показано. Именно счётчик, а не сравнение `old.lines` с `widget.lines`:
+  /// список приезжает ОДНИМ И ТЕМ ЖЕ объектом (панель мутирует его на месте), поэтому у старого
+  /// и нового виджета длина всегда одинаковая, и сравнение по нему ничего бы не заметило.
+  int _shownLen = -1;
+  bool _jumpScheduled = false;
+
+  @override
+  void initState() {
+    super.initState();
+    _scheduleJump(); // панель примингуется снимком журнала — показываем хвост, а не начало
+  }
+
   @override
   void didUpdateWidget(covariant MonoLogView old) {
     super.didUpdateWidget(old);
-    if (_autoscroll) _scheduleJump();
+    _scheduleJump();
   }
 
+  /// Прокрутить к последней строке — но ТОЛЬКО когда строк реально прибавилось.
+  ///
+  /// Раньше это вызывалось из `build` безусловно, и получался вечный двигатель: кадр → post-frame
+  /// `jumpTo` → `jumpTo` планирует следующий кадр (goIdle/goBallistic уведомляют слушателей
+  /// позиции, а Scrollbar на них перестраивается) → снова `build` → снова `jumpTo`. Приложение
+  /// рисовало кадры без остановки, независимо от того, идёт ли трафик и поднят ли туннель, — и
+  /// тем дороже, чем длиннее журнал. Отсюда и «процессор занят, хотя туннель выключен».
   void _scheduleJump() {
+    final len = widget.lines.length;
+    if (!_autoscroll || len == _shownLen || _jumpScheduled) return;
+    _shownLen = len;
+    _jumpScheduled = true;
     WidgetsBinding.instance.addPostFrameCallback((_) {
-      if (_scroll.hasClients) {
-        _scroll.jumpTo(_scroll.position.maxScrollExtent);
-      }
+      _jumpScheduled = false;
+      if (!mounted || !_scroll.hasClients) return;
+      final max = _scroll.position.maxScrollExtent;
+      // Уже внизу — не трогаем позицию вовсе: лишний jumpTo здесь и запускал следующий кадр.
+      if ((_scroll.position.pixels - max).abs() > 0.5) _scroll.jumpTo(max);
     });
   }
 
@@ -129,7 +154,8 @@ class _MonoLogViewState extends State<MonoLogView> {
   Widget build(BuildContext context) {
     final cs = Theme.of(context).colorScheme;
     final t = Strings.of(context);
-    _scheduleJump();
+    // Прокрутка планируется в `didUpdateWidget` (и при включении автоскролла), а не здесь:
+    // побочный эффект в `build`, планирующий следующий кадр, — это и есть бесконечный рендер.
     return Container(
       decoration: BoxDecoration(
         color: cs.surfaceContainerHighest,
@@ -157,7 +183,13 @@ class _MonoLogViewState extends State<MonoLogView> {
                   icon: Icon(_autoscroll
                       ? Icons.vertical_align_bottom
                       : Icons.pause_circle_outline),
-                  onPressed: () => setState(() => _autoscroll = !_autoscroll),
+                  onPressed: () => setState(() {
+                    _autoscroll = !_autoscroll;
+                    if (_autoscroll) {
+                      _shownLen = -1; // включили — догнать хвост и без новых строк
+                      _scheduleJump();
+                    }
+                  }),
                 ),
                 IconButton(
                   visualDensity: VisualDensity.compact,
