@@ -4,7 +4,7 @@
 //!
 //! ```text
 //! citadel-linkgen --servers "1.2.3.4:4433" --psk <hex64> --pin <hex64> \
-//!   [--activate-secs 86400] \
+//!   [--activate-secs 86400] [--meta-out FILE] \
 //!   [--kx all] [--tcp-port 443] [--routes "1.1.1.1/32 1.0.0.1/32"] \
 //!   [--dns 1.1.1.1] [--server-name citadel.exit] [--qr link.svg] \
 //!   [--issuer host:7000] [--issuer-pin <hex64>] [--issuer-mldsa <hex64>] [--client-seed <hex64>] \
@@ -139,6 +139,16 @@ fn main() {
     if let (Some(code), Some(h)) = (link.verify_code(), link.link_hash()) {
         eprintln!("[linkgen] код сверки: {code}   (продиктуй абоненту отдельно от самой ссылки)");
         eprintln!("[linkgen] отпечаток ссылки: {}", hex::encode(h));
+        // Машиночитаемый выход для установщика: он заверяет ссылку в реестре (`linkh=`) и
+        // печатает код сверки рядом с самой ссылкой. Разбирать ради этого человеческий stderr —
+        // напрашиваться на поломку от смены формулировки.
+        if let Some(path) = get("--meta-out") {
+            let meta = format!("linkh={}\ncode={code}\n", hex::encode(h));
+            if let Err(e) = std::fs::write(&path, meta) {
+                eprintln!("[linkgen] не записать --meta-out {path}: {e}");
+                std::process::exit(1);
+            }
+        }
     }
     if let Some(until) = bundle.exp {
         eprintln!(

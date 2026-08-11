@@ -56,10 +56,14 @@ pub async fn admin_subscribers(profile_id: String) -> Result<Vec<SubscriberDto>>
         .into_iter()
         .map(|r| (r.client_id_hex, r.label))
         .collect();
+    // M-9: пара «ссылка + устройство» уже свёрнута ядром в одну строку абонента
+    // (`citadel_client::admin::fold_activated`), а `label_id_hex` говорит, под каким id искать
+    // метку админа: у активированной ссылки метка сохранена под ЕЁ id, а показываем мы запись
+    // устройства.
     Ok(list
         .into_iter()
         .map(|e| SubscriberDto {
-            label: labels.get(&e.client_id_hex).cloned().unwrap_or_default(),
+            label: labels.get(&e.label_id_hex).cloned().unwrap_or_default(),
             client_id_hex: e.client_id_hex,
             valid_until_unix: e.valid_until_unix,
             active: e.active,

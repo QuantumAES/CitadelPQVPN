@@ -37,6 +37,21 @@ pub fn read_password(prompt: &str) -> Result<Secret> {
     s
 }
 
+/// Прочитать строку С ЭХОМ — для значений, которые секретом НЕ являются и которые человек
+/// проверяет глазами при вводе. Сейчас это код сверки ссылки (M-9): он публичен по назначению —
+/// администратор диктует его голосом, — и прятать его при вводе значило бы мешать сверке.
+pub fn read_line(prompt: &str) -> Result<String> {
+    let mut stdout = std::io::stdout();
+    write!(stdout, "{prompt}")?;
+    stdout.flush()?;
+    let mut line = String::new();
+    let n = std::io::stdin().lock().read_line(&mut line).context("читать stdin")?;
+    if n == 0 {
+        bail!("ввод пуст (EOF)");
+    }
+    Ok(line.trim().to_string())
+}
+
 /// Прочитать одну строку со stdin как секрет (без обрезки внутренних пробелов, только `\n`/`\r`).
 pub fn read_secret_line() -> Result<Secret> {
     let mut line = String::new();

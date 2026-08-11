@@ -1768,8 +1768,8 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
   LinkSummaryDto dco_decode_link_summary_dto(dynamic raw) {
     // Codec=Dco (DartCObject based), see doc to use other codecs
     final arr = raw as List<dynamic>;
-    if (arr.length != 8)
-      throw Exception('unexpected arr length: expect 8 but see ${arr.length}');
+    if (arr.length != 11)
+      throw Exception('unexpected arr length: expect 11 but see ${arr.length}');
     return LinkSummaryDto(
       valid: dco_decode_bool(arr[0]),
       servers: dco_decode_String(arr[1]),
@@ -1779,6 +1779,9 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
       hasPqAuth: dco_decode_bool(arr[5]),
       hasObfs: dco_decode_bool(arr[6]),
       isAdmin: dco_decode_bool(arr[7]),
+      isEnroll: dco_decode_bool(arr[8]),
+      activateUntilUnix: dco_decode_i_64(arr[9]),
+      verifyCode: dco_decode_String(arr[10]),
     );
   }
 
@@ -2027,6 +2030,9 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
     var var_hasPqAuth = sse_decode_bool(deserializer);
     var var_hasObfs = sse_decode_bool(deserializer);
     var var_isAdmin = sse_decode_bool(deserializer);
+    var var_isEnroll = sse_decode_bool(deserializer);
+    var var_activateUntilUnix = sse_decode_i_64(deserializer);
+    var var_verifyCode = sse_decode_String(deserializer);
     return LinkSummaryDto(
       valid: var_valid,
       servers: var_servers,
@@ -2036,6 +2042,9 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
       hasPqAuth: var_hasPqAuth,
       hasObfs: var_hasObfs,
       isAdmin: var_isAdmin,
+      isEnroll: var_isEnroll,
+      activateUntilUnix: var_activateUntilUnix,
+      verifyCode: var_verifyCode,
     );
   }
 
@@ -2342,6 +2351,9 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
     sse_encode_bool(self.hasPqAuth, serializer);
     sse_encode_bool(self.hasObfs, serializer);
     sse_encode_bool(self.isAdmin, serializer);
+    sse_encode_bool(self.isEnroll, serializer);
+    sse_encode_i_64(self.activateUntilUnix, serializer);
+    sse_encode_String(self.verifyCode, serializer);
   }
 
   @protected

@@ -2007,6 +2007,9 @@ impl SseDecode for crate::api::citadel::LinkSummaryDto {
         let mut var_hasPqAuth = <bool>::sse_decode(deserializer);
         let mut var_hasObfs = <bool>::sse_decode(deserializer);
         let mut var_isAdmin = <bool>::sse_decode(deserializer);
+        let mut var_isEnroll = <bool>::sse_decode(deserializer);
+        let mut var_activateUntilUnix = <i64>::sse_decode(deserializer);
+        let mut var_verifyCode = <String>::sse_decode(deserializer);
         return crate::api::citadel::LinkSummaryDto {
             valid: var_valid,
             servers: var_servers,
@@ -2016,6 +2019,9 @@ impl SseDecode for crate::api::citadel::LinkSummaryDto {
             has_pq_auth: var_hasPqAuth,
             has_obfs: var_hasObfs,
             is_admin: var_isAdmin,
+            is_enroll: var_isEnroll,
+            activate_until_unix: var_activateUntilUnix,
+            verify_code: var_verifyCode,
         };
     }
 }
@@ -2395,6 +2401,9 @@ impl flutter_rust_bridge::IntoDart for crate::api::citadel::LinkSummaryDto {
             self.has_pq_auth.into_into_dart().into_dart(),
             self.has_obfs.into_into_dart().into_dart(),
             self.is_admin.into_into_dart().into_dart(),
+            self.is_enroll.into_into_dart().into_dart(),
+            self.activate_until_unix.into_into_dart().into_dart(),
+            self.verify_code.into_into_dart().into_dart(),
         ]
         .into_dart()
     }
@@ -2641,6 +2650,9 @@ impl SseEncode for crate::api::citadel::LinkSummaryDto {
         <bool>::sse_encode(self.has_pq_auth, serializer);
         <bool>::sse_encode(self.has_obfs, serializer);
         <bool>::sse_encode(self.is_admin, serializer);
+        <bool>::sse_encode(self.is_enroll, serializer);
+        <i64>::sse_encode(self.activate_until_unix, serializer);
+        <String>::sse_encode(self.verify_code, serializer);
     }
 }
 

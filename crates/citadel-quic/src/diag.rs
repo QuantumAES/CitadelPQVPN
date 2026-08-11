@@ -12,6 +12,20 @@ use std::time::{Duration, Instant};
 use crate::client::{establish_session, host_of, try_quic_connect};
 use crate::config::ClientConfig;
 
+/// H-3: приписка к «порт недоступен», когда транспорт идёт под БУТСТРАПНЫМ PSK, а ключа L1
+/// текущей эпохи у нас нет. Exit с включённой ротацией такой пакет даже не разбирает и молча
+/// отбрасывает — на проводе это неотличимо от закрытого порта, и человек уходит чинить firewall
+/// вместо выдачи токенов. Пустая строка, когда ключ эпохи есть (или obfs не используется вовсе).
+fn missing_epoch_key_hint(cfg: &ClientConfig) -> &'static str {
+    if cfg.data_psk.is_none() && cfg.obfs_psk.is_some() {
+        ". NB: ключ L1 текущей эпохи не получен (идём под бутстрапным PSK) — при включённой на \
+         сервере ротации H-3 exit молча отбрасывает такие пакеты, и это выглядит ровно как \
+         закрытый порт. Сперва разберись с шагом «Токен»"
+    } else {
+        ""
+    }
+}
+
 /// Один шаг диагностики для UI: имя, вердикт, детали.
 pub struct DiagStep {
     pub name: String,
@@ -87,9 +101,15 @@ pub async fn run_diagnostics(
                 ));
                 conn.close(0u32.into(), b"diag");
             }
+            // Порт берём из адреса сервера: раньше здесь стояло литеральное «UDP:4433», и после
+            // перехода на случайные порты (M-8) диагностика называла порт, которого в деплое нет.
             Ok(None) => emit(DiagStep::fail(
                 format!("QUIC/UDP · {server}"),
-                "UDP:4433 недоступен или блокируется (порт закрыт/firewall/NAT)",
+                format!(
+                    "UDP:{} недоступен или блокируется (порт закрыт/firewall/NAT){}",
+                    addr.port(),
+                    missing_epoch_key_hint(cfg)
+                ),
             )),
             Err(e) => emit(DiagStep::fail(format!("QUIC/UDP · {server}"), format!("ошибка: {e:#}"))),
         }
@@ -111,7 +131,10 @@ pub async fn run_diagnostics(
                     format!("TCP · {tcp_target}"),
                     "порт принимает соединения (obfs-fallback доступен)",
                 )),
-                Ok(Err(e)) => emit(DiagStep::fail(format!("TCP · {tcp_target}"), format!("connect: {e:#}"))),
+                Ok(Err(e)) => emit(DiagStep::fail(
+                    format!("TCP · {tcp_target}"),
+                    format!("connect: {e}{}", crate::local_block_hint(&e)),
+                )),
                 Err(_) => emit(DiagStep::fail(format!("TCP · {tcp_target}"), "таймаут connect (3с)")),
             },
         }

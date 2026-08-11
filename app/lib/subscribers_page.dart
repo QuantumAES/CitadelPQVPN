@@ -1,3 +1,5 @@
+import 'dart:async';
+
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 
@@ -54,7 +56,12 @@ class _SubscribersPageState extends State<SubscribersPage> {
     if (_sessionUp && _entries == null && !_busy) _refresh();
   }
 
-  /// Обёртка операции: занятость + ошибка в баннер.
+  /// Потолок ожидания ОДНОЙ попытки. У ядра свои таймауты (10с connect + 15с на операцию канала),
+  /// но полагаться только на них нельзя: на мобильной сети SYN в никуда, зависший TLS-хендшейк или
+  /// не проложенный маршрут к VIP давали экран, который «крутится вечно» — жалоба ровно такая.
+  /// Лучше честный отказ через минуту, чем бесконечный индикатор без единого слова.
+  static const _opTimeout = Duration(seconds: 30);
+
   /// Обёртка операции: занятость + ошибка в баннер. `retries` — повторы при сбое (для авто-загрузки
   /// списка: #0.1 — сразу после подъёма туннеля admin-путь к ADMIN_VIP:порт, DNAT/маршрут, может
   /// быть ещё не проложен → connect/challenge падает; короткий ретрай устраняет ложную ошибку).
@@ -70,10 +77,14 @@ class _SubscribersPageState extends State<SubscribersPage> {
     try {
       for (var attempt = 0;; attempt++) {
         try {
-          return await op();
+          return await op().timeout(_opTimeout);
         } catch (e) {
           if (attempt >= retries || !mounted) {
-            if (mounted) setState(() => _error = _short(humanError(e, t)));
+            if (mounted) {
+              setState(() => _error = e is TimeoutException
+                  ? t('admin_timeout')
+                  : _short(humanError(e, t)));
+            }
             return null;
           }
           await Future.delayed(delay); // admin-путь после туннеля мог ещё не подняться

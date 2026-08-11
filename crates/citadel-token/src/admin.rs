@@ -280,24 +280,63 @@ pub fn registry_apply_enroll(
     Ok(registry_apply_add_full(&out, device, e.valid_until, None, None))
 }
 
+/// Все записи, которые гасит отзыв `pk`: он сам, устройство, в которое активирована его ссылка, и
+/// ссылка, из которой выросло это устройство. Больше одного шага в каждую сторону быть не может
+/// (устройственная запись сама одноразовой не помечается), но считаем по файлу — его мог править
+/// оператор руками.
+///
+/// Отдельная функция, потому что цепочку обязаны знать ДВОЕ: сам отзыв и защита от self-lockout
+/// (R6). Иначе админ, отозвав УСТРОЙСТВО, к которому привязана его же мастер-ссылка, запер бы
+/// себя снаружи — проверка «id не равен admin.client_id» этого бы не заметила.
+pub fn revoke_chain(existing: &str, pk: &[u8; 32]) -> Vec<[u8; 32]> {
+    let entries = parse_registry(existing);
+    let mut targets: Vec<[u8; 32]> = vec![*pk];
+    for e in &entries {
+        if &e.client_id == pk {
+            if let Some(d) = e.device {
+                targets.push(d); // ссылка → её устройство
+            }
+        }
+        if e.device.as_ref() == Some(pk) {
+            targets.push(e.client_id); // устройство → породившая ссылка
+        }
+    }
+    targets
+}
+
 /// Отзыв: у строки pub статус → `revoked` (valid_until сохраняется). Если pub нет — ошибка
 /// (нечего отзывать; защищает от опечатки в client_id). Чистая логика.
+///
+/// **M-9, живой дефект: отзыв обязан идти по всей цепочке «ссылка ⇄ устройство».** После активации
+/// подписка переезжает на УСТРОЙСТВЕННЫЙ id, а запись ссылки становится `consumed` — то есть в
+/// реестре появляются ДВЕ строки на одного абонента. Админ видит с меткой ту, которую сам выдал
+/// (ссылочную), отзывал её — и ничего не происходило: пускала-то абонента вторая строка. Поэтому
+/// отзыв ссылки гасит и её устройство, а отзыв устройства — породившую его ссылку (иначе
+/// оставшаяся `consumed`-строка выглядела бы как «ещё можно активировать»).
 pub fn registry_apply_revoke(existing: &str, pk: &[u8; 32]) -> Result<String> {
+    let targets = revoke_chain(existing, pk);
     let hexpk = hex::encode(pk);
+    let hex_targets: Vec<String> = targets.iter().map(hex::encode).collect();
     let mut out = String::new();
     let mut found = false;
+    let mut seen: Vec<String> = Vec::new();
     for line in existing.lines() {
-        if line.split_whitespace().next() == Some(hexpk.as_str()) {
-            if !found {
-                // Флаги M-9 (`enroll`/`dev`/`linkh`) при отзыве СОХРАНЯЮТСЯ: иначе отозванная
-                // первичная ссылка теряла бы отметку «уже активирована», и повторный `add`
-                // воскрешал бы её как свежую одноразовую — то есть отзыв ослаблял бы контроль.
-                let mut e = parse_registry(line).pop().unwrap_or(RegistryEntry {
-                    client_id: *pk,
-                    ..Default::default()
-                });
-                e.status = "revoked".into();
-                out.push_str(&e.to_line());
+        let head = line.split_whitespace().next().unwrap_or_default().to_string();
+        if hex_targets.contains(&head) {
+            if seen.contains(&head) {
+                continue; // дубликат строки того же id — схлопываем, как делает upsert
+            }
+            // Флаги M-9 (`enroll`/`dev`/`linkh`) при отзыве СОХРАНЯЮТСЯ: иначе отозванная
+            // первичная ссылка теряла бы отметку «уже активирована», и повторный `add`
+            // воскрешал бы её как свежую одноразовую — то есть отзыв ослаблял бы контроль.
+            let mut e = parse_registry(line).pop().unwrap_or(RegistryEntry {
+                client_id: *pk,
+                ..Default::default()
+            });
+            e.status = "revoked".into();
+            out.push_str(&e.to_line());
+            seen.push(head.clone());
+            if head == hexpk {
                 found = true;
             }
         } else if !line.trim().is_empty() {
@@ -473,8 +512,16 @@ impl AdminServer {
                 Ok(AdminResponse::Ok)
             }
             AdminRequest::Revoke { client_id } => {
-                if self.admin_client_id() == Some(client_id) {
-                    bail!("отзыв client_id админа запрещён (self-lockout, R6) — break-glass на сервере");
+                // R6 (анти-self-lockout) считается по ВСЕЙ цепочке отзыва: мастер-ссылка админа
+                // теперь тоже одноразовая, то есть его собственный доступ живёт на устройственной
+                // записи, а `admin.client_id` — на ссылочной. Проверка одного лишь равенства
+                // позволила бы админу отозвать своё устройство и вместе с ним (каскадом) себя.
+                if let Some(mine) = self.admin_client_id() {
+                    if revoke_chain(&cur, &client_id).contains(&mine) {
+                        bail!(
+                            "отзыв client_id админа запрещён (self-lockout, R6) — break-glass на сервере"
+                        );
+                    }
                 }
                 atomic_write(&path, &registry_apply_revoke(&cur, &client_id)?)?;
                 crate::dlog!("[admin] revoke {}… (действует ≤ длины эпохи)", &hex::encode(client_id)[..12]);
@@ -519,10 +566,17 @@ impl AdminClient {
         // и транспорта к exit). Он идёт к ADMIN_VIP — адресу ВНУТРИ туннеля, ядро exit'а DNAT'ит
         // его на издателя (C7.2). Пометка «мимо туннеля» увела бы соединение в обычную сеть, где
         // такого адреса нет, и «Абоненты» перестали бы открываться.
+        // Диагностика пути «Абоненты». Единственный инструмент разбора жалобы «список не
+        // грузится» — журнал ядра на самом устройстве: экран показывает лишь итог, а этапов у
+        // операции четыре (TCP по туннелю → obfs → PQ-TLS с пином → PQ-аутентификация издателя),
+        // и молчали они все. Адрес — VIP внутри туннеля, ничего приватного в строке нет.
+        let t0 = std::time::Instant::now();
+        eprintln!("[admin] подключаюсь к {addr} по туннелю…");
         let tcp = TcpStream::connect_timeout(&sa, Self::CONNECT_TIMEOUT)
             .with_context(|| format!("admin-канал {addr} недоступен (туннель поднят?)"))?;
         tcp.set_read_timeout(Some(Self::IO_TIMEOUT)).context("set_read_timeout")?;
         tcp.set_write_timeout(Some(Self::IO_TIMEOUT)).context("set_write_timeout")?;
+        eprintln!("[admin] TCP до {addr} за {} мс — поднимаю PQ-TLS", t0.elapsed().as_millis());
         let mut tls = pqtls::connect_tls(tcp, *issuer_pin, obfs_psk)?;
         let ekm = pqtls::handshake_client(&mut tls)?;
         // Издатель обязан представиться ПЕРВЫМ: admin-канал управляет реестром абонентов, и отдавать
@@ -537,6 +591,7 @@ impl AdminClient {
         if ack != b"OK" {
             bail!("admin-auth: неожиданный ответ сервера");
         }
+        eprintln!("[admin] канал открыт за {} мс (PQ-TLS+pin, подпись админа принята)", t0.elapsed().as_millis());
         Ok(Self { tls })
     }
 
@@ -728,6 +783,39 @@ mod tests {
         assert_eq!(b.device, Some(dev), "отметка активации сохранена");
         assert_eq!(b.link_hash, Some(hash), "заверенный отпечаток сохранён");
         assert_eq!(b.enroll_until, Some(1_500));
+    }
+
+    /// **Живой дефект M-9: отзыв обязан гасить и ссылку, и её устройство.** После активации
+    /// доступ даёт УСТРОЙСТВЕННАЯ запись, а метку («телефон Али») админ помнит по ссылочной —
+    /// и отзывал именно её. Устройственная оставалась `active`, абонент продолжал подключаться,
+    /// а в списке абонентов напротив него честно стояло «отозван».
+    #[test]
+    fn revoke_follows_the_link_device_chain() {
+        let boot = [0xB0u8; 32];
+        let dev = [0xD1u8; 32];
+        let other = [0x77u8; 32];
+        let hash = [0x9Au8; 32];
+        let base = registry_apply_add_full("", &boot, 2_000, Some(1_500), Some(hash));
+        let base = registry_apply_add(&base, &other, 3_000); // посторонний абонент — не трогать
+        let enrolled = registry_apply_enroll(&base, &boot, &dev, Some(hash), 1_000).unwrap();
+
+        // отзыв ПО ССЫЛКЕ гасит устройство
+        let by_link = parse_registry(&registry_apply_revoke(&enrolled, &boot).unwrap());
+        assert_eq!(by_link.iter().find(|x| x.client_id == dev).unwrap().status, "revoked");
+        assert_eq!(by_link.iter().find(|x| x.client_id == boot).unwrap().status, "revoked");
+        assert_eq!(
+            by_link.iter().find(|x| x.client_id == other).unwrap().status,
+            STATUS_ACTIVE,
+            "чужая запись не должна пострадать"
+        );
+
+        // и наоборот: отзыв ПО УСТРОЙСТВУ гасит породившую ссылку (иначе она выглядела бы как
+        // «ещё можно активировать»)
+        let by_dev = parse_registry(&registry_apply_revoke(&enrolled, &dev).unwrap());
+        assert_eq!(by_dev.iter().find(|x| x.client_id == boot).unwrap().status, "revoked");
+        assert_eq!(by_dev.iter().find(|x| x.client_id == dev).unwrap().status, "revoked");
+        // строк не прибавилось и не убавилось
+        assert_eq!(by_dev.len(), 3);
     }
 
     /// Строки без флагов (написанные до M-9 или руками оператора) читаются как раньше.

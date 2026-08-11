@@ -23,6 +23,47 @@ use citadel_tun::TunIo;
 use crate::config::{ClientConfig, MldsaExpect, PinMode};
 use crate::dataplane::{pump, ClientPath, Tunnel};
 
+/// Неудача [`establish_session`] с ответом на единственный вопрос, который нужен циклу
+/// реконнекта: **успел ли токен Layer-2 уйти exit'у**.
+///
+/// Зачем отдельный тип. Токен — одноразовый и стоит абоненту единицы квоты эпохи (A6, дефолт
+/// 64 выдачи). Раньше цикл считал его потраченным ВСЕГДА, поэтому каждая попытка подключения
+/// к недоступному exit'у (закрытый порт, нет сети, разошёлся ключ L1) выгребала из кошелька
+/// новый токен. Шторм ретраев за несколько минут упирался в квоту, после чего издатель молча
+/// прекращал выдачу — и абонент оставался без связи до конца эпохи, с диагнозом «издатель не
+/// ответил на первый ослеплённый элемент». Токен, который не дошёл до control-обмена, exit'ом
+/// не виден и обязан быть предъявлен снова.
+#[derive(Debug)]
+pub struct EstablishError {
+    /// Настоящая причина (цепочка anyhow целиком).
+    pub source: anyhow::Error,
+    /// `true` — токен ушёл в control-обмен (exit его заспендил или мог заспендить) ⇒ повторно
+    /// предъявлять нельзя, нужен свежий. `false` — транспорт не поднялся, токен остался у нас.
+    pub token_presented: bool,
+}
+
+impl std::fmt::Display for EstablishError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Всегда альтернативная форма: причина у quinn/anyhow лежит в `source`, и без неё
+        // остаётся бесполезное «read error: connection lost».
+        write!(f, "{:#}", self.source)
+    }
+}
+
+// `source()` намеренно `None`: цепочку уже печатает Display (иначе она дублировалась бы в `{e:#}`).
+impl std::error::Error for EstablishError {}
+
+impl EstablishError {
+    /// Отказ до control-обмена: токен остался неистраченным.
+    fn unspent(source: anyhow::Error) -> Self {
+        Self { source, token_presented: false }
+    }
+    /// Отказ на control-обмене или позже: токен уже у exit'а.
+    fn spent(source: anyhow::Error) -> Self {
+        Self { source, token_presented: true }
+    }
+}
+
 /// Установленная клиентская сессия: поднятый транспорт + назначенный сервером адрес.
 /// Сетевую настройку интерфейса делает вызывающий (Linux `NetConfigurator`, Android
 /// `VpnService.Builder` — адрес скармливается ДО получения fd).
@@ -225,7 +266,10 @@ fn require_pq_kx(suite: &str, allow_classical: bool) -> Result<()> {
 /// сразу obfs-TCP (минуя QUIC/UDP): эскалация VpnController'а, когда QUIC-хендшейк проходит, но
 /// мобильный/NAT64-путь не несёт крупные пакеты через QUIC (MTU: хендшейк ок, но большой ML-DSA-ответ
 /// сервера чёрнодырится) — TCP решает сегментацией/MSS.
-pub async fn establish_session(cfg: &ClientConfig, force_tcp: bool) -> Result<Session> {
+pub async fn establish_session(
+    cfg: &ClientConfig,
+    force_tcp: bool,
+) -> std::result::Result<Session, EstablishError> {
     eprintln!("[citadel-m1:client] exit-серверы (перемешаны): {}", cfg.servers.join(", "));
     // M-2/аудит-4: не-PQ suite — ОТКАЗ, а не предупреждение.
     //
@@ -235,7 +279,7 @@ pub async fn establish_session(cfg: &ClientConfig, force_tcp: bool) -> Result<Se
     // реакцией был `eprintln!`, который не превращается в `VpnEvent` и до интерфейса не доходит:
     // пользователь видел «Защищено» над классическим хендшейком. `all` тоже не гарантия — он
     // молча откатывается на X25519, если сервер не PQ (см. `kx_is_pq`).
-    require_pq_kx(&cfg.kx_suite, cfg.allow_classical_kx)?;
+    require_pq_kx(&cfg.kx_suite, cfg.allow_classical_kx).map_err(EstablishError::unspent)?;
 
     // M5 multi-server: идём по списку failover'ом — первый поднявшийся exit (QUIC или TCP-fallback).
     // Копим причины отказа по каждому exit — уходят в итоговую ошибку (видно в UI/лог-панели на
@@ -267,13 +311,25 @@ pub async fn establish_session(cfg: &ClientConfig, force_tcp: bool) -> Result<Se
             }
         }
     }
-    let mut tunnel = tunnel
-        .ok_or_else(|| anyhow!("ни один exit недоступен:\n{}", reasons.join("\n")))?;
+    let mut tunnel = tunnel.ok_or_else(|| {
+        // H-3: без ключа L1 текущей эпохи exit не может даже РАЗОБРАТЬ наши obfs-пакеты и молча их
+        // отбрасывает — на проводе это неотличимо от закрытого порта. Не сказать об этом здесь
+        // значит отправить человека чинить firewall вместо издателя.
+        let hint = if cfg.data_psk.is_none() && cfg.obfs_psk.is_some() {
+            "\nNB: используется бутстрапный PSK — ключ L1 текущей эпохи у издателя НЕ получен. \
+             Если на сервере включена ротация (H-3), exit молча отбрасывает такие пакеты, и это \
+             выглядит как закрытый порт. Сначала чини выдачу токенов, а не firewall."
+        } else {
+            ""
+        };
+        EstablishError::unspent(anyhow!("ни один exit недоступен:\n{}{hint}", reasons.join("\n")))
+    })?;
 
     // M7 PQ-auth: pin (Ed25519-cert) + ML-DSA-65 pk выбранного exit — полный pub (провижирован)
     // ЛИБО обязательство H(pub) из ссылки (полный pub дотянем по каналу, commitment-fetch §S3).
     let host = host_of(&chosen);
-    let mldsa = cfg.mldsa_expect(host)?; // M-1: нечитаемый провижированный ML-DSA pub — отказ
+    // M-1: нечитаемый провижированный ML-DSA pub — отказ
+    let mldsa = cfg.mldsa_expect(host).map_err(EstablishError::unspent)?;
     let pq_active = !matches!(mldsa, MldsaExpect::None);
     // S0.1/H2: cert_pin для ML-DSA-привязки = АКТИВНЫЙ pin. При Pinned rustls уже заставил живой
     // серт совпасть с pin ⇒ привязка идёт к живой сессии. Без активного pin привязывать не к чему
@@ -282,10 +338,10 @@ pub async fn establish_session(cfg: &ClientConfig, force_tcp: bool) -> Result<Se
         PinMode::Pinned(p) => p,
         _ => {
             if pq_active {
-                return Err(anyhow!(
+                return Err(EstablishError::unspent(anyhow!(
                     "PQ-auth: ML-DSA (pub/commit) провижирован для {host}, но серт-pin не активен — \
                      отказ (fail-closed, S0.1/H2)"
-                ));
+                )));
             }
             [0u8; 32]
         }
@@ -359,7 +415,10 @@ async fn connect_server(server: &str, cfg: &ClientConfig, force_tcp: bool) -> Re
                     eprintln!("[citadel-m1:client] PQ-туннель (QUIC/obfs-TCP) к {tcp_target} ✔");
                     return Ok(Some(Tunnel::new(conn, true)));
                 }
-                Ok(Err(e)) => eprintln!("[citadel-m1:client] obfs-TCP не удался: {}", crate::peer_text(e)),
+                Ok(Err(e)) => {
+                    let hint = crate::local_block_hint_any(&e);
+                    eprintln!("[citadel-m1:client] obfs-TCP не удался: {}{hint}", crate::peer_text(e));
+                }
                 Err(_) => eprintln!("[citadel-m1:client] obfs-TCP: таймаут"),
             }
         }
@@ -488,23 +547,29 @@ pub(crate) async fn try_quic_connect(
 /// ради которого введена ML-DSA-привязка) это кража доступа и отказ в обслуживании легитимному
 /// абоненту через double-spend. Канал издателя всегда делал наоборот — сервер представляется
 /// первым кадром (`citadel_token::pqid::verify_hello`), и exit теперь симметричен.
+///
+/// Побочное следствие того же разделения, важное для кошелька токенов: всё, что падает на шаге 1
+/// (мобильная MTU-чёрная дыра на крупном ответе сервера, обрыв, неверная подпись), происходит ДО
+/// предъявления — такой отказ помечается `token_presented=false`, и цикл реконнекта идёт с ТЕМ ЖЕ
+/// токеном, не тратя квоту эпохи (A6) на каждую неудачную попытку.
 async fn client_request_address(
     tunnel: &mut Tunnel,
     token: &[u8],
     expect: &MldsaExpect,
     cert_pin: [u8; 32],
-) -> Result<capsule::AssignedV4> {
+) -> std::result::Result<capsule::AssignedV4, EstablishError> {
     // ── Шаг 1: заставляем сервер представиться. Ничего своего, кроме случайного nonce. ──
     let mut nonce = [0u8; 32];
     rand::thread_rng().fill_bytes(&mut nonce);
-    let buf = tunnel.control_client(&nonce).await?;
+    let buf = tunnel.control_client(&nonce).await.map_err(EstablishError::unspent)?;
     // S2.6/A3: TLS exporter клиентской сессии для channel-binding ML-DSA-подписи (см. verify ниже).
-    let exporter = tunnel.exporter()?;
-    let (server_pub, sig) = parse_server_auth(&buf)?;
+    let exporter = tunnel.exporter().map_err(EstablishError::unspent)?;
+    let (server_pub, sig) = parse_server_auth(&buf).map_err(EstablishError::unspent)?;
 
     // M7/§S3: проверяем ML-DSA-65 подпись сервера согласно ожиданию (полный pub / commitment-fetch).
     // Не сошлось — выходим ЗДЕСЬ, не показав токен (в этом весь смысл разделения на два шага).
-    verify_server_mldsa(expect, server_pub, &nonce, &cert_pin, &exporter, sig)?;
+    verify_server_mldsa(expect, server_pub, &nonce, &cert_pin, &exporter, sig)
+        .map_err(EstablishError::unspent)?;
     match expect {
         MldsaExpect::Pub(_) => eprintln!(
             "[citadel-m1:client] PQ-auth ✔ ML-DSA-65 подпись сервера верна (pub провижирован)"
@@ -524,22 +589,27 @@ async fn client_request_address(
     let redeem = match token.is_empty() {
         true => Vec::new(), // токены выключены на сервере — предъявлять нечего
         false => citadel_token::Token::from_bytes(token)
-            .context("сохранённый токен непригоден (устаревший формат? перезапросите у издателя)")?
+            .context("сохранённый токен непригоден (устаревший формат? перезапросите у издателя)")
+            .map_err(EstablishError::unspent)? // разбор своего же токена — до провода
             .redeem(&citadel_token::redeem_context(&exporter)),
     };
     let req = capsule::AssignedV4 { request_id: 1, addr: [0, 0, 0, 0], prefix: 0 };
     let mut out = citadel_masque::varint::to_vec(redeem.len() as u64);
     out.extend_from_slice(&redeem);
     out.extend_from_slice(&capsule::encode_address_request_v4(&req));
-    let buf = tunnel.control_client(&out).await?;
+    // С этой строки токен считается предъявленным: даже если ответ не дойдёт, exit мог его
+    // заспендить, и повтор дал бы double-spend вместо подключения.
+    let buf = tunnel.control_client(&out).await.map_err(EstablishError::spent)?;
 
-    let (t, val, _) = capsule::decode(&buf).ok_or_else(|| anyhow!("битая капсула в ответе"))?;
+    let assign = |e: anyhow::Error| EstablishError::spent(e);
+    let (t, val, _) =
+        capsule::decode(&buf).ok_or_else(|| assign(anyhow!("битая капсула в ответе")))?;
     if t != capsule::ADDRESS_ASSIGN {
-        return Err(anyhow!("ожидался ADDRESS_ASSIGN, получен type={t}"));
+        return Err(assign(anyhow!("ожидался ADDRESS_ASSIGN, получен type={t}")));
     }
-    let assigned =
-        capsule::decode_assigned_v4(val).ok_or_else(|| anyhow!("битое тело ADDRESS_ASSIGN"))?;
-    validate_assignment(&assigned)?;
+    let assigned = capsule::decode_assigned_v4(val)
+        .ok_or_else(|| assign(anyhow!("битое тело ADDRESS_ASSIGN")))?;
+    validate_assignment(&assigned).map_err(assign)?;
     Ok(assigned)
 }
 
@@ -772,6 +842,9 @@ mod tests {
             .await
             .expect_err("подпись самозванца не должна проходить");
         assert!(format!("{err:#}").contains("ML-DSA"), "err: {err:#}");
+        // Ту же неудачу цикл реконнекта обязан прочитать как «токен НЕ потрачен»: он не покидал
+        // устройство, и следующая попытка идёт с ним же, не отнимая единицу квоты эпохи (A6).
+        assert!(!err.token_presented, "отказ на шаге 1 токен не тратит");
 
         srv.await.unwrap();
 
@@ -786,6 +859,54 @@ mod tests {
             !saw_token_stream.load(Ordering::SeqCst),
             "клиент открыл второй стрим после провала PQ-auth (H-2)"
         );
+    }
+
+    /// **Живой дефект: недоступный exit не должен стоить абоненту токена.**
+    ///
+    /// Раньше цикл реконнекта считал токен потраченным на КАЖДОЙ попытке, поэтому шторм ретраев к
+    /// закрытому порту (или к exit'у, который молча дропает наш L1) выгребал квоту эпохи за
+    /// минуты — а дальше издатель просто прекращал выдачу, и абонент оставался без связи до конца
+    /// эпохи. Здесь exit'а нет вовсе: `establish` обязан провалиться и сказать, что токен цел.
+    #[tokio::test]
+    async fn unreachable_exit_does_not_spend_the_token() {
+        use crate::config::{MldsaSource, PinSource};
+        // Порт, на котором заведомо никто не слушает (сокет создан и сразу закрыт).
+        let dead = {
+            let s = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+            s.local_addr().unwrap()
+        };
+        // Закрытый TCP-порт для obfs-fallback: connect отлетает мгновенно (RST), а сам факт
+        // наличия obfs-канала укорачивает QUIC-фазу до 5 попыток вместо 60 — тест обязан идти
+        // секунды, иначе его выключат из прогона и он перестанет что-либо охранять.
+        let dead_tcp = {
+            let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            l.local_addr().unwrap().port()
+        };
+        let cfg = ClientConfig {
+            servers: vec![dead.to_string()],
+            server_name: "citadel.exit".into(),
+            obfs_psk: Some([0x11; 32]),
+            kx_suite: "pq".into(),
+            tcp_port: dead_tcp.to_string(),
+            routes: String::new(),
+            dns: None,
+            mtu: "1280".into(),
+            token: vec![7u8; 32],
+            data_psk: None,
+            pin: PinSource::Bytes([0x22; 32]),
+            mldsa: MldsaSource::None,
+            allow_insecure_no_pin: false,
+            allow_classical_kx: false,
+            require_pq_auth: false,
+            killswitch: false,
+            split: Default::default(),
+            pacing: None,
+        };
+        let Err(err) = establish_session(&cfg, false).await else {
+            panic!("exit'а нет — establish обязан упасть");
+        };
+        assert!(!err.token_presented, "транспорт не поднялся ⇒ токен остался у нас");
+        assert!(format!("{err:#}").contains("недоступен"), "err: {err:#}");
     }
 
     /// Разбор ответа шага 1 не паникует и не выходит за границы на обрезанных/мусорных данных

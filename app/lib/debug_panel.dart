@@ -5,6 +5,7 @@ import 'package:flutter/services.dart';
 
 import 'package:app/l10n/strings.dart';
 import 'package:app/src/rust/api/diag.dart';
+import 'package:app/window_visibility.dart';
 
 /// Живой журнал ядра (stderr движка захвачен в Rust — см. api::diag). Приминг снимком +
 /// подписка на хвост. Используется в debug-режиме на главном экране.
@@ -25,17 +26,26 @@ class _DebugLogPanelState extends State<DebugLogPanel> {
     _lines.addAll(debugLogSnapshot());
     _sub = debugLogStream().listen((l) {
       if (!mounted) return;
-      setState(() {
-        _lines.add(l);
-        if (_lines.length > 4000) {
-          _lines.removeRange(0, _lines.length - 4000);
-        }
-      });
+      _lines.add(l);
+      if (_lines.length > 4000) {
+        _lines.removeRange(0, _lines.length - 4000);
+      }
+      // Строки копим всегда, а перестраиваем панель — только когда окно видно. У свёрнутого в
+      // трей приложения журнал во время реконнекта идёт плотным потоком, и каждый `setState`
+      // стоил кадра, которого никто не увидит (см. window_visibility.dart).
+      if (windowVisible.value) setState(() {});
     });
+    // Вернули окно — показываем накопленное одним обновлением.
+    windowVisible.addListener(_onVisibility);
+  }
+
+  void _onVisibility() {
+    if (mounted && windowVisible.value) setState(() {});
   }
 
   @override
   void dispose() {
+    windowVisible.removeListener(_onVisibility);
     _sub?.cancel();
     super.dispose();
   }

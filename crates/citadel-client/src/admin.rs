@@ -28,15 +28,27 @@ pub struct SubscriberEntry {
     pub valid_until_unix: i64,
     pub status: String,
     pub active: bool,
+    /// M-9: устройство, в которое активирована эта (первичная) ссылка — hex или пусто.
+    /// Нужно, чтобы UI показал ОДНУ строку на абонента: после активации в реестре их две
+    /// (ссылка `consumed` + запись устройства), и метка админа привязана к первой, а доступ
+    /// даёт вторая.
+    pub device_hex: String,
+    /// Под каким client_id искать локальную метку админа: для устройственной записи это id
+    /// ССЫЛКИ (метка сохранялась при выдаче), для обычной — она сама. Проставляет
+    /// [`fold_activated`].
+    pub label_id_hex: String,
 }
 
 impl From<RegistryEntry> for SubscriberEntry {
     fn from(e: RegistryEntry) -> Self {
+        let client_id_hex = hex::encode(e.client_id);
         Self {
             active: e.status == "active",
-            client_id_hex: hex::encode(e.client_id),
+            label_id_hex: client_id_hex.clone(),
+            client_id_hex,
             valid_until_unix: e.valid_until as i64,
             status: e.status,
+            device_hex: e.device.map(hex::encode).unwrap_or_default(),
         }
     }
 }
@@ -224,7 +236,37 @@ async fn revoke_at(
 /// Список абонентов реестра (по admin-каналу через туннель).
 pub async fn admin_list(master_uri: String) -> Result<Vec<SubscriberEntry>> {
     let (pin, mldsa, seed, obfs_psk) = admin_auth(&master_uri)?;
-    list_at(admin_addr(&master_uri)?, pin, mldsa, seed, obfs_psk).await
+    Ok(fold_activated(list_at(admin_addr(&master_uri)?, pin, mldsa, seed, obfs_psk).await?))
+}
+
+/// M-9: свернуть пару строк «ссылка + устройство» в ОДНУ строку абонента.
+///
+/// После активации в реестре два ряда: первичная ссылка (`consumed`, `dev=<id>`) и запись
+/// устройства — доступ даёт вторая. Админ же узнаёт абонента по метке, а метка сохранена под
+/// client_id ССЫЛКИ. Показ обеих строк и был той путаницей, из-за которой отзыв выглядел
+/// неработающим: гасили запись с меткой, а пускала соседняя.
+///
+/// Правило: строку ссылки прячем, если её устройство действительно есть в списке; у оставшейся
+/// (устройственной) в [`SubscriberEntry::label_id_hex`] проставляем id ссылки — по нему UI найдёт
+/// метку. Битый/поправленный руками реестр (устройства нет) ничего не прячет — иначе абонент
+/// исчез бы из списка совсем и его нельзя было бы даже отозвать.
+pub fn fold_activated(entries: Vec<SubscriberEntry>) -> Vec<SubscriberEntry> {
+    let ids: std::collections::HashSet<String> =
+        entries.iter().map(|e| e.client_id_hex.clone()).collect();
+    // устройство → ссылка, из которой оно выросло
+    let link_of: std::collections::HashMap<String, String> = entries
+        .iter()
+        .filter(|e| !e.device_hex.is_empty())
+        .map(|e| (e.device_hex.clone(), e.client_id_hex.clone()))
+        .collect();
+    entries
+        .iter()
+        .filter(|e| e.device_hex.is_empty() || !ids.contains(&e.device_hex))
+        .map(|e| SubscriberEntry {
+            label_id_hex: link_of.get(&e.client_id_hex).cloned().unwrap_or_else(|| e.client_id_hex.clone()),
+            ..e.clone()
+        })
+        .collect()
 }
 
 /// Отозвать абонента по client_id (hex). Отзыв админом собственного client_id сервер отклонит (R6).
@@ -295,6 +337,47 @@ mod tests {
     use citadel_token::admin::AdminServer;
     use citadel_token::pqtls;
     use std::net::TcpListener;
+
+    fn entry(id: &str, status: &str, dev: &str) -> SubscriberEntry {
+        SubscriberEntry {
+            client_id_hex: id.into(),
+            valid_until_unix: 1_000,
+            status: status.into(),
+            active: status == "active",
+            device_hex: dev.into(),
+            label_id_hex: id.into(),
+        }
+    }
+
+    /// M-9: активированная ссылка и её устройство — ОДИН абонент, одна строка. Показываем ту, что
+    /// даёт доступ (устройственную), а метку ищем по id ссылки: именно под ним админ её сохранил.
+    /// Пока обе строки висели рядом, отзыв выглядел неработающим — гасили запись с меткой, а
+    /// пускала соседняя.
+    #[test]
+    fn activated_link_and_device_fold_into_one_row() {
+        let rows = fold_activated(vec![
+            entry("aa", "consumed", "bb"), // ссылка, активированная в устройство bb
+            entry("bb", "active", ""),     // само устройство — живой доступ
+            entry("cc", "active", ""),     // обычный абонент
+        ]);
+        let ids: Vec<&str> = rows.iter().map(|e| e.client_id_hex.as_str()).collect();
+        assert_eq!(ids, vec!["bb", "cc"], "строка ссылки скрыта, устройство и обычный остались");
+        let dev = rows.iter().find(|e| e.client_id_hex == "bb").unwrap();
+        assert_eq!(dev.label_id_hex, "aa", "метку ищем по id ссылки");
+        assert!(dev.active);
+        let plain = rows.iter().find(|e| e.client_id_hex == "cc").unwrap();
+        assert_eq!(plain.label_id_hex, "cc", "у обычной записи метка своя");
+    }
+
+    /// Невыданное устройство (реестр поправлен руками / обрыв на активации) НЕ должно прятать
+    /// абонента: иначе он исчезает из списка, и его нельзя даже отозвать.
+    #[test]
+    fn dangling_device_reference_hides_nothing() {
+        let rows = fold_activated(vec![entry("aa", "consumed", "zz")]);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].client_id_hex, "aa");
+        assert_eq!(rows[0].label_id_hex, "aa");
+    }
 
     /// Мастер-бандл: exit/pin/issuer/obfs + admin (seed фиксирован для детерминизма теста).
     fn master_bundle(admin_seed: [u8; 32]) -> CredentialBundle {

@@ -13,6 +13,7 @@ import 'package:app/home_page.dart';
 import 'package:app/l10n/strings.dart';
 import 'package:app/locked_session_banner.dart';
 import 'package:app/traffic.dart';
+import 'package:app/window_visibility.dart';
 import 'package:app/windows_tray.dart';
 import 'package:app/src/rust/api/citadel.dart';
 import 'package:app/src/rust/api/diag.dart';
@@ -171,8 +172,31 @@ class _CitadelAppState extends State<CitadelApp> with WindowListener {
   }
 
   void _showFromTray() {
+    windowVisible.value = true;
     windowManager.show();
     windowManager.focus();
+  }
+
+  // ── видимость окна: гасим отрисовку, когда смотреть некому (см. window_visibility.dart) ──
+
+  @override
+  void onWindowMinimize() => windowVisible.value = false;
+
+  @override
+  void onWindowRestore() => windowVisible.value = true;
+
+  /// Страховка на случай, если окно показали/спрятали мимо наших вызовов (жест ОС, плагин):
+  /// `window_manager` шлёт сюда имя события, и `hide`/`show` мы обязаны заметить.
+  @override
+  void onWindowEvent(String eventName) {
+    switch (eventName) {
+      case 'hide':
+        windowVisible.value = false;
+      case 'show':
+      case 'restore':
+      case 'focus':
+        windowVisible.value = true;
+    }
   }
 
   /// Полный выход: чистый disconnect (снятие KS) → остановить службу → убрать трей → закрыть.
@@ -212,6 +236,7 @@ class _CitadelAppState extends State<CitadelApp> with WindowListener {
       return;
     }
     if (WindowsTray.supported) {
+      windowVisible.value = false; // окно ушло в трей — гасим анимации и фоновые перерисовки
       await windowManager.hide();
       return;
     }
@@ -239,6 +264,7 @@ class _CitadelAppState extends State<CitadelApp> with WindowListener {
     );
     switch (choice) {
       case 'background':
+        windowVisible.value = false;
         await windowManager.minimize();
       case 'quit':
         await _quitApp();
@@ -254,6 +280,15 @@ class _CitadelAppState extends State<CitadelApp> with WindowListener {
     return AnimatedBuilder(
       animation: state,
       builder: (context, _) => MaterialApp(
+        // Скрытое окно (трей/сворачивание) не должно стоить процессорного времени: TickerMode
+        // над всем деревом останавливает анимации — прежде всего бесконечный индикатор
+        // «Подключение…», который крутится столько же, сколько движок ретраит недоступный сервер.
+        // Работу самого движка это не трогает, только отрисовку.
+        builder: (ctx, child) => ValueListenableBuilder<bool>(
+          valueListenable: windowVisible,
+          child: child ?? const SizedBox.shrink(),
+          builder: (_, visible, inner) => TickerMode(enabled: visible, child: inner!),
+        ),
         navigatorKey: _navKey,
         title: 'CitadelPQVPN',
         debugShowCheckedModeBanner: false,
@@ -303,7 +338,7 @@ class _UnlockScreenState extends State<UnlockScreen> {
   void initState() {
     super.initState();
     _tick = Timer.periodic(const Duration(seconds: 1), (_) {
-      if (!mounted) return;
+      if (!mounted || !windowVisible.value) return; // спрятанное окно не перерисовываем
       final live = widget.state.phase == VpnPhase.up;
       if (!live || !widget.state.trafficMeter) {
         _traffic.reset();

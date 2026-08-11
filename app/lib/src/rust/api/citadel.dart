@@ -323,6 +323,16 @@ class LinkSummaryDto {
   /// C7.4: мастер-ссылка (admin) — UI предупреждает: такую нельзя раздавать абонентам.
   final bool isAdmin;
 
+  /// M-9: первичная (одноразовая) ссылка — активируется на ОДНОМ устройстве.
+  final bool isEnroll;
+
+  /// M-9: до какого момента (unix) её нужно активировать; `0` — без срока.
+  final PlatformInt64 activateUntilUnix;
+
+  /// M-9: код сверки этой ссылки — абонент сверяет его с тем, что назвал админ по другому
+  /// каналу. Единственная проверка, которая ловит подмену ссылки при доставке.
+  final String verifyCode;
+
   const LinkSummaryDto({
     required this.valid,
     required this.servers,
@@ -332,6 +342,9 @@ class LinkSummaryDto {
     required this.hasPqAuth,
     required this.hasObfs,
     required this.isAdmin,
+    required this.isEnroll,
+    required this.activateUntilUnix,
+    required this.verifyCode,
   });
 
   static Future<LinkSummaryDto> default_() =>
@@ -346,7 +359,10 @@ class LinkSummaryDto {
       hasPin.hashCode ^
       hasPqAuth.hashCode ^
       hasObfs.hashCode ^
-      isAdmin.hashCode;
+      isAdmin.hashCode ^
+      isEnroll.hashCode ^
+      activateUntilUnix.hashCode ^
+      verifyCode.hashCode;
 
   @override
   bool operator ==(Object other) =>
@@ -360,7 +376,10 @@ class LinkSummaryDto {
           hasPin == other.hasPin &&
           hasPqAuth == other.hasPqAuth &&
           hasObfs == other.hasObfs &&
-          isAdmin == other.isAdmin;
+          isAdmin == other.isAdmin &&
+          isEnroll == other.isEnroll &&
+          activateUntilUnix == other.activateUntilUnix &&
+          verifyCode == other.verifyCode;
 }
 
 /// Профиль из хранилища (без секретов — только метаданные для списка/карточки).

@@ -32,6 +32,18 @@ pub struct CredentialSummary {
     /// C7.4: мастер-ссылка (несёт admin_seed → admin-операции доступны). Показ в UI важен:
     /// мастер-ссылку нельзя раздавать абонентам.
     pub is_admin: bool,
+    /// M-9: ссылка ПЕРВИЧНАЯ — одноразовая, активируется на одном устройстве.
+    pub is_enroll: bool,
+    /// M-9: до какого момента (unix) её нужно активировать; `0` — срока нет.
+    pub activate_until: u64,
+    /// M-9: **код сверки** — короткий отпечаток ЭТОЙ ссылки. Тот же код видит админ при выдаче и
+    /// называет его по другому каналу (голосом). Пусто — код не считается (битая ссылка).
+    ///
+    /// Он не «украшение» и не подпись: подмену ссылки при доставке не ловит ничто внутри самой
+    /// ссылки (подменивший её перевыпустит вместе с любой внутренней подписью), поэтому
+    /// единственная работающая проверка — сравнение по ДРУГОМУ каналу. Ради этого код и обязан
+    /// показываться абоненту при импорте, а не только админу при выдаче.
+    pub verify_code: String,
 }
 
 impl CredentialSummary {
@@ -45,6 +57,9 @@ impl CredentialSummary {
             has_obfs: l.obfs_psk.is_some(),
             has_issuer: l.issuer.is_some(),
             is_admin: l.is_admin(),
+            is_enroll: l.enroll,
+            activate_until: l.exp.unwrap_or(0),
+            verify_code: l.verify_code().unwrap_or_default(),
         }
     }
 
@@ -58,6 +73,11 @@ impl CredentialSummary {
             has_obfs: b.obfs_psk.is_some(),
             has_issuer: b.issuer.is_some(),
             is_admin: b.admin_seed.is_some(),
+            is_enroll: b.enroll,
+            activate_until: b.exp.unwrap_or(0),
+            // У бандла (файл `.citadelconf`) кода сверки нет: он считается по канонической форме
+            // ССЫЛКИ, а бандл — другой носитель тех же полей.
+            verify_code: String::new(),
         }
     }
 }

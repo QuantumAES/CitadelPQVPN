@@ -475,14 +475,10 @@ fn guard_weak_seed(what: &str, seed: &[u8; 32]) -> Result<()> {
 }
 
 fn bootstrap_registry(dir: &str) -> Result<()> {
-    let mut pubs: Vec<[u8; 32]> = Vec::new();
+    let mut pubs: Vec<BootstrapPub> = Vec::new();
     if let Ok(list) = std::env::var("Citadel_REGISTER_PUBS") {
         for p in list.split_whitespace() {
-            let pk: [u8; 32] = hex::decode(p)
-                .ok()
-                .and_then(|v| v.try_into().ok())
-                .context("Citadel_REGISTER_PUBS: client_id должен быть 32 байта hex")?;
-            pubs.push(pk);
+            pubs.push(parse_bootstrap_pub(p)?);
         }
     }
     if let Ok(list) = std::env::var("Citadel_REGISTER_SEEDS") {
@@ -492,7 +488,11 @@ fn bootstrap_registry(dir: &str) -> Result<()> {
                 .and_then(|v| v.try_into().ok())
                 .context("Citadel_REGISTER_SEEDS: seed должен быть 32 байта hex")?;
             guard_weak_seed("Citadel_REGISTER_SEEDS", &seed)?; // L-10
-            pubs.push(citadel_token::pqid::id_from_seed(&seed)?);
+            pubs.push(BootstrapPub {
+                client_id: citadel_token::pqid::id_from_seed(&seed)?,
+                enroll_until: None,
+                link_hash: None,
+            });
         }
     }
     if pubs.is_empty() {
@@ -510,20 +510,69 @@ fn bootstrap_registry(dir: &str) -> Result<()> {
     Ok(())
 }
 
+/// Запись bootstrap-реестра из env: client_id и — с M-9 — параметры ПЕРВИЧНОЙ ссылки.
+struct BootstrapPub {
+    client_id: [u8; 32],
+    /// До какого момента (unix) ссылку можно активировать. `None` — запись многоразовая.
+    enroll_until: Option<u64>,
+    /// Отпечаток заверенной ссылки (издатель сверит его при активации).
+    link_hash: Option<[u8; 32]>,
+}
+
+/// Разбор элемента `Citadel_REGISTER_PUBS`: `<client_id>[:<enroll_until>[:<link_hash>]]`.
+///
+/// M-9: установщик заводит СВОЮ мастер-ссылку одноразовой — иначе напечатанная в терминал ссылка
+/// оставалась бы бессрочным предъявительским доступом, который поднимает туннель с любого числа
+/// устройств (ровно то, что нашлось живьём). Расширение обратно совместимо: элемент без `:` —
+/// прежняя многоразовая запись.
+fn parse_bootstrap_pub(s: &str) -> Result<BootstrapPub> {
+    let mut it = s.split(':');
+    let id = it.next().unwrap_or_default();
+    let client_id: [u8; 32] = hex::decode(id)
+        .ok()
+        .and_then(|v| v.try_into().ok())
+        .context("Citadel_REGISTER_PUBS: client_id должен быть 32 байта hex")?;
+    let enroll_until = match it.next().filter(|v| !v.is_empty()) {
+        None => None,
+        Some(v) => Some(v.parse::<u64>().context("Citadel_REGISTER_PUBS: срок активации — unix-секунды")?),
+    };
+    let link_hash = match it.next().filter(|v| !v.is_empty()) {
+        None => None,
+        Some(v) => Some(
+            hex::decode(v)
+                .ok()
+                .and_then(|b| b.try_into().ok())
+                .context("Citadel_REGISTER_PUBS: отпечаток ссылки — 32 байта hex")?,
+        ),
+    };
+    Ok(BootstrapPub { client_id, enroll_until, link_hash })
+}
+
 /// Чистая логика слияния реестра: сохраняет ВСЕ существующие строки (в т.ч. `revoked`/`expired`),
 /// добавляет только те `pubs`, которых ещё нет (по pub_hex), как `active` до `valid_until`.
-/// Идемпотентно: повторный вызов с теми же pub'ами не меняет вывод.
-fn merge_registry(existing: &str, pubs: &[[u8; 32]], valid_until: u64) -> String {
+/// Идемпотентно: повторный вызов с теми же pub'ами не меняет вывод — в том числе НЕ воскрешает
+/// уже сработавшую (`consumed`) первичную ссылку при рестарте контейнера.
+fn merge_registry(existing: &str, pubs: &[BootstrapPub], valid_until: u64) -> String {
     let present: std::collections::HashSet<&str> =
         existing.lines().filter_map(|l| l.split_whitespace().next()).collect();
     let mut out = existing.to_string();
     if !out.is_empty() && !out.ends_with('\n') {
         out.push('\n');
     }
-    for pk in pubs {
-        let hexpk = hex::encode(pk);
+    for p in pubs {
+        let hexpk = hex::encode(p.client_id);
         if !present.contains(hexpk.as_str()) {
-            out.push_str(&format!("{hexpk} {valid_until} active\n"));
+            out.push_str(
+                &citadel_token::admin::RegistryEntry {
+                    client_id: p.client_id,
+                    valid_until,
+                    status: citadel_token::admin::STATUS_ACTIVE.into(),
+                    enroll_until: p.enroll_until,
+                    device: None,
+                    link_hash: p.link_hash,
+                }
+                .to_line(),
+            );
         }
     }
     out
@@ -544,9 +593,34 @@ fn run_registry(args: &[String]) -> Result<()> {
         Some("add") => {
             let pk = parse_hex32(args.get(3), "pub (client_id, 64 hex)")?;
             let vu = parse_valid_until(args.get(4).map(String::as_str))?;
+            // M-9: `--enroll <unix> [--linkh <hex32>]` — сделать запись ОДНОРАЗОВОЙ и заверенной.
+            // Этим установщик помечает мастер-ссылку: отпечаток известен только после того, как
+            // ссылка собрана (TLS-идентичность издателя рождается при первом старте контейнера).
+            let flag = |name: &str| -> Option<&String> {
+                args.iter().position(|a| a == name).and_then(|i| args.get(i + 1))
+            };
+            let enroll = match flag("--enroll") {
+                None => None,
+                Some(v) => Some(v.parse::<u64>().context("--enroll: unix-секунды")?),
+            };
+            let linkh = match flag("--linkh") {
+                None => None,
+                Some(v) => Some(parse_hex32(Some(v), "--linkh (отпечаток ссылки, 64 hex)")?),
+            };
             let cur = std::fs::read_to_string(&path).unwrap_or_default();
-            atomic_write(&path, &registry_apply_add(&cur, &pk, vu))?;
-            eprintln!("[registry] add {} active до {vu}", hex::encode(pk));
+            let next = match enroll {
+                None => registry_apply_add(&cur, &pk, vu),
+                Some(u) => citadel_token::admin::registry_apply_add_full(&cur, &pk, vu, Some(u), linkh),
+            };
+            atomic_write(&path, &next)?;
+            match enroll {
+                None => eprintln!("[registry] add {} active до {vu}", hex::encode(pk)),
+                Some(u) => eprintln!(
+                    "[registry] add {} active до {vu}; одноразовая, активировать до {u}{}",
+                    hex::encode(pk),
+                    if linkh.is_some() { ", отпечаток заверен" } else { "" }
+                ),
+            }
         }
         Some("add-seed") => {
             // Провижининг нового абонента: из его seed выводим pub (client_id) и регистрируем ЕГО.
@@ -567,7 +641,8 @@ fn run_registry(args: &[String]) -> Result<()> {
         Some("list") => print!("{}", std::fs::read_to_string(&path).unwrap_or_default()),
         _ => anyhow::bail!(
             "citadel-token registry <add <pub>|add-seed <seed>|revoke <pub>|list> [valid_until]\n  \
-             valid_until: unix-секунды | +<N>d | +<N>h | +<секунды> (дефолт +365d).  \
+             valid_until: unix-секунды | +<N>d | +<N>h | +<секунды> (дефолт +365d).\n  \
+             add … --enroll <unix> [--linkh <hex32>]: одноразовая заверенная запись (M-9).\n  \
              Каталог реестра — $Citadel_TOKEN_DIR (том issuer'а)."
         ),
     }
@@ -1405,7 +1480,12 @@ fn run_batch() -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::merge_registry;
+    use super::{merge_registry, parse_bootstrap_pub, BootstrapPub};
+
+    /// Многоразовая bootstrap-запись (как было до M-9).
+    fn plain(pk: [u8; 32]) -> BootstrapPub {
+        BootstrapPub { client_id: pk, enroll_until: None, link_hash: None }
+    }
 
     /// C5.4b: bootstrap НЕ воскрешает отозванного абонента при рестарте (сохраняет `revoked`),
     /// новый pub добавляется как `active`, дубликатов нет.
@@ -1418,7 +1498,7 @@ mod tests {
         // Реестр после admin-revoke абонента A.
         let existing = format!("{hex_a} 9999999999 revoked\n");
         // Рестарт: bootstrap снова несёт A (уже отозванного) и нового B.
-        let merged = merge_registry(&existing, &[pk_a, pk_b], 8888888888);
+        let merged = merge_registry(&existing, &[plain(pk_a), plain(pk_b)], 8888888888);
         assert!(merged.contains(&format!("{hex_a} 9999999999 revoked")), "A остаётся revoked");
         assert_eq!(merged.matches(&hex_a).count(), 1, "A не продублирован (не воскрешён active)");
         assert!(merged.contains(&format!("{hex_b} 8888888888 active")), "B добавлен active");
@@ -1428,9 +1508,50 @@ mod tests {
     #[test]
     fn merge_is_idempotent() {
         let pk = [0x11u8; 32];
-        let first = merge_registry("", &[pk], 100);
-        let second = merge_registry(&first, &[pk], 200);
+        let first = merge_registry("", &[plain(pk)], 100);
+        let second = merge_registry(&first, &[plain(pk)], 200);
         assert_eq!(first, second);
+    }
+
+    /// M-9: установщик сеет СВОЮ мастер-ссылку одноразовой. Разбор формата
+    /// `<client_id>[:<enroll_until>[:<linkh>]]` и то, что флаги доезжают до строки реестра.
+    #[test]
+    fn bootstrap_pub_parses_enrollable_form() {
+        let pk = [0x22u8; 32];
+        let h = [0x33u8; 32];
+        let plain_form = parse_bootstrap_pub(&hex::encode(pk)).unwrap();
+        assert!(plain_form.enroll_until.is_none() && plain_form.link_hash.is_none());
+
+        let full = parse_bootstrap_pub(&format!("{}:1700000000:{}", hex::encode(pk), hex::encode(h)))
+            .unwrap();
+        assert_eq!(full.enroll_until, Some(1_700_000_000));
+        assert_eq!(full.link_hash, Some(h));
+
+        let line = merge_registry("", &[full], 5_000);
+        let e = citadel_token::admin::parse_registry(&line).pop().unwrap();
+        assert_eq!(e.enroll_until, Some(1_700_000_000), "запись одноразовая");
+        assert_eq!(e.link_hash, Some(h), "и заверенная");
+
+        // Мусор — отказ, а не молчаливая многоразовая запись (иначе ошибка в env тихо снимала бы
+        // одноразовость мастер-ссылки).
+        assert!(parse_bootstrap_pub("нехекс").is_err());
+        assert!(parse_bootstrap_pub(&format!("{}:позже", hex::encode(pk))).is_err());
+        assert!(parse_bootstrap_pub(&format!("{}:1:кривой", hex::encode(pk))).is_err());
+    }
+
+    /// И главное свойство: уже сработавшую (`consumed`) одноразовую ссылку рестарт контейнера НЕ
+    /// воскрешает — иначе одноразовость снималась бы простым `docker restart`.
+    #[test]
+    fn merge_does_not_resurrect_consumed_link() {
+        let pk = [0x44u8; 32];
+        let hexpk = hex::encode(pk);
+        let existing = format!("{hexpk} 9000 consumed enroll=1,dev={}\n", hex::encode([0x55u8; 32]));
+        let merged = merge_registry(
+            &existing,
+            &[BootstrapPub { client_id: pk, enroll_until: Some(1), link_hash: None }],
+            9000,
+        );
+        assert_eq!(merged, existing, "строка не тронута");
     }
 
     // ── C5.5 admin-CLI реестра: тесты registry_apply_* переехали в citadel_token::admin (C7.1) ──

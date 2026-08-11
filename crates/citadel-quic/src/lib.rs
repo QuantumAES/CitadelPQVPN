@@ -88,6 +88,34 @@ pub fn peer_text(e: impl std::fmt::Display) -> String {
     out
 }
 
+/// Приписка «соединение запретил ЛОКАЛЬНЫЙ фильтр» — когда ОС отдала «отказано в доступе» на
+/// исходящий connect (Windows `WSAEACCES` 10013, Unix `EPERM`/`EACCES`, типичный источник —
+/// антивирус, сторонний файрвол, корпоративная политика или чужое WFP-правило).
+///
+/// Диагностически это важно отделить от «сервер недоступен»: код 10013 на 443 при живом
+/// соединении к тому же адресу по другому порту (издатель) выглядит как поломка сервера, и
+/// человек уходит проверять firewall на VPS, где всё в порядке. Наш собственный kill-switch под
+/// подозрение не попадает: он пропускает трафик к адресу exit'а целиком, любым портом.
+pub fn local_block_hint(e: &std::io::Error) -> &'static str {
+    let denied = matches!(e.kind(), std::io::ErrorKind::PermissionDenied)
+        || matches!(e.raw_os_error(), Some(10013));
+    if denied {
+        " — исходящее соединение запретил ЛОКАЛЬНЫЙ фильтр на этом устройстве \
+         (антивирус/файрвол/политика); сервер к этому отношения не имеет"
+    } else {
+        ""
+    }
+}
+
+/// То же для ошибки в обёртке anyhow: ищем `io::Error` по всей цепочке причин.
+pub fn local_block_hint_any(e: &anyhow::Error) -> &'static str {
+    e.chain()
+        .filter_map(|c| c.downcast_ref::<std::io::Error>())
+        .map(local_block_hint)
+        .find(|h| !h.is_empty())
+        .unwrap_or("")
+}
+
 /// `eprintln!`, который на серверной стороне молчит без [`debug_logs`].
 #[macro_export]
 macro_rules! dlog {

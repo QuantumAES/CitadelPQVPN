@@ -73,6 +73,13 @@ pub struct LinkSummaryDto {
     pub has_obfs: bool,
     /// C7.4: мастер-ссылка (admin) — UI предупреждает: такую нельзя раздавать абонентам.
     pub is_admin: bool,
+    /// M-9: первичная (одноразовая) ссылка — активируется на ОДНОМ устройстве.
+    pub is_enroll: bool,
+    /// M-9: до какого момента (unix) её нужно активировать; `0` — без срока.
+    pub activate_until_unix: i64,
+    /// M-9: код сверки этой ссылки — абонент сверяет его с тем, что назвал админ по другому
+    /// каналу. Единственная проверка, которая ловит подмену ссылки при доставке.
+    pub verify_code: String,
 }
 
 /// C7.4: QR-код ссылки как битовая матрица `size × size` (1 = тёмный модуль) — рендер в UI
@@ -875,6 +882,9 @@ pub fn parse_link_summary(uri: String) -> LinkSummaryDto {
             has_pq_auth: s.has_pq_auth,
             has_obfs: s.has_obfs,
             is_admin: s.is_admin,
+            is_enroll: s.is_enroll,
+            activate_until_unix: s.activate_until as i64,
+            verify_code: s.verify_code,
         },
         None => LinkSummaryDto::default(),
     }
@@ -1380,7 +1390,9 @@ pub fn run_diagnostics(
                     let _ = sink.add(DiagLineDto {
                         step: "Токен (Layer-1)".into(),
                         ok: false,
-                        detail: format!("не удалось добыть у issuer: {e}"),
+                        // `{e:#}` — вся цепочка: без неё в панели оставался верхний контекст
+                        // («издатель прекратил выдачу»), а настоящая причина обрыва терялась.
+                        detail: format!("не удалось добыть у issuer: {e:#}"),
                     });
                     cfg // без токена — establish покажет отказ token-required exit честно
                 }

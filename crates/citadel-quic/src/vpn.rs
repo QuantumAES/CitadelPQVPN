@@ -241,9 +241,16 @@ impl VpnController {
         self.set_state(VpnState::Connecting);
         let mut backoff = RECONNECT_BACKOFF_START;
         let mut ever_up = false;
-        // Предъявлялся ли текущий `cfg.token` exit'у: потраченный токен повторно слать нельзя
-        // (exit ловит double-spend → «auth-failed»), нужен свежий от issuer.
-        let mut token_spent = false;
+        // Лежит ли в `cfg.token` НЕПРЕДЪЯВЛЕННЫЙ токен. Потраченный слать повторно нельзя (exit
+        // ловит double-spend → «auth-failed»), а непотраченный — обязательно нужно: попытка,
+        // которая не дошла до control-обмена (закрытый порт, нет сети, разошёлся ключ L1), токен
+        // не тратит, и брать новый значило бы жечь квоту эпохи абонента (A6) на каждый ретрай.
+        // Стартовое значение: непустой токен из конфига (CLI/`Citadel_TOKENS`) ещё не предъявлялся.
+        let mut have_unspent_token = !cfg.token.is_empty();
+        // Была ли уже хоть одна попытка establish. Нужно ровно для одного случая: на самой первой
+        // итерации без токена мы идём к exit'у как есть — чтобы человек увидел настоящий отказ
+        // token-required exit'а, а не молчаливое ожидание.
+        let mut attempted = false;
 
         loop {
             if self.stopped.load(Ordering::SeqCst) {
@@ -255,7 +262,11 @@ impl VpnController {
             // Недоступен issuer → None → establish покажет отказ token-required exit, цикл ретраит
             // (само-лечится по восстановлении сети). token-less/без Layer-1 → refresher не задан.
             let refresher = self.token_refresh.lock().unwrap().clone();
-            if let Some(f) = &refresher {
+            // К издателю идём, ТОЛЬКО если предъявлять нечего. Раньше сюда заходили на каждой
+            // итерации, и шторм ретраев к недоступному exit'у выгребал квоту эпохи (A6): после
+            // ~64 неудачных попыток издатель прекращал выдачу, и абонент оставался без связи до
+            // конца эпохи — с диагнозом «издатель не ответил на первый ослеплённый элемент».
+            if let (Some(f), false) = (&refresher, have_unspent_token) {
                 // Фаза может тянуться (издатель недоступен → таймауты+ретраи), а пользователь
                 // вправе нажать «Отключить» прямо в ней: ждём токен, но не дольше, чем до отмены.
                 let Some(fetched) = self.until_stop(f()).await else {
@@ -263,7 +274,10 @@ impl VpnController {
                 };
                 match fetched {
                     Some(g) => {
-                        cfg.token = g.token; // свежий токен — этой попытке есть что предъявить
+                        // Свежий токен — этой попытке есть что предъявить. Судьбу флага решает
+                        // исход самой попытки (`match established` ниже), поэтому здесь его не
+                        // трогаем: любое значение всё равно было бы перезаписано.
+                        cfg.token = g.token;
                         // H-3: ключ L1 текущей эпохи приезжает тем же заходом. Не затираем прежний,
                         // если издатель ротацию не настроил (`None`) — иначе рабочая сессия после
                         // обновления сервера «теряла» бы ключ на ровном месте.
@@ -272,10 +286,9 @@ impl VpnController {
                         }
                     }
                     // Свежего токена нет (issuer недоступен ЛИБО держит single-session-аренду 4/B
-                    // после предыдущей сессии). Если прошлый токен уже предъявлялся — он потрачен,
-                    // и повтор гарантированно даст «auth-failed» от exit: получился бы шторм
-                    // бессмысленных попыток с ложной причиной в UI. Ждём и пробуем снова.
-                    None if token_spent => {
+                    // после предыдущей сессии). Идти к exit'у с потраченным токеном бессмысленно —
+                    // он ответит «auth-failed», и в UI встанет ложная причина. Ждём и пробуем снова.
+                    None if attempted => {
                         let why = "нет свежего Layer-1 токена (issuer недоступен или ещё держит \
                                    аренду прошлой сессии) — жду и пробую снова";
                         self.emit(VpnEvent::Error(why.into()));
@@ -287,10 +300,10 @@ impl VpnController {
                         }
                         continue;
                     }
-                    None => {} // первый заход: токен из ссылки/vault ещё не предъявлялся — пробуем им
+                    None => {} // первый заход: пусть exit сам скажет, что требует токен
                 }
             }
-            token_spent = true; // ниже токен уходит exit'у; повторно его предъявлять нельзя
+            attempted = true;
 
             // ── establish: сперва QUIC/UDP ──
             // Самая длинная фаза цикла (до 5 попыток QUIC по 3с + obfs-TCP): «Отключить» обязано
@@ -309,14 +322,20 @@ impl VpnController {
             // иначе жжём второй токен и подменяем настоящую причину бесполезным «auth-failed»).
             if let Err(e) = &established {
                 let first = format!("{e:#}");
+                let quic_spent = e.token_presented;
                 if cfg.transport_psk().is_some() && should_escalate_to_tcp(&first) {
                     eprintln!("[vpn] establish/QUIC не удался ({first}) — эскалация на obfs-TCP (мобильный MTU/NAT64?)");
-                    if let Some(f) = &refresher {
+                    // Второй токен берём, ТОЛЬКО если первый действительно ушёл exit'у на
+                    // QUIC-попытке. Иначе идём тем же — эскалация не должна стоить абоненту
+                    // лишней единицы квоты (это ровно то, что жгло её на мобильной сети).
+                    let mut replaced = false;
+                    if let (Some(f), true) = (&refresher, quic_spent) {
                         let Some(fresh) = self.until_stop(f()).await else {
                             return self.finish_stopped();
                         };
                         if let Some(g) = fresh {
                             cfg.token = g.token;
+                            replaced = true;
                             if g.data_psk.is_some() {
                                 cfg.data_psk = g.data_psk; // H-3: ключ мог смениться на границе эпохи
                             }
@@ -327,12 +346,24 @@ impl VpnController {
                     let Some(second) = self.until_stop(establish_session(&cfg, true)).await else {
                         return self.finish_stopped();
                     };
-                    established = second.map_err(|e2| anyhow::anyhow!("{e2:#}; ранее по QUIC/UDP: {first}"));
+                    established = second.map_err(|e2| crate::client::EstablishError {
+                        // Про токен, который сейчас в cfg: он потрачен, если его предъявила
+                        // TCP-попытка ЛИБО если это по-прежнему тот же токен, что сгорел на QUIC
+                        // (свежий взять не удалось — издатель недоступен).
+                        token_presented: e2.token_presented || (quic_spent && !replaced),
+                        source: anyhow::anyhow!("{e2:#}; ранее по QUIC/UDP: {first}"),
+                    });
                 }
             }
             let session = match established {
-                Ok(s) => s,
+                Ok(s) => {
+                    have_unspent_token = false; // токен предъявлен и принят — реконнекту нужен новый
+                    s
+                }
                 Err(e) => {
+                    // Токен, не дошедший до control-обмена, остаётся у нас и пойдёт в следующую
+                    // попытку. Это и есть починка «квота кончилась после шторма ретраев».
+                    have_unspent_token = !e.token_presented;
                     // Ретраим ВСЕГДА, в т.ч. ПЕРВЫЙ коннект: сеть/issuer могли быть недоступны на
                     // старте (подключились до появления сети) — по восстановлении следующая попытка
                     // возьмёт свежий токен и поднимется. Причину показываем (Error), но не сдаёмся до

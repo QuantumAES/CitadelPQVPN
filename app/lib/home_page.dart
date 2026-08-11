@@ -15,6 +15,8 @@ import 'package:app/src/rust/api/citadel.dart';
 import 'package:app/split_tunnel_page.dart';
 import 'package:app/subscribers_page.dart';
 import 'package:app/traffic.dart';
+import 'package:app/verify_code.dart';
+import 'package:app/window_visibility.dart';
 
 /// Версия сборки для экрана «О приложении». Задаётся `--dart-define=CITADEL_VERSION=<tag>` в
 /// mk-client-release.sh (совпадает с тегом релиза, напр. v0.3.0-pre2); для локальных `flutter run`
@@ -41,9 +43,10 @@ class _HomePageState extends State<HomePage> {
   @override
   void initState() {
     super.initState();
-    // обновляем счётчик времени сессии раз в секунду, пока подключены
+    // обновляем счётчик времени сессии раз в секунду, пока подключены и пока окно видно:
+    // перестраивать экран, спрятанный в трей, незачем (см. window_visibility.dart)
     _tick = Timer.periodic(const Duration(seconds: 1), (_) {
-      if (widget.state.phase == VpnPhase.up && mounted) {
+      if (widget.state.phase == VpnPhase.up && mounted && windowVisible.value) {
         _sampleTraffic();
         setState(() {});
       }
@@ -1318,6 +1321,8 @@ class AddProfileSheet extends StatefulWidget {
 class _AddProfileSheetState extends State<AddProfileSheet> {
   final _link = TextEditingController();
   final _name = TextEditingController();
+  /// M-9: код сверки, который абоненту назвал администратор ДРУГИМ каналом (голосом, при встрече).
+  final _code = TextEditingController();
   LinkSummaryDto? _summary;
 
   /// Пауза после последнего нажатия, по истечении которой ссылку отдаём на проверку. Без неё
@@ -1384,6 +1389,15 @@ class _AddProfileSheetState extends State<AddProfileSheet> {
     }
   }
 
+  /// Ссылка требует сверки кода по другому каналу: только ПЕРВИЧНЫЕ (одноразовые) ссылки — у них
+  /// код показал администратор при выдаче. Ранее розданные (многоразовые) ссылки кода не имеют,
+  /// и требовать его значило бы запереть уже работающих абонентов.
+  bool get _needsCode => (_summary?.isEnroll ?? false) && (_summary?.verifyCode ?? '').isNotEmpty;
+
+  /// Введённый код совпал с кодом самой ссылки (правила сравнения — `lib/verify_code.dart`).
+  bool get _codeOk =>
+      !_needsCode || verifyCodeMatches(_code.text, _summary?.verifyCode ?? '');
+
   void _submit() {
     final uri = _link.text.trim();
     Navigator.pop<({String name, String uri})>(
@@ -1395,6 +1409,7 @@ class _AddProfileSheetState extends State<AddProfileSheet> {
     _pending?.cancel();
     _link.dispose();
     _name.dispose();
+    _code.dispose();
     super.dispose();
   }
 
@@ -1456,6 +1471,31 @@ class _AddProfileSheetState extends State<AddProfileSheet> {
             const SizedBox(height: 12),
             _LinkPreview(summary: _summary!),
           ],
+          // M-9: сверка кода. Подмену ссылки при доставке (мессенджер, почта, чужой Wi-Fi) не
+          // ловит ничто ВНУТРИ самой ссылки — подменивший перевыпустит её целиком вместе с любой
+          // внутренней подписью. Ловит только сравнение по ДРУГОМУ каналу, поэтому код здесь
+          // спрашивается, а не показывается «для сведения»: без совпадения профиль не сохраняем.
+          if (valid && _needsCode) ...[
+            const SizedBox(height: 12),
+            TextField(
+              controller: _code,
+              onChanged: (_) => setState(() {}),
+              textCapitalization: TextCapitalization.characters,
+              decoration: InputDecoration(
+                labelText: t('verify_code_label'),
+                hintText: t('verify_code_hint'),
+                helperText: t('verify_code_help'),
+                helperMaxLines: 3,
+                border: const OutlineInputBorder(),
+                errorText: _code.text.trim().isEmpty || _codeOk
+                    ? null
+                    : t('verify_code_mismatch'),
+                suffixIcon: _codeOk && _code.text.trim().isNotEmpty
+                    ? Icon(Icons.check_circle_outline, color: Colors.green.shade600)
+                    : null,
+              ),
+            ),
+          ],
           if (valid) ...[
             const SizedBox(height: 12),
             TextField(
@@ -1469,7 +1509,9 @@ class _AddProfileSheetState extends State<AddProfileSheet> {
           ],
           const SizedBox(height: 20),
           FilledButton.icon(
-            onPressed: valid ? _submit : null,
+            onPressed: valid && _codeOk && (!_needsCode || _code.text.trim().isNotEmpty)
+                ? _submit
+                : null,
             icon: const Icon(Icons.shield_outlined),
             label: Text(t('connect_and_save')),
           ),
@@ -1504,6 +1546,9 @@ class _LinkPreview extends StatelessWidget {
     }
     final feats = <String>[
       if (summary.isAdmin) t('feat_admin_master'),
+      // M-9: первичная ссылка живёт до активации на ОДНОМ устройстве — человек должен видеть это
+      // до того, как отдаст её кому-то ещё «на всякий случай».
+      if (summary.isEnroll) t('feat_one_time'),
       if (summary.hasPqAuth) 'PQ-auth',
       if (summary.hasObfs) t('feat_obfs_full'),
       if (summary.hasPin) 'cert-pin',

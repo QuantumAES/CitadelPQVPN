@@ -53,6 +53,11 @@ ISSUER_PORT="${CITADEL_ISSUER_PORT:-}"       # публичный порт из�
 ADMIN_PORT="${CITADEL_ADMIN_PORT:-7001}"     # C7.2: порт admin-канала — НЕ публикуется наружу (только из туннеля)
 ADMIN_VIP="${CITADEL_ADMIN_VIP:-10.7.0.1}"   # C7.2: admin-VIP = шлюз туннеля (= Citadel_TUN_ADDR exit'а)
 EPOCH_SECS="${CITADEL_EPOCH_SECS:-3600}"     # длина эпохи токенов (exit и issuer ДОЛЖНЫ совпадать)
+# M-9: окно активации МАСТЕР-ссылки, которую печатает установщик. Ссылка одноразовая: первое
+# устройство админа забирает её себе (подписка переезжает на ключ устройства), копия становится
+# бесполезной. Просроченную ссылку не активирует уже никто — это и есть защита напечатанной в
+# терминал ссылки, которая иначе живёт вечно и работает с любого числа устройств.
+ACTIVATE_SECS="${CITADEL_ACTIVATE_SECS:-86400}"
 LEASE_SECS="${CITADEL_LEASE_SECS:-0}"        # задача 4/B: single-session — окно аренды на абонента (с);
                                              # 0 = выкл. >0 ⇒ одна ссылка открывает новую сессию не чаще
                                              # раза в N с (ограничивает шеринг; реконнект в окне ждёт)
@@ -90,6 +95,9 @@ CitadelPQVPN — установщик exit-сервера (запускать н
   --tcp-port    N   (443)   obfs-over-TCP fallback      [CITADEL_TCP_PORT]
   --issuer-port N   (случайный) издатель токенов (публичный) [CITADEL_ISSUER_PORT]
   --admin-port  N   (7001)  admin-канал, НАРУЖУ НЕ ОТКРЫТ — только из туннеля [CITADEL_ADMIN_PORT]
+  --ufw / --no-ufw  синхронизировать правила ufw без вопроса / не трогать их вовсе.
+                    По умолчанию: если ufw активен и порты разошлись — спросить [CITADEL_UFW=yes|no]
+  --activate-secs N (86400) окно активации мастер-ссылки, сек [CITADEL_ACTIVATE_SECS]
   --admin-peer  IP  адрес exit-машины, которому разрешён admin-канал (L-14).
                     ОБЯЗАТЕЛЕН при --role issuer (там порт публикуется наружу);
                     'any' — открыть всем осознанно                [CITADEL_ADMIN_PEER]
@@ -147,6 +155,9 @@ while (($#)); do
     --issuer-port)  CITADEL_ISSUER_PORT="${2:-}";  shift 2 ;;
     --admin-port)   CITADEL_ADMIN_PORT="${2:-}";   shift 2 ;;
     --admin-peer)   CITADEL_ADMIN_PEER="${2:-}";   shift 2 ;;
+    --activate-secs) CITADEL_ACTIVATE_SECS="${2:-}"; shift 2 ;;
+    --ufw)          CITADEL_UFW=yes;               shift ;;
+    --no-ufw)       CITADEL_UFW=no;                shift ;;
     --rate-limit)   CITADEL_RATE_LIMIT="${2:-}";   shift 2 ;;
     --rate-burst)   CITADEL_RATE_BURST="${2:-}";   shift 2 ;;
     --rate-limit-down) CITADEL_RATE_LIMIT_DOWN="${2:-}"; shift 2 ;;
@@ -172,6 +183,12 @@ ROUTES="${CITADEL_ROUTES:-$ROUTES}"
 DNS="${CITADEL_DNS:-$DNS}"
 DIR="${CITADEL_DIR:-$DIR}"
 ISSUER_ON="${CITADEL_ISSUER:-$ISSUER_ON}"
+ACTIVATE_SECS="${CITADEL_ACTIVATE_SECS:-$ACTIVATE_SECS}"
+[[ "$ACTIVATE_SECS" =~ ^[0-9]+$ ]] && ((ACTIVATE_SECS > 0)) \
+  || die "--activate-secs: ожидаются секунды > 0 (окно активации мастер-ссылки), получено '$ACTIVATE_SECS'"
+ACTIVATE_UNTIL=$(( $(date +%s) + ACTIVATE_SECS ))
+# Firewall: yes|no|ask. `ask` (по умолчанию) — при активном ufw спросить и синхронизировать порты.
+UFW_MODE="${CITADEL_UFW:-ask}"
 ROLE="${CITADEL_ROLE:-all}"
 RATE_LIMIT="${CITADEL_RATE_LIMIT:-$RATE_LIMIT}"
 RATE_BURST="${CITADEL_RATE_BURST:-$RATE_BURST}"
@@ -281,13 +298,24 @@ PORTS_FILE="$DIR/etc/ports.env"
 ROTATING=0
 [[ -f "$DIR/keys/obfs.psk" && "${CITADEL_KEEP_KEYS:-0}" != 1 ]] && ROTATING=1
 
-if [[ -r "$PORTS_FILE" && "$ROTATING" != 1 ]]; then
+# Порты ПРЕЖНЕЙ установки — нужны, даже когда мы их не наследуем: по ним в firewall стоят
+# разрешающие правила, и при смене портов их надо снять (иначе на сервере годами висят открытые
+# порты, которых уже никто не слушает — лишняя примета деплоя и лишняя поверхность).
+PREV_UDP_PORT=""; PREV_ISSUER_PORT=""
+if [[ -r "$PORTS_FILE" ]]; then
   while IFS='=' read -r k v; do
     case "$k" in
-      UDP_PORT)    [[ -n "$UDP_PORT"    ]] || UDP_PORT="$v" ;;
-      ISSUER_PORT) [[ -n "$ISSUER_PORT" ]] || ISSUER_PORT="$v" ;;
+      UDP_PORT)    PREV_UDP_PORT="$v" ;;
+      ISSUER_PORT) PREV_ISSUER_PORT="$v" ;;
     esac
   done < "$PORTS_FILE"
+elif [[ -f "$DIR/etc/compose.yml" ]]; then
+  # Установка до M-8 (ports.env ещё не было) — исторические значения.
+  PREV_UDP_PORT=4433; PREV_ISSUER_PORT=7000
+fi
+if [[ -r "$PORTS_FILE" && "$ROTATING" != 1 ]]; then
+  [[ -n "$UDP_PORT"    ]] || UDP_PORT="$PREV_UDP_PORT"
+  [[ -n "$ISSUER_PORT" ]] || ISSUER_PORT="$PREV_ISSUER_PORT"
 fi
 # Обновление УЖЕ СТОЯЩЕЙ установки, сделанной до M-8 (ports.env ещё нет): порты обязаны остаться
 # прежними — исторические 4433/7000, — но ТОЛЬКО когда идентичность сохраняется. Иначе
@@ -566,6 +594,11 @@ elif [[ "$ISSUER_ON" == 1 ]]; then
   log "admin-плоскость: admin_id=${ADMIN_PUB:0:16}… (admin.seed только в мастер-ссылке)"
 fi
 
+# M-9: как посеять запись админа в реестр. Одноразовой её делает суффикс со сроком активации —
+# см. `Citadel_REGISTER_PUBS` в entrypoint издателя.
+REGISTER_PUBS="$CLIENT_PUB"
+[[ "$ISSUER_ON" == 1 ]] && REGISTER_PUBS="$CLIENT_PUB:$ACTIVATE_UNTIL"
+
 # ─── 5. образ (Dockerfile) + entrypoints + compose ───
 # Где exit ищет издателя: в общей установке — по docker-DNS имени сервиса, при раздельной — по
 # хосту из bundle (DNAT работает по адресу, поэтому имя резолвится в entrypoint при старте).
@@ -701,7 +734,14 @@ export Citadel_TOKEN_LISTEN=0.0.0.0:7000
 export Citadel_ADMIN_LISTEN=0.0.0.0:$ADMIN_PORT
 export Citadel_EPOCH_SECS=$EPOCH_SECS
 export Citadel_TOKEN_LEASE_SECS=$LEASE_SECS   # задача 4/B: single-session (0=выкл; см. CITADEL_LEASE_SECS)
-export Citadel_REGISTER_PUBS="$CLIENT_PUB"   # client_id админа (issuer НЕ получает seed)
+# client_id админа (issuer НЕ получает seed). M-9: суффикс `:<unix>` делает запись ОДНОРАЗОВОЙ —
+# мастер-ссылка активируется на первом устройстве админа и до этого момента, дальше мертва.
+# Отпечаток ссылки (`linkh`) здесь ещё неизвестен — TLS-идентичность издателя рождается при первом
+# старте контейнера, то есть ПОСЛЕ генерации этого файла; его дописывает установщик сразу после
+# того, как соберёт ссылку (см. ниже `registry add --linkh`). Если реестр когда-нибудь потеряется,
+# этот bootstrap пересоздаст запись одноразовой и просроченной — то есть fail-closed, а не
+# «внезапно снова многоразовая».
+export Citadel_REGISTER_PUBS="$REGISTER_PUBS"
 # M-6/P1: кому отдавать секретный ключ эпохи по сети (роль keysync у exit-машины). При установке
 # «всё на одном сервере» ключ читается с общего тома и раздача по сети не нужна — но id всё равно
 # задан, чтобы `--role issuer` и `--role all` вели себя одинаково.
@@ -968,6 +1008,76 @@ EOF
   exit 0
 fi
 
+# ─── 7.5. firewall: синхронизировать порты в ufw (обнаружение прежней установки) ───
+#
+# Самая частая живая поломка после переустановки: порты выбраны заново (M-8), в ufw открыты
+# ПРЕЖНИЕ — сервер исправен, а у всех абонентов «сервер недоступен». Раньше установщик про это
+# только писал текстом. Теперь: если ufw активен, предлагаем добавить нужные правила и снять
+# правила прежних портов. Спрашиваем всегда (кроме `--ufw`/`--no-ufw`), потому что правила
+# firewall — это изменение конфигурации машины, а не нашего каталога.
+#
+# NB: docker публикует порты через свою цепочку в nat/FORWARD и ufw их, как правило, НЕ режет.
+# Это не повод не приводить правила в порядок: (а) на серверах с ufw-docker и на iptables-политике
+# DROP это уже не так; (б) висящие разрешения на портах, которые никто не слушает, — лишняя
+# поверхность и лишняя примета деплоя.
+ufw_sync() {
+  command -v ufw >/dev/null 2>&1 || return 0
+  ufw status 2>/dev/null | head -1 | grep -qi 'active' || return 0   # неактивный ufw не трогаем
+
+  # Что должно быть открыто в этой роли (admin-порт — НИКОГДА: он только из туннеля).
+  local -a want=()
+  case "$ROLE" in
+    issuer) want+=("$ISSUER_PORT/tcp") ;;
+    exit)   want+=("$UDP_PORT/udp" "$TCP_PORT/tcp") ;;
+    *)      want+=("$UDP_PORT/udp" "$TCP_PORT/tcp"); [[ "$ISSUER_ON" == 1 ]] && want+=("$ISSUER_PORT/tcp") ;;
+  esac
+  # Что осталось от прежней установки и больше не нужно.
+  local -a stale=()
+  [[ -n "$PREV_UDP_PORT"    && "$PREV_UDP_PORT"    != "$UDP_PORT"    ]] && stale+=("$PREV_UDP_PORT/udp")
+  [[ -n "$PREV_ISSUER_PORT" && "$PREV_ISSUER_PORT" != "$ISSUER_PORT" ]] && stale+=("$PREV_ISSUER_PORT/tcp")
+
+  # Уже открытые правила (ufw печатает `12345/udp   ALLOW  Anywhere`).
+  local rules; rules="$(ufw status 2>/dev/null || true)"
+  local -a add=()
+  local p
+  for p in "${want[@]}"; do
+    grep -qE "^${p//\//\\/}[[:space:]]+ALLOW" <<<"$rules" || add+=("$p")
+  done
+  local -a del=()
+  for p in "${stale[@]}"; do
+    grep -qE "^${p//\//\\/}[[:space:]]+ALLOW" <<<"$rules" && del+=("$p")
+  done
+  ((${#add[@]} + ${#del[@]})) || { log "ufw активен, порты уже в порядке"; return 0; }
+
+  echo
+  echo "Обнаружен активный ufw. Предлагаю привести правила в соответствие с этой установкой:"
+  ((${#add[@]})) && printf '  открыть:  %s\n' "${add[*]}"
+  ((${#del[@]})) && printf '  закрыть:  %s   (порты прежней установки)\n' "${del[*]}"
+  case "$UFW_MODE" in
+    yes) : ;;
+    no)  log "ufw не трогаю (--no-ufw). Открой порты сам, иначе абоненты получат «сервер недоступен»."; return 0 ;;
+    *)
+      # Без tty (curl | bash в чужом скрипте) ничего молча не меняем — только подсказываем.
+      if [[ ! -t 0 ]]; then
+        warn "нет терминала для вопроса — правила ufw НЕ меняю. Повтори с --ufw либо сделай вручную:"
+        for p in "${add[@]}"; do echo "    ufw allow ${p%/*}/${p#*/}"; done
+        for p in "${del[@]}"; do echo "    ufw delete allow ${p%/*}/${p#*/}"; done
+        return 0
+      fi
+      local ans=""
+      read -r -p "Применить? [y/N] " ans || true
+      [[ "$ans" =~ ^[YyДд]$ ]] || { log "ufw оставлен как есть (порты открой сам)"; return 0; }
+      ;;
+  esac
+  for p in "${add[@]}"; do
+    ufw allow "$p" >/dev/null 2>&1 && log "ufw: открыт $p" || warn "ufw: не удалось открыть $p"
+  done
+  for p in "${del[@]}"; do
+    ufw delete allow "$p" >/dev/null 2>&1 && log "ufw: закрыт прежний $p" || warn "ufw: не удалось закрыть $p"
+  done
+}
+ufw_sync
+
 LINKARGS=(--servers "$SERVER_HOST:$UDP_PORT" --psk "$PSK" --pin "$PIN"
           --kx pq --tcp-port "$TCP_PORT" --routes "$ROUTES" --dns "$DNS" "${MLDSA_ARGS[@]}")
 if [[ "$ISSUER_ON" == 1 ]]; then
@@ -979,17 +1089,41 @@ if [[ "$ISSUER_ON" == 1 ]]; then
   LINKARGS+=(--issuer "$LINK_ISSUER" --issuer-pin "$ISSUER_TLS_PIN" \
              --issuer-mldsa "$ISSUER_MLDSA" --client-seed "$CLIENT_SEED")
 fi
-# Клиентская ссылка (для раздачи абонентам) — БЕЗ admin-seed. Генерим ДО добавления admin-полей.
-# $LINKGEN — во временном каталоге (на бокс не кладётся, Q4).
-CLIENT_LINK="$("$LINKGEN" "${LINKARGS[@]}" 2>/dev/null)" \
-  || die "citadel-linkgen не сгенерировал клиентскую ссылку"
-
-# C7.2: МАСТЕР-ссылка = клиентская + admin-плоскость (управление реестром по туннелю). ТОЛЬКО админу.
+# M-9: установка печатает ТОЛЬКО мастер-ссылку, и та — ОДНОРАЗОВАЯ.
+#
+# Отдельной клиентской ссылки здесь больше нет. Она была ровно тем, чем аудит назвал суть находки
+# M-9: бессрочным предъявительским доступом, напечатанным в терминал, — и вживую оказалось, что по
+# ней поднимается туннель с любого числа устройств. После установки она и не нужна: абонентов
+# выдаёт админ из приложения («Абоненты» → выдать), и каждая такая ссылка уже одноразовая.
+#
+# Мастер-ссылка активируется на ПЕРВОМ устройстве администратора (окно $ACTIVATE_SECS), после чего
+# её копия бесполезна. Следствие принято сознательно: у админа одно устройство; второе — это
+# переустановка сервера (или выдача себе абонентской ссылки для обычного доступа).
 if [[ "$ISSUER_ON" == 1 ]]; then
-  LINKARGS+=(--admin-seed "$ADMIN_SEED" --admin-port "$ADMIN_PORT")
+  LINKARGS+=(--admin-seed "$ADMIN_SEED" --admin-port "$ADMIN_PORT"
+             --activate-secs "$ACTIVATE_SECS" --meta-out "$work/link.meta")
 fi
+# $LINKGEN — во временном каталоге (на бокс не кладётся, Q4).
 LINK="$("$LINKGEN" "${LINKARGS[@]}" 2>/dev/null)" \
   || die "citadel-linkgen не сгенерировал мастер-ссылку"
+LINK_HASH=""; VERIFY_CODE=""
+if [[ -r "$work/link.meta" ]]; then
+  LINK_HASH="$(sed -n 's/^linkh=//p' "$work/link.meta")"
+  VERIFY_CODE="$(sed -n 's/^code=//p' "$work/link.meta")"
+  rm -f "$work/link.meta"
+fi
+if [[ "$ISSUER_ON" == 1 ]]; then
+  [[ -n "$LINK_HASH" ]] \
+    || die "citadel-linkgen не отдал отпечаток ссылки (--meta-out): без него издатель не сможет заверить активацию"
+  [[ "$REGISTER_PUBS" == "$CLIENT_PUB:"* ]] \
+    || die "внутренняя ошибка: bootstrap реестра не помечен как одноразовый"
+  # Заверяем ссылку в реестре: одноразовая запись + отпечаток именно ЭТОЙ ссылки. Если её подменят
+  # по дороге (мессенджер, чужой Wi-Fi), издатель откажет в активации, а не молча пустит чужого.
+  # Запись идёт прямо в том издателя (реестр перечитывается на КАЖДЫЙ auth — рестарт не нужен).
+  Citadel_TOKEN_DIR="$DIR/keys" "$DIR/bin/citadel-token" registry add \
+      "$CLIENT_PUB" "+3650d" --enroll "$ACTIVATE_UNTIL" --linkh "$LINK_HASH" >/dev/null 2>&1 \
+    || die "не удалось заверить мастер-ссылку в реестре (citadel-token registry add --enroll)"
+fi
 
 # Задача 3: ссылки НЕ сохраняем на диск сервера — печатаем ОДИН РАЗ здесь. Секретные креды
 # (obfs_psk/pin/issuer_pin/seed'ы инлайн) не должны лежать в файле на VPS (кража диска/бэкапа =
@@ -1031,6 +1165,19 @@ fi)
 МАСТЕР-ссылка (СЕКРЕТ, ТОЛЬКО АДМИНУ — даёт управление реестром абонентов по туннелю):
 
 $LINK
+$(if [[ "$ISSUER_ON" == 1 ]]; then cat <<ONETIME
+
+⚠ ССЫЛКА ОДНОРАЗОВАЯ. Она активируется на ПЕРВОМ устройстве, которое по ней подключится, и
+  привязывается к нему; вторая копия после этого не работает — так утёкшая или пересланная
+  ссылка перестаёт давать доступ. Активировать нужно до $(date -d "@$ACTIVATE_UNTIL" '+%F %T %Z' 2>/dev/null || echo "$ACTIVATE_UNTIL (unix)");
+  позже она мертва, и потребуется переустановка. Сменить окно: --activate-secs СЕКУНД.
+  Код сверки этой ссылки: $VERIFY_CODE
+  (приложение спросит его при импорте — так ловится подмена ссылки по дороге).
+
+  Абонентов дальше выдавай ИЗ ПРИЛОЖЕНИЯ: «Абоненты» → выдать. Отдельной клиентской ссылки
+  установщик больше не печатает — она была бессрочной и работала с любого числа устройств.
+ONETIME
+fi)
 
 НЕ раздавать абонентам. Управление: docker compose -f $DIR/etc/compose.yml {ps,logs,down}
 
@@ -1042,15 +1189,6 @@ $LINK
 Что даёт злоумышленнику украденный диск и почему шифрование каталога ключей помогает не от всего
 — docs/SERVER-KEY-PROTECTION.md.
 EOF
-
-if [[ "$ISSUER_ON" == 1 ]]; then
-cat <<EOF
-
-Клиентская ссылка (для абонента — без admin-прав):
-
-$CLIENT_LINK
-EOF
-fi
 
 if [[ "$ISSUER_ON" == 1 ]]; then
 cat <<EOF
