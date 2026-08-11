@@ -152,14 +152,23 @@ class AppState extends ChangeNotifier {
   /// Имя профиля текущей (или последней) попытки подключения. Нужно для человекочитаемых
   /// сообщений: «Сервер недоступен» само по себе не говорит, к ЧЕМУ не удалось подключиться.
   /// Пусто для пробного коннекта по сырой ссылке (профиля ещё нет).
-  String get activeProfileName {
-    final id = activeProfileId;
+  String get activeProfileName => profileName(activeProfileId);
+
+  /// Имя профиля по его id (пусто — профиля с таким id уже нет).
+  String profileName(String? id) {
     if (id == null) return '';
     for (final p in profiles) {
       if (p.id == id) return p.name;
     }
     return '';
   }
+
+  /// Профиль, с которым работали последним. В отличие от [activeProfileId] отключение его НЕ
+  /// сбрасывает: диагностику запускают как раз после неудачной попытки, и «активного» профиля в
+  /// этот момент уже нет. Пока признак отсутствовал, диагностика молча уходила на ПЕРВЫЙ профиль
+  /// в списке — то есть проверяла не тот сервер, о котором спрашивал человек, и её вывод
+  /// («всё хорошо» либо чужие ошибки) уводил разбор в сторону.
+  String? lastProfileId;
 
   StreamSubscription<VpnEventDto>? _sub;
 
@@ -356,6 +365,7 @@ class AppState extends ChangeNotifier {
     _sub?.cancel();
     phase = VpnPhase.connecting;
     activeProfileId = profileId;
+    if (profileId != null) lastProfileId = profileId; // переживёт отключение (нужно диагностике)
     exit = transport = cidr = '';
     _clearError();
     since = null;

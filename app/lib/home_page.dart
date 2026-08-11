@@ -899,9 +899,14 @@ class _DebugSectionState extends State<_DebugSection> {
   /// Строки текущего языка.
   Strings get t => Strings.of(context);
 
-  /// Профиль для диагностики: активный, иначе первый в списке.
+  /// Профиль для диагностики: активный, иначе тот, с которым работали последним, и лишь затем
+  /// первый в списке. Средняя ступень принципиальна: диагностику запускают ПОСЛЕ неудачной
+  /// попытки, когда активного профиля уже нет, — и без неё проверялся первый профиль списка,
+  /// то есть совсем другой сервер.
   String? get _targetId =>
-      s.activeProfileId ?? (s.profiles.isNotEmpty ? s.profiles.first.id : null);
+      s.activeProfileId ??
+      s.lastProfileId ??
+      (s.profiles.isNotEmpty ? s.profiles.first.id : null);
 
   void _run() {
     final id = _targetId;
@@ -912,10 +917,15 @@ class _DebugSectionState extends State<_DebugSection> {
       return;
     }
     _sub?.cancel();
+    // Профиль называем в первой же строке: вывод диагностики читают как приговор серверу, и он
+    // обязан говорить, КАКОЙ сервер проверяли. Профилей у человека несколько, они отличаются
+    // версией и адресом — молчаливая проверка «какого-то» из них дезориентирует сильнее, чем
+    // отсутствие диагностики.
+    final name = s.profileName(id);
     setState(() {
       _diag
         ..clear()
-        ..add('▶ ${t('diag_start')}');
+        ..add(name.isEmpty ? '▶ ${t('diag_start')}' : '▶ ${t('diag_start')} · $name');
       _running = true;
     });
     _sub = runDiagnostics(profileId: id).listen(

@@ -110,7 +110,8 @@ CitadelPQVPN — установщик exit-сервера (запускать н
   --role all        (умолчание) exit и издатель на ОДНОМ сервере
   --role issuer     только издатель: реестр абонентов + выдача токенов + admin-канал
   --role exit       только exit-узел; параметры издателя берутся из его bundle
-  --issuer-bundle F файл `KEY=VALUE`, напечатанный установкой издателя (для --role exit)
+  --issuer-bundle F файл `KEY=VALUE`, напечатанный установкой издателя (для --role exit);
+                    `-` — прочитать со stdin (вставить копипастом, без файла на диске)
   --keysync-seed H  идентичность exit-узла для получения ключа эпохи (обычно из --issuer-bundle)
 
 Одна кража диска не должна давать обе идентичности сразу, поэтому на серьёзной установке
@@ -196,7 +197,16 @@ case "$ROLE" in
 esac
 # Файл-bundle от установки издателя: те же имена, что и env-переменные (KEY=VALUE, без экспорта).
 if [[ -n "${CITADEL_ISSUER_BUNDLE:-}" ]]; then
-  [[ -r "$CITADEL_ISSUER_BUNDLE" ]] || die "--issuer-bundle: файл не читается: $CITADEL_ISSUER_BUNDLE"
+  # `-` = читать со stdin: bundle несёт seed'ы и мастер L1, и класть его файлом на exit-машину
+  # необязательно — оператор вставляет строки прямо в терминал (Ctrl-D в конце), секрет остаётся
+  # в памяти процесса. Файл по-прежнему поддержан: он удобнее при автоматизации (scp + прогон).
+  if [[ "$CITADEL_ISSUER_BUNDLE" == - ]]; then
+    log "жду bundle издателя на stdin: вставь строки и заверши Ctrl-D"
+    BUNDLE_SRC=/dev/stdin
+  else
+    [[ -r "$CITADEL_ISSUER_BUNDLE" ]] || die "--issuer-bundle: файл не читается: $CITADEL_ISSUER_BUNDLE"
+    BUNDLE_SRC="$CITADEL_ISSUER_BUNDLE"
+  fi
   # Только известные ключи и только hex/host:port — файл приходит с другой машины, доверять ему
   # как shell-скрипту («source») нельзя: одна строка `rm -rf /` выполнилась бы от root.
   while IFS='=' read -r k v; do
@@ -210,7 +220,8 @@ if [[ -n "${CITADEL_ISSUER_BUNDLE:-}" ]]; then
         [[ -n "${!k:-}" ]] || printf -v "$k" '%s' "$v" ;;
       *) warn "issuer-bundle: неизвестный ключ '$k' пропущен" ;;
     esac
-  done < "$CITADEL_ISSUER_BUNDLE"
+  done < "$BUNDLE_SRC"
+  [[ -n "${CITADEL_ISSUER_ADDR:-}" ]] || die "--issuer-bundle: в bundle нет CITADEL_ISSUER_ADDR (вставился пустой/не тот текст?)"
   ADMIN_PORT="${CITADEL_ADMIN_PORT:-$ADMIN_PORT}"
   ISSUER_PORT="${CITADEL_ISSUER_PORT:-$ISSUER_PORT}"
   EPOCH_SECS="${CITADEL_EPOCH_SECS:-$EPOCH_SECS}"
@@ -262,7 +273,15 @@ fi
 # новым случайным портом молча оборвал бы всех абонентов (в т.ч. при CITADEL_KEEP_KEYS=1, где
 # ссылки обязаны пережить обновление).
 PORTS_FILE="$DIR/etc/ports.env"
-if [[ -r "$PORTS_FILE" ]]; then
+# Переустановка БЕЗ `CITADEL_KEEP_KEYS` ротирует идентичность (§3.5), и все розданные ссылки
+# умирают в любом случае. Держаться в этом сценарии за прежние порты незачем: это бесплатно
+# оставляло бы деплою прежнюю примету — а именно так и сохранялись исторические 4433/7000 на
+# серверах, поставленных до M-8. С `CITADEL_KEEP_KEYS=1` всё наоборот: ссылки живут, значит порты
+# обязаны остаться теми же. Явный флаг/env сильнее любого из правил.
+ROTATING=0
+[[ -f "$DIR/keys/obfs.psk" && "${CITADEL_KEEP_KEYS:-0}" != 1 ]] && ROTATING=1
+
+if [[ -r "$PORTS_FILE" && "$ROTATING" != 1 ]]; then
   while IFS='=' read -r k v; do
     case "$k" in
       UDP_PORT)    [[ -n "$UDP_PORT"    ]] || UDP_PORT="$v" ;;
@@ -271,11 +290,11 @@ if [[ -r "$PORTS_FILE" ]]; then
   done < "$PORTS_FILE"
 fi
 # Обновление УЖЕ СТОЯЩЕЙ установки, сделанной до M-8 (ports.env ещё нет): порты обязаны остаться
-# прежними — исторические 4433/7000. Иначе `CITADEL_KEEP_KEYS=1`, который существует ровно затем,
-# чтобы выданные ссылки пережили обновление, молча уводил бы сервер на случайный порт, и все
-# абоненты получили бы «ни один exit недоступен». Кто ставил со своими портами — передаёт их тем
-# же флагом, что и раньше.
-if [[ ! -r "$PORTS_FILE" && -f "$DIR/etc/compose.yml" ]]; then
+# прежними — исторические 4433/7000, — но ТОЛЬКО когда идентичность сохраняется. Иначе
+# `CITADEL_KEEP_KEYS=1`, который существует ровно затем, чтобы выданные ссылки пережили обновление,
+# молча уводил бы сервер на случайный порт, и все абоненты получили бы «ни один exit недоступен».
+# Кто ставил со своими портами — передаёт их тем же флагом, что и раньше.
+if [[ ! -r "$PORTS_FILE" && -f "$DIR/etc/compose.yml" && "$ROTATING" != 1 ]]; then
   [[ -n "$UDP_PORT"    ]] || { UDP_PORT=4433; LEGACY_PORTS=1; }
   [[ -n "$ISSUER_PORT" ]] || { ISSUER_PORT=7000; LEGACY_PORTS=1; }
   if [[ "${LEGACY_PORTS:-0}" == 1 ]]; then
@@ -391,6 +410,9 @@ if [[ "$PORTS_PICKED" == 1 ]]; then
     *)      log "порты выбраны случайно (M-8: не «подпись Citadel»): QUIC/UDP $UDP_PORT, издатель TCP $ISSUER_PORT" ;;
   esac
   log "запомнены в $PORTS_FILE и попадут в ссылки; открой их в firewall/security-group; свои — --udp-port/--issuer-port"
+  # Переустановка с ротацией: прежние порты у оператора уже открыты, новые — ещё нет, и это самая
+  # частая причина «поставил заново, а туннель не поднимается». Говорим об этом прямо.
+  [[ "$ROTATING" == 1 ]] && warn "переустановка с ротацией идентичности: порты выбраны ЗАНОВО — открой новые в firewall (прежние можно закрыть)"
 fi
 # Q4: citadel-linkgen НЕ кладём на бокс (только tmp) — после установки нет инструмента минта ссылок.
 LINKGEN="$work/citadel-linkgen"
@@ -881,8 +903,11 @@ fi
 
 # ── роль issuer: ссылок здесь нет (у машины нет exit-идентичности) — печатаем bundle для exit'а ──
 if [[ "$ROLE" == issuer ]]; then
-  BUNDLE="$(mktemp)"
-  cat > "$BUNDLE" <<EOF
+  # Bundle держим ТОЛЬКО в переменной: он несёт seed'ы абонента и админа и мастер L1, а временный
+  # файл (пусть и на минуту) — это тот самый секрет на диске, которого установщик избегает везде
+  # ещё (ссылки не сохраняются, seed'ы шредятся). Оператору он и не нужен: ниже bundle печатается
+  # на экран, а exit-машина принимает его копипастом (`--issuer-bundle -` читает со stdin).
+  BUNDLE="$(cat <<EOF
 CITADEL_ISSUER_ADDR=$SERVER_HOST:$ISSUER_PORT
 CITADEL_ISSUER_PIN=$ISSUER_TLS_PIN
 CITADEL_ISSUER_MLDSA=$ISSUER_MLDSA
@@ -894,6 +919,7 @@ CITADEL_ADMIN_PORT=$ADMIN_PORT
 CITADEL_EPOCH_SECS=$EPOCH_SECS
 CITADEL_KEYSYNC_SEED=$KEYSYNC_SEED
 EOF
+)"
   cat <<EOF
 
 ╔══════════════════════════════════════════════════════════════════╗
@@ -915,7 +941,11 @@ EOF
 
   ./install-citadel-server.sh $VERSION --role exit --issuer-bundle issuer.env
 
-$(cat "$BUNDLE")
+Либо БЕЗ файла — вставить прямо в терминал exit-машины (bundle не ляжет на её диск):
+
+  ./install-citadel-server.sh $VERSION --role exit --issuer-bundle -   # затем вставь строки и Ctrl-D
+
+$BUNDLE
 ─────────────────────────────────────────────────────────────────────────────
 Bundle содержит seed'ы абонента и админа — это секрет уровня «доступ к сервису». Передавай его
 на exit-машину защищённым каналом (scp), не через мессенджер, и удали файл после установки.
@@ -928,7 +958,7 @@ TLS-идентичность и PQ-идентичность) и следом п�
 станут нерабочими, раздай новые. Смысл раздельного деплоя в том, что кража ЭТОЙ машины не даёт
 идентичность туннеля (она на exit-узле) — и наоборот. Подробнее: docs/SERVER-KEY-PROTECTION.md.
 EOF
-  rm -f "$BUNDLE"
+  unset BUNDLE   # секрет жил только в памяти этого процесса — на диск он не ложился
   # Seed'ы напечатаны — на диске издателя их не оставляем (Q2/Q4, как в общей установке).
   for sfile in "$DIR/keys/admin.seed" "$DIR/keys/client.seed"; do
     [[ -f "$sfile" ]] || continue
@@ -985,6 +1015,13 @@ else cat <<PORTS
 PORTS
 fi)
   Свои значения: ./install-citadel-server.sh --udp-port N --tcp-port N --issuer-port N (см. --help).
+$(if [[ "$PORTS_PICKED" == 1 ]]; then cat <<PORTSWARN
+
+⚠ ПОРТЫ ВЫБРАНЫ ЗАНОВО этой установкой (M-8: фиксированные 4433/7000 опознают деплой сканером).
+  Открой их в firewall/security-group ПРЯМО СЕЙЧАС — иначе абоненты получат «сервер недоступен»,
+  хотя сервер исправен. Прежние, если были открыты, можно закрыть.
+PORTSWARN
+fi)
 
 ⚠ Ссылки печатаются ЗДЕСЬ и НИГДЕ не сохраняются. Скопируй их СЕЙЧАС. Забыл / потерял →
   запусти скрипт снова: он ротирует идентичность и выдаст НОВЫЕ ссылки (прежние, розданные до
