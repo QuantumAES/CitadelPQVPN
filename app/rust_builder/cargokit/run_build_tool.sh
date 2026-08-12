@@ -25,6 +25,17 @@ else
   DART="$FLUTTER_ROOT/bin/cache/dart-sdk/bin/dart"
 fi
 
+# CitadelPQVPN patch: `dart pub get` здесь ходит в сеть (резолв + advisories с pub.dev) на КАЖДОЙ
+# сборке, где нет .package_hash. Кратковременный сбой DNS в середине 10-минутной сборки APK ронял
+# весь gradle-таск с кодом 69 (EX_UNAVAILABLE). Все зависимости build_tool запинены в его
+# pubspec.yaml и лежат в ~/.pub-cache, поэтому при недоступности pub.dev откатываемся на --offline
+# (резолв строго из локального кэша) вместо падения релизной сборки.
+pub_get() {
+  "$DART" pub get --no-precompile && return 0
+  echo "run_build_tool.sh: pub.dev недоступен, пробуем резолв из локального pub-cache (--offline)" >&2
+  "$DART" pub get --no-precompile --offline
+}
+
 cat << EOF > "pubspec.yaml"
 name: build_tool_runner
 version: 1.0.0
@@ -60,10 +71,14 @@ fi
 # package directory. This should be good enough, as the build_tool package
 # itself is not meant to have any path dependencies.
 
+# CitadelPQVPN patch: листинг снимаем ИЗНУТРИ пакета (`cd … && ls -lR .`). В апстриме путь
+# передаётся аргументом и потому попадает в заголовки строк ls → в хэш. Gradle зовёт скрипт как
+# «…/cargokit/gradle/../run_build_tool.sh», CMake — нормализованным путём, Android Studio — своим:
+# .package_hash инвалидируется на ровном месте, и каждая такая сборка снова идёт в сеть за pub get.
 if [[ "$OSTYPE" == "darwin"* ]]; then
-  PACKAGE_HASH=$(ls -lTR "$BUILD_TOOL_PKG_DIR" | shasum)
+  PACKAGE_HASH=$(cd "$BUILD_TOOL_PKG_DIR" && ls -lTR . | shasum)
 else
-  PACKAGE_HASH=$(ls -lR --full-time "$BUILD_TOOL_PKG_DIR" | shasum)
+  PACKAGE_HASH=$(cd "$BUILD_TOOL_PKG_DIR" && ls -lR --full-time . | shasum)
 fi
 
 PACKAGE_HASH_FILE=".package_hash"
@@ -77,7 +92,7 @@ fi
 
 # Run pub get if needed.
 if [ ! -f "$PACKAGE_HASH_FILE" ]; then
-    "$DART" pub get --no-precompile
+    pub_get
     "$DART" compile kernel bin/build_tool_runner.dart
     echo "$PACKAGE_HASH" > "$PACKAGE_HASH_FILE"
 fi
@@ -95,7 +110,7 @@ exit_code=$?
 
 # 253 means invalid snapshot version.
 if [ $exit_code == 253 ]; then
-  "$DART" pub get --no-precompile
+  pub_get
   "$DART" compile kernel bin/build_tool_runner.dart
   "$DART" bin/build_tool_runner.dill "$@"
   exit_code=$?

@@ -117,14 +117,56 @@ impl Tunnel {
     }
 }
 
+/// Политика exit'а для трафика ИЗ туннеля. Осмысленна только в exit-режиме (`egress = Some`);
+/// на клиенте (`egress = None`) не применяется вовсе.
+#[derive(Clone, Default, Debug, PartialEq, Eq)]
+pub struct EgressPolicy {
+    /// C7.2: `Some((admin_vip, admin_port))` → TCP к этому dst:port на exit'е пропускается мимо
+    /// egress-фильтра (ядро DNAT'ит его на issuer, admin-плоскость по туннелю). Прочее — как раньше.
+    pub admin_dst: Option<([u8; 4], u16)>,
+    /// **G1 (аудит-5): адреса, к которым exit не форвардит из туннеля вовсе.** F2 режет приватные
+    /// и служебные сети, но публичный адрес САМОГО деплоя для него — обычный публичный адрес, а
+    /// ядровый `INPUT -i tun -j DROP` живёт в netns КОНТЕЙНЕРА и такой пакет не видит: он уходит
+    /// через `FORWARD`+MASQUERADE на docker-бридж и приходит в INPUT ХОСТА как локальный трафик —
+    /// мимо облачной security-group. То есть абонент дотягивался из туннеля до всего, что хост
+    /// слушает на 0.0.0.0 (sshd, агенты, published-порты соседних контейнеров). Сюда installer
+    /// кладёт публичный IP самой машины и адрес издателя.
+    ///
+    /// Побочная польза: сокет движка, который по ошибке пошёл В СВОЙ туннель (инвариант protect
+    /// ломался дважды), теперь даёт явный дроп с адресом в логе, а не бесконечную петлю.
+    pub deny_dsts: Vec<[u8; 4]>,
+    /// Исключения к [`Self::deny_dsts`]: **TCP** на эти `(addr, port)` проходит. Нужно ровно для
+    /// одного — token-порт издателя: фоновая дозаправка кошелька (§7.1, заход 7) идёт СКВОЗЬ
+    /// туннель нарочно, чтобы издатель видел адрес exit'а, а не абонента. Всё остальное на том же
+    /// адресе (admin-порт, ssh, published-порты) остаётся закрытым — этим же закрыт G2: прямой
+    /// путь абонента к `ISSUER_IP:7001` в обход admin-VIP, где SNAT exit'а выдавал его за
+    /// разрешённый адрес exit-машины (`Citadel_ADMIN_PEER`, L-14).
+    pub allow_dsts: Vec<([u8; 4], u16)>,
+}
+
+impl EgressPolicy {
+    /// Запрещён ли `dst` целиком (с учётом исключений по TCP-порту). `dport` — [`ip::tcp_dport`],
+    /// то есть `None` для не-TCP: ICMP/UDP на запрещённый адрес не проходят никогда (fail-closed —
+    /// исключение выдаётся ровно под один TCP-сервис, а не под адрес).
+    pub fn denies(&self, dst: [u8; 4], dport: Option<u16>) -> bool {
+        if !self.deny_dsts.contains(&dst) {
+            return false;
+        }
+        !matches!(dport, Some(p) if self.allow_dsts.contains(&(dst, p)))
+    }
+
+    /// Есть ли что применять (для лога и для ядровых правил-дублёров).
+    pub fn is_empty(&self) -> bool {
+        self.deny_dsts.is_empty()
+    }
+}
+
 /// Обработка входящего (от клиента) пакета на exit: анти-спуфинг + egress-фильтр (S0.2/F2) +
 /// rate-limit (F7). `accept` → `true` пропустить в TUN, `false` дропнуть. Per-connection.
 pub struct Inbound {
     /// `Some(назначенный клиенту адрес)` → exit-режим (анти-спуфинг+egress); `None` → клиент.
     egress: Option<[u8; 4]>,
-    /// C7.2: `Some((admin_vip, admin_port))` → TCP к этому dst:port на exit'е пропускается мимо
-    /// egress-фильтра (ядро DNAT'ит его на issuer, admin-плоскость по туннелю). Прочее — как раньше.
-    admin_dst: Option<([u8; 4], u16)>,
+    policy: EgressPolicy,
     bucket: Option<TokenBucket>,
     dropped: u64,
     dropped_bytes: u64,
@@ -132,19 +174,19 @@ pub struct Inbound {
 
 impl Inbound {
     pub fn new(egress: Option<[u8; 4]>, rate_limit: Option<RateCfg>) -> Self {
-        Self::with_admin(egress, rate_limit, None)
+        Self::with_policy(egress, rate_limit, EgressPolicy::default())
     }
 
-    /// Как [`Inbound::new`], но с точечным разрешением admin-VIP:порта (C7.2). Только exit-режим
-    /// (`egress = Some`) его использует; на клиенте (`egress = None`) фильтр не активен вовсе.
-    pub fn with_admin(
+    /// Как [`Inbound::new`], но с политикой exit'а (admin-VIP C7.2 + deny/allow G1-G2). Только
+    /// exit-режим (`egress = Some`) её использует; на клиенте (`egress = None`) фильтра нет вовсе.
+    pub fn with_policy(
         egress: Option<[u8; 4]>,
         rate_limit: Option<RateCfg>,
-        admin_dst: Option<([u8; 4], u16)>,
+        policy: EgressPolicy,
     ) -> Self {
         Self {
             egress,
-            admin_dst,
+            policy,
             bucket: rate_limit.map(|c| TokenBucket::new(c, Instant::now())),
             dropped: 0,
             dropped_bytes: 0,
@@ -167,13 +209,25 @@ impl Inbound {
                         );
                         return false;
                     }
+                    let dport = ip::tcp_dport(&v);
+                    // G1/G2: явный запрет проверяется ПЕРВЫМ — раньше admin-исключения и раньше F2.
+                    // Порядок принципиален: список пишет оператор деплоя, и он обязан побеждать
+                    // любое послабление, а не наоборот (иначе будущее исключение мимо F2 тихо
+                    // открыло бы дорогу к адресам, ради закрытия которых список и заведён).
+                    if self.policy.denies(v.dst, dport) {
+                        // no-logs: адрес назначения — под Citadel_DEBUG_LOG, как и остальные дропы.
+                        crate::dlog!(
+                            "[exit] G1: инфраструктурный inner-dst {}.{}.{}.{} запрещён из туннеля",
+                            v.dst[0], v.dst[1], v.dst[2], v.dst[3]
+                        );
+                        return false;
+                    }
                     // C7.2: admin-плоскость — TCP к назначенному admin-VIP:порту разрешён мимо
                     // egress-фильтра (ядро DNAT'ит его на issuer). Анти-спуфинг src уже пройден,
                     // так что доступ имеет только легитимно подключённый клиент; сам доступ к
                     // управлению реестром отсекается admin-подписью на issuer (citadel-token::admin).
-                    let is_admin = self.admin_dst.is_some_and(|(vip, port)| {
-                        v.dst == vip && ip::tcp_dport(&v) == Some(port)
-                    });
+                    let is_admin =
+                        self.policy.admin_dst.is_some_and(|(vip, port)| v.dst == vip && dport == Some(port));
                     // F2: не форвардить во внутренние/служебные сети (metadata/RFC1918/loopback/…)
                     if !is_admin && ip::is_blocked_dst(v.dst) {
                         // no-logs: назначение пользователя — самое чувствительное, что тут есть.
@@ -423,8 +477,8 @@ pub struct ClientPath {
 /// inner-src (S0.2/H3), default-deny не-IPv4 и F2 (дроп во внутренние/служебные сети); `None`
 /// (клиент) — без фильтра. `rate` (на exit) ограничивает ОБА направления token-bucket'ами
 /// (F7/D3 + M-3-bis: `up` — в `Inbound`, `down` — в sender-задаче ниже).
-/// `admin_dst` (C7.2, только exit) — `Some((vip, port))` пропускает TCP к admin-VIP мимо F2
-/// (ядро DNAT'ит на issuer); `None` — admin-плоскость по туннелю выключена.
+/// `policy` (только exit) — admin-VIP мимо F2 (C7.2) и список инфраструктурных адресов, к которым
+/// из туннеля не форвардим вовсе (G1/G2); на клиенте — [`EgressPolicy::default`], то есть пусто.
 ///
 /// TUN читается/пишется через `TunIo` — блокирующие recv/send изолированы в отдельных
 /// потоках и мостятся в async каналами (платформа туннеля движку не важна).
@@ -436,7 +490,7 @@ pub async fn pump(
     // только для диагностики (см. [`ClientPath`]).
     client: Option<ClientPath>,
     rate: RateLimits,
-    admin_dst: Option<([u8; 4], u16)>,
+    policy: EgressPolicy,
     // Источник return-пакетов (TUN→сеть). На КЛИЕНТЕ — `None`: pump сам читает свой TUN. На EXIT —
     // `Some(rx)` из [`ExitTunRouter`]: единый reader общего exit-TUN демультиплексирует пакеты по
     // inner-dst нужному клиенту. Без этого N pump'ов на общем TUN воровали бы друг у друга return-
@@ -627,7 +681,7 @@ pub async fn pump(
     let recv_rx = rx_count.clone();
     let recv_cfw = cfw.clone();
     let receiver = tokio::spawn(async move {
-        let mut inb = Inbound::with_admin(egress, rate.up, admin_dst);
+        let mut inb = Inbound::with_policy(egress, rate.up, policy);
         loop {
             match recv_conn.read_datagram().await {
                 Ok(dg) => {
@@ -1282,7 +1336,8 @@ mod tests {
     fn inbound_admin_dst_exception() {
         let assigned = [10, 7, 0, 5];
         let vip = [10, 7, 0, 1];
-        let mut exit = Inbound::with_admin(Some(assigned), None, Some((vip, 7001)));
+        let admin = EgressPolicy { admin_dst: Some((vip, 7001)), ..Default::default() };
+        let mut exit = Inbound::with_policy(Some(assigned), None, admin.clone());
         // TCP к admin-VIP:7001 с легитимным src — пропуск, хотя dst приватный
         assert!(exit.accept(&tcp(assigned, vip, 7001)), "admin TCP → VIP:порт пропущен мимо F2");
         // тот же VIP, другой порт — F2 дропает (не admin)
@@ -1297,8 +1352,50 @@ mod tests {
         assert!(exit.accept(&tcp(assigned, [1, 1, 1, 1], 443)), "публичный dst — пропуск");
 
         // без admin_dst (None) VIP:7001 снова дропается (базовое поведение F2)
-        let mut plain = Inbound::with_admin(Some(assigned), None, None);
+        let mut plain = Inbound::new(Some(assigned), None);
         assert!(!plain.accept(&tcp(assigned, vip, 7001)), "нет admin-исключения → F2 дропает");
+    }
+
+    /// G1/G2 (аудит-5): инфраструктурные адреса (публичный IP самой машины, адрес издателя) из
+    /// туннеля недостижимы, хотя F2 их не режет — они публичные. Исключение — ровно один TCP-порт
+    /// издателя (§7.1: фоновая дозаправка кошелька идёт СКВОЗЬ туннель нарочно).
+    #[test]
+    fn inbound_denies_infra_dsts_except_issuer_token_port() {
+        let assigned = [10, 7, 0, 5];
+        let own = [203, 0, 114, 10]; // публичный адрес самого exit-хоста (F2 его пропускает)
+        let issuer = [203, 0, 114, 20];
+        let vip = [10, 7, 0, 1];
+        let mut exit = Inbound::with_policy(
+            Some(assigned),
+            None,
+            EgressPolicy {
+                admin_dst: Some((vip, 7001)),
+                deny_dsts: vec![own, issuer],
+                allow_dsts: vec![(issuer, 7000)],
+            },
+        );
+        // G1: собственный хост закрыт целиком — и ssh, и published-порты, и ICMP
+        assert!(!exit.accept(&tcp(assigned, own, 22)), "ssh хоста из туннеля — дроп");
+        assert!(!exit.accept(&tcp(assigned, own, 7000)), "published-порт хоста — дроп");
+        assert!(!exit.accept(&ipv4(assigned, own)), "не-TCP на свой хост — дроп");
+        // G2: у издателя открыт ровно token-порт; admin-порт напрямую — закрыт (только через VIP)
+        assert!(exit.accept(&tcp(assigned, issuer, 7000)), "token-порт издателя — пропуск (§7.1)");
+        assert!(!exit.accept(&tcp(assigned, issuer, 7001)), "admin-порт издателя напрямую — дроп (G2)");
+        assert!(!exit.accept(&ipv4(assigned, issuer)), "не-TCP на издателя — дроп (исключение только TCP)");
+        // Запрет сильнее admin-исключения: список оператора побеждает любое послабление
+        let mut both = Inbound::with_policy(
+            Some(assigned),
+            None,
+            EgressPolicy {
+                admin_dst: Some((vip, 7001)),
+                deny_dsts: vec![vip],
+                allow_dsts: vec![],
+            },
+        );
+        assert!(!both.accept(&tcp(assigned, vip, 7001)), "явный deny сильнее admin-исключения");
+        // Соседние публичные адреса не задеты (нет over-block)
+        assert!(exit.accept(&tcp(assigned, [203, 0, 114, 11], 443)), "чужой публичный dst — пропуск");
+        assert!(exit.accept(&tcp(assigned, [1, 1, 1, 1], 443)), "обычный трафик не задет");
     }
 
     /// pump-watchdog: рвём путь только когда под нагрузкой (tx ≥ порога) нет НИ обратных датаграмм,

@@ -599,6 +599,14 @@ fi
 REGISTER_PUBS="$CLIENT_PUB"
 [[ "$ISSUER_ON" == 1 ]] && REGISTER_PUBS="$CLIENT_PUB:$ACTIVATE_UNTIL"
 
+# Публичный адрес машины. Определяем ЗДЕСЬ, а не перед печатью ссылки: он нужен уже entrypoint'у
+# exit'а (G1: свой публичный адрес из туннеля недостижим). Заодно установка падает до сборки
+# образа, а не после неё, если адрес не определить.
+if [[ -z "$SERVER_HOST" ]]; then
+  SERVER_HOST="$(curl -fsS --max-time 8 https://api.ipify.org 2>/dev/null || true)"
+fi
+[[ -n "$SERVER_HOST" ]] || die "не удалось определить публичный IP — задай CITADEL_SERVER_HOST=<ip/host>"
+
 # ─── 5. образ (Dockerfile) + entrypoints + compose ───
 # Где exit ищет издателя: в общей установке — по docker-DNS имени сервиса, при раздельной — по
 # хосту из bundle (DNAT работает по адресу, поэтому имя резолвится в entrypoint при старте).
@@ -608,6 +616,20 @@ if [[ "$ROLE" == exit ]]; then
 else
   ISSUER_DNS_NAME="issuer"
   ISSUER_TOKEN_PORT="$ISSUER_PORT"
+fi
+# G1/G2: что именно закрыть у exit'а со стороны туннеля (подставляется в entrypoint ниже).
+#   * своя машина закрывается ВСЕГДА; при совмещённой установке на ней же опубликован token-порт
+#     издателя — его оставляем открытым (§7.1: дозаправка кошелька идёт сквозь туннель нарочно);
+#   * при раздельной установке закрывается ещё и машина издателя — с тем же единственным
+#     исключением на её token-порт (admin-порт с неё закрыт: в admin ходят через VIP, C7.2).
+G1_OWN_TOKEN_PORT=""; G1_ISSUER_HOST=""; G1_ISSUER_PORT=""
+if [[ "$ISSUER_ON" == 1 ]]; then
+  if [[ "$ROLE" == exit ]]; then
+    G1_ISSUER_HOST="$ISSUER_DNS_NAME"
+    G1_ISSUER_PORT="$ISSUER_TOKEN_PORT"
+  else
+    G1_OWN_TOKEN_PORT="$ISSUER_PORT"
+  fi
 fi
 cat > "$DIR/etc/Dockerfile" <<'EOF'
 # S1.5: digest-pin базового образа (OCI index, мульти-арч) — supply-chain/воспроизводимость
@@ -697,6 +719,45 @@ EOF
   else
     echo 'echo "[citadel-exit] token-less; listen 4433/udp + 443/tcp"'
   fi
+  # G1/G2 (аудит-5): инфраструктурные адреса из туннеля недостижимы.
+  #
+  # F2 в движке режет приватные и служебные сети, но публичный адрес САМОЙ машины для него —
+  # обычный публичный адрес. Ядровый `INPUT -i Citadel0 -j DROP` его тоже не ловит: он стоит в
+  # netns КОНТЕЙНЕРА, а пакет с dst = публичный IP хоста в этот INPUT не попадает — контейнер
+  # форвардит его наружу (MASQUERADE), и в INPUT он приходит уже у ХОЗЯЙСКОГО ядра, как локальный
+  # трафик с docker-бриджа, то есть мимо облачной security-group. Без этого списка любой абонент
+  # дотягивался из туннеля до всего, что хост слушает на 0.0.0.0 (sshd, агенты мониторинга,
+  # published-порты соседних контейнеров), и до admin-порта издателя напрямую — там SNAT exit'а
+  # выдавал его за разрешённый адрес exit-машины (Citadel_ADMIN_PEER, L-14) — это G2.
+  #
+  # Исключение ровно одно и точечное: token-порт издателя. Фоновая дозаправка кошелька (§7.1,
+  # заход 7) идёт СКВОЗЬ туннель нарочно — чтобы издатель видел адрес exit'а, а не абонента.
+  cat <<EOF
+resolve_ip() {   # имя → IP; литеральный IPv4 отдаём как есть (getent на него вернёт пусто)
+  case "\$1" in
+    *[!0-9.]*) getent hosts "\$1" | awk '{print \$1}' | head -n1 ;;
+    *) printf '%s' "\$1" ;;
+  esac
+}
+DENY=""; ALLOW=""
+# \$1 — адрес/имя, \$2 — единственный TCP-порт, который на нём остаётся открытым (пусто — ни одного).
+# Явный \`return 0\`: без него пустой \$2 сделал бы последним неуспешный test, и \`set -e\` убил бы старт.
+add_deny() {
+  [ -n "\$1" ] || return 0
+  DENY="\${DENY:+\$DENY,}\$1"
+  [ -n "\$2" ] && ALLOW="\${ALLOW:+\$ALLOW,}\$1:\$2"
+  return 0
+}
+add_deny "\$(resolve_ip '$SERVER_HOST')" '$G1_OWN_TOKEN_PORT'
+add_deny "\$(resolve_ip '$G1_ISSUER_HOST')" '$G1_ISSUER_PORT'
+export Citadel_DENY_DSTS="\$DENY"
+export Citadel_ALLOW_DSTS="\$ALLOW"
+if [ -n "\$DENY" ]; then
+  echo "[citadel-exit] G1: из туннеля закрыты \$DENY (открыт из них только: \${ALLOW:-ничего})"
+else
+  echo "[citadel-exit] ⚠ G1: публичный адрес не резолвится — инфраструктурный запрет НЕ поднят"
+fi
+EOF
   echo 'exec citadel-m1'
 } > "$DIR/etc/entrypoint-exit.sh"
 chmod +x "$DIR/etc/entrypoint-exit.sh"
@@ -935,11 +996,7 @@ if [[ "$ISSUER_ON" == 1 && "$ROLE" != exit && -n "$MASTER" ]]; then
   esac
 fi
 
-# ─── 7. публичный адрес + citadel:// (секрет) ───
-if [[ -z "$SERVER_HOST" ]]; then
-  SERVER_HOST="$(curl -fsS --max-time 8 https://api.ipify.org 2>/dev/null || true)"
-fi
-[[ -n "$SERVER_HOST" ]] || die "не удалось определить публичный IP — задай CITADEL_SERVER_HOST=<ip/host>"
+# ─── 7. citadel:// (секрет) ─── (публичный адрес уже определён до генерации entrypoint'ов, §5)
 
 # ── роль issuer: ссылок здесь нет (у машины нет exit-идентичности) — печатаем bundle для exit'а ──
 if [[ "$ROLE" == issuer ]]; then

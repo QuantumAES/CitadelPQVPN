@@ -18,7 +18,7 @@
 //! Сетевой формат: кадр `u32(len, BE) ‖ payload`; запрос — ослеплённый элемент (32 Б), ответ —
 //! `evaluated(32) ‖ DLEQ(64)`.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::io::Write;
 use std::net::{IpAddr, TcpListener, TcpStream};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -153,6 +153,51 @@ const WATCH_TICK: Duration = Duration::from_millis(250);
 struct GateState {
     total: usize,
     per_ip: HashMap<IpAddr, usize>,
+    /// G3 (аудит-5): живые pre-auth соединения в порядке появления (front — самое старое).
+    /// Нужен, чтобы при заполнении гейта вытеснять старое, а не отказывать новому (см. [`Gate`]).
+    live: VecDeque<Live>,
+    next_id: u64,
+}
+
+/// Занятый слот с точки зрения гейта: чем его закрыть и кому он принадлежит.
+struct Live {
+    id: u64,
+    ip: IpAddr,
+    /// Дублированный дескриптор соединения — `shutdown` по нему выводит рабочий поток из
+    /// блокирующего чтения. `None` только в тестах учёта (такую запись гейт вытеснять не станет).
+    sock: Option<TcpStream>,
+}
+
+impl GateState {
+    /// Вытеснить самое старое соединение (при `only_ip` — самое старое С ЭТОГО адреса) и
+    /// освободить его слот. Записи без дескриптора пропускаем: закрыть их нечем, а снять с учёта,
+    /// не закрыв, значило бы пустить сверх потолка. `false` — вытеснять нечего.
+    fn evict_oldest(&mut self, only_ip: Option<IpAddr>) -> bool {
+        let Some(pos) = self.live.iter().position(|l| {
+            l.sock.is_some() && only_ip.is_none_or(|ip| l.ip == ip)
+        }) else {
+            return false;
+        };
+        let victim = self.live.remove(pos).expect("позиция получена из этого же дека");
+        self.forget(victim.ip);
+        if let Some(s) = victim.sock {
+            // Рабочий поток жертвы сидит в blocking-read внутри TLS/obfs — он выйдет по ошибке
+            // и дропнет свой Pass; release по id уже ничего не найдёт (двойного учёта нет).
+            let _ = s.shutdown(std::net::Shutdown::Both);
+        }
+        true
+    }
+
+    /// Снять один слот с учёта (общий счётчик + per-ip, с уборкой пустых записей).
+    fn forget(&mut self, ip: IpAddr) {
+        self.total = self.total.saturating_sub(1);
+        if let Some(n) = self.per_ip.get_mut(&ip) {
+            *n -= 1;
+            if *n == 0 {
+                self.per_ip.remove(&ip); // пустые записи не копим
+            }
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -167,11 +212,12 @@ struct Gate {
 struct Pass {
     gate: Gate,
     ip: IpAddr,
+    id: u64,
 }
 
 impl Drop for Pass {
     fn drop(&mut self) {
-        self.gate.release(self.ip);
+        self.gate.release(self.id, self.ip);
     }
 }
 
@@ -180,30 +226,50 @@ impl Gate {
         Self { state: Arc::new(Mutex::new(GateState::default())), max_total, max_per_ip }
     }
 
-    /// Взять слот под pre-auth фазу. `None` — потолок исчерпан (соединение закрываем немедленно,
-    /// не заводя ни потока, ни состояния).
-    fn admit(&self, ip: IpAddr) -> Option<Pass> {
+    /// Взять слот под pre-auth фазу, при заполнении — **вытеснив самое старое** соединение.
+    ///
+    /// G3 (аудит-5). Отказывать новому нельзя: за exit'ом весь туннельный трафик приходит с ОДНОГО
+    /// адреса (MASQUERADE), поэтому счётчик «на адрес» у admin-канала общий для всех абонентов И
+    /// для самого админа. Четыре молчащих соединения абонента (переоткрываемых по истечении
+    /// `PREAUTH_DEADLINE`) намертво запирали админа снаружи реестра — при исправном сервере и без
+    /// единой ошибки аутентификации.
+    ///
+    /// Вытеснение переворачивает исход: честный хендшейк укладывается в миллисекунды и уходит из
+    /// очереди сам (слот освобождается на границе auth), а паразитное соединение как раз ВИСИТ —
+    /// то есть всегда оказывается ближе к голове очереди. Новоприбывший встаёт в хвост, и чтобы его
+    /// вытеснить, атакующему нужно занять весь потолок ЗАНОВО, потратив на каждое соединение по
+    /// RTT. Ценой становится редкий разрыв чужого недоделанного хендшейка под предельной нагрузкой
+    /// — на порядок меньшее зло, чем гарантированная потеря управления.
+    ///
+    /// `sock` — дублированный дескриптор (по нему закрывается вытесняемое соединение). `None`
+    /// допустим только в тестах учёта: такую запись гейт не вытесняет, она лишь занимает слот.
+    /// `None` в ответе — вытеснять было нечего (все слоты заняты незакрываемыми записями).
+    fn admit(&self, ip: IpAddr, sock: Option<TcpStream>) -> Option<Pass> {
         let mut st = self.state.lock().unwrap();
-        if st.total >= self.max_total {
+        // Сначала потолок адреса: жертву ищем среди соединений ЭТОГО адреса, чтобы флудер не
+        // выбивал чужие соединения, уперевшись в свой персональный лимит.
+        if st.per_ip.get(&ip).copied().unwrap_or(0) >= self.max_per_ip && !st.evict_oldest(Some(ip))
+        {
             return None;
         }
-        let cur = st.per_ip.get(&ip).copied().unwrap_or(0);
-        if cur >= self.max_per_ip {
+        if st.total >= self.max_total && !st.evict_oldest(None) {
             return None;
         }
-        st.per_ip.insert(ip, cur + 1);
+        st.next_id += 1;
+        let id = st.next_id;
+        *st.per_ip.entry(ip).or_insert(0) += 1;
         st.total += 1;
-        Some(Pass { gate: self.clone(), ip })
+        st.live.push_back(Live { id, ip, sock });
+        Some(Pass { gate: self.clone(), ip, id })
     }
 
-    fn release(&self, ip: IpAddr) {
+    /// Освободить слот по завершении обслуживания. Если соединение уже вытеснено (`id` из очереди
+    /// пропал), счётчики не трогаем — их уменьшил тот, кто вытеснял.
+    fn release(&self, id: u64, ip: IpAddr) {
         let mut st = self.state.lock().unwrap();
-        st.total = st.total.saturating_sub(1);
-        if let Some(n) = st.per_ip.get_mut(&ip) {
-            *n -= 1;
-            if *n == 0 {
-                st.per_ip.remove(&ip); // пустые записи не копим
-            }
+        if let Some(pos) = st.live.iter().position(|l| l.id == id) {
+            st.live.remove(pos);
+            st.forget(ip);
         }
     }
 }
@@ -346,13 +412,15 @@ where
             }
             continue;
         }
-        let Some(pass) = gate.admit(ip) else {
-            drop(tcp); // потолок исчерпан — закрываем сразу, состояния не заводим
+        // G3: гейт вытесняет самое старое pre-auth соединение вместо отказа новому (см. `admit`).
+        // Отказ остаётся лишь на вырожденный случай «вытеснять нечем» (нет дублей дескрипторов).
+        let Some(pass) = gate.admit(ip, tcp.try_clone().ok()) else {
+            drop(tcp);
             rejected += 1;
             if last_log.elapsed() >= Duration::from_secs(1) {
                 eprintln!(
                     "[issuer] {what}: лимит одновременных pre-auth соединений \
-                     ({} всего / {} на адрес) — отклонено {rejected} за секунду (H-1)",
+                     ({} всего / {} на адрес) и вытеснять нечего — отклонено {rejected} за секунду (H-1/G3)",
                     gate.max_total, gate.max_per_ip
                 );
                 rejected = 0;
@@ -1699,35 +1767,96 @@ mod tests {
         std::net::IpAddr::V4(std::net::Ipv4Addr::new(203, 0, 113, n))
     }
 
-    /// Общий потолок: сверх него слот не выдаётся, а освобождение (дроп) возвращает место.
-    /// Это и есть замена «поток на каждый accept без единого таймаута».
+    /// Пара соединённых по loopback сокетов: гейту нужен ЖИВОЙ дескриптор, чтобы вытеснение было
+    /// настоящим (`shutdown`), а не только записью в счётчике. Возвращаем оба конца — если бросить
+    /// клиентский, серверный станет читаемым (EOF), и тест перестанет отличать вытеснение от него.
+    fn sock_pair() -> (std::net::TcpStream, std::net::TcpStream) {
+        let l = std::net::TcpListener::bind("127.0.0.1:0").expect("listener");
+        let a = std::net::TcpStream::connect(l.local_addr().unwrap()).expect("connect");
+        let (b, _) = l.accept().expect("accept");
+        (a, b)
+    }
+
+    /// Общий потолок: сверх него новое соединение вытесняет самое старое, а освобождение (дроп)
+    /// возвращает место. Это и есть замена «поток на каждый accept без единого таймаута».
     #[test]
     fn gate_caps_total_and_releases_on_drop() {
         use super::Gate;
         let g = Gate::new(3, 3);
-        let a = g.admit(ip(1)).expect("слот 1");
-        let b = g.admit(ip(2)).expect("слот 2");
-        let c = g.admit(ip(3)).expect("слот 3");
-        assert!(g.admit(ip(4)).is_none(), "сверх потолка слот выдаваться не должен");
-        drop(b);
-        assert!(g.admit(ip(4)).is_some(), "освободившееся место переиспользуется");
+        let (_k1, s1) = sock_pair();
+        let (_k2, s2) = sock_pair();
+        let (_k3, s3) = sock_pair();
+        let (_k4, s4) = sock_pair();
+        let a = g.admit(ip(1), Some(s1)).expect("слот 1");
+        let b = g.admit(ip(2), Some(s2)).expect("слот 2");
+        let c = g.admit(ip(3), Some(s3)).expect("слот 3");
+        assert_eq!(g.state.lock().unwrap().total, 3, "потолок занят");
+        // Сверх потолка: место освобождается вытеснением САМОГО СТАРОГО (слот 1), а не отказом.
+        let d = g.admit(ip(4), Some(s4)).expect("новое соединение проходит за счёт вытеснения");
+        assert_eq!(g.state.lock().unwrap().total, 3, "потолок не превышен");
+        // Дроп уже вытесненного Pass'а счётчики не трогает (иначе они уехали бы в минус).
         drop(a);
+        assert_eq!(g.state.lock().unwrap().total, 3, "вытесненный Pass повторно слот не отдаёт");
+        drop(b);
         drop(c);
+        drop(d);
+        assert_eq!(g.state.lock().unwrap().total, 0, "все слоты освобождены");
     }
 
-    /// Потолок НА АДРЕС: без него один источник забирает весь общий лимит, и легитимные клиенты
-    /// не проходят — глобальный счётчик от этого не спасает.
+    /// Потолок НА АДРЕС: жертву ищем среди соединений ТОГО ЖЕ адреса — флудер, упёршийся в свой
+    /// лимит, не должен выбивать чужие соединения.
     #[test]
     fn gate_caps_per_ip_so_one_source_cannot_starve_others() {
         use super::Gate;
         let g = Gate::new(100, 2);
-        let _a = g.admit(ip(1)).expect("первый от адреса");
-        let b = g.admit(ip(1)).expect("второй от адреса");
-        assert!(g.admit(ip(1)).is_none(), "третий с того же адреса — отказ");
-        // другой адрес при этом не задет (иначе флудер отключал бы всех)
-        assert!(g.admit(ip(2)).is_some(), "чужой адрес не должен страдать от флуда соседа");
-        drop(b);
-        assert!(g.admit(ip(1)).is_some(), "освобождённый слот адреса снова доступен");
+        let (_k1, s1) = sock_pair();
+        let (_k2, s2) = sock_pair();
+        let (_k3, s3) = sock_pair();
+        let (_k4, s4) = sock_pair();
+        let a = g.admit(ip(1), Some(s1)).expect("первый от адреса");
+        let _b = g.admit(ip(1), Some(s2)).expect("второй от адреса");
+        let other = g.admit(ip(2), Some(s3)).expect("чужой адрес не должен страдать от соседа");
+        // Третий с того же адреса вытесняет ПЕРВЫЙ с того же адреса, а не чужой.
+        let _c = g.admit(ip(1), Some(s4)).expect("третий с адреса проходит за счёт вытеснения");
+        {
+            let st = g.state.lock().unwrap();
+            assert_eq!(st.per_ip.get(&ip(1)).copied(), Some(2), "лимит адреса соблюдён");
+            assert_eq!(st.per_ip.get(&ip(2)).copied(), Some(1), "чужой слот на месте");
+            assert!(!st.live.iter().any(|l| l.id == a.id), "вытеснено самое старое с этого адреса");
+        }
+        drop(other);
+    }
+
+    /// G3 (аудит-5): за exit'ом все туннельные соединения приходят с ОДНОГО адреса, поэтому
+    /// «потолок на адрес» — общий счётчик абонентов и админа. Флудер, заливший его молчащими
+    /// коннектами, обязан НЕ запирать управление: новое соединение проходит, вытесняя старое
+    /// паразитное, и вытесненное реально закрывается (рабочий поток жертвы выйдет из read).
+    #[test]
+    fn gate_evicts_stale_flood_instead_of_locking_admin_out() {
+        use super::Gate;
+        use std::io::Read;
+        let g = Gate::new(32, 4);
+        let shared = ip(7); // адрес exit'а: и флудер, и админ приходят с него
+        let mut flood_peers = Vec::new();
+        let mut passes = Vec::new();
+        for _ in 0..4 {
+            let (peer, s) = sock_pair();
+            passes.push(g.admit(shared, Some(s)).expect("слот флудера"));
+            flood_peers.push(peer);
+        }
+        // Админ приходит пятым — до G3 здесь был отказ, и управление реестром терялось.
+        let (_admin_peer, admin_sock) = sock_pair();
+        let admin = g.admit(shared, Some(admin_sock)).expect("админ обязан пройти");
+        assert!(
+            g.state.lock().unwrap().live.iter().any(|l| l.id == admin.id),
+            "соединение админа стоит в очереди"
+        );
+        // Самое старое соединение флудера закрыто на уровне сокета: его сторона читает EOF.
+        let mut buf = [0u8; 1];
+        flood_peers[0].set_read_timeout(Some(std::time::Duration::from_secs(5))).unwrap();
+        assert_eq!(flood_peers[0].read(&mut buf).ok(), Some(0), "вытесненное соединение закрыто");
+        // Соседние соединения флудера при этом живы — вытесняется ровно одно, самое старое.
+        assert_eq!(g.state.lock().unwrap().per_ip.get(&shared).copied(), Some(4));
     }
 
     /// Карта адресов не растёт: запись убирается, когда её счётчик обнуляется (иначе долгий
@@ -1737,12 +1866,14 @@ mod tests {
         use super::Gate;
         let g = Gate::new(8, 4);
         for n in 0..200u8 {
-            let p = g.admit(ip(n)).expect("слот");
+            let (_peer, s) = sock_pair();
+            let p = g.admit(ip(n), Some(s)).expect("слот");
             drop(p);
         }
         let st = g.state.lock().unwrap();
         assert_eq!(st.total, 0, "все слоты освобождены");
         assert!(st.per_ip.is_empty(), "пустые записи адресов не копятся: {}", st.per_ip.len());
+        assert!(st.live.is_empty(), "очередь живых соединений тоже пуста: {}", st.live.len());
     }
 
     /// Дедлайн pre-auth строго больше таймаута одной операции: иначе сторож рвал бы соединение

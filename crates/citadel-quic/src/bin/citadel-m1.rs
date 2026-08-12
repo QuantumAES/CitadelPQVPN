@@ -258,7 +258,55 @@ fn admin_dst_from_env() -> Option<([u8; 4], u16)> {
     Some((ip, port.trim().parse().ok()?))
 }
 
-fn server_setup_net(ifname: &str) {
+/// Разобрать список адресов через запятую/пробел в IPv4-октеты. Мусор — ОШИБКА, а не пропуск
+/// записи: опечатка в адресе обязана уронить старт, иначе фильтр молча окажется уже, чем думает
+/// оператор (тот же fail-closed, что у `Citadel_ADMIN_PEER`/L-14 и `Citadel_OBFS_PSK`/M-7).
+fn parse_v4_list(var: &str) -> Result<Vec<[u8; 4]>> {
+    let Ok(raw) = std::env::var(var) else { return Ok(Vec::new()) };
+    raw.split([',', ' ', ';'])
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(|s| {
+            s.parse::<std::net::Ipv4Addr>()
+                .map(|a| a.octets())
+                .map_err(|_| anyhow::anyhow!("{var}: '{s}' — не IPv4-адрес"))
+        })
+        .collect()
+}
+
+/// То же для `addr:port` (исключения из запрета).
+fn parse_v4_port_list(var: &str) -> Result<Vec<([u8; 4], u16)>> {
+    let Ok(raw) = std::env::var(var) else { return Ok(Vec::new()) };
+    raw.split([',', ' ', ';'])
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(|s| {
+            let (a, p) = s
+                .rsplit_once(':')
+                .ok_or_else(|| anyhow::anyhow!("{var}: '{s}' — ожидается addr:port"))?;
+            let addr: std::net::Ipv4Addr =
+                a.parse().map_err(|_| anyhow::anyhow!("{var}: '{a}' — не IPv4-адрес"))?;
+            let port: u16 = p.parse().map_err(|_| anyhow::anyhow!("{var}: '{p}' — не порт"))?;
+            Ok((addr.octets(), port))
+        })
+        .collect()
+}
+
+/// Политика exit'а для трафика из туннеля: admin-VIP (C7.2) + запреты G1/G2.
+///
+/// `Citadel_DENY_DSTS` — адреса, к которым из туннеля не форвардим (публичный IP самой машины,
+/// адрес издателя); `Citadel_ALLOW_DSTS` — точечные исключения `addr:port` (token-порт издателя,
+/// §7.1). Оба пустые — прежнее поведение. Установщик заполняет их сам; отдельные env оставлены и
+/// для ручных деплоев (несколько публичных адресов, отдельный сервис на том же хосте).
+fn egress_policy_from_env() -> Result<citadel_quic::dataplane::EgressPolicy> {
+    Ok(citadel_quic::dataplane::EgressPolicy {
+        admin_dst: admin_dst_from_env(),
+        deny_dsts: parse_v4_list("Citadel_DENY_DSTS")?,
+        allow_dsts: parse_v4_port_list("Citadel_ALLOW_DSTS")?,
+    })
+}
+
+fn server_setup_net(ifname: &str, policy: &citadel_quic::dataplane::EgressPolicy) {
     if let Ok(addr) = std::env::var("Citadel_TUN_ADDR") {
         run("ip", &["addr", "add", &addr, "dev", ifname]);
     }
@@ -291,6 +339,31 @@ fn server_setup_net(ifname: &str) {
     // окружения (как `-I OUTPUT 1` в kill-switch). Admin-DNAT (C7.2) этим не задет: он в PREROUTING
     // до routing-decision → DNAT'нутый пакет уходит в FORWARD, а не в INPUT.
     run("iptables", &["-I", "INPUT", "1", "-i", ifname, "-j", "DROP"]);
+    // G1/G2 (аудит-5): ядровый дубль запрета инфраструктурных адресов. Именно ЗДЕСЬ у INPUT-правила
+    // выше кончается зона действия: пакет из туннеля с dst = ПУБЛИЧНЫЙ адрес хоста в INPUT этого
+    // netns не попадает вовсе — контейнер форвардит его наружу (MASQUERADE), и в INPUT он приходит
+    // уже у ХОЗЯЙСКОГО ядра, как локальный трафик с docker-бриджа, мимо облачной security-group.
+    // Правила ставятся `-I FORWARD 1` (в НАЧАЛО): выше уже добавлен `-A FORWARD -i tun -s pool
+    // -o eg -j ACCEPT`, и append встал бы ПОСЛЕ него — то есть никогда не сработал бы. Сначала
+    // DROP'ы, потом исключения — вставка в позицию 1 переворачивает порядок, и итог такой:
+    // [ACCEPT исключений] → [DROP запретов] → [прежние правила].
+    for d in &policy.deny_dsts {
+        let dst = format!("{}.{}.{}.{}", d[0], d[1], d[2], d[3]);
+        run("iptables", &["-I", "FORWARD", "1", "-i", ifname, "-d", &dst, "-j", "DROP"]);
+    }
+    for (a, port) in &policy.allow_dsts {
+        let dst = format!("{}.{}.{}.{}", a[0], a[1], a[2], a[3]);
+        let p = port.to_string();
+        run("iptables", &["-I", "FORWARD", "1", "-i", ifname, "-p", "tcp", "-d", &dst,
+            "--dport", &p, "-j", "ACCEPT"]);
+    }
+    if !policy.is_empty() {
+        eprintln!(
+            "[net] G1: из туннеля закрыто {} инфраструктурных адрес(ов), исключений (addr:port): {}",
+            policy.deny_dsts.len(),
+            policy.allow_dsts.len()
+        );
+    }
     let _ = std::fs::write("/proc/sys/net/ipv4/conf/all/rp_filter", b"1");
     // MSS-clamp: ограничить TCP-сегменты под PMTU туннеля. Без него крупные ответные
     // сегменты (TLS ServerHello/cert) не влезают в QUIC-датаграмму и теряются — PMTUD
@@ -302,10 +375,10 @@ fn server_setup_net(ifname: &str) {
 
     // C7.2 admin-плоскость: пакеты из туннеля на admin-VIP:порт DNAT'им на issuer. Правило —
     // ТОЛЬКО `-i ifname` (из туннеля): admin-канал недостижим с WAN (порт не опубликован наружу).
-    // Требует пропуска этого dst в data-plane (`admin_dst_from_env` → Inbound), иначе egress-фильтр
+    // Требует пропуска этого dst в data-plane (`policy.admin_dst` → Inbound), иначе egress-фильтр
     // дропнул бы его до ядра. `Citadel_ADMIN_DNAT` = "issuer_host:port" (entrypoint резолвит issuer).
     if let (Some((vip, port)), Ok(target)) =
-        (admin_dst_from_env(), std::env::var("Citadel_ADMIN_DNAT"))
+        (policy.admin_dst, std::env::var("Citadel_ADMIN_DNAT"))
     {
         let vip_s = format!("{}.{}.{}.{}", vip[0], vip[1], vip[2], vip[3]);
         let port_s = port.to_string();
@@ -759,7 +832,10 @@ fn persistent_mldsa_seed(dir: &str) -> Result<[u8; citadel_quic::pqauth::MLDSA_S
 
 // ------------------------------- роли -------------------------------
 async fn run_server(tun: Arc<Tun>) -> Result<()> {
-    server_setup_net(tun.name());
+    // Политика egress разбирается ДО подъёма сети: опечатка в списке адресов обязана уронить старт,
+    // а не оставить exit с фильтром шире, чем задумано (fail-closed, как L-14/M-7).
+    let policy = egress_policy_from_env()?;
+    server_setup_net(tun.name(), &policy);
 
     // Демукс общего exit-TUN: единый reader маршрутизирует return-пакеты нужному клиенту по inner-dst.
     // Без него несколько клиентских pump'ов на ОДНОМ TUN воруют пакеты друг у друга (multi-client
@@ -868,14 +944,23 @@ async fn run_server(tun: Arc<Tun>) -> Result<()> {
         }
     }
 
-    // C7.2: admin-VIP:порт (пропуск в data-plane к admin-каналу issuer'а по туннелю). Копируемое
-    // значение — захватывается в per-client задачи наравне с rate_limit; DNAT ставится отдельно
-    // в server_setup_net. Нет env → admin-плоскость по туннелю выключена (клиентам недоступна).
-    let admin_dst = admin_dst_from_env();
-    if let Some((ip, port)) = admin_dst {
+    // C7.2: admin-VIP:порт (пропуск в data-plane к admin-каналу issuer'а по туннелю). Политика
+    // клонируется в per-client задачи наравне с rate_limit; ядровые правила (DNAT, G1-запреты)
+    // ставит server_setup_net по ней же. Нет admin-env → admin-плоскость по туннелю выключена.
+    if let Some((ip, port)) = policy.admin_dst {
         eprintln!(
             "[citadel-m1:server] C7.2 admin-plane: пропуск в data-plane к {}.{}.{}.{}:{port} (DNAT → issuer)",
             ip[0], ip[1], ip[2], ip[3]
+        );
+    }
+    for d in &policy.deny_dsts {
+        eprintln!(
+            "[citadel-m1:server] G1: {}.{}.{}.{} из туннеля недостижим{}",
+            d[0], d[1], d[2], d[3],
+            match policy.allow_dsts.iter().find(|(a, _)| a == d) {
+                Some((_, p)) => format!(" (кроме TCP :{p})"),
+                None => String::new(),
+            }
         );
     }
 
@@ -903,6 +988,7 @@ async fn run_server(tun: Arc<Tun>) -> Result<()> {
         let signer = signer.clone();
         let router = router.clone();
         let pool = pool.clone();
+        let policy = policy.clone();
         // S2.5/A5: каждый accept'нутый TCP-стрим аллоцирует quinn-Endpoint + задачи ДО обфс/PQ-auth;
         // флуд «молчаливыми» коннектами (ничего не шлют) копил бы их безлимитно (DoS-исчерпание
         // fd/памяти). Ограничиваем число ОДНОВРЕМЕННЫХ pre-auth хендшейков семафором (нет слота →
@@ -931,7 +1017,7 @@ async fn run_server(tun: Arc<Tun>) -> Result<()> {
                                 continue;
                             }
                         };
-                        let (tun, issuer_auth, spent, signer, scfg, router, pool) = (
+                        let (tun, issuer_auth, spent, signer, scfg, router, pool, policy) = (
                             tun.clone(),
                             issuer_auth.clone(),
                             spent.clone(),
@@ -939,6 +1025,7 @@ async fn run_server(tun: Arc<Tun>) -> Result<()> {
                             tcp_server_cfg.clone(),
                             router.clone(),
                             pool.clone(),
+                            policy.clone(),
                         );
                         tokio::spawn(async move {
                             // H-3: те же ключи, что у UDP-кольца — текущая и прошлая эпоха.
@@ -972,7 +1059,7 @@ async fn run_server(tun: Arc<Tun>) -> Result<()> {
                             // Хендшейк прошёл (obfs+PQ+токен впереди) → освобождаем pre-auth слот:
                             // established-сессия лимит одновременных хендшейков больше не держит.
                             drop(permit);
-                            handle_client(Tunnel::new(conn, true), tun, issuer_auth, spent, rate_limit, admin_dst, signer, pin, router, pool).await;
+                            handle_client(Tunnel::new(conn, true), tun, issuer_auth, spent, rate_limit, policy, signer, pin, router, pool).await;
                             // ep жив до конца handle_client (в scope) → соединение не рвётся
                         });
                     }
@@ -1011,11 +1098,12 @@ async fn run_server(tun: Arc<Tun>) -> Result<()> {
         let signer = signer.clone();
         let router = router.clone();
         let pool = pool.clone();
+        let policy = policy.clone();
         tokio::spawn(async move {
             match incoming.await {
                 Ok(conn) => {
                     drop(permit); // хендшейк прошёл → освободить pre-auth слот (established не держит)
-                    handle_client(Tunnel::new(conn, false), tun, issuer_auth, spent, rate_limit, admin_dst, signer, pin, router, pool).await;
+                    handle_client(Tunnel::new(conn, false), tun, issuer_auth, spent, rate_limit, policy, signer, pin, router, pool).await;
                 }
                 // L-15: сообщение об ошибке несёт reason-фразу КЛИЕНТА (недоверенный пир) —
                 // без обеззараживания он вписывал бы свои строки в лог exit'а.
@@ -1038,7 +1126,7 @@ async fn handle_client(
     issuer_auth: Arc<IssuerAuth>,
     spent: Arc<Mutex<SpentStore>>,
     rate_limit: citadel_quic::ratelimit::RateLimits,
-    admin_dst: Option<([u8; 4], u16)>,
+    policy: citadel_quic::dataplane::EgressPolicy,
     signer: Arc<Option<citadel_quic::pqauth::ServerSigner>>,
     cert_pin: [u8; 32],
     router: ExitTunRouter,
@@ -1062,7 +1150,7 @@ async fn handle_client(
     // Регистрируем адрес в демуксе на время сессии → return-пакеты пойдут ИМЕННО этому клиенту
     // (не «украдёт» соседний pump). Снимаем регистрацию + освобождаем пул по завершении pump.
     let return_rx = router.register(addr);
-    let res = pump(tunnel, tun, Some(addr), None, rate_limit, admin_dst, Some(return_rx)).await;
+    let res = pump(tunnel, tun, Some(addr), None, rate_limit, policy, Some(return_rx)).await;
     router.unregister(addr);
     pool.lock().unwrap().free(addr); // C4: вернуть адрес в пул
     if let Err(e) = res {

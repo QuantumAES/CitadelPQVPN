@@ -42,6 +42,12 @@ export Citadel_ADMIN_PORT=${CITADEL_ADMIN_PORT:-7001}
 ISSUER_IP=$(getent hosts issuer | awk '{print $1; exit}')
 export Citadel_ADMIN_DNAT="${ISSUER_IP}:${Citadel_ADMIN_PORT}"
 echo "[exit] admin-plane: DNAT ${Citadel_ADMIN_VIP}:${Citadel_ADMIN_PORT} -> ${Citadel_ADMIN_DNAT} (только из туннеля)"
+# G1/G2 (аудит-5): запрет форварда из туннеля на инфраструктурные адреса. На живом деплое сюда
+# установщик кладёт публичный IP машины и адрес издателя; на стенде публичного адреса у контейнера
+# нет, поэтому механизм проверяется на паре публичных адресов Cloudflare (ТЕСТ 25): 1.0.0.1
+# закрыт целиком, кроме TCP :80 — ровно так же, как на деплое закрыт хост, кроме token-порта.
+export Citadel_DENY_DSTS=${CITADEL_DENY_DSTS:-1.0.0.1}
+export Citadel_ALLOW_DSTS=${CITADEL_ALLOW_DSTS:-1.0.0.1:80}
 rm -f /shared/exit.pin   # убрать устаревший pin от прошлого запуска
 echo "[exit] старт citadel-m1 (server, PQ X25519MLKEM768)…"
 exec citadel-m1
