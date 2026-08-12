@@ -219,6 +219,9 @@ const Map<String, String> langEn = {
   'need_session': 'An active session is required',
   'need_session_body': 'Subscriber management runs over the admin channel inside the tunnel. '
       'Connect to “{name}” to continue.',
+  'session_restoring': 'Restoring the session',
+  'session_restoring_body': 'The tunnel to “{name}” is reconnecting. '
+      'The subscriber list will load by itself once the channel is back.',
   'registry_loading': 'Loading the registry…',
   'registry_empty': 'The registry is empty — issue the first access.',
   'entry_expired': 'expired',

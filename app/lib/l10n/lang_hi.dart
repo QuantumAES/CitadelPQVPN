@@ -217,6 +217,9 @@ const Map<String, String> langHi = {
   'need_session': 'सक्रिय सत्र आवश्यक है',
   'need_session_body': 'सब्सक्राइबर प्रबंधन टनल के भीतर admin चैनल से होता है। '
       'जारी रखने के लिए “{name}” से कनेक्ट करें।',
+  'session_restoring': 'सत्र बहाल किया जा रहा है',
+  'session_restoring_body': '“{name}” की टनल फिर से जुड़ रही है। '
+      'चैनल लौटते ही सब्सक्राइबर सूची अपने आप लोड हो जाएगी।',
   'registry_loading': 'रजिस्ट्री लोड हो रही है…',
   'registry_empty': 'रजिस्ट्री खाली है — पहला एक्सेस जारी करें।',
   'entry_expired': 'समाप्त',

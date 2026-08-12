@@ -1150,7 +1150,7 @@ async fn run_auth_probe() -> Result<()> {
     // ключом, который тот больше не принимает, и «отказ» означал бы не то, что проверяется.
     let ep = match citadel_quic::config::ClientConfig::from_env()?.transport_psk() {
         Some(p) => citadel_quic::client_endpoint_obfs(p, citadel_quic::pacing_profile(None))?,
-        None => quinn::Endpoint::client("0.0.0.0:0".parse()?)?,
+        None => citadel_quic::client_endpoint_plain()?,
     };
     let cfg = match read_pin_for(citadel_quic::client::host_of(&connect)) {
         PinMode::Pinned(p) => citadel_quic::client_config_pinned(citadel_quic::kx_groups_from_env(), p)?,

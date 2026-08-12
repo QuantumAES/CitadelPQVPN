@@ -602,6 +602,14 @@ fn build_endpoint(
 ) -> Result<quinn::Endpoint> {
     // Android: исключить исходящий сокет движка из собственного туннеля (анти-петля).
     // На desktop/сервере протектор не установлен → no-op. Должно быть ДО connect.
+    //
+    // Без этой строки хендшейк проходит (он идёт ДО `VpnService.Builder.establish`, туннеля ещё
+    // нет), а в момент подъёма TUN с маршрутом по умолчанию наши же UDP-пакеты к exit'у уходят
+    // В СОБСТВЕННЫЙ туннель: данные встают намертво, ACK'и не возвращаются, cwnd не открывается —
+    // «на провод ушло 2 из 113, потерь 0». Ровно это и наблюдалось на Android (см. регрессию из
+    // захода 7, где строку потеряли при переносе `pacing` в параметр). Тест
+    // `udp_transport_socket_goes_through_protector` держит инвариант.
+    crate::protect::protect_socket(crate::protect::handle_of(&std_sock));
     let sock = Arc::new(ObfsUdpSocket::new(std_sock, psk, pacing)?);
     // Pacer спавним только при включённом пейсинге; держит Weak → не мешает дропу сокета.
     if matches!(pacing, Pacing::Slotted { .. }) {
@@ -650,6 +658,19 @@ pub fn server_endpoint_obfs(
 /// в token-less деплое). Перебирать эпохи клиенту незачем: он знает, чем говорит.
 pub fn client_endpoint_obfs(psk: [u8; 32], pacing: Pacing) -> Result<quinn::Endpoint> {
     build_endpoint(std::net::UdpSocket::bind("0.0.0.0:0")?, None, PskSource::Fixed(psk), pacing)
+}
+
+/// КЛИЕНТ без obfs (token-less деплой/проба, где транспортного PSK нет): обычный QUIC-endpoint,
+/// но с той же защитой сокета от заворачивания в собственный туннель, что и у obfs-пути.
+///
+/// Своя функция нужна ровно из-за этого: `quinn::Endpoint::client` создаёт UDP-сокет ВНУТРИ себя,
+/// и вклиниться между `bind` и `connect` с `protect()` там негде — на Android такой endpoint
+/// работал бы только до подъёма TUN (та же беда, что описана в [`build_endpoint`]).
+pub fn client_endpoint_plain() -> Result<quinn::Endpoint> {
+    let sock = std::net::UdpSocket::bind("0.0.0.0:0")?;
+    crate::protect::protect_socket(crate::protect::handle_of(&sock));
+    let runtime = quinn::default_runtime().ok_or_else(|| anyhow!("нет async runtime (tokio)"))?;
+    Ok(quinn::Endpoint::new(quinn::EndpointConfig::default(), None, sock, runtime)?)
 }
 
 #[cfg(test)]

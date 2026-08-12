@@ -492,7 +492,8 @@ pub(crate) async fn try_quic_connect(
     let ep = match cfg.transport_psk() {
         // M-8: профиль шейпинга — из настройки клиента (GUI-тумблер), иначе из env (консольные роли).
         Some(psk) => crate::client_endpoint_obfs(psk, crate::pacing_profile(cfg.pacing.as_deref()))?,
-        None => quinn::Endpoint::client("0.0.0.0:0".parse()?)?,
+        // Не `Endpoint::client`: его сокет не пройдёт через протектор (см. `client_endpoint_plain`).
+        None => crate::client_endpoint_plain()?,
     };
     eprintln!(
         "[citadel-m1:client] QUIC: пробую {connect} ({addr}), server_name={}, KX={}",

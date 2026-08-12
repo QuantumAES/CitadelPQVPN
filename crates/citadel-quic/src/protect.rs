@@ -41,21 +41,37 @@ mod tests {
         }
     }
 
-    /// Транспортный obfs-TCP сокет обязан быть защищён ДО connect — иначе на Android туннель
-    /// заворачивает собственный транспорт в себя (сессия живёт секунды). Проверяем сам helper,
-    /// через который ходят `quic_over_tcp_connect` и TCP-проба диагностики.
+    /// Транспортные сокеты движка обязаны проходить через протектор ДО соединения — иначе на
+    /// Android туннель заворачивает собственный транспорт в себя.
+    ///
+    /// Проверяются ОБА транспорта в одном тесте намеренно: реестр протектора глобален на процесс,
+    /// и два теста, ставящих его параллельно, мешали бы друг другу.
+    ///
+    /// UDP-половина — регрессионная. Строку `protect_socket` в `build_endpoint` однажды уже
+    /// потеряли при рефакторинге (заход 7, перенос `pacing` в параметр), и на Android это дало
+    /// самый неприятный вид поломки: хендшейк проходит (туннеля ещё нет), а данные после подъёма
+    /// TUN встают намертво — наши же пакеты к exit'у уходят в наш же туннель. Симптом при этом
+    /// выглядит как «сеть плохая», и разбор уезжает в MTU/оператора.
     #[tokio::test]
-    async fn tcp_transport_socket_goes_through_protector() {
+    async fn transport_sockets_go_through_protector() {
         let seen = Arc::new(Mutex::new(Vec::new()));
         let srv = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = srv.local_addr().unwrap();
 
         set_socket_protector(Arc::new(Peeker(seen.clone())));
         let s = connect_tcp(addr).await.unwrap();
-        clear_socket_protector();
+        let tcp_seen = seen.lock().unwrap().clone();
+        assert_eq!(tcp_seen.len(), 1, "obfs-TCP: протектор вызван ровно один раз");
+        assert_eq!(tcp_seen[0], handle_of(&s), "защищали тот сокет, который соединили");
 
-        let seen = seen.lock().unwrap().clone();
-        assert_eq!(seen.len(), 1, "протектор вызван ровно один раз");
-        assert_eq!(seen[0], handle_of(&s), "защищали тот сокет, который соединили");
+        // QUIC/UDP: и обфусцированный endpoint, и «голый» (token-less деплой) — оба обязаны
+        // защитить свой сокет при создании.
+        seen.lock().unwrap().clear();
+        let obfs = crate::client_endpoint_obfs([7u8; 32], crate::Pacing::None).unwrap();
+        assert_eq!(seen.lock().unwrap().len(), 1, "QUIC/UDP obfs: сокет не прошёл протектор");
+        let plain = crate::client_endpoint_plain().unwrap();
+        assert_eq!(seen.lock().unwrap().len(), 2, "QUIC/UDP без obfs: сокет не прошёл протектор");
+        clear_socket_protector();
+        drop((obfs, plain));
     }
 }

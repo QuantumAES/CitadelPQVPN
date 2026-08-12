@@ -219,6 +219,9 @@ const Map<String, String> langEs = {
   'need_session': 'Se necesita una sesión activa',
   'need_session_body': 'La gestión de suscriptores va por el canal admin dentro del túnel. '
       'Conéctate a «{name}» para continuar.',
+  'session_restoring': 'Restaurando la sesión',
+  'session_restoring_body': 'El túnel a «{name}» se está reconectando. '
+      'La lista de suscriptores se cargará sola en cuanto vuelva el canal.',
   'registry_loading': 'Cargando el registro…',
   'registry_empty': 'El registro está vacío: emite el primer acceso.',
   'entry_expired': 'caducado',

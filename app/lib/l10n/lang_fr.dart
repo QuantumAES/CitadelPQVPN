@@ -220,6 +220,9 @@ const Map<String, String> langFr = {
   'need_session': 'Une session active est nécessaire',
   'need_session_body': 'La gestion des abonnés passe par le canal admin à l’intérieur du tunnel. '
       'Connectez-vous à « {name} » pour continuer.',
+  'session_restoring': 'Restauration de la session',
+  'session_restoring_body': 'Le tunnel vers « {name} » se reconnecte. '
+      'La liste des abonnés se chargera d’elle-même dès le retour du canal.',
   'registry_loading': 'Chargement du registre…',
   'registry_empty': 'Le registre est vide — délivrez le premier accès.',
   'entry_expired': 'expiré',

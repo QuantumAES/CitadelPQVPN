@@ -221,6 +221,9 @@ const Map<String, String> langDe = {
   'need_session': 'Eine aktive Sitzung ist erforderlich',
   'need_session_body': 'Die Teilnehmerverwaltung läuft über den Admin-Kanal im Tunnel. '
       'Verbinden Sie sich mit „{name}“, um fortzufahren.',
+  'session_restoring': 'Sitzung wird wiederhergestellt',
+  'session_restoring_body': 'Der Tunnel zu „{name}“ verbindet sich neu. '
+      'Die Teilnehmerliste lädt von selbst, sobald der Kanal zurück ist.',
   'registry_loading': 'Register wird geladen…',
   'registry_empty': 'Das Register ist leer — stellen Sie den ersten Zugang aus.',
   'entry_expired': 'abgelaufen',

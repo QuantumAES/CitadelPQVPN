@@ -218,6 +218,9 @@ const Map<String, String> langCs = {
   'need_session': 'Je potřeba aktivní relace',
   'need_session_body': 'Správa účastníků probíhá admin kanálem uvnitř tunelu. '
       'Pokračujte připojením k „{name}“.',
+  'session_restoring': 'Obnovuji relaci',
+  'session_restoring_body': 'Tunel k „{name}“ se znovu připojuje. '
+      'Seznam účastníků se načte sám, jakmile se kanál vrátí.',
   'registry_loading': 'Načítání registru…',
   'registry_empty': 'Registr je prázdný — vydejte první přístup.',
   'entry_expired': 'vypršel',

@@ -136,6 +136,7 @@ class AppState extends ChangeNotifier {
 
   void _setError(String title, String hint, String detail) {
     phase = VpnPhase.error;
+    reconnecting = false;
     errorTitle = title;
     errorHint = hint;
     errorMsg = detail;
@@ -148,6 +149,13 @@ class AppState extends ChangeNotifier {
 
   /// Момент перехода в `up` — для счётчика времени сессии.
   DateTime? since;
+
+  /// Сессия УЖЕ поднималась и сейчас восстанавливается движком (событие `migrating`), а не
+  /// подключается с нуля. Для интерфейса это разные вещи: при первом подключении человеку нужна
+  /// кнопка «Подключить», а во время реконнекта — сообщение «восстанавливаю», потому что кнопка
+  /// там бессмысленна (движок уже работает) и читается как отказ. Оба состояния приходят в
+  /// [VpnPhase.connecting], различить их иначе нечем.
+  bool reconnecting = false;
 
   /// Имя профиля текущей (или последней) попытки подключения. Нужно для человекочитаемых
   /// сообщений: «Сервер недоступен» само по себе не говорит, к ЧЕМУ не удалось подключиться.
@@ -338,6 +346,7 @@ class AppState extends ChangeNotifier {
   Future<void> _androidConnect({String? profileId, String? link}) async {
     // «Подключаемся» уже на время консента/старта сервиса (может всплыть системный диалог).
     phase = VpnPhase.connecting;
+    reconnecting = false;
     activeProfileId = profileId;
     exit = transport = cidr = '';
     _clearError();
@@ -364,6 +373,7 @@ class AppState extends ChangeNotifier {
   void _listen(Stream<VpnEventDto> stream, {String? profileId}) {
     _sub?.cancel();
     phase = VpnPhase.connecting;
+    reconnecting = false;
     activeProfileId = profileId;
     if (profileId != null) lastProfileId = profileId; // переживёт отключение (нужно диагностике)
     exit = transport = cidr = '';
@@ -430,11 +440,14 @@ class AppState extends ChangeNotifier {
         if (phase != VpnPhase.error) phase = VpnPhase.connecting;
       case 'migrating':
         phase = VpnPhase.connecting;
+        reconnecting = true;
       case 'up':
         phase = VpnPhase.up;
+        reconnecting = false;
         since ??= DateTime.now();
       case 'down':
       case 'idle':
+        reconnecting = false;
         // Движок сообщает это состояние, только свернув цикл (`finish_stopped`) — реконнект такого
         // не шлёт. Значит останавливать больше нечего.
         _sessionLive = false;
@@ -455,6 +468,7 @@ class AppState extends ChangeNotifier {
     _sub = null;
     _sessionLive = false;
     phase = VpnPhase.off;
+    reconnecting = false;
     activeProfileId = null;
     exit = transport = cidr = '';
     _clearError(); // отключились сами — прошлый отказ больше не про текущее состояние

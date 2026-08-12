@@ -40,6 +40,11 @@ class _SubscribersPageState extends State<SubscribersPage> {
   int _autoTried = 0;
   static const _autoLimit = 2;
 
+  /// Сколько раз потолок авто-загрузок был возвращён из-за оборвавшейся под попыткой сессии
+  /// (см. [_autoRefresh]). Ограничен, чтобы мигающий туннель не давал бесконечный круг попыток.
+  int _refunds = 0;
+  static const _refundLimit = 2;
+
   AppState get s => widget.state;
 
   /// Строки текущего языка.
@@ -71,10 +76,23 @@ class _SubscribersPageState extends State<SubscribersPage> {
 
   /// Авто-загрузка списка — с потолком попыток (см. [_autoLimit]). Ручное «Обновить» потолок
   /// сбрасывает: человек нажал сам, значит, ждёт результата именно сейчас.
+  ///
+  /// Попытка, под которой ОБОРВАЛАСЬ сама сессия, потолок не тратит: она проверяла не admin-канал,
+  /// а туннель, которого в тот момент уже не было. Именно так уходила первая из двух попыток —
+  /// движок за 4с признавал путь мёртвым и переустанавливал сессию другим транспортом, а экран
+  /// засчитывал себе неудачу и после второй такой же сдавался на «Обновить». Возвраты ограничены
+  /// ([_refundLimit]), иначе мигающий туннель крутил бы загрузку бесконечно.
   void _autoRefresh() {
     if (!_sessionUp || _busy || _entries != null || _autoTried >= _autoLimit) return;
     _autoTried++;
-    _refresh();
+    _refresh().then((_) {
+      if (!mounted || _entries != null || _sessionUp || _refunds >= _refundLimit) return;
+      _refunds++;
+      _autoTried--;
+      // Отказ был про оборвавшуюся сессию, а не про реестр: баннер с ним только пугает, пока
+      // движок переподключается. Новая попытка пойдёт сама на событии «сессия поднялась».
+      setState(() => _error = null);
+    });
   }
 
   /// Потолок ожидания ОДНОЙ попытки. У ядра свои таймауты (10с connect + 15с на операцию канала),
@@ -127,6 +145,7 @@ class _SubscribersPageState extends State<SubscribersPage> {
   /// Ручное «Обновить»: потолок авто-попыток сброшен (человек ждёт результата сейчас).
   Future<void> _manualRefresh() async {
     _autoTried = 0;
+    _refunds = 0;
     await _refresh();
   }
 
@@ -390,23 +409,33 @@ class _SubscribersPageState extends State<SubscribersPage> {
   }
 
   /// Гейт: admin-канал живёт за туннелем — без активной сессии профиля операций нет.
+  ///
+  /// Два РАЗНЫХ состояния, которые нельзя показывать одинаково:
+  ///   * сессии нет вовсе — нужна кнопка «Подключить»;
+  ///   * сессия была и восстанавливается движком (смена транспорта после мёртвого пути, смена
+  ///     сети) — здесь «Нужна активная сессия» с кнопкой читается как ОТКАЗ, хотя всё идёт своим
+  ///     чередом и через несколько секунд список подтянется сам. Ровно на это и жалуются: «ретраи,
+  ///     затем „Нужна активная сессия“, после этого открывается».
   Widget _gate(BuildContext context) {
     final cs = Theme.of(context).colorScheme;
-    final connecting =
-        s.activeProfileId == widget.profile.id && s.phase == VpnPhase.connecting;
+    final mine = s.activeProfileId == widget.profile.id;
+    final connecting = mine && s.phase == VpnPhase.connecting;
+    final restoring = connecting && s.reconnecting;
     return Center(
       child: Padding(
         padding: const EdgeInsets.all(24),
         child: Column(
           mainAxisSize: MainAxisSize.min,
           children: [
-            Icon(Icons.vpn_lock, size: 56, color: cs.outline),
+            Icon(restoring ? Icons.autorenew : Icons.vpn_lock,
+                size: 56, color: cs.outline),
             const SizedBox(height: 16),
-            Text(t('need_session'),
+            Text(t(restoring ? 'session_restoring' : 'need_session'),
                 style: Theme.of(context).textTheme.titleMedium),
             const SizedBox(height: 4),
             Text(
-              t('need_session_body', {'name': widget.profile.name}),
+              t(restoring ? 'session_restoring_body' : 'need_session_body',
+                  {'name': widget.profile.name}),
               textAlign: TextAlign.center,
               style: Theme.of(context)
                   .textTheme
@@ -414,17 +443,23 @@ class _SubscribersPageState extends State<SubscribersPage> {
                   ?.copyWith(color: cs.outline),
             ),
             const SizedBox(height: 24),
-            FilledButton.icon(
-              onPressed:
-                  connecting ? null : () => s.connectProfile(widget.profile.id),
-              icon: connecting
-                  ? const SizedBox(
-                      width: 16,
-                      height: 16,
-                      child: CircularProgressIndicator(strokeWidth: 2))
-                  : const Icon(Icons.shield_outlined),
-              label: Text(connecting ? t('status_connecting') : t('connect')),
-            ),
+            // При восстановлении кнопки нет: движок уже подключается сам, а нажатие подняло бы
+            // ВТОРУЮ сессию (ядро гасит прежнюю) — то есть отбросило бы человека назад.
+            if (restoring)
+              const SizedBox(
+                  width: 24, height: 24, child: CircularProgressIndicator(strokeWidth: 2))
+            else
+              FilledButton.icon(
+                onPressed:
+                    connecting ? null : () => s.connectProfile(widget.profile.id),
+                icon: connecting
+                    ? const SizedBox(
+                        width: 16,
+                        height: 16,
+                        child: CircularProgressIndicator(strokeWidth: 2))
+                    : const Icon(Icons.shield_outlined),
+                label: Text(connecting ? t('status_connecting') : t('connect')),
+              ),
           ],
         ),
       ),

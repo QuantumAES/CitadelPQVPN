@@ -25,7 +25,10 @@ pub mod protect;
 pub mod ratelimit;
 pub mod tcp_obfs;
 pub mod vpn;
-pub use obfs_socket::{client_endpoint_obfs, pacing_profile, server_endpoint_obfs, Pacing, PskSource};
+pub use obfs_socket::{
+    client_endpoint_obfs, client_endpoint_plain, pacing_profile, server_endpoint_obfs, Pacing,
+    PskSource,
+};
 pub use obfs_tcp::{client_endpoint_obfs_tcp, server_endpoint_obfs_tcp};
 pub use protect::{clear_socket_protector, set_socket_protector, SocketProtector};
 

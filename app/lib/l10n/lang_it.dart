@@ -219,6 +219,9 @@ const Map<String, String> langIt = {
   'need_session': 'Serve una sessione attiva',
   'need_session_body': 'La gestione degli abbonati passa dal canale admin dentro il tunnel. '
       'Connettiti a «{name}» per continuare.',
+  'session_restoring': 'Ripristino della sessione',
+  'session_restoring_body': 'Il tunnel verso «{name}» si sta riconnettendo. '
+      'L’elenco degli abbonati si caricherà da solo appena torna il canale.',
   'registry_loading': 'Caricamento del registro…',
   'registry_empty': 'Il registro è vuoto: rilascia il primo accesso.',
   'entry_expired': 'scaduto',
