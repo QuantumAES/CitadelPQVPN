@@ -423,8 +423,10 @@ impl AdminServer {
         self.read_hex32("admin_id")
     }
 
-    /// Layer-1 client_id самого админа: его `Revoke` отклоняется (анти-self-lockout, R6);
-    /// разотзыв/ротация — break-glass на сервере.
+    /// Layer-1 client_id самого админа: его `Revoke` отклоняется (анти-self-lockout, R6).
+    /// Разотзыв любого другого абонента — `Add` по этому же каналу (upsert возвращает `active`);
+    /// ротация самой admin-идентичности и восстановление утраченного мастер-доступа — РЕИНСТАЛЛ:
+    /// серверного break-glass больше нет, `registry revoke|list` с бокса убраны намеренно.
     pub fn admin_client_id(&self) -> Option<[u8; 32]> {
         self.read_hex32("admin.client_id")
     }
@@ -519,7 +521,8 @@ impl AdminServer {
                 if let Some(mine) = self.admin_client_id() {
                     if revoke_chain(&cur, &client_id).contains(&mine) {
                         bail!(
-                            "отзыв client_id админа запрещён (self-lockout, R6) — break-glass на сервере"
+                            "отзыв client_id админа запрещён (self-lockout, R6): восстановить \
+                             admin-доступ на сервере нечем — только реинсталл"
                         );
                     }
                 }

@@ -10,9 +10,10 @@
 //!               в схеме v2 (M-6) ключ эпохи секретен, см. `citadel_token::fetch_epoch_key`.
 //!   `batch`   — (legacy) выпустить N токенов в одном процессе → файл (для локального демо/тестов).
 //!
-//! CLI-подкоманды (arg[1], вне env-роли): `registry` — оффлайн-правка Layer-1 реестра на сервере
-//! (C5.5); `admin` — те же операции ПО СЕТЕВОМУ admin-каналу (PQ-TLS+pin, домен+EKM; C7.5) — путь
-//! GUI, обычно через туннель к ADMIN_VIP.
+//! CLI-подкоманды (arg[1], вне env-роли): `registry` — провижининг Layer-1 реестра на сервере
+//! (C5.5), ТОЛЬКО `add`/`add-seed`: отзыв и список с сервера убраны (см. [`run_registry`]);
+//! `admin` — управление ПО СЕТЕВОМУ admin-каналу (PQ-TLS+pin, домен+EKM; C7.5) — путь GUI,
+//! обычно через туннель к ADMIN_VIP, требует admin-seed из мастер-ссылки.
 //!
 //! Сетевой формат: кадр `u32(len, BE) ‖ payload`; запрос — ослеплённый элемент (32 Б), ответ —
 //! `evaluated(32) ‖ DLEQ(64)`.
@@ -580,14 +581,25 @@ fn merge_registry(existing: &str, pubs: &[BootstrapPub], valid_until: u64) -> St
 
 // ===================== C5.5: admin-CLI управления реестром =====================
 
-/// `citadel-token registry <add|add-seed|revoke|list> …` — оффлайн-правка Layer-1 реестра админом
-/// (замена ручного `sed` из installer'а). Каталог реестра — `Citadel_TOKEN_DIR` (том issuer'а).
-/// Issuer перечитывает реестр на КАЖДЫЙ auth ⇒ add/revoke действуют со следующего коннекта
-/// (отзыв — ≤ длины эпохи). Запись атомарна (temp+rename) — конкурентный читатель-issuer видит
-/// старый ИЛИ новый файл, не частичный. C7.1: логика реестра — общая `citadel_token::admin`
-/// (те же функции обслуживают admin-канал по туннелю).
+/// `citadel-token registry <add|add-seed> …` — провижининг Layer-1 реестра на самом сервере.
+/// Каталог реестра — `Citadel_TOKEN_DIR` (том issuer'а). Issuer перечитывает реестр на КАЖДЫЙ auth
+/// ⇒ запись действует со следующего коннекта. Запись атомарна (temp+rename) — конкурентный
+/// читатель-issuer видит старый ИЛИ новый файл, не частичный. C7.1: логика реестра — общая
+/// `citadel_token::admin` (те же функции обслуживают admin-канал по туннелю).
+///
+/// **`revoke` и `list` на сервере УБРАНЫ (Q4-класс, как убран `citadel-linkgen`).** Управление
+/// абонентской базой — исключительно по мастер-ссылке через admin-канал (`citadel-token admin`,
+/// GUI «Абоненты»), то есть требует ключа, которого на боксе нет. Смысл: скомпрометированный
+/// сервер не получает вместе с root'ом готовый инструмент перечисления базы и массового отзыва.
+/// Это снимает инструмент, а не физическую возможность (root читает файл реестра и так) — ровно
+/// как отсутствие `linkgen` не мешает root'у собрать URI руками; ценность в том, что серверу не
+/// приписано НИ ОДНОЙ управляющей операции: ни в коде, ни в инструкции оператора.
+///
+/// Цена, принятая осознанно: break-glass после self-lockout (R6) и после потери мастер-доступа —
+/// **реинсталл**, а не команда на боксе. `add`/`add-seed` остаются: их зовёт сам установщик
+/// (заверение мастер-ссылки, `--enroll`/`--linkh`), и они не читают и не гасят чужие записи.
 fn run_registry(args: &[String]) -> Result<()> {
-    use citadel_token::admin::{atomic_write, registry_apply_add, registry_apply_revoke};
+    use citadel_token::admin::{atomic_write, registry_apply_add};
     let path = registry_path(&token_dir());
     match args.get(2).map(String::as_str) {
         Some("add") => {
@@ -632,18 +644,22 @@ fn run_registry(args: &[String]) -> Result<()> {
             atomic_write(&path, &registry_apply_add(&cur, &pk, vu))?;
             eprintln!("[registry] add-seed → client_id {} active до {vu}", hex::encode(pk));
         }
-        Some("revoke") => {
-            let pk = parse_hex32(args.get(3), "pub (client_id, 64 hex)")?;
-            let cur = std::fs::read_to_string(&path).unwrap_or_default();
-            atomic_write(&path, &registry_apply_revoke(&cur, &pk)?)?;
-            eprintln!("[registry] revoke {} (действует ≤ длины эпохи)", hex::encode(pk));
-        }
-        Some("list") => print!("{}", std::fs::read_to_string(&path).unwrap_or_default()),
+        // Явный отказ, а не «неизвестная подкоманда»: оператор (и тот, кто читает старую
+        // инструкцию) обязан увидеть, что операции не потерялись, а переехали в admin-канал.
+        Some(gone @ ("revoke" | "list")) => anyhow::bail!(
+            "`registry {gone}` на сервере больше нет. Отзыв и просмотр абонентской базы — только \n  \
+             по мастер-ссылке через admin-канал: `citadel-token admin <list|revoke>` (env \n  \
+             Citadel_ADMIN_ADDR/Citadel_ISSUER_PIN/Citadel_ISSUER_MLDSA/Citadel_ADMIN_SEED) либо \n  \
+             GUI «Абоненты». На боксе управляющего ключа нет — и это намеренно (Q4-класс: как и \n  \
+             citadel-linkgen, инструмент управления сервером не поставляется).\n  \
+             Мастер-доступ утрачен → реинсталл (новая идентичность, прежние ссылки мертвы)."
+        ),
         _ => anyhow::bail!(
-            "citadel-token registry <add <pub>|add-seed <seed>|revoke <pub>|list> [valid_until]\n  \
+            "citadel-token registry <add <pub>|add-seed <seed>> [valid_until]\n  \
              valid_until: unix-секунды | +<N>d | +<N>h | +<секунды> (дефолт +365d).\n  \
              add … --enroll <unix> [--linkh <hex32>]: одноразовая заверенная запись (M-9).\n  \
-             Каталог реестра — $Citadel_TOKEN_DIR (том issuer'а)."
+             Каталог реестра — $Citadel_TOKEN_DIR (том issuer'а).\n  \
+             Отзыв/список — НЕ на сервере: `citadel-token admin <list|revoke>` по мастер-ссылке."
         ),
     }
     Ok(())
@@ -1485,6 +1501,29 @@ mod tests {
     /// Многоразовая bootstrap-запись (как было до M-9).
     fn plain(pk: [u8; 32]) -> BootstrapPub {
         BootstrapPub { client_id: pk, enroll_until: None, link_hash: None }
+    }
+
+    /// Управляющих операций на сервере нет: `registry revoke|list` убраны (Q4-класс, как linkgen).
+    /// Тест держит решение: случайный «возврат для удобства ops» уронит сборку, а не тихо вернёт
+    /// скомпрометированному серверу готовый инструмент перечисления базы и массового отзыва.
+    /// Провижининг (`add`/`add-seed`, зовёт установщик) обязан остаться живым.
+    #[test]
+    fn server_cli_has_no_revoke_and_no_list() {
+        let argv = |cmd: &str| -> Vec<String> {
+            ["citadel-token", "registry", cmd, &hex::encode([0x11u8; 32])]
+                .iter()
+                .map(|s| s.to_string())
+                .collect()
+        };
+        for cmd in ["revoke", "list"] {
+            let e = super::run_registry(&argv(cmd)).expect_err("операция обязана быть недоступна");
+            let msg = format!("{e:#}");
+            assert!(msg.contains("admin"), "отказ обязан указывать на admin-канал: {msg}");
+        }
+        // Неизвестная подкоманда печатает usage — и он тоже не должен рекламировать удалённое.
+        let usage = format!("{:#}", super::run_registry(&argv("wat")).unwrap_err());
+        assert!(!usage.contains("|revoke <pub>|list>"), "usage рекламирует удалённые команды: {usage}");
+        assert!(usage.contains("add-seed"), "провижининг обязан остаться: {usage}");
     }
 
     /// C5.4b: bootstrap НЕ воскрешает отозванного абонента при рестарте (сохраняет `revoked`),
