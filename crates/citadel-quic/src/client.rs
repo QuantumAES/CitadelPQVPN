@@ -21,7 +21,7 @@ use citadel_masque::{capsule, datagram, ip};
 use citadel_tun::TunIo;
 
 use crate::config::{ClientConfig, MldsaExpect, PinMode};
-use crate::dataplane::{pump, ClientPath, Tunnel};
+use crate::dataplane::{pump, ClientPath, PumpExit, Tunnel};
 
 /// Неудача [`establish_session`] с ответом на единственный вопрос, который нужен циклу
 /// реконнекта: **успел ли токен Layer-2 уйти exit'у**.
@@ -81,6 +81,10 @@ impl Session {
     /// Транспорт сессии: `"QUIC/UDP"` или `"obfs-TCP"`.
     pub fn transport(&self) -> &'static str {
         self.tunnel.kind()
+    }
+    /// Поднят ли транспорт поверх obfs-TCP (см. [`Tunnel::is_tcp`]).
+    pub fn over_tcp(&self) -> bool {
+        self.tunnel.is_tcp()
     }
     /// Фактический адрес exit'а, с которым говорит транспорт (для bypass-маршрута на Linux —
     /// исключить собственные пакеты к exit из full-tunnel, иначе петля маршрутизации).
@@ -367,7 +371,10 @@ pub async fn establish_session(
 
 /// Запустить data-plane: перекачка пакетов TUN ⇄ транспорт. Клиент себя не лимитирует
 /// (rate-limit F7 — забота exit). Поглощает `session` (транспорт уходит в `pump`).
-pub async fn run_data_plane(session: Session, tun: Arc<dyn TunIo>) -> Result<()> {
+///
+/// Возвращает [`PumpExit`] — цикл реконнекта по нему решает, повторять ли тот же транспорт
+/// (см. `vpn::VpnController::connect`).
+pub async fn run_data_plane(session: Session, tun: Arc<dyn TunIo>) -> Result<PumpExit> {
     // клиент: egress-фильтр/rate-limit/admin-VIP выключены (это политика exit-стороны).
     // return_rx=None — у клиента один TUN и одно соединение, читает свой TUN сам (демукс — только exit).
     // ClientPath — чистая диагностика (pump ничего не фильтрует): назначенный адрес, чтобы назвать

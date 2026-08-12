@@ -27,6 +27,19 @@ class _SubscribersPageState extends State<SubscribersPage> {
   bool _busy = false;
   String? _error;
 
+  /// Номер идущей попытки и сколько их всего в текущей операции — показываем прямо на экране.
+  /// Без этого ожидание было немым: попытки идут по 10–30с каждая, а человек всё это время видит
+  /// одну и ту же надпись «загрузка» и не понимает, живо ли вообще что-нибудь.
+  int _attempt = 0;
+  int _attemptsTotal = 0;
+
+  /// Сколько раз экран уже пытался подтянуть список САМ. Потолок обязателен: авто-загрузка
+  /// висит на «сессия поднялась», а неудачная попытка оставляет `_entries == null`, поэтому
+  /// каждый реконнект запускал её заново — получался бесконечный круг «загрузка → отказ →
+  /// переподключение → загрузка», ровно тот, на который жалуются. Дальше — только «Обновить».
+  int _autoTried = 0;
+  static const _autoLimit = 2;
+
   AppState get s => widget.state;
 
   /// Строки текущего языка.
@@ -40,7 +53,7 @@ class _SubscribersPageState extends State<SubscribersPage> {
   void initState() {
     super.initState();
     s.addListener(_onStateChanged);
-    if (_sessionUp) _refresh();
+    if (_sessionUp) _autoRefresh();
   }
 
   @override
@@ -53,7 +66,15 @@ class _SubscribersPageState extends State<SubscribersPage> {
   void _onStateChanged() {
     if (!mounted) return;
     setState(() {});
-    if (_sessionUp && _entries == null && !_busy) _refresh();
+    _autoRefresh();
+  }
+
+  /// Авто-загрузка списка — с потолком попыток (см. [_autoLimit]). Ручное «Обновить» потолок
+  /// сбрасывает: человек нажал сам, значит, ждёт результата именно сейчас.
+  void _autoRefresh() {
+    if (!_sessionUp || _busy || _entries != null || _autoTried >= _autoLimit) return;
+    _autoTried++;
+    _refresh();
   }
 
   /// Потолок ожидания ОДНОЙ попытки. У ядра свои таймауты (10с connect + 15с на операцию канала),
@@ -73,9 +94,12 @@ class _SubscribersPageState extends State<SubscribersPage> {
     setState(() {
       _busy = true;
       _error = null;
+      _attempt = 1;
+      _attemptsTotal = retries + 1;
     });
     try {
       for (var attempt = 0;; attempt++) {
+        if (mounted && attempt > 0) setState(() => _attempt = attempt + 1);
         try {
           return await op().timeout(_opTimeout);
         } catch (e) {
@@ -91,15 +115,30 @@ class _SubscribersPageState extends State<SubscribersPage> {
         }
       }
     } finally {
-      if (mounted) setState(() => _busy = false);
+      if (mounted) {
+        setState(() {
+          _busy = false;
+          _attemptsTotal = 0;
+        });
+      }
     }
   }
 
+  /// Ручное «Обновить»: потолок авто-попыток сброшен (человек ждёт результата сейчас).
+  Future<void> _manualRefresh() async {
+    _autoTried = 0;
+    await _refresh();
+  }
+
   Future<void> _refresh() async {
-    // #0.1: авто-загрузка после подъёма туннеля — до 3 повторов, пока admin-путь стабилизируется.
+    // #0.1: авто-загрузка после подъёма туннеля — повтор, пока admin-путь стабилизируется
+    // (DNAT/маршрут к VIP могут быть готовы на секунду позже самого туннеля). Повторов ДВА, а не
+    // четыре: каждая неудачная попытка стоит до `_opTimeout`, и четыре подряд превращались в две
+    // минуты немого ожидания — за это время туннель успевал переподключиться, и круг начинался
+    // сначала.
     final list = await _run(
       () => adminSubscribers(profileId: widget.profile.id),
-      retries: 3,
+      retries: 1,
     );
     if (list != null && mounted) {
       // активные сверху, внутри групп — по убыванию срока (свежевыданные видны сразу)
@@ -120,27 +159,31 @@ class _SubscribersPageState extends State<SubscribersPage> {
       context: context,
       builder: (dctx) => AlertDialog(
         title: Text(t('issue_access')),
-        content: Column(
-          mainAxisSize: MainAxisSize.min,
-          children: [
-            TextField(
-              controller: labelC,
-              autofocus: true,
-              decoration: InputDecoration(
-                labelText: t('issue_label'),
-                hintText: t('issue_label_hint'),
-                helperText: t('issue_label_helper'),
+        // Прокрутка: с поднятой клавиатурой диалогу остаётся полоска в пару сотен пикселей, и два
+        // поля с подсказками в неё не влезают (та же беда, что была у листа добавления профиля).
+        content: SingleChildScrollView(
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              TextField(
+                controller: labelC,
+                autofocus: true,
+                decoration: InputDecoration(
+                  labelText: t('issue_label'),
+                  hintText: t('issue_label_hint'),
+                  helperText: t('issue_label_helper'),
+                ),
               ),
-            ),
-            const SizedBox(height: 12),
-            TextField(
-              controller: vuC,
-              decoration: InputDecoration(
-                labelText: t('issue_valid_until'),
-                hintText: t('issue_valid_until_hint'),
+              const SizedBox(height: 12),
+              TextField(
+                controller: vuC,
+                decoration: InputDecoration(
+                  labelText: t('issue_valid_until'),
+                  hintText: t('issue_valid_until_hint'),
+                ),
               ),
-            ),
-          ],
+            ],
+          ),
         ),
         actions: [
           TextButton(
@@ -318,7 +361,7 @@ class _SubscribersPageState extends State<SubscribersPage> {
           ),
           IconButton(
             tooltip: t('refresh'),
-            onPressed: _busy || !_sessionUp ? null : _refresh,
+            onPressed: _busy || !_sessionUp ? null : _manualRefresh,
             icon: const Icon(Icons.refresh),
           ),
         ],
@@ -390,10 +433,27 @@ class _SubscribersPageState extends State<SubscribersPage> {
 
   Widget _list() {
     if (_entries == null) {
+      // Попытки кончились (причина — в баннере сверху): «Загружаю реестр…» здесь было бы враньём
+      // и именно оно выглядело как «висит вечно». Показываем кнопку повтора.
+      if (!_busy) {
+        return Center(
+          child: Padding(
+            padding: const EdgeInsets.all(24),
+            child: OutlinedButton.icon(
+              onPressed: _sessionUp ? _manualRefresh : null,
+              icon: const Icon(Icons.refresh),
+              label: Text(t('refresh')),
+            ),
+          ),
+        );
+      }
+      // Номер попытки — рядом с надписью: ожидание перестаёт быть немым, а по «2/2» видно, что
+      // дальше экран сам пробовать не будет.
+      final counter = _attemptsTotal > 1 ? ' ($_attempt/$_attemptsTotal)' : '';
       return Center(
         child: Padding(
           padding: const EdgeInsets.all(24),
-          child: Text(t('registry_loading'), textAlign: TextAlign.center),
+          child: Text('${t('registry_loading')}$counter', textAlign: TextAlign.center),
         ),
       );
     }

@@ -251,6 +251,11 @@ impl VpnController {
         // итерации без токена мы идём к exit'у как есть — чтобы человек увидел настоящий отказ
         // token-required exit'а, а не молчаливое ожидание.
         let mut attempted = false;
+        // Идти ли сразу obfs-TCP. Ставится, когда предыдущая сессия по QUIC/UDP оказалась
+        // ОДНОСТОРОННЕЙ (наши датаграммы перестали доезжать: узкий MTU пути/потери — см.
+        // `dataplane::PumpExit`). Реконнект тем же транспортом в такой сети упирается ровно в то
+        // же самое, и абонент получает бесконечное «переподключение» вместо связи.
+        let mut prefer_tcp = false;
 
         loop {
             if self.stopped.load(Ordering::SeqCst) {
@@ -311,7 +316,14 @@ impl VpnController {
             // остановки — и лез конфигурировать TUN поверх погашенного сервиса (на Android это и
             // был «CitadelVpnService не зарегистрирован» в логе), а на desktop мог поднять туннель
             // и kill-switch заново, когда пользователь их только что снял.
-            let Some(mut established) = self.until_stop(establish_session(&cfg, false)).await else {
+            if prefer_tcp {
+                eprintln!(
+                    "[vpn] поднимаю сессию сразу obfs-TCP: QUIC/UDP на этой сети оказался \
+                     односторонним (сегментация переживает узкий MTU и потери)"
+                );
+            }
+            let Some(mut established) = self.until_stop(establish_session(&cfg, prefer_tcp)).await
+            else {
                 return self.finish_stopped();
             };
             // Эскалация на obfs-TCP: QUIC мог подняться (хендшейк), но крупный control-обмен не прошёл —
@@ -323,7 +335,9 @@ impl VpnController {
             if let Err(e) = &established {
                 let first = format!("{e:#}");
                 let quic_spent = e.token_presented;
-                if cfg.transport_psk().is_some() && should_escalate_to_tcp(&first) {
+                // `!prefer_tcp`: эскалировать на obfs-TCP с попытки, которая УЖЕ шла obfs-TCP,
+                // бессмысленно — это был бы второй заход тем же транспортом ценой второго токена.
+                if !prefer_tcp && cfg.transport_psk().is_some() && should_escalate_to_tcp(&first) {
                     eprintln!("[vpn] establish/QUIC не удался ({first}) — эскалация на obfs-TCP (мобильный MTU/NAT64?)");
                     // Второй токен берём, ТОЛЬКО если первый действительно ушёл exit'у на
                     // QUIC-попытке. Иначе идём тем же — эскалация не должна стоить абоненту
@@ -364,6 +378,13 @@ impl VpnController {
                     // Токен, не дошедший до control-обмена, остаётся у нас и пойдёт в следующую
                     // попытку. Это и есть починка «квота кончилась после шторма ретраев».
                     have_unspent_token = !e.token_presented;
+                    // Принудительный obfs-TCP не поднялся (порт 443 закрыт/фильтруется) — снимаем
+                    // предпочтение, иначе застряли бы на заведомо мёртвом транспорте навсегда.
+                    // Обычный порядок сам попробует QUIC, а при его недоступности — тот же TCP.
+                    if prefer_tcp {
+                        eprintln!("[vpn] obfs-TCP тоже не поднялся — возвращаюсь к обычному порядку транспортов");
+                        prefer_tcp = false;
+                    }
                     // Ретраим ВСЕГДА, в т.ч. ПЕРВЫЙ коннект: сеть/issuer могли быть недоступны на
                     // старте (подключились до появления сети) — по восстановлении следующая попытка
                     // возьмёт свежий токен и поднимется. Причину показываем (Error), но не сдаёмся до
@@ -467,6 +488,8 @@ impl VpnController {
             // (Linux GuiTun шлёт 'Q' → helper снимает kill-switch). На реконнекте не зовём → KS остаётся.
             let tun_ctrl = tun.clone();
             let mut net_changed = false;
+            // Каким транспортом жила эта сессия — нужно ПОСЛЕ неё (session уезжает в data-plane).
+            let via_tcp = session.over_tcp();
             let r = tokio::select! {
                 r = run_data_plane(session, tun) => r,
                 // `cancelled` (а не голый `shutdown.notified()`): disconnect, пришедший ДО входа в
@@ -484,7 +507,7 @@ impl VpnController {
                     // Не глушит авто-реконнект (в отличие от disconnect): loop идёт на следующую итерацию.
                     eprintln!("[vpn] смена сети — переустанавливаю сессию над новой сетью");
                     net_changed = true;
-                    Ok(())
+                    Ok(Default::default())
                 }
             };
             drop(tun_ctrl); // реконнект: закрыть старый TUN/сокет сейчас (helper EOF без 'Q' → KS держится)
@@ -492,10 +515,17 @@ impl VpnController {
                 return self.finish_stopped();
             }
 
+            // Односторонний путь (наши датаграммы не доезжали до exit'а) лечится сменой
+            // транспорта, а не повтором: следующую попытку делаем сразу obfs-TCP. Если
+            // односторонним оказался УЖЕ obfs-TCP — дело не в транспорте, возвращаемся к обычному
+            // порядку (QUIC/UDP сперва), иначе застряли бы на TCP навсегда.
+            if matches!(&r, Ok(x) if x.uplink_dead) {
+                prefer_tcp = !via_tcp && cfg.transport_psk().is_some();
+            }
             // Транспорт упал сам (не пользователь) → авто-реконнект.
             if !net_changed {
                 match r {
-                    Ok(()) => eprintln!("[vpn] транспорт закрылся — восстанавливаю соединение"),
+                    Ok(_) => eprintln!("[vpn] транспорт закрылся — восстанавливаю соединение"),
                     Err(e) => eprintln!("[vpn] data-plane упал: {e} — восстанавливаю соединение"),
                 }
             }

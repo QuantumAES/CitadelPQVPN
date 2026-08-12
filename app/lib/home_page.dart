@@ -118,6 +118,9 @@ class _HomePageState extends State<HomePage> {
       context: context,
       isScrollControlled: true,
       showDragHandle: true,
+      // С клавиатурой лист занимает почти весь экран: без safe-area его шапка уезжает под
+      // статус-бар/вырез (на Android это видно сразу).
+      useSafeArea: true,
       builder: (_) => const AddProfileSheet(),
     );
     if (res == null || !mounted) return;
@@ -1417,7 +1420,13 @@ class _AddProfileSheetState extends State<AddProfileSheet> {
   Widget build(BuildContext context) {
     final t = Strings.of(context);
     final valid = _summary?.valid ?? false;
-    return Padding(
+    // Прокрутка обязательна, а не «на всякий случай»: полей здесь до четырёх (ссылка, код сверки,
+    // имя) плюс превью и кнопка, а поднявшаяся клавиатура забирает половину экрана. Без Scrollable
+    // Column просто обрезался снизу — поля и «Подключить и сохранить» оказывались ПОД клавиатурой,
+    // и добавить профиль на телефоне было нельзя. Отступ `viewInsets.bottom` держит последний
+    // элемент над клавиатурой, а Scrollable ещё и сам подматывает сфокусированное поле в видимую
+    // часть (EditableText.showOnScreen работает только внутри прокручиваемого предка).
+    return SingleChildScrollView(
       padding: EdgeInsets.only(
         left: 20,
         right: 20,

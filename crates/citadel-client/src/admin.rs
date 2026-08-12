@@ -179,6 +179,45 @@ fn build_subscriber_link_full(
 // Внутренние `*_at` берут явный `addr` (тестируемы против in-process issuer); публичные выводят
 // адрес из мастер-ссылки ([`ADMIN_VIP`]).
 
+/// Дополнить отказ admin-операции тем, что движок знает о САМОМ туннеле.
+///
+/// Канал «Абоненты» живёт ВНУТРИ туннеля, поэтому «список не грузится» — обычно не про admin-канал
+/// вовсе, а про то, что туннель поднят, но данные по нему не ходят. Без этой приписки экран
+/// показывал «admin-канал 10.7.0.1:7001 недоступен (туннель поднят?)» — вопрос, на который у
+/// человека нет способа ответить, хотя движок ответ уже знает (см. `dataplane::data_path`).
+/// Отказать СРАЗУ, если движок уже знает, что канал не работает.
+///
+/// Admin-канал идёт к ADMIN_VIP внутри туннеля, и его SYN в мёртвый туннель тонет молча до
+/// `CONNECT_TIMEOUT` (10с). Пока он тонет, движок успевает диагностировать путь и переподключиться
+/// другим транспортом — то есть эти 10с человек ждёт впустую, а потом ещё и получает отказ. Если
+/// вердикт уже вынесен, честнее сказать это мгновенно: повтор через несколько секунд попадёт на
+/// живую сессию.
+fn refuse_if_path_dead() -> Result<()> {
+    if citadel_quic::dataplane::data_path() == citadel_quic::dataplane::DataPath::UplinkDead {
+        anyhow::bail!(
+            "туннель поднят, но наши пакеты не доходят до узла — движок сейчас переподключается \
+             другим транспортом; повторите через несколько секунд"
+        );
+    }
+    Ok(())
+}
+
+fn explain_path(e: anyhow::Error) -> anyhow::Error {
+    use citadel_quic::dataplane::{data_path, DataPath};
+    match data_path() {
+        DataPath::UplinkDead => e.context(
+            "туннель поднят, но наши пакеты не доходят до узла (потери / узкий MTU пути) — \
+             admin-канал идёт ВНУТРИ туннеля, поэтому и он молчит; движок переподключится другим \
+             транспортом",
+        ),
+        DataPath::ExitSilent => e.context(
+            "туннель поднят, до узла пакеты доходят, а обратного трафика нет — молчит сам узел \
+             (admin-канал идёт ВНУТРИ туннеля)",
+        ),
+        DataPath::Ok | DataPath::Unknown => e,
+    }
+}
+
 async fn list_at(
     addr: String,
     pin: [u8; 32],
@@ -186,12 +225,14 @@ async fn list_at(
     seed: [u8; 32],
     obfs_psk: Option<[u8; 32]>,
 ) -> Result<Vec<SubscriberEntry>> {
+    refuse_if_path_dead()?;
     tokio::task::spawn_blocking(move || -> Result<Vec<SubscriberEntry>> {
         let mut c = AdminClient::connect(&addr, &pin, &mldsa, &seed, obfs_psk)?;
         Ok(c.list()?.into_iter().map(SubscriberEntry::from).collect())
     })
     .await
     .context("admin-list задача паникнула")?
+    .map_err(explain_path)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -206,6 +247,7 @@ async fn add_at(
     // M-9: `Some((окно активации, отпечаток ссылки))` — запись становится одноразовой и заверенной.
     enroll: Option<(u64, [u8; 32])>,
 ) -> Result<()> {
+    refuse_if_path_dead()?;
     tokio::task::spawn_blocking(move || -> Result<()> {
         let mut c = AdminClient::connect(&addr, &pin, &mldsa, &seed, obfs_psk)?;
         match enroll {
@@ -215,6 +257,7 @@ async fn add_at(
     })
     .await
     .context("admin-add задача паникнула")?
+    .map_err(explain_path)
 }
 
 async fn revoke_at(
@@ -225,12 +268,14 @@ async fn revoke_at(
     obfs_psk: Option<[u8; 32]>,
     client_id: [u8; 32],
 ) -> Result<()> {
+    refuse_if_path_dead()?;
     tokio::task::spawn_blocking(move || -> Result<()> {
         let mut c = AdminClient::connect(&addr, &pin, &mldsa, &seed, obfs_psk)?;
         c.revoke(client_id)
     })
     .await
     .context("admin-revoke задача паникнула")?
+    .map_err(explain_path)
 }
 
 /// Список абонентов реестра (по admin-каналу через туннель).

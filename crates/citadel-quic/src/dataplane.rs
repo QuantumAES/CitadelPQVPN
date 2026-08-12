@@ -60,6 +60,12 @@ impl Tunnel {
         }
     }
 
+    /// Идёт ли транспорт поверх obfs-TCP (а не UDP). Нужно циклу реконнекта: лечение
+    /// односторонней дыры — смена транспорта, и оно применимо только к UDP-сессии.
+    pub fn is_tcp(&self) -> bool {
+        self.over_tcp
+    }
+
     pub fn close(&self, code: u32, reason: &[u8]) {
         self.conn.close(code.into(), reason);
     }
@@ -261,6 +267,105 @@ pub fn traffic_bytes() -> (u64, u64) {
 const WATCHDOG_INTERVAL: std::time::Duration = std::time::Duration::from_secs(8);
 const WATCHDOG_TX_MIN: u64 = 12;
 
+/// Шаг watchdog. Окно диагностики осталось прежним ([`WATCHDOG_INTERVAL`] = [`TICKS_PER_WINDOW`]
+/// тиков), но отказ сокета (см. [`uplink_is_stalled`]) проверяется на КАЖДОМ тике: ждать полного
+/// окна там нечего, а цена ожидания — секунды мёртвого туннеля у человека в руках.
+const WATCHDOG_TICK: std::time::Duration = std::time::Duration::from_secs(2);
+const TICKS_PER_WINDOW: u32 = 4;
+/// Порог отданных датаграмм НА ТИК для быстрой проверки (ниже — простой, беды не видно).
+const STALL_TX_MIN: u64 = 12;
+/// Сколько тиков подряд держится затор, прежде чем рвать транспорт (2 тика = 4с).
+const STALL_TICKS: u32 = 2;
+
+/// Сколько окон подряд путь должен быть односторонним, прежде чем рвать транспорт. Одно окно —
+/// это ещё может быть всплеск потерь на мобильной сети; два подряд (16с) означают, что канал в эту
+/// сторону не работает, и ждать дальше бессмысленно — человек всё это время видит «Защищено» и
+/// пустой интернет.
+const ONE_WAY_WINDOWS: u32 = 2;
+
+/// Чем закончился `pump` (нужно циклу реконнекта, см. `vpn::VpnController::connect`).
+///
+/// До этого data-plane отдавал только `()`, и цикл не мог отличить «пир закрыл соединение» от
+/// «наши пакеты перестали доходить». Разница принципиальна: во втором случае повтор ТОГО ЖЕ
+/// транспорта упирается ровно в то же самое, и абонент получает бесконечное «переподключение».
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct PumpExit {
+    /// Транспорт был жив, но наши датаграммы переставали доходить до пира (потери/чёрная дыра по
+    /// MTU/затор своей же очереди) — лечится сменой транспорта, а не повтором.
+    pub uplink_dead: bool,
+}
+
+/// Что клиентский data-plane знает о СОБСТВЕННОМ канале. Нужно не только логу: операции, которые
+/// ходят ПО туннелю (admin-плоскость «Абоненты»), падают по той же причине, что и «интернета нет»,
+/// и назвать её обязан движок — иначе экран показывает «не удалось», а человек гадает, сломан ли
+/// сервер, ссылка или сеть.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[repr(u8)]
+pub enum DataPath {
+    /// Ещё не мерили: сессии нет либо в окне не было заметного трафика.
+    Unknown = 0,
+    /// Обратный трафик идёт — канал рабочий.
+    Ok = 1,
+    /// Наши пакеты не доезжают до exit'а (потери/узкий MTU пути/затор собственной очереди).
+    UplinkDead = 2,
+    /// До exit'а доезжают, обратно тихо: дропает exit либо молчит назначение.
+    ExitSilent = 3,
+}
+
+/// Последний вердикт клиентского watchdog о канале (см. [`DataPath`]). Глобальный на процесс —
+/// как и счётчики трафика: клиентская сессия в процессе одна. На exit'е НЕ ведётся (там это был бы
+/// учёт чужого трафика, см. no-logs).
+static DATA_PATH: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+/// Снимок состояния клиентского канала.
+pub fn data_path() -> DataPath {
+    match DATA_PATH.load(std::sync::atomic::Ordering::Relaxed) {
+        1 => DataPath::Ok,
+        2 => DataPath::UplinkDead,
+        3 => DataPath::ExitSilent,
+        _ => DataPath::Unknown,
+    }
+}
+
+fn set_data_path(v: DataPath) {
+    DATA_PATH.store(v as u8, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Разбор окна watchdog на КЛИЕНТЕ, когда обратных датаграмм нет, а транспорт жив: наши пакеты
+/// вообще не доходят до exit'а — или доходят, а exit молчит? Раньше этой развилки не было, и в лог
+/// уезжал единственный вердикт «похоже, пакеты дропает exit», который в первом случае просто
+/// врёт и уводит разбор в сторону (ровно на этом застряла прошлая сессия).
+///
+/// `enqueued` — сколько датаграмм мы отдали quinn; `on_wire` — сколько он реально положил на
+/// провод (`frame_tx.datagram`); `lost` — сколько отправленных пакетов он объявил потерянными.
+/// Разница `enqueued - on_wire` — не «где-то потерялись»: при заторе quinn МОЛЧА вытесняет из
+/// очереди датаграмм самые старые (`datagram_send_buffer_size`), то есть успешный `send_datagram`
+/// ничего не обещает. Поэтому «отправлено N» в старом сообщении тоже было неправдой.
+fn uplink_is_dead(enqueued: u64, on_wire: u64, lost: u64) -> bool {
+    // Больше половины даже не ушло в транспорт: очередь не рассасывается (cwnd схлопнулся).
+    let stalled = on_wire * 2 < enqueued;
+    // Половина и больше из ушедшего объявлена потерянной: путь их глотает.
+    let lossy = on_wire > 0 && lost * 2 >= on_wire;
+    stalled || lossy
+}
+
+/// Быстрая (тиковая) проверка ровно одной беды: **сокет перестал брать наши пакеты**.
+///
+/// Полевой лог: за окно отдано 116 датаграмм, на провод ушло 2, потеряно 0 — то есть пакеты никуда
+/// не отправлялись (иначе они числились бы потерянными), а те двое, что ушли, — наши keep-alive,
+/// мелкие. Механизм локальный: quinn зовёт `poll_transmit` только пока UDP-сокет пишется, а на
+/// Android он перестаёт брать пакеты (переполненная очередь устройства → `ENOBUFS`, либо пакет
+/// крупнее того, что путь готов нести, при выставленном DF). Уходят лишь те, что попадают на
+/// пробуждение по таймеру — отсюда «пара штук за окно».
+///
+/// Это НЕ транзиент: ждать полные два окна (16с) значит держать человека в мёртвом туннеле,
+/// который лечится сменой транспорта за секунду. Поэтому сигнатуре хватает 2 тиков (4с). Условия
+/// намеренно жёстче оконных: `lost == 0` (иначе это обычные потери сети, а не отказ сокета) и
+/// разрыв на порядок (`on_wire * 8 < enqueued`), чтобы не спутать с честным затором cwnd.
+fn uplink_is_stalled(enqueued: u64, on_wire: u64, lost: u64) -> bool {
+    enqueued >= STALL_TX_MIN && lost == 0 && on_wire * 8 < enqueued
+}
+
 /// Решение watchdog по дельтам за окно. Путь считаем мёртвым, только если ОДНОВРЕМЕННО:
 ///   * отправлено ≥ порога датаграмм (мы реально под нагрузкой, а не в простое);
 ///   * принято 0 датаграмм (обратного туннельного трафика нет);
@@ -315,7 +420,7 @@ pub async fn pump(
     // inner-dst нужному клиенту. Без этого N pump'ов на общем TUN воровали бы друг у друга return-
     // трафик (гонка multi-client → потеря/медленно/watchdog-шторм при >1 клиента).
     return_rx: Option<tokio::sync::mpsc::Receiver<Vec<u8>>>,
-) -> Result<()> {
+) -> Result<PumpExit> {
     use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
     use tokio::sync::mpsc;
     let (net_to_tun_tx, mut net_to_tun_rx) = mpsc::channel::<Vec<u8>>(1024);
@@ -560,18 +665,73 @@ pub async fn pump(
     // Диагностику окна печатает только КЛИЕНТ (`egress == None`): на exit'е это был бы лог о
     // трафике пользователя — против no-logs (см. handle_client).
     let wd_client = egress.is_none();
+    if wd_client {
+        // Новая сессия — прежний вердикт о канале недействителен (иначе «Абоненты» объясняли бы
+        // свежий отказ диагнозом прошлой, уже оборванной сессии).
+        set_data_path(DataPath::Unknown);
+    }
+    // Итог для вызывающего: путь оказался односторонним (см. [`PumpExit::uplink_dead`]).
+    let uplink_dead = Arc::new(AtomicBool::new(false));
+    let wd_uplink_dead = uplink_dead.clone();
     let watchdog = tokio::spawn(async move {
         let (mut seen_tx, mut seen_rx, mut seen_v6, mut seen_urx) = (0u64, 0u64, 0u64, 0u64);
         let (mut seen_bad_src, mut seen_self_loop) = (0u64, 0u64);
+        // Реально ушедшие на провод датаграммы и объявленные потерянными пакеты — предыдущий
+        // снимок (считаем дельты за окно, как и всё остальное здесь).
+        let (mut seen_wire, mut seen_lost) = (0u64, 0u64);
+        // UDP-пакеты и байты транспорта — для среднего размера ушедшего пакета (см. ниже).
+        let (mut seen_utx, mut seen_ubytes) = (0u64, 0u64);
+        // Сколько окон подряд путь односторонний (см. ONE_WAY_WINDOWS).
+        let mut one_way = 0u32;
         // F8: предыдущий снимок счётчиков клиентского inbound-фильтра (не-IPv4, чужой dst, без
         // запроса, ICMP-тип) — печатаем дельту за окно, а не итог за сессию.
         let mut seen_fw = (0u64, 0u64, 0u64, 0u64);
+        // Тиковые снимки (быстрая проверка отказа сокета) — отдельные от оконных: у них свой шаг.
+        let (mut tick_tx, mut tick_rx, mut tick_wire, mut tick_lost) = (0u64, 0u64, 0u64, 0u64);
+        let (mut stalled_ticks, mut tick_no) = (0u32, 0u32);
         loop {
-            tokio::time::sleep(WATCHDOG_INTERVAL).await;
+            tokio::time::sleep(WATCHDOG_TICK).await;
             if wd_stop.load(Ordering::Acquire) {
                 break;
             }
             let st = wd_conn.stats();
+            // ── быстрая проверка (каждый тик): сокет перестал брать наши пакеты ──
+            {
+                let (tx, rx, wire, lost) = (
+                    wd_tx.load(Ordering::Relaxed),
+                    wd_rx.load(Ordering::Relaxed),
+                    st.frame_tx.datagram,
+                    st.path.lost_packets,
+                );
+                let (d_tx, d_rx, d_wire, d_lost) = (
+                    tx.wrapping_sub(tick_tx),
+                    rx.wrapping_sub(tick_rx),
+                    wire.wrapping_sub(tick_wire),
+                    lost.wrapping_sub(tick_lost),
+                );
+                (tick_tx, tick_rx, tick_wire, tick_lost) = (tx, rx, wire, lost);
+                if wd_client && d_rx == 0 && uplink_is_stalled(d_tx, d_wire, d_lost) {
+                    stalled_ticks += 1;
+                    if stalled_ticks >= STALL_TICKS {
+                        eprintln!(
+                            "[pump] транспорт не принимает наши пакеты {}с подряд (за тик отдано \
+                             {d_tx}, на провод ушло {d_wire}, потеряно 0) — это отказ ОТПРАВКИ, а \
+                             не потери в сети; рву транспорт и иду другим",
+                            WATCHDOG_TICK.as_secs() * STALL_TICKS as u64
+                        );
+                        set_data_path(DataPath::UplinkDead);
+                        wd_uplink_dead.store(true, Ordering::Release);
+                        wd_conn.close(0u32.into(), b"citadel: send path stalled");
+                        break;
+                    }
+                } else {
+                    stalled_ticks = 0;
+                }
+            }
+            tick_no += 1;
+            if !tick_no.is_multiple_of(TICKS_PER_WINDOW) {
+                continue; // оконная диагностика — раз в WATCHDOG_INTERVAL
+            }
             let (tx, rx, v6, urx) = (
                 wd_tx.load(Ordering::Relaxed),
                 wd_rx.load(Ordering::Relaxed),
@@ -590,20 +750,77 @@ pub async fn pump(
                     "[pump] watchdog: {sent} датаграмм отправлено, 0 принято и НИ ОДНОГО QUIC-пакета от exit за {}с — путь мёртв, рву транспорт",
                     WATCHDOG_INTERVAL.as_secs()
                 );
+                if wd_client {
+                    set_data_path(DataPath::UplinkDead);
+                }
                 wd_conn.close(0u32.into(), b"citadel: data-path watchdog");
                 break;
             }
-            // Путь жив (QUIC-пакеты идут), но туннельного ответа нет — раньше здесь был разрыв,
-            // теперь только сигнал: проблема выше транспорта (дроп на exit / молчит назначение).
+            // Путь жив (QUIC-пакеты идут), но туннельного ответа нет. Раньше здесь стоял один
+            // безусловный вердикт «похоже, пакеты дропает exit» — и он вводил в заблуждение ровно
+            // в самом частом мобильном случае, когда до exit'а не доезжаем МЫ. Теперь окно
+            // разбирается по счётчикам транспорта (см. [`uplink_is_dead`]), и у двух разных бед
+            // разные и диагноз, и реакция.
+            let (wire, lost) = (
+                st.frame_tx.datagram.wrapping_sub(seen_wire),
+                st.path.lost_packets.wrapping_sub(seen_lost),
+            );
+            (seen_wire, seen_lost) = (st.frame_tx.datagram, st.path.lost_packets);
+            // Средний размер УШЕДШЕГО пакета. Разделяет две локальные причины отказа отправки,
+            // которые по остальным счётчикам неотличимы: путь не несёт КРУПНЫЕ пакеты (тогда
+            // уходят только мелкие — среднее в районе сотен байт, и лечится это размером) либо
+            // очередь устройства переполнена (`ENOBUFS` — уходит всё подряд, просто редко).
+            let (utx, ubytes) = (
+                st.udp_tx.datagrams.wrapping_sub(seen_utx),
+                st.udp_tx.bytes.wrapping_sub(seen_ubytes),
+            );
+            (seen_utx, seen_ubytes) = (st.udp_tx.datagrams, st.udp_tx.bytes);
+            let avg_wire = ubytes.checked_div(utx).unwrap_or(0);
             if wd_client && sent >= WATCHDOG_TX_MIN && recvd == 0 {
-                eprintln!(
-                    "[pump] обратных датаграмм нет {}с: отправлено {sent}, принято 0, но транспорт ЖИВ \
-                     (QUIC-пакетов от exit: {transport_rx}, RTT {} мс, MTU пути {}) — рвать сессию не буду; \
-                     похоже, пакеты дропает exit или молчит назначение",
+                let head = format!(
+                    "[pump] обратных датаграмм нет {}с: в транспорт отдано {sent}, на провод ушло \
+                     {wire}, объявлено потерянными {lost}, принято 0 (QUIC-пакетов от exit: \
+                     {transport_rx}, RTT {} мс, MTU пути {}, cwnd {}, средний ушедший пакет \
+                     {avg_wire} б из {utx})",
                     WATCHDOG_INTERVAL.as_secs(),
                     st.path.rtt.as_millis(),
                     st.path.current_mtu,
+                    st.path.cwnd,
                 );
+                if uplink_is_dead(sent, wire, lost) {
+                    set_data_path(DataPath::UplinkDead);
+                    one_way += 1;
+                    eprintln!(
+                        "{head} — НАШИ пакеты не доезжают до exit'а (потери/узкий MTU пути/затор \
+                         собственной очереди), окно {one_way} из {ONE_WAY_WINDOWS}"
+                    );
+                    if one_way >= ONE_WAY_WINDOWS {
+                        eprintln!(
+                            "[pump] путь односторонний {}с подряд — рву транспорт, чтобы \
+                             переподключиться поверх другого (obfs-TCP переживает узкий MTU и \
+                             потери там, где QUIC/UDP чёрнодырится)",
+                            WATCHDOG_INTERVAL.as_secs() * ONE_WAY_WINDOWS as u64
+                        );
+                        wd_uplink_dead.store(true, Ordering::Release);
+                        wd_conn.close(0u32.into(), b"citadel: one-way data path");
+                        break;
+                    }
+                } else {
+                    // Наши датаграммы уходят и подтверждаются — значит, они у exit'а, и тишина
+                    // обратно уже НЕ транспортная. Рвать нечего: новая сессия упрётся в то же
+                    // самое (это и был реконнект-шторм, закрытый ранее).
+                    set_data_path(DataPath::ExitSilent);
+                    one_way = 0;
+                    eprintln!(
+                        "{head} — до exit'а наши пакеты доезжают, обратно тихо: дропает сам exit \
+                         (egress-фильтр/лимит) либо молчит назначение; сессию не рву"
+                    );
+                }
+            } else if recvd > 0 {
+                one_way = 0; // обратный трафик пошёл — счётчик окон сбрасывается
+                if wd_client {
+                    set_data_path(DataPath::Ok);
+                }
             }
             // Пакеты с чужим src: exit дропает их анти-спуфингом, поэтому «отправлено много,
             // принято 0» — не загадка, а следствие. Называем адрес: по нему сразу видно природу
@@ -729,7 +946,7 @@ pub async fn pump(
     // sender: на EXIT он читает return_rx из демукса, а tx там держится до unregister (ПОСЛЕ pump) —
     // при закрытии транспорта его некому закрыть, try_join завис бы и pump не снял бы регистрацию.
     let _ = receiver.await;
-    Ok(())
+    Ok(PumpExit { uplink_dead: uplink_dead.load(Ordering::Acquire) })
 }
 
 /// EXIT: демультиплексор общего TUN. На сервере один TUN обслуживает ВСЕХ клиентов; читать его
@@ -1008,5 +1225,41 @@ mod tests {
         // это дроп на стороне exit, а не мёртвый путь. Транспорт не рвём.
         assert!(!watchdog_trips(WATCHDOG_TX_MIN + 100, 0, 1), "QUIC-пакеты идут — путь жив");
         assert!(!watchdog_trips(WATCHDOG_TX_MIN, 0, 40), "поток ACK'ов — путь жив");
+    }
+
+    /// Разбор «транспорт жив, а обратно тихо» на две РАЗНЫЕ беды. Прежний код валил их в один
+    /// вердикт «похоже, пакеты дропает exit», и мобильный случай (до exit'а не доезжаем мы сами)
+    /// уводил разбор в сторону: на сервере искали дроп, которого там не было.
+    #[test]
+    fn uplink_verdict_separates_our_loss_from_exit_silence() {
+        // Живой пример из полевого лога: 630 датаграмм отдано транспорту, на провод ушла горстка —
+        // очередь не рассасывается (cwnd схлопнулся), до exit'а физически не доезжаем.
+        assert!(uplink_is_dead(630, 30, 5), "очередь встала — виноват путь, а не exit");
+        // Ушли все, но половину и больше объявили потерянными — путь их глотает (узкий MTU/потери).
+        assert!(uplink_is_dead(630, 630, 600), "потеряно почти всё отправленное — путь глотает");
+        assert!(uplink_is_dead(100, 100, 50), "ровно половина потерь — уже дыра");
+        // Уходят и подтверждаются: пакеты У EXIT'а, тишина обратно — не транспортная беда.
+        // Рвать сессию нельзя (это и есть закрытый ранее реконнект-шторм).
+        assert!(!uplink_is_dead(630, 630, 0), "всё доехало, ответа нет — молчит exit/назначение");
+        assert!(!uplink_is_dead(630, 620, 20), "единичные потери — нормальная сеть");
+        // Вырожденный случай: транспорт вообще ничего не отправлял (простой) — не обвиняем путь.
+        assert!(!uplink_is_dead(0, 0, 0), "простоя не бывает виноватым");
+    }
+
+    /// Быстрая тиковая сигнатура «сокет не берёт наши пакеты». Числа — из полевого лога Android:
+    /// за окно отдано 116, ушло 2, потеряно 0 (ушли ровно keep-alive). Ждать полных 16с в таком
+    /// состоянии нельзя: это не потери сети, а отказ отправки, и лечится он сменой транспорта.
+    #[test]
+    fn stall_signature_fires_fast_but_not_on_ordinary_loss() {
+        assert!(uplink_is_stalled(116, 2, 0), "поле: отдано 116, ушло 2, потерь нет — затор");
+        assert!(uplink_is_stalled(583, 33, 0), "первое окно того же лога");
+        // Потери есть ⇒ пакеты УХОДИЛИ и умирали в сети: это другая беда, её судит оконная логика
+        // (иначе рвали бы транспорт на всплеске потерь мобильной сети).
+        assert!(!uplink_is_stalled(116, 2, 5), "есть потери — не отказ отправки");
+        // Уходит существенная доля — обычный затор cwnd, не отказ.
+        assert!(!uplink_is_stalled(100, 20, 0), "ушла пятая часть — не сигнатура отказа");
+        // Простой: мало отдали — молчим (иначе рвали бы сессию на любой паузе трафика).
+        assert!(!uplink_is_stalled(STALL_TX_MIN - 1, 0, 0), "простой не судим");
+        assert!(!uplink_is_stalled(0, 0, 0), "полная тишина — не повод рвать");
     }
 }
