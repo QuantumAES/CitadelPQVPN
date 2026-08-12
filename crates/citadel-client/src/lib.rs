@@ -42,7 +42,9 @@ pub use citadel_quic::client::{establish_session, run_data_plane, Session};
 // Индикация скорости в UI: монотонные счётчики inner-байтов туннеля (клиентская сторона).
 pub use citadel_quic::dataplane::traffic_bytes;
 pub use citadel_quic::diag::{run_diagnostics, DiagStep};
-pub use citadel_quic::protect::{clear_socket_protector, set_socket_protector, SocketProtector};
+pub use citadel_quic::protect::{
+    clear_socket_protector, protector_active, set_socket_protector, SocketProtector,
+};
 pub use citadel_quic::vpn::{
     clamp_tun_mtu, SessionGrant, TunParams, TunProvider, VpnController, VpnEvent, VpnState,
 };

@@ -327,7 +327,7 @@ impl ObfsUdpSocket {
     fn rebind(&self) -> io::Result<()> {
         let std_sock = std::net::UdpSocket::bind("0.0.0.0:0")?;
         // после миграции новый сокет тоже исключаем из туннеля (Android); desktop — no-op
-        crate::protect::protect_socket(crate::protect::handle_of(&std_sock));
+        let _ = crate::protect::protect_socket(crate::protect::handle_of(&std_sock));
         std_sock.set_nonblocking(true)?;
         let new = tokio::net::UdpSocket::from_std(std_sock)?;
         let old = self.inner.load().local_addr().ok();
@@ -608,8 +608,24 @@ fn build_endpoint(
     // В СОБСТВЕННЫЙ туннель: данные встают намертво, ACK'и не возвращаются, cwnd не открывается —
     // «на провод ушло 2 из 113, потерь 0». Ровно это и наблюдалось на Android (см. регрессию из
     // захода 7, где строку потеряли при переносе `pacing` в параметр). Тест
-    // `udp_transport_socket_goes_through_protector` держит инвариант.
-    crate::protect::protect_socket(crate::protect::handle_of(&std_sock));
+    // `transport_sockets_go_through_protector` держит инвариант.
+    let protected = crate::protect::protect_socket(crate::protect::handle_of(&std_sock));
+    // На Android результат обязан быть в журнале: «не защищён» и «защищён» дают ОДИНАКОВО успешный
+    // хендшейк (туннеля в этот момент ещё нет) и расходятся только потом — когда поднимается TUN.
+    // Пока строка молчала, гонка «сервис не успел зарегистрироваться» была неотличима от нормы, и
+    // разбор дважды уезжал в сеть/MTU. `server_config.is_none()` — только клиент: на exit'е
+    // протектора нет по построению, и предупреждение там было бы ложью.
+    if cfg!(target_os = "android") && server_config.is_none() {
+        let local = std_sock.local_addr().map(|a| a.to_string()).unwrap_or_default();
+        if protected {
+            eprintln!("[protect] QUIC/UDP сокет {local} исключён из туннеля ✔");
+        } else {
+            eprintln!(
+                "[protect] ⚠ QUIC/UDP сокет {local} НЕ защищён (VpnService не зарегистрирован либо \
+                 protect() отказал) — как только поднимется TUN, транспорт замкнётся сам на себя"
+            );
+        }
+    }
     let sock = Arc::new(ObfsUdpSocket::new(std_sock, psk, pacing)?);
     // Pacer спавним только при включённом пейсинге; держит Weak → не мешает дропу сокета.
     if matches!(pacing, Pacing::Slotted { .. }) {
@@ -668,7 +684,7 @@ pub fn client_endpoint_obfs(psk: [u8; 32], pacing: Pacing) -> Result<quinn::Endp
 /// работал бы только до подъёма TUN (та же беда, что описана в [`build_endpoint`]).
 pub fn client_endpoint_plain() -> Result<quinn::Endpoint> {
     let sock = std::net::UdpSocket::bind("0.0.0.0:0")?;
-    crate::protect::protect_socket(crate::protect::handle_of(&sock));
+    let _ = crate::protect::protect_socket(crate::protect::handle_of(&sock));
     let runtime = quinn::default_runtime().ok_or_else(|| anyhow!("нет async runtime (tokio)"))?;
     Ok(quinn::Endpoint::new(quinn::EndpointConfig::default(), None, sock, runtime)?)
 }

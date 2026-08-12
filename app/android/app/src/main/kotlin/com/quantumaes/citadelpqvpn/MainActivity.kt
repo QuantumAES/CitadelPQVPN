@@ -48,11 +48,17 @@ class MainActivity : FlutterActivity() {
                     }
                 }
                 "startService" -> {
-                    if (CitadelVpnService.instance != null) {
+                    // `ready()`, а не `instance != null`: экземпляр, получивший stopSelf, ещё жив,
+                    // но его onDestroy снимет протектор уже из-под новой сессии. Такой считаем
+                    // отсутствующим и поднимаем сервис заново — ждать готовности нового экземпляра.
+                    if (CitadelVpnService.ready()) {
                         result.success(true) // уже запущен (реконнект)
                     } else {
                         // ждём onCreate+nativeRegister: протектор сокетов должен встать ДО
-                        // establish, иначе первый сокет движка уйдёт незащищённым (петля)
+                        // establish, иначе первый сокет движка уйдёт незащищённым (петля).
+                        // Незакрытый прошлый запрос (сервис умер, не дойдя до onCreate) закрываем
+                        // сами: иначе тот await в Dart висел бы вечно, и «Подключить» не работало бы.
+                        CitadelVpnService.onServiceReady?.invoke()
                         CitadelVpnService.onServiceReady = {
                             runOnUiThread { result.success(true) }
                         }

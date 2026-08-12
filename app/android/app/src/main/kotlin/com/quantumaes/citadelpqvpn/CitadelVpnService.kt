@@ -36,6 +36,21 @@ class CitadelVpnService : VpnService() {
         @Volatile
         var onServiceReady: (() -> Unit)? = null
 
+        /**
+         * Экземпляр получил stopSelf() и ждёт onDestroy.
+         *
+         * `instance` обнуляется только в onDestroy, а тот приходит асинхронно — поэтому «Отключить,
+         * затем сразу Подключить» заставало `instance != null` у УМИРАЮЩЕГО сервиса. startService
+         * отвечал «уже запущен», интент не слал, сессия стартовала — и тут приходил onDestroy,
+         * снимая протектор из-под уже работающего движка. Первый транспортный сокет уходил
+         * незащищённым, то есть в собственный туннель; в журнале это выглядит как «UDP не пускают».
+         */
+        @Volatile
+        var stopping = false
+
+        /** Готов ли сервис принять сессию: жив и не в процессе остановки. */
+        fun ready(): Boolean = instance != null && !stopping
+
         const val CHANNEL_ID = "citadel_vpn"
         const val NOTIF_ID = 1
 
@@ -106,6 +121,7 @@ class CitadelVpnService : VpnService() {
     override fun onCreate() {
         super.onCreate()
         instance = this
+        stopping = false // новый экземпляр — прошлая остановка к нему не относится
         nativeRegister() // движок теперь может protect() свои исходящие сокеты
         registerNetCallback() // мониторим underlying-сеть на всю жизнь сервиса
         onServiceReady?.invoke()
@@ -114,6 +130,13 @@ class CitadelVpnService : VpnService() {
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         startForegroundNotif()
+        // Новый интент ОТМЕНЯЕТ ожидающую остановку: система в этом случае не уничтожает сервис, а
+        // доставляет команду существующему экземпляру — onCreate не вызывается. Значит, и снять
+        // флаг, и позвать колбэк готовности обязаны здесь, иначе `startService` из Dart ждал бы
+        // onCreate, которого не будет, и подключение не начиналось бы вовсе.
+        stopping = false
+        onServiceReady?.invoke()
+        onServiceReady = null
         // `intent == null` — сервис ВОСКРЕШЁН системой по START_STICKY после того, как процесс был
         // убит (нехватка памяти, чистка «недавних» на OEM-прошивках — на устройствах эпохи
         // Android 9 это рядовое событие). Восстановить сессию мы при этом не можем по построению:
@@ -286,6 +309,9 @@ class CitadelVpnService : VpnService() {
     fun protectFd(fd: Int): Boolean = protect(fd)
 
     fun stopTun() {
+        // Пометить ДО stopSelf: с этого момента сервис «есть», но принимать новую сессию не может —
+        // иначе следующее «Подключить» стартует поверх умирающего экземпляра (см. `stopping`).
+        stopping = true
         stopForeground(STOP_FOREGROUND_REMOVE)
         stopSelf()
     }

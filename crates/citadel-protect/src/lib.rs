@@ -71,12 +71,21 @@ pub fn protector_active() -> bool {
 
 /// Применить протектор к свежесозданному исходящему сокету. No-op, если не установлен (desktop).
 /// Вызывать ДО connect/первой отправки — иначе первые пакеты уйдут в туннель (см. модульный док).
-pub fn protect_socket(sock: SocketHandle) {
-    if let Some(p) = PROTECTOR.lock().unwrap().as_ref() {
-        if !p.protect(sock) {
-            eprintln!("[protect] VpnService.protect({sock}) вернул false — возможна маршрутная петля");
-        }
+///
+/// Возвращает `true`, только если сокет ДЕЙСТВИТЕЛЬНО защищён. `false` — либо протектора нет,
+/// либо платформа отказала. Различать это обязан вызывающий: на desktop `false` штатен (анти-петлю
+/// там держит bypass-маршрут), а на Android он означает, что транспорт сейчас уйдёт в собственный
+/// туннель. Раньше функция ничего не возвращала, и отсутствие протектора было НЕОТЛИЧИМО от успеха —
+/// из-за этого гонка «сервис ещё не зарегистрировался» выглядела в журнале как исправная работа.
+pub fn protect_socket(sock: SocketHandle) -> bool {
+    let Some(p) = PROTECTOR.lock().unwrap().as_ref().cloned() else {
+        return false;
+    };
+    if !p.protect(sock) {
+        eprintln!("[protect] VpnService.protect({sock}) вернул false — возможна маршрутная петля");
+        return false;
     }
+    true
 }
 
 /// Куда именно должен уйти сокет относительно СОБСТВЕННОГО туннеля.
@@ -111,7 +120,7 @@ pub fn connect_tcp_route(addr: SocketAddr, timeout: Duration, route: Route) -> i
         Some(socket2::Protocol::TCP),
     )?;
     if route == Route::Bypass {
-        protect_socket(handle_of(&sock));
+        let _ = protect_socket(handle_of(&sock));
     }
     sock.connect_timeout(&addr.into(), timeout)?;
     Ok(sock.into())
@@ -176,18 +185,20 @@ mod tests {
     fn noop_without_protector_then_invoked_after_set() {
         let _g = serial();
         clear_socket_protector();
-        protect_socket(7); // без протектора — просто no-op, не паникует
+        // Без протектора — no-op, не паникует, и ЧЕСТНО отвечает «не защищено»: на Android это
+        // означает, что сервис ещё не зарегистрировался, и транспорт уйдёт в свой же туннель.
+        assert!(!protect_socket(7), "нет протектора — сокет не защищён, и это должно быть видно");
         assert!(!protector_active());
 
         let n = Arc::new(AtomicUsize::new(0));
         set_socket_protector(Arc::new(Counter(n.clone())));
         assert!(protector_active());
-        protect_socket(7);
-        protect_socket(8);
+        assert!(protect_socket(7));
+        assert!(protect_socket(8));
         assert_eq!(n.load(Ordering::SeqCst), 2);
 
         clear_socket_protector();
-        protect_socket(9); // снова no-op
+        assert!(!protect_socket(9)); // снова no-op
         assert_eq!(n.load(Ordering::SeqCst), 2);
     }
 

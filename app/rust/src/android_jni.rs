@@ -92,13 +92,31 @@ pub extern "system" fn Java_com_quantumaes_citadelpqvpn_CitadelVpnService_native
 }
 
 /// Kotlin `onDestroy` → снять протектор.
+///
+/// Снимаем, ТОЛЬКО если умирает тот самый сервис, который сейчас зарегистрирован. Быстрый цикл
+/// «Отключить → Подключить» даёт перекрытие: новый экземпляр успевает пройти `onCreate` и
+/// зарегистрироваться раньше, чем система добирается до `onDestroy` старого. Безусловный сброс в
+/// этот момент снимал ЖИВОЙ протектор — и первый транспортный сокет новой сессии уходил
+/// незащищённым, то есть в собственный туннель. Внешне это неотличимо от «сеть не пускает UDP».
 #[no_mangle]
 pub extern "system" fn Java_com_quantumaes_citadelpqvpn_CitadelVpnService_nativeUnregister<'local>(
-    _env: JNIEnv<'local>,
-    _service: JObject<'local>,
+    env: JNIEnv<'local>,
+    service: JObject<'local>,
 ) {
+    let mut slot = SERVICE.lock().unwrap();
+    let mine = match slot.as_ref() {
+        // `is_same_object` сравнивает Java-ссылки (GlobalRef и локальную) — это и есть «тот же
+        // экземпляр сервиса». Ошибку JNI трактуем как «тот же»: лучше снять протектор лишний раз,
+        // чем оставить висеть ссылку на уничтоженный сервис.
+        Some(cur) => env.is_same_object(cur.as_obj(), &service).unwrap_or(true),
+        None => false,
+    };
+    if !mine {
+        eprintln!("[jni] onDestroy старого экземпляра сервиса — протектор нового не трогаю");
+        return;
+    }
     clear_socket_protector();
-    *SERVICE.lock().unwrap() = None;
+    *slot = None;
 }
 
 /// Kotlin `CitadelVpnService` NetworkCallback → сменилась underlying-сеть (WiFi↔LTE/toggle) →

@@ -1073,9 +1073,44 @@ fn spawn_controller(
     let rx = controller.subscribe();
     rt().spawn(async move {
         controller.begin();
+        #[cfg(target_os = "android")]
+        wait_for_socket_protector().await;
         let _ = controller.connect(cfg, provider).await;
     });
     Ok(rx)
+}
+
+/// Android: дождаться регистрации `CitadelVpnService` протектором сокетов, прежде чем движок
+/// создаст ПЕРВЫЙ транспортный сокет.
+///
+/// Порядок «сервис → сессия» держит Kotlin (`startService` ждёт `onServiceReady`), но полагаться
+/// только на него нельзя: сервис может пересоздаваться (быстрое «Отключить → Подключить»,
+/// воскрешение по START_STICKY), и тогда между снятием старого протектора и регистрацией нового
+/// есть окно. Сокет, созданный в этом окне, не защищён — а значит, уйдёт в собственный туннель,
+/// как только поднимется TUN. Симптом при этом обманчив: хендшейк проходит (туннеля ещё нет), и
+/// беда всплывает лишь на данных.
+///
+/// Ждём коротко и не насмерть: если протектора нет и через секунду — идём как есть, но говорим об
+/// этом прямо. Пустая сессия хуже, чем сессия с честным предупреждением в журнале.
+#[cfg(target_os = "android")]
+async fn wait_for_socket_protector() {
+    use std::time::{Duration, Instant};
+    const WAIT: Duration = Duration::from_secs(1);
+    let started = Instant::now();
+    while !citadel_client::protector_active() {
+        if started.elapsed() >= WAIT {
+            eprintln!(
+                "[protect] ⚠ VpnService не зарегистрировался за {}с — сокеты движка сейчас НЕ \
+                 защищены от собственного туннеля",
+                WAIT.as_secs()
+            );
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    if started.elapsed() > Duration::from_millis(50) {
+        eprintln!("[protect] протектор сокетов встал за {} мс", started.elapsed().as_millis());
+    }
 }
 
 /// Desktop: старт через polkit-helper (`GuiTunProvider`) + прямая пересылка событий в `sink`
