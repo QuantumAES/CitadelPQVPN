@@ -38,7 +38,7 @@ flutter_rust_bridge::frb_generated_boilerplate!(
     default_rust_auto_opaque = RustAutoOpaqueMoi,
 );
 pub(crate) const FLUTTER_RUST_BRIDGE_CODEGEN_VERSION: &str = "2.12.0";
-pub(crate) const FLUTTER_RUST_BRIDGE_CODEGEN_CONTENT_HASH: i32 = -112728141;
+pub(crate) const FLUTTER_RUST_BRIDGE_CODEGEN_CONTENT_HASH: i32 = -1630234849;
 
 // Section: executor
 
@@ -1330,6 +1330,168 @@ fn wire__crate__api__citadel__vault_add_impl(
         },
     )
 }
+fn wire__crate__api__citadel__vault_biometric_blob_impl(
+    ptr_: flutter_rust_bridge::for_generated::PlatformGeneralizedUint8ListPtr,
+    rust_vec_len_: i32,
+    data_len_: i32,
+) -> flutter_rust_bridge::for_generated::WireSyncRust2DartSse {
+    FLUTTER_RUST_BRIDGE_HANDLER.wrap_sync::<flutter_rust_bridge::for_generated::SseCodec, _>(
+        flutter_rust_bridge::for_generated::TaskInfo {
+            debug_name: "vault_biometric_blob",
+            port: None,
+            mode: flutter_rust_bridge::for_generated::FfiCallMode::Sync,
+        },
+        move || {
+            let message = unsafe {
+                flutter_rust_bridge::for_generated::Dart2RustMessageSse::from_wire(
+                    ptr_,
+                    rust_vec_len_,
+                    data_len_,
+                )
+            };
+            let mut deserializer =
+                flutter_rust_bridge::for_generated::SseDeserializer::new(message);
+            deserializer.end();
+            transform_result_sse::<_, ()>((move || {
+                let output_ok = Result::<_, ()>::Ok(crate::api::citadel::vault_biometric_blob())?;
+                Ok(output_ok)
+            })())
+        },
+    )
+}
+fn wire__crate__api__citadel__vault_biometric_disable_impl(
+    port_: flutter_rust_bridge::for_generated::MessagePort,
+    ptr_: flutter_rust_bridge::for_generated::PlatformGeneralizedUint8ListPtr,
+    rust_vec_len_: i32,
+    data_len_: i32,
+) {
+    FLUTTER_RUST_BRIDGE_HANDLER.wrap_normal::<flutter_rust_bridge::for_generated::SseCodec, _, _>(
+        flutter_rust_bridge::for_generated::TaskInfo {
+            debug_name: "vault_biometric_disable",
+            port: Some(port_),
+            mode: flutter_rust_bridge::for_generated::FfiCallMode::Normal,
+        },
+        move || {
+            let message = unsafe {
+                flutter_rust_bridge::for_generated::Dart2RustMessageSse::from_wire(
+                    ptr_,
+                    rust_vec_len_,
+                    data_len_,
+                )
+            };
+            let mut deserializer =
+                flutter_rust_bridge::for_generated::SseDeserializer::new(message);
+            deserializer.end();
+            move |context| {
+                transform_result_sse::<_, flutter_rust_bridge::for_generated::anyhow::Error>(
+                    (move || {
+                        let output_ok = crate::api::citadel::vault_biometric_disable()?;
+                        Ok(output_ok)
+                    })(),
+                )
+            }
+        },
+    )
+}
+fn wire__crate__api__citadel__vault_biometric_enable_impl(
+    port_: flutter_rust_bridge::for_generated::MessagePort,
+    ptr_: flutter_rust_bridge::for_generated::PlatformGeneralizedUint8ListPtr,
+    rust_vec_len_: i32,
+    data_len_: i32,
+) {
+    FLUTTER_RUST_BRIDGE_HANDLER.wrap_normal::<flutter_rust_bridge::for_generated::SseCodec, _, _>(
+        flutter_rust_bridge::for_generated::TaskInfo {
+            debug_name: "vault_biometric_enable",
+            port: Some(port_),
+            mode: flutter_rust_bridge::for_generated::FfiCallMode::Normal,
+        },
+        move || {
+            let message = unsafe {
+                flutter_rust_bridge::for_generated::Dart2RustMessageSse::from_wire(
+                    ptr_,
+                    rust_vec_len_,
+                    data_len_,
+                )
+            };
+            let mut deserializer =
+                flutter_rust_bridge::for_generated::SseDeserializer::new(message);
+            let api_wrapped = <Vec<u8>>::sse_decode(&mut deserializer);
+            deserializer.end();
+            move |context| {
+                transform_result_sse::<_, flutter_rust_bridge::for_generated::anyhow::Error>(
+                    (move || {
+                        let output_ok = crate::api::citadel::vault_biometric_enable(api_wrapped)?;
+                        Ok(output_ok)
+                    })(),
+                )
+            }
+        },
+    )
+}
+fn wire__crate__api__citadel__vault_biometric_enrolled_impl(
+    ptr_: flutter_rust_bridge::for_generated::PlatformGeneralizedUint8ListPtr,
+    rust_vec_len_: i32,
+    data_len_: i32,
+) -> flutter_rust_bridge::for_generated::WireSyncRust2DartSse {
+    FLUTTER_RUST_BRIDGE_HANDLER.wrap_sync::<flutter_rust_bridge::for_generated::SseCodec, _>(
+        flutter_rust_bridge::for_generated::TaskInfo {
+            debug_name: "vault_biometric_enrolled",
+            port: None,
+            mode: flutter_rust_bridge::for_generated::FfiCallMode::Sync,
+        },
+        move || {
+            let message = unsafe {
+                flutter_rust_bridge::for_generated::Dart2RustMessageSse::from_wire(
+                    ptr_,
+                    rust_vec_len_,
+                    data_len_,
+                )
+            };
+            let mut deserializer =
+                flutter_rust_bridge::for_generated::SseDeserializer::new(message);
+            deserializer.end();
+            transform_result_sse::<_, ()>((move || {
+                let output_ok =
+                    Result::<_, ()>::Ok(crate::api::citadel::vault_biometric_enrolled())?;
+                Ok(output_ok)
+            })())
+        },
+    )
+}
+fn wire__crate__api__citadel__vault_biometric_key_to_wrap_impl(
+    port_: flutter_rust_bridge::for_generated::MessagePort,
+    ptr_: flutter_rust_bridge::for_generated::PlatformGeneralizedUint8ListPtr,
+    rust_vec_len_: i32,
+    data_len_: i32,
+) {
+    FLUTTER_RUST_BRIDGE_HANDLER.wrap_normal::<flutter_rust_bridge::for_generated::SseCodec, _, _>(
+        flutter_rust_bridge::for_generated::TaskInfo {
+            debug_name: "vault_biometric_key_to_wrap",
+            port: Some(port_),
+            mode: flutter_rust_bridge::for_generated::FfiCallMode::Normal,
+        },
+        move || {
+            let message = unsafe {
+                flutter_rust_bridge::for_generated::Dart2RustMessageSse::from_wire(
+                    ptr_,
+                    rust_vec_len_,
+                    data_len_,
+                )
+            };
+            let mut deserializer =
+                flutter_rust_bridge::for_generated::SseDeserializer::new(message);
+            deserializer.end();
+            move |context| {
+                transform_result_sse::<_, flutter_rust_bridge::for_generated::anyhow::Error>(
+                    (move || {
+                        let output_ok = crate::api::citadel::vault_biometric_key_to_wrap()?;
+                        Ok(output_ok)
+                    })(),
+                )
+            }
+        },
+    )
+}
 fn wire__crate__api__citadel__vault_change_password_impl(
     port_: flutter_rust_bridge::for_generated::MessagePort,
     ptr_: flutter_rust_bridge::for_generated::PlatformGeneralizedUint8ListPtr,
@@ -1742,6 +1904,42 @@ fn wire__crate__api__citadel__vault_unlock_impl(
         },
     )
 }
+fn wire__crate__api__citadel__vault_unlock_biometric_impl(
+    port_: flutter_rust_bridge::for_generated::MessagePort,
+    ptr_: flutter_rust_bridge::for_generated::PlatformGeneralizedUint8ListPtr,
+    rust_vec_len_: i32,
+    data_len_: i32,
+) {
+    FLUTTER_RUST_BRIDGE_HANDLER.wrap_normal::<flutter_rust_bridge::for_generated::SseCodec, _, _>(
+        flutter_rust_bridge::for_generated::TaskInfo {
+            debug_name: "vault_unlock_biometric",
+            port: Some(port_),
+            mode: flutter_rust_bridge::for_generated::FfiCallMode::Normal,
+        },
+        move || {
+            let message = unsafe {
+                flutter_rust_bridge::for_generated::Dart2RustMessageSse::from_wire(
+                    ptr_,
+                    rust_vec_len_,
+                    data_len_,
+                )
+            };
+            let mut deserializer =
+                flutter_rust_bridge::for_generated::SseDeserializer::new(message);
+            let api_master_key = <Vec<u8>>::sse_decode(&mut deserializer);
+            deserializer.end();
+            move |context| {
+                transform_result_sse::<_, flutter_rust_bridge::for_generated::anyhow::Error>(
+                    (move || {
+                        let output_ok =
+                            crate::api::citadel::vault_unlock_biometric(api_master_key)?;
+                        Ok(output_ok)
+                    })(),
+                )
+            }
+        },
+    )
+}
 fn wire__crate__api__citadel__vpn_activate_profile_impl(
     port_: flutter_rust_bridge::for_generated::MessagePort,
     ptr_: flutter_rust_bridge::for_generated::PlatformGeneralizedUint8ListPtr,
@@ -2085,6 +2283,17 @@ impl SseDecode for Option<String> {
     }
 }
 
+impl SseDecode for Option<Vec<u8>> {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    fn sse_decode(deserializer: &mut flutter_rust_bridge::for_generated::SseDeserializer) -> Self {
+        if (<bool>::sse_decode(deserializer)) {
+            return Some(<Vec<u8>>::sse_decode(deserializer));
+        } else {
+            return None;
+        }
+    }
+}
+
 impl SseDecode for crate::api::citadel::ProfileDto {
     // Codec=Sse (Serialization based), see doc to use other codecs
     fn sse_decode(deserializer: &mut flutter_rust_bridge::for_generated::SseDeserializer) -> Self {
@@ -2252,16 +2461,40 @@ fn pde_ffi_dispatcher_primary_impl(
         23 => wire__crate__api__citadel__parse_link_summary_impl(port, ptr, rust_vec_len, data_len),
         24 => wire__crate__api__citadel__run_diagnostics_impl(port, ptr, rust_vec_len, data_len),
         39 => wire__crate__api__citadel__vault_add_impl(port, ptr, rust_vec_len, data_len),
-        40 => {
+        41 => wire__crate__api__citadel__vault_biometric_disable_impl(
+            port,
+            ptr,
+            rust_vec_len,
+            data_len,
+        ),
+        42 => wire__crate__api__citadel__vault_biometric_enable_impl(
+            port,
+            ptr,
+            rust_vec_len,
+            data_len,
+        ),
+        44 => wire__crate__api__citadel__vault_biometric_key_to_wrap_impl(
+            port,
+            ptr,
+            rust_vec_len,
+            data_len,
+        ),
+        45 => {
             wire__crate__api__citadel__vault_change_password_impl(port, ptr, rust_vec_len, data_len)
         }
-        41 => wire__crate__api__citadel__vault_create_impl(port, ptr, rust_vec_len, data_len),
-        52 => wire__crate__api__citadel__vault_unlock_impl(port, ptr, rust_vec_len, data_len),
-        53 => {
+        46 => wire__crate__api__citadel__vault_create_impl(port, ptr, rust_vec_len, data_len),
+        57 => wire__crate__api__citadel__vault_unlock_impl(port, ptr, rust_vec_len, data_len),
+        58 => wire__crate__api__citadel__vault_unlock_biometric_impl(
+            port,
+            ptr,
+            rust_vec_len,
+            data_len,
+        ),
+        59 => {
             wire__crate__api__citadel__vpn_activate_profile_impl(port, ptr, rust_vec_len, data_len)
         }
-        54 => wire__crate__api__citadel__vpn_connect_impl(port, ptr, rust_vec_len, data_len),
-        55 => {
+        60 => wire__crate__api__citadel__vpn_connect_impl(port, ptr, rust_vec_len, data_len),
+        61 => {
             wire__crate__api__citadel__vpn_connect_profile_impl(port, ptr, rust_vec_len, data_len)
         }
         _ => unreachable!(),
@@ -2303,17 +2536,19 @@ fn pde_ffi_dispatcher_sync_impl(
         36 => wire__crate__api__diag__start_log_capture_impl(ptr, rust_vec_len, data_len),
         37 => wire__crate__api__citadel__traffic_counters_impl(ptr, rust_vec_len, data_len),
         38 => wire__crate__api__citadel__traffic_meter_enabled_impl(ptr, rust_vec_len, data_len),
-        42 => wire__crate__api__citadel__vault_exists_impl(ptr, rust_vec_len, data_len),
-        43 => wire__crate__api__citadel__vault_is_unlocked_impl(ptr, rust_vec_len, data_len),
-        44 => wire__crate__api__citadel__vault_list_impl(ptr, rust_vec_len, data_len),
-        45 => wire__crate__api__citadel__vault_location_impl(ptr, rust_vec_len, data_len),
-        46 => wire__crate__api__citadel__vault_lock_impl(ptr, rust_vec_len, data_len),
-        47 => wire__crate__api__citadel__vault_max_name_len_impl(ptr, rust_vec_len, data_len),
-        48 => wire__crate__api__citadel__vault_min_password_len_impl(ptr, rust_vec_len, data_len),
-        49 => wire__crate__api__citadel__vault_move_to_impl(ptr, rust_vec_len, data_len),
-        50 => wire__crate__api__citadel__vault_remove_impl(ptr, rust_vec_len, data_len),
-        51 => wire__crate__api__citadel__vault_rename_impl(ptr, rust_vec_len, data_len),
-        56 => wire__crate__api__citadel__vpn_disconnect_impl(ptr, rust_vec_len, data_len),
+        40 => wire__crate__api__citadel__vault_biometric_blob_impl(ptr, rust_vec_len, data_len),
+        43 => wire__crate__api__citadel__vault_biometric_enrolled_impl(ptr, rust_vec_len, data_len),
+        47 => wire__crate__api__citadel__vault_exists_impl(ptr, rust_vec_len, data_len),
+        48 => wire__crate__api__citadel__vault_is_unlocked_impl(ptr, rust_vec_len, data_len),
+        49 => wire__crate__api__citadel__vault_list_impl(ptr, rust_vec_len, data_len),
+        50 => wire__crate__api__citadel__vault_location_impl(ptr, rust_vec_len, data_len),
+        51 => wire__crate__api__citadel__vault_lock_impl(ptr, rust_vec_len, data_len),
+        52 => wire__crate__api__citadel__vault_max_name_len_impl(ptr, rust_vec_len, data_len),
+        53 => wire__crate__api__citadel__vault_min_password_len_impl(ptr, rust_vec_len, data_len),
+        54 => wire__crate__api__citadel__vault_move_to_impl(ptr, rust_vec_len, data_len),
+        55 => wire__crate__api__citadel__vault_remove_impl(ptr, rust_vec_len, data_len),
+        56 => wire__crate__api__citadel__vault_rename_impl(ptr, rust_vec_len, data_len),
+        62 => wire__crate__api__citadel__vpn_disconnect_impl(ptr, rust_vec_len, data_len),
         _ => unreachable!(),
     }
 }
@@ -2702,6 +2937,16 @@ impl SseEncode for Option<String> {
         <bool>::sse_encode(self.is_some(), serializer);
         if let Some(value) = self {
             <String>::sse_encode(value, serializer);
+        }
+    }
+}
+
+impl SseEncode for Option<Vec<u8>> {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    fn sse_encode(self, serializer: &mut flutter_rust_bridge::for_generated::SseSerializer) {
+        <bool>::sse_encode(self.is_some(), serializer);
+        if let Some(value) = self {
+            <Vec<u8>>::sse_encode(value, serializer);
         }
     }
 }

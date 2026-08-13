@@ -78,6 +78,17 @@ const Map<String, String> langIt = {
   'traffic_meter_sub': 'Velocità attuale in ricezione e invio sulla scheda di connessione',
   'pacing_title': 'Mascheramento dei tempi',
   'pacing_sub': 'Uniforma e riempie il traffico in uscita (più lento, ma più difficile da correlare); dalla prossima sessione',
+  // ── C9 ──
+  'biometric_title': 'Sblocco con impronta',
+  'biometric_sub':
+      'Apri la cassaforte con l’impronta; la password principale continua a funzionare',
+  'biometric_unlock': 'Sblocca con impronta',
+  'biometric_prompt_unlock': 'Tocca il sensore per aprire la cassaforte',
+  'biometric_prompt_enable': 'Tocca il sensore per attivare lo sblocco con impronta',
+  'biometric_key_gone':
+      'La biometria del dispositivo è cambiata: accedi con la password principale e riattiva l’impronta',
+  'biometric_failed': 'Impossibile usare l’impronta',
+  'biometric_none_enrolled': 'Aggiungi prima un’impronta nelle impostazioni del dispositivo',
   'debug_title': 'Modalità debug',
   'debug_sub': 'Log del core e diagnostica della connessione',
   'screenshot_title': 'Blocca gli screenshot',

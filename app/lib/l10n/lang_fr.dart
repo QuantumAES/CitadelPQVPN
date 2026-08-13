@@ -78,6 +78,16 @@ const Map<String, String> langFr = {
   'traffic_meter_sub': 'Débit actuel en réception et en envoi sur la carte de connexion',
   'pacing_title': 'Masquage du rythme',
   'pacing_sub': 'Lisser et rembourrer le trafic sortant (plus lent, mais plus difficile à corréler) ; dès la prochaine session',
+  // ── C9 ──
+  'biometric_title': 'Déverrouillage par empreinte',
+  'biometric_sub': 'Ouvrir le coffre avec une empreinte ; le mot de passe maître reste actif',
+  'biometric_unlock': 'Déverrouiller par empreinte',
+  'biometric_prompt_unlock': 'Touchez le capteur pour ouvrir le coffre',
+  'biometric_prompt_enable': 'Touchez le capteur pour activer le déverrouillage par empreinte',
+  'biometric_key_gone':
+      'La biométrie de l’appareil a changé — connectez-vous avec le mot de passe maître, puis réactivez l’empreinte',
+  'biometric_failed': 'Impossible d’utiliser l’empreinte',
+  'biometric_none_enrolled': 'Ajoutez d’abord une empreinte dans les réglages de l’appareil',
   'debug_title': 'Mode débogage',
   'debug_sub': 'Journal du cœur et diagnostic de connexion',
   'screenshot_title': 'Bloquer les captures d’écran',

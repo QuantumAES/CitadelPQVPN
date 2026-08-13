@@ -6,6 +6,7 @@ import 'package:flutter/services.dart';
 
 import 'package:app/android_vpn.dart';
 import 'package:app/app_state.dart';
+import 'package:app/biometric.dart';
 import 'package:app/debug_panel.dart';
 import 'package:app/errors.dart';
 import 'package:app/format.dart';
@@ -43,6 +44,9 @@ class _HomePageState extends State<HomePage> {
   @override
   void initState() {
     super.initState();
+    // C9: готовность биометрии спрашиваем у платформы (отпечаток могли добавить или удалить в
+    // системных настройках между запусками) — от ответа зависит, есть ли вообще тумблер.
+    unawaited(s.refreshBiometric());
     // обновляем счётчик времени сессии раз в секунду, пока подключены и пока окно видно:
     // перестраивать экран, спрятанный в трей, незачем (см. window_visibility.dart)
     _tick = Timer.periodic(const Duration(seconds: 1), (_) {
@@ -399,6 +403,21 @@ class _HomePageState extends State<HomePage> {
                   s.lockVault();
                 },
               ),
+              // C9: вход по отпечатку. Показываем только там, где он реально работает — платформа
+              // умеет И в устройстве есть зарегистрированный отпечаток сильного класса. Тумблер
+              // рядом со сменой пароля, потому что это ровно тот же вопрос: как открывается
+              // хранилище. Дефолт — выключено: палец прикладывают под принуждением, пароль — нет.
+              if (s.biometricOffered)
+                SwitchListTile(
+                  secondary: const Icon(Icons.fingerprint),
+                  title: Text(t('biometric_title')),
+                  subtitle: Text(t('biometric_sub')),
+                  value: s.biometricEnrolled,
+                  onChanged: (on) {
+                    Navigator.pop(sheetCtx); // системный диалог отпечатка — поверх, без шторки
+                    _toggleBiometric(on: on);
+                  },
+                ),
             ],
             // Индикация трафика: только текущая скорость на плашке подключения, без итогов.
             // По умолчанию выключена — лишняя строка на главном экране нужна не всем.
@@ -876,6 +895,29 @@ class _HomePageState extends State<HomePage> {
     pw.dispose();
     pw2.dispose();
     return ok ?? false;
+  }
+
+  /// C9: включить/выключить вход по отпечатку. Включение спрашивает палец (иначе мы завернули бы
+  /// ключ в Keystore, ни разу не проверив, что человек вообще может им пользоваться), выключение —
+  /// нет: отзывать себе доступ человек должен свободно и мгновенно.
+  Future<void> _toggleBiometric({required bool on}) async {
+    try {
+      if (on) {
+        await s.enableBiometric(BiometricTexts(
+          title: 'CitadelPQVPN',
+          subtitle: t('biometric_prompt_enable'),
+          cancel: t('cancel'),
+        ));
+      } else {
+        await s.disableBiometric();
+      }
+    } on BiometricFailure catch (e) {
+      if (e.cancelled) return; // отмену комментировать не нужно
+      debugPrint('[biometric] $e'); // код платформы — в журнал, не в лицо человеку
+      _toast(e.keyGone ? t('biometric_key_gone') : t('biometric_failed'));
+    } catch (e) {
+      _toast(humanError(e)); // отказ ядра (не записалось хранилище) — уже человеческая фраза
+    }
   }
 
   void _toast(String msg) {

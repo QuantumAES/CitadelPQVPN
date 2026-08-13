@@ -137,6 +137,50 @@ Future<void> vaultChangePassword({required String old, required String new_}) =>
       new_: new_,
     );
 
+/// Настроена ли разблокировка отпечатком для этого файла хранилища. Читается БЕЗ пароля (в слоте
+/// нет секрета — он бесполезен без ключа из TEE), потому что экран блокировки обязан решить,
+/// показывать ли кнопку, до того как что-либо разблокировано.
+bool vaultBiometricEnrolled() =>
+    RustLib.instance.api.crateApiCitadelVaultBiometricEnrolled();
+
+/// Завёрнутый мастер-ключ из файла — его надо отдать Keystore на разворачивание.
+Uint8List? vaultBiometricBlob() =>
+    RustLib.instance.api.crateApiCitadelVaultBiometricBlob();
+
+/// **Мастер-ключ хранилища для обёртки платформой.** Требует разблокированного хранилища: включить
+/// биометрию можно только тому, кто уже доказал знание пароля.
+///
+/// Байты пересекают границу FFI и на короткое время живут в Dart — иного пути нет, ключ обязан
+/// попасть в `Cipher` из Keystore, а тот живёт в Kotlin. Вызывающий обязан затереть свою копию
+/// сразу после обёртки (см. `lib/biometric.dart`). Экспозиция ограничена: это тот же процесс, в
+/// котором уже лежит расшифрованное хранилище, — читающий его память противник и так победил.
+Future<Uint8List> vaultBiometricKeyToWrap() =>
+    RustLib.instance.api.crateApiCitadelVaultBiometricKeyToWrap();
+
+/// Включить разблокировку отпечатком: положить в файл блоб, который вернул Keystore.
+Future<void> vaultBiometricEnable({required List<int> wrapped}) =>
+    RustLib.instance.api.crateApiCitadelVaultBiometricEnable(wrapped: wrapped);
+
+/// Выключить разблокировку отпечатком (слот из файла долой). Ключ в самом Keystore удаляет
+/// платформенный слой — здесь только файл.
+///
+/// Мастер-ключ при этом НЕ меняется, и это осознанно: сменить его — значит перезавернуть слот
+/// пароля, а пароля у нас в этот момент нет (хранилище могли открыть тем же отпечатком). Остаточный
+/// риск — старая КОПИЯ файла хранилища плюс живой ключ в Keystore; закрывается тем, что ключ
+/// удаляется вместе со слотом. Человеку, у которого утекли резервные копии, поможет смена пароля.
+Future<void> vaultBiometricDisable() =>
+    RustLib.instance.api.crateApiCitadelVaultBiometricDisable();
+
+/// Открыть хранилище мастер-ключом, который Keystore вернул после успешного отпечатка.
+///
+/// Отказ здесь — это НЕ «палец не подошёл» (палец проверила ОС до нас): это «ключ не открывает
+/// именно этот файл» — хранилище пересоздали, восстановили из чужой копии, подменили. Поэтому и
+/// фраза человеку другая, чем при неверном пароле.
+Future<void> vaultUnlockBiometric({required List<int> masterKey}) => RustLib
+    .instance
+    .api
+    .crateApiCitadelVaultUnlockBiometric(masterKey: masterKey);
+
 /// Список профилей (vault должен быть разблокирован).
 List<ProfileDto> vaultList() => RustLib.instance.api.crateApiCitadelVaultList();
 

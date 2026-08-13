@@ -7,6 +7,7 @@ import 'package:path_provider/path_provider.dart';
 import 'package:window_manager/window_manager.dart';
 
 import 'package:app/app_state.dart';
+import 'package:app/biometric.dart';
 import 'package:app/errors.dart';
 import 'package:app/format.dart';
 import 'package:app/home_page.dart';
@@ -328,6 +329,13 @@ class _UnlockScreenState extends State<UnlockScreen> {
   bool _busy = false;
   String? _error;
 
+  /// C9: идёт системный диалог отпечатка. Отдельно от [_busy] — там Argon2id на пароле, здесь
+  /// ожидание пальца, и блокировать надо обе кнопки, но подписи у них разные.
+  bool _bioBusy = false;
+
+  /// Предлагать ли отпечаток: настроен для этого хранилища И устройство готово.
+  bool get _bioReady => widget.state.biometricEnrolled && widget.state.biometricOffered;
+
   /// Индикация трафика на плашке живой сессии — тот же расчёт, что на главном экране
   /// (`lib/traffic.dart`). Счётчики ядра к хранилищу отношения не имеют, поэтому под замком
   /// доступны как обычно.
@@ -348,6 +356,50 @@ class _UnlockScreenState extends State<UnlockScreen> {
       _traffic.sample(c.rxBytes.toInt(), c.txBytes.toInt(), DateTime.now());
       setState(() {});
     });
+    // C9: если вход по отпечатку включён — спрашиваем палец сразу, не дожидаясь нажатия. Ради
+    // этого настройку и включают; отменивший диалог получает обычное поле пароля (и клавиатуру мы
+    // ему заранее не открываем — см. autofocus ниже).
+    WidgetsBinding.instance.addPostFrameCallback((_) => _biometricOnEntry());
+  }
+
+  Future<void> _biometricOnEntry() async {
+    await widget.state.refreshBiometric();
+    if (!mounted || !_bioReady) return;
+    await _biometric(auto: true);
+  }
+
+  /// Разблокировать отпечатком. `auto` — вызов при входе на экран: там о неудаче молчим (человек
+  /// диалога не просил), а по явному нажатию — говорим.
+  Future<void> _biometric({bool auto = false}) async {
+    if (_busy || _bioBusy) return;
+    final t = Strings.of(context);
+    setState(() {
+      _bioBusy = true;
+      _error = null;
+    });
+    try {
+      await widget.state.unlockWithBiometric(BiometricTexts(
+        title: 'CitadelPQVPN',
+        subtitle: t('biometric_prompt_unlock'),
+        cancel: t('cancel'),
+      ));
+    } on BiometricFailure catch (e) {
+      // «Ключа больше нет» показываем ВСЕГДА, даже при автозапуске: иначе человек видит, что
+      // отпечаток молча перестал работать, и не знает, что чинится это входом по паролю.
+      if (!mounted) return;
+      if (e.keyGone) {
+        setState(() => _error = t('biometric_key_gone'));
+      } else if (!e.cancelled && !auto) {
+        // Причина отказа платформы (занят датчик, слишком много попыток) человеку ничего не
+        // объясняет и не переведена — она уходит в журнал, а на экране остаётся суть.
+        debugPrint('[biometric] $e');
+        setState(() => _error = t('biometric_failed'));
+      }
+    } catch (e) {
+      if (mounted) setState(() => _error = humanError(e));
+    } finally {
+      if (mounted) setState(() => _bioBusy = false);
+    }
   }
 
   Future<void> _submit() async {
@@ -419,7 +471,9 @@ class _UnlockScreenState extends State<UnlockScreen> {
                 const SizedBox(height: 28),
                 TextField(
                   controller: _pw,
-                  autofocus: true,
+                  // Клавиатуру не поднимаем, если человек и так собирался войти отпечатком:
+                  // системный диалог уже открыт поверх, и поле под ним ждать ввода не должно.
+                  autofocus: !_bioReady,
                   obscureText: true,
                   onSubmitted: (_) => _submit(),
                   decoration: InputDecoration(
@@ -434,7 +488,7 @@ class _UnlockScreenState extends State<UnlockScreen> {
                 ],
                 const SizedBox(height: 16),
                 FilledButton(
-                  onPressed: _busy ? null : _submit,
+                  onPressed: (_busy || _bioBusy) ? null : _submit,
                   child: _busy
                       ? const SizedBox(
                           height: 20,
@@ -442,6 +496,15 @@ class _UnlockScreenState extends State<UnlockScreen> {
                           child: CircularProgressIndicator(strokeWidth: 2))
                       : Text(t('unlock')),
                 ),
+                // C9: повторный вызов отпечатка — на случай отменённого/промахнувшегося диалога.
+                if (_bioReady) ...[
+                  const SizedBox(height: 8),
+                  OutlinedButton.icon(
+                    onPressed: (_busy || _bioBusy) ? null : _biometric,
+                    icon: const Icon(Icons.fingerprint),
+                    label: Text(t('biometric_unlock')),
+                  ),
+                ],
               ],
             ),
           ),

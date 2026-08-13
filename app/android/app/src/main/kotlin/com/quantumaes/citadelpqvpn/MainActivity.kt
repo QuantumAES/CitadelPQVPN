@@ -6,7 +6,7 @@ import android.net.VpnService
 import android.os.Build
 import android.os.Bundle
 import android.view.WindowManager
-import io.flutter.embedding.android.FlutterActivity
+import io.flutter.embedding.android.FlutterFragmentActivity
 import io.flutter.embedding.engine.FlutterEngine
 import io.flutter.plugin.common.MethodChannel
 
@@ -19,8 +19,14 @@ import io.flutter.plugin.common.MethodChannel
  * Мониторинг underlying-сети (WiFi↔LTE) и сигнал реконнекта при её смене живут в CitadelVpnService
  * (S2 — переживают Activity, работают при закрытом окне), а не здесь: Activity в смене сети больше
  * не участвует.
+ *
+ * Второй канал — `citadel/biometric` (C9, разблокировка хранилища отпечатком, см. [BiometricVault]).
+ *
+ * NB: базовый класс — `FlutterFragmentActivity`, а не `FlutterActivity`. Это требование
+ * `androidx.biometric`: системный диалог отпечатка живёт во фрагменте и без `FragmentActivity`
+ * падает в рантайме. Для остального кода замена прозрачна (тот же жизненный цикл, тот же движок).
  */
-class MainActivity : FlutterActivity() {
+class MainActivity : FlutterFragmentActivity() {
     private val channelName = "dev.citadelpqvpn/vpn"
     private val reqVpn = 0x1011
     private var prepareResult: MethodChannel.Result? = null
@@ -35,6 +41,13 @@ class MainActivity : FlutterActivity() {
 
     override fun configureFlutterEngine(flutterEngine: FlutterEngine) {
         super.configureFlutterEngine(flutterEngine)
+        // C9: разблокировка хранилища отпечатком — свой канал, своя ответственность (Keystore +
+        // BiometricPrompt). К VPN отношения не имеет и с ним не пересекается.
+        BiometricVault.register(
+            this,
+            MethodChannel(flutterEngine.dartExecutor.binaryMessenger, BiometricVault.CHANNEL),
+        )
+
         val ch = MethodChannel(flutterEngine.dartExecutor.binaryMessenger, channelName)
         ch.setMethodCallHandler { call, result ->
             when (call.method) {

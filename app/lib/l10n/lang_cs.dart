@@ -78,6 +78,16 @@ const Map<String, String> langCs = {
   'traffic_meter_sub': 'Aktuální rychlost příjmu a odesílání na kartě připojení',
   'pacing_title': 'Maskování časování',
   'pacing_sub': 'Vyrovnat a doplnit odchozí provoz (pomalejší, ale hůře korelovatelný); od příštího sezení',
+  // ── C9 ──
+  'biometric_title': 'Odemknutí otiskem',
+  'biometric_sub': 'Otevřít trezor otiskem; hlavní heslo funguje dál',
+  'biometric_unlock': 'Odemknout otiskem',
+  'biometric_prompt_unlock': 'Přiložte prst a otevřete trezor',
+  'biometric_prompt_enable': 'Přiložte prst a zapněte odemykání otiskem',
+  'biometric_key_gone':
+      'Biometrie zařízení se změnila — přihlaste se hlavním heslem a otisk znovu zapněte',
+  'biometric_failed': 'Otisk se nepodařilo použít',
+  'biometric_none_enrolled': 'Nejprve přidejte otisk v nastavení zařízení',
   'debug_title': 'Režim ladění',
   'debug_sub': 'Protokol jádra a diagnostika připojení',
   'screenshot_title': 'Blokovat snímky obrazovky',

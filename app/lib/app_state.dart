@@ -4,6 +4,7 @@ import 'dart:io';
 import 'package:flutter/foundation.dart';
 
 import 'package:app/android_vpn.dart';
+import 'package:app/biometric.dart';
 import 'package:app/l10n/strings.dart';
 import 'package:app/src/rust/api/citadel.dart';
 import 'package:app/windows_secure.dart';
@@ -228,6 +229,12 @@ class AppState extends ChangeNotifier {
   Future<void> unlock(String pw) async {
     await vaultUnlock(passphrase: pw);
     _unlocked = true;
+    // C9: система уничтожила ключ биометрии (добавили отпечаток, очистили данные приложения), а
+    // слот в файле остался. Вычищаем его при первом же входе по паролю — иначе кнопка «Войти
+    // отпечатком» продолжала бы обещать то, чего платформа уже не может.
+    if (biometricKeyGone) {
+      await disableBiometric();
+    }
     _reloadProfiles();
     notifyListeners();
   }
@@ -239,8 +246,97 @@ class AppState extends ChangeNotifier {
     notifyListeners();
   }
 
+  /// Смена мастер-пароля. Биометрию НЕ трогает: с формата v4 ключ хранилища не выводится из
+  /// пароля, пароль лишь один из способов до него добраться (см. `citadel_client::vault`).
   Future<void> changePassword(String oldPw, String newPw) =>
       vaultChangePassword(old: oldPw, new_: newPw);
+
+  // ─────────────────── C9: разблокировка отпечатком (Android, по желанию) ───────────────────
+  //
+  // Дефолт — выключено, и включает только сам человек. Биометрия — это размен: удобство против
+  // того, что палец прикладывают под принуждением, а пароль остаётся в голове. Поэтому мастер-пароль
+  // работает всегда и остаётся единственным резервным путём (системный PIN устройства к хранилищу
+  // намеренно не допущен — см. `BiometricVault.prompt` в Kotlin).
+
+  /// Настроена ли биометрия для ЭТОГО файла хранилища. Признак лежит в самом файле (слот ключа), а
+  /// не в настройках рядом: иначе «включено» и «на самом деле открывается» разъезжались бы при
+  /// переносе хранилища на другое устройство или восстановлении из копии.
+  bool biometricEnrolled = vaultBiometricEnrolled();
+
+  /// Готовность устройства (датчик, зарегистрированные отпечатки). Обновляется на старте и после
+  /// операций: отпечаток могли удалить в системных настройках, пока приложение было в фоне.
+  BiometricStatus biometricStatus = BiometricStatus.unavailable;
+
+  /// Ключ в Keystore мёртв, а слот в файле есть: сменилась биометрия устройства либо очистили
+  /// данные приложения. Экран разблокировки говорит об этом человеку, вход по паролю чинит.
+  bool biometricKeyGone = false;
+
+  bool get biometricSupported => BiometricUnlock.supported;
+
+  /// Показывать ли настройку/кнопку: платформа умеет И устройство готово.
+  bool get biometricOffered => biometricSupported && biometricStatus == BiometricStatus.ok;
+
+  Future<void> refreshBiometric() async {
+    if (!biometricSupported) return;
+    biometricStatus = await BiometricUnlock.status();
+    biometricEnrolled = vaultBiometricEnrolled();
+    notifyListeners();
+  }
+
+  /// Разблокировать хранилище отпечатком. Бросает [BiometricFailure] (отмена/нет ключа) либо
+  /// ошибку ядра, если ключ не открывает этот файл.
+  Future<void> unlockWithBiometric(BiometricTexts t) async {
+    final blob = vaultBiometricBlob();
+    if (blob == null) {
+      biometricEnrolled = false;
+      notifyListeners();
+      throw BiometricFailure('no_key', null);
+    }
+    final Uint8List key;
+    try {
+      key = await BiometricUnlock.unwrap(blob, t);
+    } on BiometricFailure catch (e) {
+      if (e.keyGone) {
+        biometricKeyGone = true;
+        notifyListeners();
+      }
+      rethrow;
+    }
+    try {
+      await vaultUnlockBiometric(masterKey: key);
+    } finally {
+      BiometricUnlock.zeroize(key); // ключ хранилища не должен пережить эту строку
+    }
+    _unlocked = true;
+    _reloadProfiles();
+    notifyListeners();
+  }
+
+  /// Включить разблокировку отпечатком. Требует уже открытого хранилища: право включить биометрию
+  /// даёт знание пароля, а не наличие пальца.
+  Future<void> enableBiometric(BiometricTexts t) async {
+    final key = await vaultBiometricKeyToWrap();
+    final Uint8List wrapped;
+    try {
+      wrapped = await BiometricUnlock.wrap(key, t);
+    } finally {
+      BiometricUnlock.zeroize(key);
+    }
+    await vaultBiometricEnable(wrapped: wrapped);
+    biometricEnrolled = true;
+    biometricKeyGone = false;
+    notifyListeners();
+  }
+
+  /// Выключить: слот из файла, затем ключ из Keystore. Порядок важен — если удаление ключа не
+  /// удастся, завёрнутого блоба уже нет, и ключ становится бесполезен сам по себе.
+  Future<void> disableBiometric() async {
+    await vaultBiometricDisable();
+    await BiometricUnlock.remove();
+    biometricEnrolled = false;
+    biometricKeyGone = false;
+    notifyListeners();
+  }
 
   /// Заблокировать хранилище. Живую сессию НЕ трогаем: замок — про секреты на диске, а не про
   /// туннель. Всё нужное для работы движок уже держит у себя (ссылка разобрана при старте сессии,

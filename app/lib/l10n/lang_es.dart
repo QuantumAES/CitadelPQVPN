@@ -78,6 +78,16 @@ const Map<String, String> langEs = {
   'traffic_meter_sub': 'Velocidad actual de recepción y envío en la tarjeta de conexión',
   'pacing_title': 'Enmascarar los tiempos',
   'pacing_sub': 'Uniformar y rellenar el tráfico saliente (más lento, pero más difícil de correlacionar); desde la próxima sesión',
+  // ── C9 ──
+  'biometric_title': 'Desbloqueo con huella',
+  'biometric_sub': 'Abrir el almacén con la huella; la contraseña maestra sigue funcionando',
+  'biometric_unlock': 'Desbloquear con huella',
+  'biometric_prompt_unlock': 'Toca el sensor para abrir el almacén',
+  'biometric_prompt_enable': 'Toca el sensor para activar el desbloqueo con huella',
+  'biometric_key_gone':
+      'La biometría del dispositivo cambió: entra con la contraseña maestra y activa la huella de nuevo',
+  'biometric_failed': 'No se pudo usar la huella',
+  'biometric_none_enrolled': 'Primero añade una huella en los ajustes del dispositivo',
   'debug_title': 'Modo de depuración',
   'debug_sub': 'Registro del núcleo y diagnóstico de la conexión',
   'screenshot_title': 'Bloquear capturas de pantalla',

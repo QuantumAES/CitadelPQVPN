@@ -4,17 +4,35 @@
 //! и лежат одним файлом. Крипта — в Rust-ядре (aws-lc-rs, та же библиотека, что и в движке;
 //! кроссится под Android/iOS), НЕ в открытом виде и без зависимости от OS-keyring-демона.
 //!
-//! Формат файла (binary), v3 — текущий:
+//! Формат файла (binary), v4 — текущий:
 //! ```text
-//! "CPQV" | ver(1)=3 | m_kib(u32 BE) | t(u32 BE) | p(u32 BE) | salt(16) | nonce(12) | AES-256-GCM(ct‖tag)
+//! "CPQV" | ver(1)=4 | m_kib(u32 BE) | t(u32 BE) | p(u32 BE) | salt(16) | nonce(12)
+//!        | slots_len(u16 BE) | slots(CBOR) | AES-256-GCM(ct‖tag)
 //! ```
-//! Ключ = Argon2id(passphrase, salt, m_kib/t/p) → 32 B. Открытый текст = CBOR(VaultData).
-//! **Весь заголовок входит в AAD** (L-2/аудит-4), поэтому его правка ломает проверку тега.
-//! Неверный пароль → AEAD open не проходит → `open` возвращает ошибку (аутентификация AEAD =
+//! Открытый текст = CBOR(VaultData). **Всё, что до шифртекста (заголовок И таблица слотов), входит
+//! в AAD** (L-2/аудит-4 + C9): правка любого поля ломает проверку тега.
+//!
+//! **Ключевая схема (C9, key slots — как у LUKS/FileVault).** Данные шифрует случайный мастер-ключ
+//! `MK` (32 B), а сам `MK` лежит в файле столько раз, сколькими способами хранилище разрешено
+//! открыть:
+//!   * слот `password` — `MK`, завёрнутый в AES-256-GCM под `Argon2id(passphrase, salt, m/t/p)`;
+//!   * слот `platform` — `MK`, завёрнутый **платформенным** хранилищем ключей (Android Keystore,
+//!     ключ неэкспортируемый и требует биометрии; см. [`Vault::set_platform_slot`]). Блоб для нас
+//!     непрозрачен: развернуть его умеет только та же ОС на том же устройстве.
+//!
+//! Так пароль перестаёт быть ключом файла и становится ОДНИМ ИЗ способов добыть ключ. Практическая
+//! разница: смена пароля не трогает `MK` (биометрия переживает её), а платформенный слот на чужом
+//! устройстве — мёртвый груз (ключа в TEE нет), и хранилище там открывается по-старому, паролем.
+//! Стойкость к офлайн-перебору не меняется: слот `platform` без TEE не даёт ничего, и украденный
+//! файл по-прежнему упирается в Argon2id над паролем.
+//!
+//! Неверный пароль → AEAD слота не проходит → `open` возвращает ошибку (аутентификация AEAD =
 //! проверка пароля, отдельный верификатор не нужен).
 //!
-//! Читаются и прозрачно пере-сохраняются как v3: **v2** (тот же Argon2id, но AAD пустой) и
-//! **v1** (legacy PBKDF2-HMAC-SHA256 — миграция на Argon2id при первом открытии, C1/аудит-3).
+//! Читаются и прозрачно пере-сохраняются как v4: **v3** (ключ файла = Argon2id(пароль), заголовок в
+//! AAD), **v2** (то же, но AAD пустой) и **v1** (legacy PBKDF2-HMAC-SHA256 — миграция на Argon2id
+//! при первом открытии, C1/аудит-3). Обратной дороги нет: v4 старым клиентом не читается — ровно
+//! как было при миграциях v1→v2→v3.
 
 use std::num::NonZeroU32;
 use std::path::{Path, PathBuf};
@@ -30,13 +48,17 @@ use zeroize::Zeroize;
 use crate::creds::CredentialLink;
 
 const MAGIC: &[u8; 4] = b"CPQV";
-/// v3 (L-2/аудит-4) = Argon2id + заголовок под AAD. v2 = Argon2id без AAD, v1 = legacy PBKDF2 —
-/// оба читаются и прозрачно пере-сохраняются как v3 при первом успешном открытии.
-const VERSION: u8 = 3;
+/// v4 (C9) = мастер-ключ в слотах (пароль + платформенный). v3 (L-2/аудит-4) = ключ файла выведен
+/// из пароля, заголовок под AAD; v2 = то же без AAD; v1 = legacy PBKDF2. Все три читаются и
+/// прозрачно пере-сохраняются как v4 при первом успешном открытии.
+const VERSION: u8 = 4;
+const VERSION_DIRECT_KEY_AAD: u8 = 3;
 const VERSION_ARGON_NO_AAD: u8 = 2;
 const VERSION_PBKDF2: u8 = 1;
 const SALT_LEN: usize = 16;
 const KEY_LEN: usize = 32;
+/// Длина мастер-ключа `MK` (он же ключ AES-256-GCM для полезной нагрузки).
+const MK_LEN: usize = 32;
 /// Argon2id-параметры (C1): memory-hard KDF против GPU/ASIC-перебора мастер-пароля (vault хранит
 /// bearer-креды: obfs_psk/seed/pins). Параметры хранятся В ФАЙЛЕ → поднимаются без слома
 /// существующих хранилищ (старые до-считываются своими, а затем прозрачно пере-шифровываются —
@@ -106,6 +128,182 @@ fn check_argon_params(m_kib: u32, t: u32, p: u32) -> Result<()> {
 fn header_aad(header: &[u8]) -> Aad<&[u8]> {
     Aad::from(header)
 }
+
+// ────────────────────────────── C9: слоты мастер-ключа (v4) ──────────────────────────────
+
+/// Слот пароля: `MK` под ключом `Argon2id(passphrase, salt, m/t/p)` из заголовка.
+const SLOT_PASSWORD: u8 = 1;
+/// Слот платформенного хранилища ключей: `MK`, завёрнутый ОС (Android Keystore под биометрией).
+/// Для нас блоб непрозрачен — мы его только храним и отдаём обратно платформе.
+const SLOT_PLATFORM: u8 = 2;
+
+/// Потолок числа слотов и размера их таблицы. Границы нужны по той же причине, что и границы
+/// Argon2-параметров (L-2): таблица читается ДО того, как AEAD подтвердит подлинность файла, и
+/// подложенный файл иначе диктует нам объём разбора. Реальный файл держит 1–2 слота по ~60–100 B.
+const MAX_SLOTS: usize = 8;
+const MAX_SLOTS_BLOB: usize = 8 * 1024;
+
+/// Завёрнутый `MK` = `nonce(12) ‖ AES-256-GCM(MK)‖tag`.
+const WRAPPED_MK_LEN: usize = NONCE_LEN + MK_LEN + 16;
+
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+struct KeySlot {
+    /// [`SLOT_PASSWORD`] | [`SLOT_PLATFORM`]. Незнакомый вид слота (файл от более новой версии)
+    /// не ошибка: он просто не подойдёт ни одному способу открытия — пропускаем и сохраняем как есть.
+    kind: u8,
+    /// Завёрнутый мастер-ключ. Для `password` — [`WRAPPED_MK_LEN`] байт нашего формата, для
+    /// `platform` — непрозрачный блоб ОС (у Android Keystore это `IV(12) ‖ ct(32) ‖ tag(16)`).
+    #[serde(with = "serde_bytes")]
+    wrapped: Vec<u8>,
+    /// Метка платформы (`"android-keystore"`) — диагностика и различение слотов, когда их станет
+    /// больше одного (Windows Hello и т.д.). Для слота пароля пустая.
+    #[serde(default)]
+    label: String,
+}
+
+/// Платформенный слот, прочитанный из файла без пароля (для экрана блокировки).
+#[derive(Clone, Debug)]
+pub struct PlatformSlot {
+    /// Непрозрачный блоб ОС: развернуть его умеет только то же устройство после аутентификации.
+    pub blob: Vec<u8>,
+    /// Метка платформы (`"android-keystore"`).
+    pub label: String,
+}
+
+/// AAD слота пароля: домен ‖ версия ‖ Argon2-параметры ‖ salt. Привязывает завёрнутый `MK` к тем
+/// самым параметрам вывода ключа, которыми он был завёрнут — подмена `m/t/p/salt` в заголовке (в
+/// том числе на более слабые) ломает разворачивание, а не тихо меняет стоимость перебора.
+///
+/// Nonce полезной нагрузки сюда НЕ входит намеренно: он меняется при каждой записи файла, а слот
+/// пароля переписывать на каждое сохранение нечем — пароля в памяти нет.
+fn pass_slot_aad(m_kib: u32, t: u32, p: u32, salt: &[u8; SALT_LEN]) -> Vec<u8> {
+    let mut a = Vec::with_capacity(64);
+    a.extend_from_slice(b"CitadelPQVPN/vault/v4/slot/pass");
+    a.push(VERSION);
+    a.extend_from_slice(&m_kib.to_be_bytes());
+    a.extend_from_slice(&t.to_be_bytes());
+    a.extend_from_slice(&p.to_be_bytes());
+    a.extend_from_slice(salt);
+    a
+}
+
+/// Завернуть `MK` под ключом слота (KEK).
+fn wrap_mk(kek: &LessSafeKey, mk: &[u8; MK_LEN], aad: &[u8]) -> Result<Vec<u8>> {
+    let rng = SystemRandom::new();
+    let mut nonce = [0u8; NONCE_LEN];
+    rng.fill(&mut nonce).map_err(|_| anyhow!("RNG"))?;
+    let mut buf = mk.to_vec();
+    kek.seal_in_place_append_tag(
+        Nonce::assume_unique_for_key(nonce),
+        Aad::from(aad),
+        &mut buf,
+    )
+    .map_err(|_| anyhow!("завернуть мастер-ключ (AEAD)"))?;
+    let mut out = Vec::with_capacity(WRAPPED_MK_LEN);
+    out.extend_from_slice(&nonce);
+    out.extend_from_slice(&buf);
+    Ok(out)
+}
+
+/// Развернуть `MK`. `None` — ключ слота не тот (для слота пароля это и есть «неверный пароль»).
+fn unwrap_mk(kek: &LessSafeKey, wrapped: &[u8], aad: &[u8]) -> Option<[u8; MK_LEN]> {
+    if wrapped.len() != WRAPPED_MK_LEN {
+        return None;
+    }
+    let mut nonce = [0u8; NONCE_LEN];
+    nonce.copy_from_slice(&wrapped[..NONCE_LEN]);
+    let mut buf = wrapped[NONCE_LEN..].to_vec();
+    let mk = {
+        let plain = kek
+            .open_in_place(Nonce::assume_unique_for_key(nonce), Aad::from(aad), &mut buf)
+            .ok()?;
+        let mut mk = [0u8; MK_LEN];
+        if plain.len() != MK_LEN {
+            return None;
+        }
+        mk.copy_from_slice(plain);
+        mk
+    };
+    buf.zeroize();
+    Some(mk)
+}
+
+/// Ключ AES-256-GCM полезной нагрузки из мастер-ключа.
+fn payload_key(mk: &[u8; MK_LEN]) -> Result<LessSafeKey> {
+    let unbound = UnboundKey::new(&AES_256_GCM, mk).map_err(|_| anyhow!("ключ AEAD"))?;
+    Ok(LessSafeKey::new(unbound))
+}
+
+fn random_mk() -> Result<[u8; MK_LEN]> {
+    let mut mk = [0u8; MK_LEN];
+    SystemRandom::new().fill(&mut mk).map_err(|_| anyhow!("RNG"))?;
+    Ok(mk)
+}
+
+/// Разобранный заголовок v4 (всё, что лежит в файле открытым текстом).
+struct V4Header {
+    m_kib: u32,
+    t: u32,
+    p: u32,
+    salt: [u8; SALT_LEN],
+    nonce: [u8; NONCE_LEN],
+    slots: Vec<KeySlot>,
+    /// Граница AAD и начало шифртекста: длина всего, что предшествует полезной нагрузке.
+    aad_end: usize,
+}
+
+/// Разобрать открытую часть файла v4. Все границы проверяются ДО криптографии: таблица слотов —
+/// недоверенный ввод ровно в том же смысле, что и Argon2-параметры (L-2).
+fn parse_v4(raw: &[u8]) -> Result<V4Header> {
+    if raw.len() < HEADER_LEN_V2 + SLOTS_LEN_FIELD {
+        bail!("повреждённый v4-заголовок хранилища");
+    }
+    let m_kib = u32::from_be_bytes(raw[5..9].try_into().unwrap());
+    let t = u32::from_be_bytes(raw[9..13].try_into().unwrap());
+    let p = u32::from_be_bytes(raw[13..17].try_into().unwrap());
+    check_argon_params(m_kib, t, p)?;
+    let mut salt = [0u8; SALT_LEN];
+    salt.copy_from_slice(&raw[17..17 + SALT_LEN]);
+    let mut nonce = [0u8; NONCE_LEN];
+    nonce.copy_from_slice(&raw[17 + SALT_LEN..HEADER_LEN_V2]);
+
+    let slots_len = u16::from_be_bytes(
+        raw[HEADER_LEN_V2..HEADER_LEN_V2 + SLOTS_LEN_FIELD].try_into().unwrap(),
+    ) as usize;
+    let start = HEADER_LEN_V2 + SLOTS_LEN_FIELD;
+    let aad_end = start.checked_add(slots_len).filter(|e| *e <= raw.len()).ok_or_else(|| {
+        anyhow!("таблица слотов ключа не помещается в файл — хранилище повреждено")
+    })?;
+    if slots_len > MAX_SLOTS_BLOB {
+        bail!("таблица слотов ключа неправдоподобно велика ({slots_len} б) — файл повреждён или подложен");
+    }
+    let slots: Vec<KeySlot> = ciborium::from_reader(&raw[start..aad_end])
+        .context("разобрать таблицу слотов ключа (CBOR)")?;
+    if slots.len() > MAX_SLOTS {
+        bail!("слотов ключа больше допустимого: {}", slots.len());
+    }
+    Ok(V4Header { m_kib, t, p, salt, nonce, slots, aad_end })
+}
+
+/// Общий хвост миграции v1/v2/v3 → v4: рождаем новый мастер-ключ, заворачиваем его в слот пароля и
+/// перезаписываем файл. Профили при этом не меняются — меняется только то, как хранится ключ.
+///
+/// Мастер-ключ именно НОВЫЙ, а не «старый производный»: иначе ключ файла навсегда остался бы
+/// функцией пароля, и смена пароля продолжала бы перешифровывать всё, а платформенный слот —
+/// слетать при каждой такой смене.
+fn migrate_to_v4(
+    path: PathBuf,
+    passphrase: &str,
+    data: VaultData,
+    from: &str,
+) -> std::result::Result<Vault, VaultOpenError> {
+    let mk = random_mk().map_err(VaultOpenError::Unavailable)?;
+    let v = Vault::with_master_key(path, mk, passphrase, data)
+        .map_err(VaultOpenError::Unavailable)?;
+    eprintln!("[vault] хранилище мигрировано {from} → v4 (мастер-ключ в слотах)");
+    Ok(v)
+}
+
 /// Минимальная длина мастер-пароля (backstop; визуальную «силу» показывает UI отдельно).
 /// Публичная: UI обязан проверять то же самое ДО дорогого Argon2-derive и говорить человеку
 /// конкретное число, а не «не удалось» (иначе пользователь угадывает политику вслепую).
@@ -117,8 +315,13 @@ pub const MAX_PROFILE_NAME_LEN: usize = 64;
 /// Префикс авто-имени профиля, когда пользователь своё не задал: `Citadel001`, `Citadel002`, …
 const DEFAULT_NAME_PREFIX: &str = "Citadel";
 /// Заголовок v2: magic+ver+m_kib+t+p+salt+nonce = 45. v1 (legacy): magic+ver+iters+salt+nonce = 37.
+/// У v4 фиксированная часть заголовка байт-в-байт та же, что у v2/v3 (те же поля и порядок), а за
+/// ней идёт `slots_len(u16 BE) ‖ slots(CBOR)` — поэтому разбор заголовка общий, отличается только
+/// то, что делается с выведенным из пароля ключом: в v2/v3 это ключ файла, в v4 — ключ слота.
 const HEADER_LEN_V2: usize = 4 + 1 + 4 + 4 + 4 + SALT_LEN + NONCE_LEN;
 const HEADER_LEN_V1: usize = 4 + 1 + 4 + SALT_LEN + NONCE_LEN;
+/// Длина поля `slots_len` (u16 BE) сразу за фиксированным заголовком v4.
+const SLOTS_LEN_FIELD: usize = 2;
 
 /// Профиль подключения (один exit-сервер). `uri` несёт секреты (pin/psk/seed) — поэтому весь
 /// vault шифруется.
@@ -174,26 +377,33 @@ struct VaultData {
     issued: Vec<IssuedRecord>,
 }
 
-/// Разблокированное хранилище профилей. Держит производный ключ в памяти, пока открыто;
+/// Разблокированное хранилище профилей. Держит мастер-ключ в памяти, пока открыто;
 /// каждое изменение немедленно пере-шифровывает и атомарно пишет файл.
 pub struct Vault {
     path: PathBuf,
     key: LessSafeKey,
+    /// C9: мастер-ключ в сыром виде. Нужен именно так (а не только внутри `key`): им
+    /// перезаворачиваются слоты — при смене пароля и при включении биометрии. Затирается в `drop`.
+    mk: [u8; MK_LEN],
     salt: [u8; SALT_LEN],
-    /// Argon2id-параметры этого файла (v2). Хранятся в файле → future-bump читается.
+    /// Argon2id-параметры СЛОТА ПАРОЛЯ этого файла. Хранятся в файле → future-bump читается.
     m_kib: u32,
     t: u32,
     p: u32,
+    /// C9: способы добыть `MK` (слот пароля обязателен, платформенный — по желанию пользователя).
+    slots: Vec<KeySlot>,
     data: VaultData,
 }
 
 impl Drop for Vault {
-    /// S1.3/M7: при закрытии хранилища затираем расшифрованные профили (uri несёт pin/psk/seed).
-    /// Производный ключ (`LessSafeKey`) чистит aws-lc-rs; `save` уже перезаписал plaintext шифртекстом.
+    /// S1.3/M7: при закрытии хранилища затираем расшифрованные профили (uri несёт pin/psk/seed)
+    /// и мастер-ключ. Производный ключ (`LessSafeKey`) чистит aws-lc-rs; `save` уже перезаписал
+    /// plaintext шифртекстом.
     fn drop(&mut self) {
         for p in &mut self.data.profiles {
             p.uri.zeroize();
         }
+        self.mk.zeroize();
     }
 }
 
@@ -240,25 +450,39 @@ impl Vault {
     /// Создать новое пустое хранилище под мастер-паролем (перезаписывает существующее). Argon2id (C1).
     pub fn create(path: impl AsRef<Path>, passphrase: &str) -> Result<Vault> {
         check_passphrase(passphrase)?;
+        Self::with_master_key(path.as_ref().to_path_buf(), random_mk()?, passphrase, VaultData::default())
+    }
+
+    /// C9: собрать хранилище вокруг готового `MK` со слотом пароля и записать файл. Общий шаг для
+    /// [`Vault::create`] и для миграции v1/v2/v3 (там `data` уже расшифрована старым ключом).
+    fn with_master_key(
+        path: PathBuf,
+        mk: [u8; MK_LEN],
+        passphrase: &str,
+        data: VaultData,
+    ) -> Result<Vault> {
         let rng = SystemRandom::new();
         let mut salt = [0u8; SALT_LEN];
         rng.fill(&mut salt).map_err(|_| anyhow!("RNG"))?;
-        let key = derive_key_argon2(passphrase, &salt, ARGON_M_KIB, ARGON_T, ARGON_P)?;
+        let kek = derive_key_argon2(passphrase, &salt, ARGON_M_KIB, ARGON_T, ARGON_P)?;
+        let wrapped = wrap_mk(&kek, &mk, &pass_slot_aad(ARGON_M_KIB, ARGON_T, ARGON_P, &salt))?;
         let v = Vault {
-            path: path.as_ref().to_path_buf(),
-            key,
+            path,
+            key: payload_key(&mk)?,
+            mk,
             salt,
             m_kib: ARGON_M_KIB,
             t: ARGON_T,
             p: ARGON_P,
-            data: VaultData::default(),
+            slots: vec![KeySlot { kind: SLOT_PASSWORD, wrapped, label: String::new() }],
+            data,
         };
         v.save()?;
         Ok(v)
     }
 
-    /// Открыть существующее хранилище мастер-паролем. Неверный пароль → ошибка. v2 (Argon2id) —
-    /// штатно; v1 (PBKDF2) — расшифровывается и МИГРИРУЕТ на Argon2id (пере-сохранение файла, C1).
+    /// Открыть существующее хранилище мастер-паролем. Неверный пароль → ошибка. v4 (слоты) —
+    /// штатно; v1/v2/v3 расшифровываются старым способом и МИГРИРУЮТ на v4 (C1/C9).
     pub fn open(path: impl AsRef<Path>, passphrase: &str) -> Result<Vault> {
         Self::open_detailed(path, passphrase).map_err(VaultOpenError::flatten)
     }
@@ -270,7 +494,24 @@ impl Vault {
         passphrase: &str,
     ) -> std::result::Result<Vault, VaultOpenError> {
         let path = path.as_ref().to_path_buf();
-        let raw = std::fs::read(&path)
+        let raw = Self::read_raw(&path)?;
+        match raw[4] {
+            // v4 — мастер-ключ в слотах; v3 — ключ файла из пароля, заголовок под AAD;
+            // v2 — то же, но AAD пустой. Все дочитываются и мигрируют на v4.
+            VERSION => Self::open_v4(path, passphrase, &raw),
+            VERSION_DIRECT_KEY_AAD => Self::open_legacy_argon(path, passphrase, &raw, true),
+            VERSION_ARGON_NO_AAD => Self::open_legacy_argon(path, passphrase, &raw, false),
+            VERSION_PBKDF2 => Self::open_v1_migrate(path, passphrase, &raw),
+            v => Err(VaultOpenError::Unavailable(anyhow!(
+                "неподдерживаемая версия хранилища: {v}"
+            ))),
+        }
+    }
+
+    /// Прочитать файл и убедиться, что это вообще наше хранилище. Общий шаг для всех путей
+    /// открытия и для чтения таблицы слотов БЕЗ пароля ([`Vault::platform_slot_blob`]).
+    fn read_raw(path: &Path) -> std::result::Result<Vec<u8>, VaultOpenError> {
+        let raw = std::fs::read(path)
             .with_context(|| format!("читать хранилище {}", path.display()))
             .map_err(VaultOpenError::Unavailable)?;
         if raw.len() < 5 || &raw[0..4] != MAGIC {
@@ -279,15 +520,7 @@ impl Vault {
                 path.display()
             )));
         }
-        match raw[4] {
-            // v3 — заголовок под AAD; v2 — тот же Argon2id, но AAD пустой (читаем и апгрейдим).
-            VERSION => Self::open_v2(path, passphrase, &raw, true),
-            VERSION_ARGON_NO_AAD => Self::open_v2(path, passphrase, &raw, false),
-            VERSION_PBKDF2 => Self::open_v1_migrate(path, passphrase, &raw),
-            v => Err(VaultOpenError::Unavailable(anyhow!(
-                "неподдерживаемая версия хранилища: {v}"
-            ))),
-        }
+        Ok(raw)
     }
 
     /// Подходит ли мастер-пароль к файлу хранилища: `Ok(true|false)` — про пароль, `Err` — про
@@ -301,9 +534,104 @@ impl Vault {
         }
     }
 
-    /// v2/v3: Argon2id-заголовок `m_kib‖t‖p‖salt‖nonce` → derive → decrypt.
+    /// v4: заголовок + таблица слотов → развернуть `MK` слотом ПАРОЛЯ → расшифровать профили.
+    fn open_v4(
+        path: PathBuf,
+        passphrase: &str,
+        raw: &[u8],
+    ) -> std::result::Result<Vault, VaultOpenError> {
+        let h = parse_v4(raw).map_err(VaultOpenError::Unavailable)?;
+        let kek = derive_key_argon2(passphrase, &h.salt, h.m_kib, h.t, h.p)
+            .map_err(VaultOpenError::Unavailable)?;
+        let aad = pass_slot_aad(h.m_kib, h.t, h.p, &h.salt);
+        // Слот не открылся = пароль не тот (штатный случай), а не поломка машины. Слотов пароля
+        // в норме один, но перебираем все: так добавление второго (напр. «пароль восстановления»)
+        // не потребует трогать путь открытия.
+        let mk = h
+            .slots
+            .iter()
+            .filter(|s| s.kind == SLOT_PASSWORD)
+            .find_map(|s| unwrap_mk(&kek, &s.wrapped, &aad))
+            .ok_or(VaultOpenError::WrongPassword)?;
+        let (m_kib, t) = (h.m_kib, h.t);
+        let mut v = Self::open_payload(path, raw, h, mk)?;
+        // Файл сделан на слабых параметрах (старая версия клиента) — поднимаем до текущих прямо
+        // сейчас: пароль в руках, момент единственный. Мастер-ключ при этом НЕ меняется, поэтому
+        // платформенный слот (биометрия) переживает апгрейд. Не смогли пере-записать — не беда,
+        // работаем на прочитанных параметрах (открытие хранилища важнее апгрейда его стойкости).
+        if argon_cost(m_kib, t) < argon_cost(ARGON_M_KIB, ARGON_T) {
+            match v.rewrap_password(passphrase) {
+                Ok(()) => eprintln!(
+                    "[vault] параметры Argon2id подняты: m={m_kib}KiB,t={t} → m={ARGON_M_KIB}KiB,t={ARGON_T}"
+                ),
+                Err(e) => eprintln!("[vault] апгрейд параметров Argon2id пропущен: {e:#}"),
+            }
+        }
+        Ok(v)
+    }
+
+    /// C9: открыть хранилище **платформенным** мастер-ключом — тем, что вернуло хранилище ключей
+    /// ОС после успешной биометрии (см. [`Vault::set_platform_slot`]). Пароль здесь не участвует:
+    /// Argon2id не считается вовсе, поэтому разблокировка мгновенная.
+    ///
+    /// `WrongPassword` тут означает «ключ не подошёл»: файл подменили либо блоб от другого
+    /// хранилища. Для UI это не «неверный палец» (палец проверила ОС) — это «биометрия больше не
+    /// открывает ЭТО хранилище, войдите паролем».
+    pub fn open_with_master_key(
+        path: impl AsRef<Path>,
+        mk: &[u8],
+    ) -> std::result::Result<Vault, VaultOpenError> {
+        let path = path.as_ref().to_path_buf();
+        let raw = Self::read_raw(&path)?;
+        if raw[4] != VERSION {
+            return Err(VaultOpenError::Unavailable(anyhow!(
+                "хранилище версии {} не умеет открываться платформенным ключом",
+                raw[4]
+            )));
+        }
+        let mk: [u8; MK_LEN] = mk.try_into().map_err(|_| {
+            VaultOpenError::Unavailable(anyhow!("платформенный ключ не той длины ({} б)", mk.len()))
+        })?;
+        let h = parse_v4(&raw).map_err(VaultOpenError::Unavailable)?;
+        Self::open_payload(path, &raw, h, mk)
+    }
+
+    /// Общий хвост открытия v4: расшифровать полезную нагрузку готовым `MK` и собрать `Vault`.
+    fn open_payload(
+        path: PathBuf,
+        raw: &[u8],
+        h: V4Header,
+        mk: [u8; MK_LEN],
+    ) -> std::result::Result<Vault, VaultOpenError> {
+        let key = payload_key(&mk).map_err(VaultOpenError::Unavailable)?;
+        let mut in_out = raw[h.aad_end..].to_vec();
+        let plain = key
+            .open_in_place(
+                Nonce::assume_unique_for_key(h.nonce),
+                header_aad(&raw[..h.aad_end]), // заголовок + таблица слотов
+                &mut in_out,
+            )
+            .map_err(|_| VaultOpenError::WrongPassword)?;
+        let data: VaultData = ciborium::from_reader(&plain[..])
+            .context("разобрать профили (CBOR)")
+            .map_err(VaultOpenError::Unavailable)?;
+        in_out.zeroize(); // S1.3/M7: затереть расшифрованный plaintext профилей (секреты)
+        Ok(Vault {
+            path,
+            key,
+            mk,
+            salt: h.salt,
+            m_kib: h.m_kib,
+            t: h.t,
+            p: h.p,
+            slots: h.slots,
+            data,
+        })
+    }
+
+    /// v2/v3: Argon2id-заголовок `m_kib‖t‖p‖salt‖nonce` → derive → decrypt → МИГРАЦИЯ на v4.
     /// `aad = true` (v3) — заголовок входит в AAD (L-2); `false` (v2) — как раньше, пустой AAD.
-    fn open_v2(
+    fn open_legacy_argon(
         path: PathBuf,
         passphrase: &str,
         raw: &[u8],
@@ -339,30 +667,11 @@ impl Vault {
             .context("разобрать профили (CBOR)")
             .map_err(VaultOpenError::Unavailable)?;
         in_out.zeroize(); // S1.3/M7: затереть расшифрованный plaintext профилей (секреты)
-        let mut v = Vault { path, key, salt, m_kib, t, p, data };
-        // Файл сделан на слабых параметрах (старая версия клиента) — поднимаем до текущих прямо
-        // сейчас: пароль в руках, момент единственный. Не смогли пере-записать — не беда, работаем
-        // на прочитанных параметрах (открытие хранилища важнее апгрейда его стойкости).
-        if argon_cost(m_kib, t) < argon_cost(ARGON_M_KIB, ARGON_T) {
-            match v.rekey(passphrase) {
-                Ok(()) => eprintln!(
-                    "[vault] параметры Argon2id подняты: m={m_kib}KiB,t={t} → m={ARGON_M_KIB}KiB,t={ARGON_T}"
-                ),
-                Err(e) => eprintln!("[vault] апгрейд параметров Argon2id пропущен: {e:#}"),
-            }
-        } else if !aad {
-            // L-2: файл v2 (без AAD) — пере-сохранить как v3 тем же ключом. Пароль менять не надо:
-            // salt и параметры те же, меняется только привязка заголовка к шифртексту.
-            match v.save() {
-                Ok(()) => eprintln!("[vault] хранилище пере-сохранено как v3 (заголовок под AAD)"),
-                Err(e) => eprintln!("[vault] апгрейд формата v2→v3 пропущен: {e:#}"),
-            }
-        }
-        Ok(v)
+        migrate_to_v4(path, passphrase, data, if aad { "v3" } else { "v2" })
     }
 
-    /// v1 (legacy PBKDF2): расшифровать старым ключом, затем МИГРИРОВАТЬ на Argon2id — новый salt,
-    /// Argon2-ключ, пере-сохранить как v2 (прозрачный upgrade при первом открытии, C1).
+    /// v1 (legacy PBKDF2): расшифровать старым ключом, затем МИГРИРОВАТЬ на v4 — новый мастер-ключ
+    /// в слоте под Argon2id (прозрачный upgrade при первом открытии, C1/C9).
     fn open_v1_migrate(
         path: PathBuf,
         passphrase: &str,
@@ -387,26 +696,7 @@ impl Vault {
             .context("разобрать профили (CBOR)")
             .map_err(VaultOpenError::Unavailable)?;
         in_out.zeroize();
-
-        // миграция → Argon2id v2 (новый salt + ключ, пере-сохранить файл)
-        let migrate = |e: anyhow::Error| VaultOpenError::Unavailable(e);
-        let rng = SystemRandom::new();
-        let mut new_salt = [0u8; SALT_LEN];
-        rng.fill(&mut new_salt).map_err(|_| migrate(anyhow!("RNG")))?;
-        let new_key = derive_key_argon2(passphrase, &new_salt, ARGON_M_KIB, ARGON_T, ARGON_P)
-            .map_err(migrate)?;
-        let v = Vault {
-            path,
-            key: new_key,
-            salt: new_salt,
-            m_kib: ARGON_M_KIB,
-            t: ARGON_T,
-            p: ARGON_P,
-            data,
-        };
-        v.save().map_err(migrate)?; // перезаписать файл как v2 (Argon2id)
-        eprintln!("[vault] мигрирован PBKDF2(v1) → Argon2id(v2)");
-        Ok(v)
+        migrate_to_v4(path, passphrase, data, "v1 (PBKDF2)")
     }
 
     /// Путь файла хранилища (диагностика: в сообщениях об ошибках человеку нужно знать, ГДЕ лежит
@@ -586,32 +876,113 @@ impl Vault {
     /// файл нечитаемым обоими паролями.
     pub fn change_password(&mut self, new_passphrase: &str) -> Result<()> {
         check_passphrase(new_passphrase)?;
-        self.rekey(new_passphrase)
+        self.rewrap_password(new_passphrase)
     }
 
-    /// Пере-шифровать файл под `passphrase` с ТЕКУЩИМИ Argon2-параметрами (новый salt + ключ).
-    /// Общий шаг для смены пароля и для апгрейда параметров старого хранилища.
-    fn rekey(&mut self, passphrase: &str) -> Result<()> {
+    /// C9: перезавернуть мастер-ключ в слот пароля под `passphrase` с ТЕКУЩИМИ Argon2-параметрами
+    /// (новый salt + новый KEK). Общий шаг для смены пароля и для апгрейда параметров старого
+    /// хранилища.
+    ///
+    /// Сам `MK` НЕ меняется — и это главное практическое следствие перехода на слоты: смена пароля
+    /// больше не отзывает биометрию (раньше ключ файла был функцией пароля, и любой платформенный
+    /// слот пришлось бы отзывать вместе с ним).
+    fn rewrap_password(&mut self, passphrase: &str) -> Result<()> {
         let rng = SystemRandom::new();
         let mut salt = [0u8; SALT_LEN];
         rng.fill(&mut salt).map_err(|_| anyhow!("RNG"))?;
-        let new_key = derive_key_argon2(passphrase, &salt, ARGON_M_KIB, ARGON_T, ARGON_P)?;
-        let prev = (
-            std::mem::replace(&mut self.key, new_key),
-            self.salt,
-            self.m_kib,
-            self.t,
-            self.p,
-        );
+        let kek = derive_key_argon2(passphrase, &salt, ARGON_M_KIB, ARGON_T, ARGON_P)?;
+        let wrapped =
+            wrap_mk(&kek, &self.mk, &pass_slot_aad(ARGON_M_KIB, ARGON_T, ARGON_P, &salt))?;
+        let prev = (self.salt, self.m_kib, self.t, self.p, self.slots.clone());
         self.salt = salt;
         self.m_kib = ARGON_M_KIB;
         self.t = ARGON_T;
         self.p = ARGON_P;
+        self.put_slot(SLOT_PASSWORD, wrapped, String::new());
         if let Err(e) = self.save() {
-            (self.key, self.salt, self.m_kib, self.t, self.p) = prev; // откат: диск — источник истины
+            // откат: диск — источник истины (иначе в памяти файл заперт новым паролем, а на диске
+            // старым, и следующая же запись сделала бы его нечитаемым обоими)
+            (self.salt, self.m_kib, self.t, self.p, self.slots) = prev;
             return Err(e);
         }
         Ok(())
+    }
+
+    /// Заменить единственный слот данного вида (или добавить, если его не было). `retain` перед
+    /// вставкой — не перестраховка: два слота одного вида означали бы, что старый способ открытия
+    /// продолжает работать после «смены», а это тихая дыра.
+    fn put_slot(&mut self, kind: u8, wrapped: Vec<u8>, label: String) {
+        self.slots.retain(|s| s.kind != kind);
+        self.slots.push(KeySlot { kind, wrapped, label });
+        self.slots.sort_by_key(|s| s.kind); // стабильный порядок в файле: пароль, затем платформа
+    }
+
+    // ── C9: платформенный слот (Android Keystore под биометрией; опционально) ──
+
+    /// **Мастер-ключ хранилища в сыром виде** — чтобы платформенное хранилище ключей завернуло его
+    /// своим неэкспортируемым ключом. Единственный законный потребитель — FFI-слой приложения,
+    /// который сразу передаёт эти байты в ОС и затирает свою копию.
+    ///
+    /// Метод намеренно называется прямо, а не `secret()`/`token()`: тот, кто его вызывает, обязан
+    /// понимать, что держит в руках ключ ко ВСЕМУ хранилищу.
+    pub fn master_key(&self) -> [u8; MK_LEN] {
+        self.mk
+    }
+
+    /// Есть ли у этого хранилища платформенный слот (биометрия включена).
+    pub fn has_platform_slot(&self) -> bool {
+        self.slots.iter().any(|s| s.kind == SLOT_PLATFORM)
+    }
+
+    /// Включить платформенную разблокировку: положить в файл блоб, который вернула ОС, завернув
+    /// [`Vault::master_key`]. Повторный вызов заменяет прежний блоб (перевыпуск ключа в Keystore).
+    pub fn set_platform_slot(&mut self, blob: Vec<u8>, label: &str) -> Result<()> {
+        if blob.is_empty() || blob.len() > MAX_SLOTS_BLOB / 2 {
+            bail!("платформенный блоб неправдоподобного размера ({} б)", blob.len());
+        }
+        let prev = self.slots.clone();
+        self.put_slot(SLOT_PLATFORM, blob, sanitize_name(label));
+        if let Err(e) = self.save() {
+            self.slots = prev;
+            return Err(e);
+        }
+        Ok(())
+    }
+
+    /// Выключить платформенную разблокировку (слот из файла долой). Ключ в самом Keystore удаляет
+    /// платформенный слой — здесь мы отвечаем только за файл. Нет слота — no-op без перезаписи.
+    pub fn clear_platform_slot(&mut self) -> Result<()> {
+        if !self.has_platform_slot() {
+            return Ok(());
+        }
+        let prev = self.slots.clone();
+        self.slots.retain(|s| s.kind != SLOT_PLATFORM);
+        if let Err(e) = self.save() {
+            self.slots = prev;
+            return Err(e);
+        }
+        Ok(())
+    }
+
+    /// Блоб платформенного слота, прочитанный из файла **без пароля** — экран блокировки обязан
+    /// узнать, предлагать ли отпечаток, ДО того как что-либо разблокировано. Секрета здесь нет:
+    /// блоб бесполезен без ключа из TEE того же устройства.
+    ///
+    /// `None` — биометрия не настроена либо файл не годится (нет, не наш, старой версии, побит):
+    /// во всех этих случаях UI просто не показывает кнопку, а причину человек увидит на обычном
+    /// пути с паролем — там ошибки разобраны по смыслу ([`VaultOpenError`]).
+    pub fn platform_slot_blob(path: impl AsRef<Path>) -> Option<PlatformSlot> {
+        let raw = Self::read_raw(path.as_ref()).ok()?;
+        if raw[4] != VERSION {
+            return None;
+        }
+        let h = parse_v4(&raw)
+            .inspect_err(|e| eprintln!("[vault] таблица слотов не читается: {e:#}"))
+            .ok()?;
+        h.slots
+            .into_iter()
+            .find(|s| s.kind == SLOT_PLATFORM)
+            .map(|s| PlatformSlot { blob: s.wrapped, label: s.label })
     }
 
     /// Сериализовать + зашифровать + атомарно записать (temp → rename).
@@ -626,13 +997,23 @@ impl Vault {
         // Заголовок собирается ПЕРВЫМ: он же AAD (L-2), значит шифруем уже под него.
         let mut out = Vec::with_capacity(HEADER_LEN_V2 + plain.len() + AES_256_GCM.tag_len());
         out.extend_from_slice(MAGIC);
-        out.push(VERSION); // v3 = Argon2id + заголовок под AAD
+        out.push(VERSION); // v4 = мастер-ключ в слотах, заголовок и слоты под AAD
         out.extend_from_slice(&self.m_kib.to_be_bytes());
         out.extend_from_slice(&self.t.to_be_bytes());
         out.extend_from_slice(&self.p.to_be_bytes());
         out.extend_from_slice(&self.salt);
         out.extend_from_slice(&nonce);
         debug_assert_eq!(out.len(), HEADER_LEN_V2);
+
+        // C9: таблица слотов идёт следом и тоже входит в AAD. Поэтому вычеркнуть слот пароля из
+        // файла (оставив только биометрический) или подставить чужой набор слотов нельзя молча —
+        // тег полезной нагрузки перестанет сходиться.
+        let mut slots = Vec::new();
+        ciborium::into_writer(&self.slots, &mut slots).context("сериализовать слоты ключа (CBOR)")?;
+        let slots_len = u16::try_from(slots.len())
+            .map_err(|_| anyhow!("таблица слотов ключа не помещается в формат"))?;
+        out.extend_from_slice(&slots_len.to_be_bytes());
+        out.extend_from_slice(&slots);
 
         let mut in_out = plain;
         self.key
@@ -880,50 +1261,28 @@ mod tests {
         std::fs::remove_file(&path).ok();
     }
 
-    /// L-2: старый файл v2 (заголовок не в AAD) открывается тем же паролем и молча
-    /// пере-сохраняется как v3; попытка выдать v3 за v2 (сброс версии, чтобы «отключить» AAD)
+    /// L-2/C9: старый файл v2 (заголовок не в AAD) открывается тем же паролем и молча
+    /// пере-сохраняется как v4; попытка выдать v4 за v2 (сброс версии, чтобы «отключить» AAD)
     /// ломает AEAD — ровно то, ради чего заголовок и попал в AAD.
     #[test]
-    fn v2_upgrades_to_v3_and_version_downgrade_breaks_aead() {
+    fn v2_upgrades_to_v4_and_version_downgrade_breaks_aead() {
         let path = tmp_path("aad-upgrade");
         let pass = "aadpass12345";
         let uri = sample_uri();
-        // v2-файл: те же параметры (иначе сработает ветка апгрейда стойкости), но AAD пустой.
-        {
-            let mut v = Vault::create(&path, pass).unwrap();
-            v.add("p", &uri).unwrap();
-            let mut plain = Vec::new();
-            ciborium::into_writer(&v.data, &mut plain).unwrap();
-            let nonce = [0x11u8; NONCE_LEN];
-            let mut in_out = plain;
-            v.key
-                .seal_in_place_append_tag(
-                    Nonce::assume_unique_for_key(nonce),
-                    Aad::empty(),
-                    &mut in_out,
-                )
-                .unwrap();
-            let mut out = Vec::new();
-            out.extend_from_slice(MAGIC);
-            out.push(VERSION_ARGON_NO_AAD);
-            out.extend_from_slice(&v.m_kib.to_be_bytes());
-            out.extend_from_slice(&v.t.to_be_bytes());
-            out.extend_from_slice(&v.p.to_be_bytes());
-            out.extend_from_slice(&v.salt);
-            out.extend_from_slice(&nonce);
-            out.extend_from_slice(&in_out);
-            std::fs::write(&path, &out).unwrap();
-        }
+        // v2-файл: ключ файла выведен прямо из пароля, AAD пустой (формат до L-2).
+        let mut data = VaultData::default();
+        data.profiles.push(sample_profile("p", &uri));
+        write_legacy_argon(&path, pass, &data, ARGON_M_KIB, ARGON_T, ARGON_P, false);
         assert_eq!(std::fs::read(&path).unwrap()[4], VERSION_ARGON_NO_AAD, "исходно v2");
 
         let v = Vault::open(&path, pass).unwrap();
         assert_eq!(v.list().len(), 1, "профиль пережил апгрейд формата");
         drop(v);
         let raw = std::fs::read(&path).unwrap();
-        assert_eq!(raw[4], VERSION, "после открытия файл стал v3");
-        assert!(Vault::open(&path, pass).is_ok(), "v3 открывается тем же паролем");
+        assert_eq!(raw[4], VERSION, "после открытия файл стал v4");
+        assert!(Vault::open(&path, pass).is_ok(), "v4 открывается тем же паролем");
 
-        // downgrade-атака на формат: объявляем v3-файл как v2 (AAD «выключен») → тег не сойдётся
+        // downgrade-атака на формат: объявляем v4-файл как v2 (AAD «выключен») → тег не сойдётся
         let mut tampered = raw.clone();
         tampered[4] = VERSION_ARGON_NO_AAD;
         std::fs::write(&path, &tampered).unwrap();
@@ -939,26 +1298,27 @@ mod tests {
         std::fs::remove_file(&path).ok();
     }
 
+    /// Апгрейд слабых Argon2-параметров при открытии. C9: апгрейд перезаворачивает СЛОТ ПАРОЛЯ и
+    /// не трогает мастер-ключ — поэтому платформенный слот (биометрия) обязан его пережить.
     #[test]
     fn weak_argon_params_upgraded_on_open() {
         let path = tmp_path("argon-upgrade");
         let pass = "upgradepass1";
         let uri = sample_uri();
+        let weak = 19 * 1024;
         {
             // файл со слабыми параметрами (прежний OWASP-минимум: m=19 MiB, t=2)
             let mut v = Vault::create(&path, pass).unwrap();
             v.add("p", &uri).unwrap();
-            let weak = 19 * 1024;
-            v.key = derive_key_argon2(pass, &v.salt, weak, 2, ARGON_P).unwrap();
-            v.m_kib = weak;
-            v.t = 2;
-            v.save().unwrap();
+            v.set_platform_slot(b"opaque-keystore-blob".to_vec(), "android-keystore").unwrap();
+            weaken_password_slot(&mut v, pass, weak, 2);
         }
         let raw = std::fs::read(&path).unwrap();
         assert_eq!(u32::from_be_bytes(raw[5..9].try_into().unwrap()), 19 * 1024, "исходно слабый");
 
         let v = Vault::open(&path, pass).unwrap();
         assert_eq!(v.list().len(), 1, "профили пережили апгрейд");
+        assert!(v.has_platform_slot(), "биометрия пережила апгрейд параметров");
         drop(v);
         let raw = std::fs::read(&path).unwrap();
         assert_eq!(u32::from_be_bytes(raw[5..9].try_into().unwrap()), ARGON_M_KIB);
@@ -968,37 +1328,95 @@ mod tests {
         std::fs::remove_file(&path).ok();
     }
 
-    /// C1: старый v1-файл (PBKDF2) читается и МИГРИРУЕТ на Argon2id (v2) при открытии — прозрачный
-    /// upgrade без потери профилей; после миграции файл — v2, повторное открытие работает.
+    /// C1/C9: старый v1-файл (PBKDF2) читается и МИГРИРУЕТ на v4 (Argon2id + слоты) при открытии —
+    /// прозрачный upgrade без потери профилей; после миграции файл — v4, повторное открытие работает.
     #[test]
-    fn v1_pbkdf2_migrates_to_argon2() {
+    fn v1_pbkdf2_migrates_to_v4() {
         let path = tmp_path("migrate");
         let uri = sample_uri();
         let pass = "correct horse";
         // построить legacy v1-файл (PBKDF2) с одним профилем — формат до C1.
         let mut data = VaultData::default();
-        data.profiles.push(Profile {
-            id: "id1".into(),
-            name: "nl".into(),
-            uri: uri.clone(),
-            created: 1,
-            last_exit: None,
-            device_seed: None,
-            enrolled: false,
-        });
+        data.profiles.push(sample_profile("nl", &uri));
         write_legacy_v1(&path, pass, &data);
         assert_eq!(std::fs::read(&path).unwrap()[4], VERSION_PBKDF2, "исходно v1");
 
-        // открытие мигрирует на v2
+        // открытие мигрирует на v4
         let v = Vault::open(&path, pass).unwrap();
         assert_eq!(v.list().len(), 1);
         assert_eq!(v.list()[0].uri, uri);
         drop(v);
-        assert_eq!(std::fs::read(&path).unwrap()[4], VERSION, "после миграции — v2 Argon2id");
+        assert_eq!(std::fs::read(&path).unwrap()[4], VERSION, "после миграции — v4 (слоты)");
         // повторное открытие тем же паролем (уже Argon2id) работает
         assert!(Vault::open(&path, pass).is_ok());
         assert!(Vault::open(&path, "wrongpass").is_err());
         std::fs::remove_file(&path).ok();
+    }
+
+    fn sample_profile(name: &str, uri: &str) -> Profile {
+        Profile {
+            id: format!("id-{name}"),
+            name: name.into(),
+            uri: uri.into(),
+            created: 1,
+            last_exit: None,
+            device_seed: None,
+            enrolled: false,
+        }
+    }
+
+    /// Собрать legacy-файл v2/v3 (ключ файла = Argon2id(пароль)) — для тестов миграции на v4:
+    /// write-путь этих версий из прода удалён, а читать их мы обязаны.
+    fn write_legacy_argon(
+        path: &std::path::Path,
+        passphrase: &str,
+        data: &VaultData,
+        m_kib: u32,
+        t: u32,
+        p: u32,
+        aad: bool,
+    ) {
+        let rng = SystemRandom::new();
+        let mut salt = [0u8; SALT_LEN];
+        rng.fill(&mut salt).unwrap();
+        let mut nonce = [0u8; NONCE_LEN];
+        rng.fill(&mut nonce).unwrap();
+        let key = derive_key_argon2(passphrase, &salt, m_kib, t, p).unwrap();
+
+        let mut header = Vec::new();
+        header.extend_from_slice(MAGIC);
+        header.push(if aad { VERSION_DIRECT_KEY_AAD } else { VERSION_ARGON_NO_AAD });
+        header.extend_from_slice(&m_kib.to_be_bytes());
+        header.extend_from_slice(&t.to_be_bytes());
+        header.extend_from_slice(&p.to_be_bytes());
+        header.extend_from_slice(&salt);
+        header.extend_from_slice(&nonce);
+
+        let mut in_out = Vec::new();
+        ciborium::into_writer(data, &mut in_out).unwrap();
+        key.seal_in_place_append_tag(
+            Nonce::assume_unique_for_key(nonce),
+            header_aad(if aad { &header } else { &[] }),
+            &mut in_out,
+        )
+        .unwrap();
+        let mut out = header;
+        out.extend_from_slice(&in_out);
+        std::fs::write(path, out).unwrap();
+    }
+
+    /// Перезавернуть слот пароля СЛАБЫМИ Argon2-параметрами (эмуляция файла от старого клиента) и
+    /// записать файл. Мастер-ключ не меняется — как и при штатном перезаворачивании.
+    fn weaken_password_slot(v: &mut Vault, passphrase: &str, m_kib: u32, t: u32) {
+        let mut salt = [0u8; SALT_LEN];
+        SystemRandom::new().fill(&mut salt).unwrap();
+        let kek = derive_key_argon2(passphrase, &salt, m_kib, t, ARGON_P).unwrap();
+        let wrapped = wrap_mk(&kek, &v.mk, &pass_slot_aad(m_kib, t, ARGON_P, &salt)).unwrap();
+        v.salt = salt;
+        v.m_kib = m_kib;
+        v.t = t;
+        v.put_slot(SLOT_PASSWORD, wrapped, String::new());
+        v.save().unwrap();
     }
 
     /// Собрать legacy-v1-файл (PBKDF2) вручную — для теста миграции (write-путь v1 удалён из прода).
@@ -1199,5 +1617,157 @@ mod tests {
 
     fn names(v: &Vault) -> Vec<String> {
         v.list().into_iter().map(|p| p.name).collect()
+    }
+
+    // ─────────────────────────── C9: слоты ключа и платформенная разблокировка ───────────────────
+
+    /// Главный сценарий биометрии: мастер-ключ открывает хранилище без пароля, а смена пароля его
+    /// НЕ отзывает. Именно ради второго свойства ключ файла и перестал быть функцией пароля —
+    /// иначе каждая смена пароля просила бы человека заново прикладывать палец.
+    #[test]
+    fn platform_slot_unlocks_and_survives_password_change() {
+        let path = tmp_path("platform-unlock");
+        let uri = sample_uri();
+        let mk = {
+            let mut v = Vault::create(&path, "firstpass1").unwrap();
+            v.add("nl", &uri).unwrap();
+            let mk = v.master_key(); // это отдаётся Keystore на обёртку
+            v.set_platform_slot(b"blob-from-keystore".to_vec(), "android-keystore").unwrap();
+            assert!(v.has_platform_slot());
+            mk
+        };
+
+        let v = Vault::open_with_master_key(&path, &mk).unwrap();
+        assert_eq!(v.list()[0].uri, uri, "хранилище открылось платформенным ключом");
+        drop(v);
+
+        let mut v = Vault::open(&path, "firstpass1").unwrap();
+        v.change_password("secondpass1").unwrap();
+        drop(v);
+        assert!(Vault::open(&path, "firstpass1").is_err(), "старый пароль отозван");
+        assert!(Vault::open(&path, "secondpass1").is_ok(), "новый пароль работает");
+        let v = Vault::open_with_master_key(&path, &mk).unwrap();
+        assert!(v.has_platform_slot(), "смена пароля не отозвала биометрию");
+        assert_eq!(v.list().len(), 1);
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// Экран блокировки обязан узнать про биометрию ДО разблокировки — блоб читается из файла без
+    /// пароля. И исчезает, когда пользователь биометрию выключил.
+    #[test]
+    fn platform_blob_is_readable_without_password_and_removable() {
+        let path = tmp_path("platform-blob");
+        let mut v = Vault::create(&path, "blobpass123").unwrap();
+        assert!(Vault::platform_slot_blob(&path).is_none(), "по умолчанию биометрии нет");
+
+        v.set_platform_slot(b"blob-42".to_vec(), "android-keystore").unwrap();
+        let slot = Vault::platform_slot_blob(&path).expect("слот виден без пароля");
+        assert_eq!(slot.blob, b"blob-42");
+        assert_eq!(slot.label, "android-keystore");
+
+        v.clear_platform_slot().unwrap();
+        assert!(Vault::platform_slot_blob(&path).is_none(), "выключили — слота нет");
+        assert!(v.clear_platform_slot().is_ok(), "повторное выключение — no-op");
+        drop(v);
+        assert!(Vault::open(&path, "blobpass123").is_ok(), "пароль работает как работал");
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// Мастер-ключ ЧУЖОГО хранилища не открывает наше (иначе подложенный блоб от другого файла
+    /// давал бы «успешную» биометрию с мусором вместо профилей), и битый ключ не паникует.
+    #[test]
+    fn foreign_master_key_rejected() {
+        let a = tmp_path("mk-a");
+        let b = tmp_path("mk-b");
+        let mk_a = Vault::create(&a, "apass12345").unwrap().master_key();
+        let mk_b = Vault::create(&b, "bpass12345").unwrap().master_key();
+        assert!(matches!(
+            Vault::open_with_master_key(&a, &mk_b),
+            Err(VaultOpenError::WrongPassword)
+        ));
+        assert!(matches!(
+            Vault::open_with_master_key(&a, &mk_a[..16]),
+            Err(VaultOpenError::Unavailable(_)),
+        ));
+        assert!(Vault::open_with_master_key(&a, &mk_a).is_ok());
+        std::fs::remove_file(&a).ok();
+        std::fs::remove_file(&b).ok();
+    }
+
+    /// Таблица слотов входит в AAD: пересадить в наш файл слоты из ЧУЖОГО хранилища (чтобы открыть
+    /// его известным паролем) невозможно — тег полезной нагрузки перестаёт сходиться. Точечная
+    /// правка байта внутри завёрнутого ключа — то же самое.
+    #[test]
+    fn slot_table_is_bound_to_payload() {
+        let a = tmp_path("slots-a");
+        let b = tmp_path("slots-b");
+        Vault::create(&a, "apass12345").unwrap().add("p", &sample_uri()).unwrap();
+        Vault::create(&b, "bpass12345").unwrap();
+        let (raw_a, raw_b) = (std::fs::read(&a).unwrap(), std::fs::read(&b).unwrap());
+        let (ha, hb) = (parse_v4(&raw_a).unwrap(), parse_v4(&raw_b).unwrap());
+
+        // файл A, но заголовок+слоты от B (то есть пароль B) — шифртекст остаётся от A
+        let mut spliced = raw_b[..hb.aad_end].to_vec();
+        spliced.extend_from_slice(&raw_a[ha.aad_end..]);
+        std::fs::write(&a, &spliced).unwrap();
+        assert!(
+            matches!(Vault::open_detailed(&a, "bpass12345"), Err(VaultOpenError::WrongPassword)),
+            "чужая таблица слотов не должна открывать наш шифртекст"
+        );
+
+        // правка одного байта в завёрнутом ключе → пароль перестаёт разворачивать слот
+        let mut bitflip = raw_a.clone();
+        let victim = HEADER_LEN_V2 + SLOTS_LEN_FIELD + 8;
+        bitflip[victim] ^= 0x01;
+        std::fs::write(&a, &bitflip).unwrap();
+        assert!(Vault::open_detailed(&a, "apass12345").is_err(), "битый слот обязан ломать open");
+
+        std::fs::write(&a, &raw_a).unwrap();
+        assert!(Vault::open(&a, "apass12345").is_ok(), "исходный файл цел");
+        std::fs::remove_file(&a).ok();
+        std::fs::remove_file(&b).ok();
+    }
+
+    /// Границы таблицы слотов (та же логика, что у Argon2-параметров, L-2): длина читается ДО
+    /// проверки подлинности файла, поэтому подложенное значение обязано давать честную ошибку, а
+    /// не панику по выходу за срез и не аллокацию «на 64 КиБ мусора».
+    #[test]
+    fn planted_slot_table_rejected() {
+        let path = tmp_path("slots-bounds");
+        Vault::create(&path, "boundspass2").unwrap();
+        let good = std::fs::read(&path).unwrap();
+
+        for (why, len) in [("длина за концом файла", u16::MAX), ("длина обрывает CBOR", 3u16)] {
+            let mut raw = good.clone();
+            raw[HEADER_LEN_V2..HEADER_LEN_V2 + SLOTS_LEN_FIELD]
+                .copy_from_slice(&len.to_be_bytes());
+            std::fs::write(&path, &raw).unwrap();
+            assert!(
+                matches!(Vault::open_detailed(&path, "boundspass2"), Err(VaultOpenError::Unavailable(_))),
+                "{why}: ожидалась ошибка «файл не годится»"
+            );
+        }
+        // файл вовсе без слотов (slots_len=0 → пустой CBOR не разберётся) тоже не должен паниковать
+        let mut raw = good.clone();
+        raw.truncate(HEADER_LEN_V2 + SLOTS_LEN_FIELD);
+        raw[HEADER_LEN_V2..].copy_from_slice(&0u16.to_be_bytes());
+        std::fs::write(&path, &raw).unwrap();
+        assert!(Vault::open_detailed(&path, "boundspass2").is_err());
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// Слот каждого вида — ровно один: повторное включение биометрии заменяет блоб, а не копит
+    /// слоты (два слота одного вида означали бы, что прежний способ открытия продолжает работать).
+    #[test]
+    fn slot_of_a_kind_is_replaced_not_appended() {
+        let path = tmp_path("slots-unique");
+        let mut v = Vault::create(&path, "uniqpass123").unwrap();
+        v.set_platform_slot(b"first".to_vec(), "android-keystore").unwrap();
+        v.set_platform_slot(b"second".to_vec(), "android-keystore").unwrap();
+        v.change_password("uniqpass456").unwrap();
+        assert_eq!(v.slots.len(), 2, "ровно два слота: пароль и платформа");
+        assert_eq!(v.slots[0].kind, SLOT_PASSWORD, "слот пароля идёт первым");
+        assert_eq!(Vault::platform_slot_blob(&path).unwrap().blob, b"second");
+        std::fs::remove_file(&path).ok();
     }
 }

@@ -94,6 +94,13 @@ android {
     }
 }
 
+dependencies {
+    // C9: системный диалог отпечатка поверх CryptoObject (androidx.biometric умеет это с API 23,
+    // платформенный android.hardware.biometrics.BiometricPrompt — только с 28). Тянет за собой
+    // androidx.fragment — отсюда и FlutterFragmentActivity в MainActivity.
+    implementation("androidx.biometric:biometric:1.1.0")
+}
+
 kotlin {
     compilerOptions {
         jvmTarget = org.jetbrains.kotlin.gradle.dsl.JvmTarget.JVM_17

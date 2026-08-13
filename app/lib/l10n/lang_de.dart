@@ -79,6 +79,17 @@ const Map<String, String> langDe = {
   'traffic_meter_sub': 'Aktuelle Empfangs- und Senderate auf der Verbindungskarte',
   'pacing_title': 'Zeitmuster verschleiern',
   'pacing_sub': 'Ausgehenden Verkehr glätten und auffüllen (langsamer, aber schwerer zuzuordnen); ab der nächsten Sitzung',
+  // ── C9 ──
+  'biometric_title': 'Entsperren per Fingerabdruck',
+  'biometric_sub': 'Tresor per Fingerabdruck öffnen; das Master-Passwort funktioniert weiterhin',
+  'biometric_unlock': 'Mit Fingerabdruck entsperren',
+  'biometric_prompt_unlock': 'Sensor berühren, um den Tresor zu öffnen',
+  'biometric_prompt_enable': 'Sensor berühren, um das Entsperren per Fingerabdruck zu aktivieren',
+  'biometric_key_gone':
+      'Die Biometrie des Geräts hat sich geändert — mit dem Master-Passwort anmelden und den Fingerabdruck erneut aktivieren',
+  'biometric_failed': 'Fingerabdruck konnte nicht verwendet werden',
+  'biometric_none_enrolled':
+      'Fügen Sie zuerst einen Fingerabdruck in den Geräteeinstellungen hinzu',
   'debug_title': 'Debug-Modus',
   'debug_sub': 'Kern-Protokoll und Verbindungsdiagnose',
   'screenshot_title': 'Screenshots blockieren',

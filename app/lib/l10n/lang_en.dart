@@ -78,6 +78,16 @@ const Map<String, String> langEn = {
   'traffic_meter_sub': 'Current download and upload speed on the connection card',
   'pacing_title': 'Traffic timing masking',
   'pacing_sub': 'Even out and pad outgoing traffic (slower, but harder to correlate); from the next session',
+  // ── C9 ──
+  'biometric_title': 'Fingerprint unlock',
+  'biometric_sub': 'Open the vault with a fingerprint; the master password keeps working',
+  'biometric_unlock': 'Unlock with fingerprint',
+  'biometric_prompt_unlock': 'Touch the sensor to open your vault',
+  'biometric_prompt_enable': 'Touch the sensor to turn on fingerprint unlock',
+  'biometric_key_gone':
+      'Device biometrics changed — sign in with the master password and turn fingerprint unlock on again',
+  'biometric_failed': 'Could not use the fingerprint',
+  'biometric_none_enrolled': 'Add a fingerprint in your device settings first',
   'debug_title': 'Debug mode',
   'debug_sub': 'Core log and connection diagnostics',
   'screenshot_title': 'Block screenshots',
