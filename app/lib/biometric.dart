@@ -1,5 +1,6 @@
 import 'dart:io' show Platform;
 
+import 'package:flutter/foundation.dart' show debugPrint;
 import 'package:flutter/services.dart';
 
 /// Готовность устройства к разблокировке отпечатком (ответ канала `citadel/biometric`).
@@ -47,6 +48,13 @@ class BiometricFailure implements Exception {
 /// **Секрет через этот слой проходит транзитом.** `wrap` получает мастер-ключ хранилища из ядра и
 /// сразу отдаёт его в ОС; `unwrap` получает его обратно и сразу возвращает ядру. Вызывающий обязан
 /// затирать свои копии — см. [zeroize] и его использование в `AppState`.
+///
+/// **Чего затереть нельзя.** Ответ канала приходит неизменяемым представлением буфера движка
+/// (`platform_dispatcher.dart`, `_wrapUnmodifiableByteData`), и запись в него запрещена. Поэтому
+/// [_call] отдаёт наверх СВОЮ копию: её [zeroize] затирает по-настоящему, а транспортная копия
+/// движка живёт до ближайшей сборки мусора и нам недоступна. Это осознанный остаток: противник,
+/// читающий кучу процесса, в котором уже открыто хранилище, и так победил (см. `citadel.rs`,
+/// `vault_biometric_key_to_wrap`).
 class BiometricUnlock {
   static const _ch = MethodChannel('citadel/biometric');
 
@@ -98,7 +106,10 @@ class BiometricUnlock {
       if (out == null || out.isEmpty) {
         throw BiometricFailure('empty', 'платформа вернула пустой ответ');
       }
-      return out;
+      // Копия обязательна: сам `out` — неизменяемое окно в буфер движка, и [zeroize] по нему
+      // бросает «Cannot modify an unmodifiable list». Именно так вход по отпечатку падал уже
+      // ПОСЛЕ успешной разблокировки ядра.
+      return Uint8List.fromList(out);
     } on PlatformException catch (e) {
       throw BiometricFailure(e.code, e.message);
     } on MissingPluginException {
@@ -109,7 +120,17 @@ class BiometricUnlock {
   /// Затереть копию секрета в памяти Dart. Гарантий у управляемой памяти нет (GC мог сделать копию
   /// при перемещении), но оставлять ключ хранилища лежать в куче до следующей сборки мусора — это
   /// на порядок хуже, чем не идеальное, но немедленное затирание.
-  static void zeroize(Uint8List b) => b.fillRange(0, b.length, 0);
+  ///
+  /// Неизменяемый буфер (см. примечание к классу) не роняет вызывающего: невозможность затереть
+  /// секрет — это ухудшение гигиены памяти, а не отказ входа. Ронять разблокировку из-за неудачной
+  /// уборки нельзя; жалоба уходит в журнал, чтобы регрессия не осталась незамеченной.
+  static void zeroize(Uint8List b) {
+    try {
+      b.fillRange(0, b.length, 0);
+    } on UnsupportedError {
+      debugPrint('[biometric] секрет не затёрт: буфер неизменяем');
+    }
+  }
 }
 
 /// Тексты системного диалога. Приходят из l10n приложения, а не из системной локали: язык

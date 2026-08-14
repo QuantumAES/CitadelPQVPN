@@ -167,7 +167,15 @@ object BiometricVault {
                 return@prompt
             }
             try {
-                result.success(c.doFinal(blob, IV_LEN, blob.size - IV_LEN))
+                val plain = c.doFinal(blob, IV_LEN, blob.size - IV_LEN)
+                // Симметрично `wrap`: копия мастер-ключа в Kotlin живёт ровно до конца этой
+                // строки. `success` кодирует ответ в буфер синхронно, поэтому затирать сразу
+                // после возврата безопасно.
+                try {
+                    result.success(plain)
+                } finally {
+                    plain.fill(0)
+                }
             } catch (e: Exception) {
                 result.error("keystore", e.message ?: e.toString(), null)
             }

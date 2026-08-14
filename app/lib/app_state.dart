@@ -322,10 +322,12 @@ class AppState extends ChangeNotifier {
     }
     try {
       await vaultUnlockBiometric(masterKey: key);
+      // Отметить открытие НАДО до уборки: иначе любой отказ в `finally` оставляет ядро с открытым
+      // хранилищем, а экран — запертым (ровно так выглядел упавший вход по отпечатку).
+      _unlocked = true;
     } finally {
       BiometricUnlock.zeroize(key); // ключ хранилища не должен пережить эту строку
     }
-    _unlocked = true;
     _reloadProfiles();
     notifyListeners();
   }
