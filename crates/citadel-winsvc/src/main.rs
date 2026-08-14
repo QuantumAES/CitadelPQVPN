@@ -5,8 +5,12 @@
 //! Движок (QUIC/obfs) остаётся в приложении (`WindowsTunProvider`), как на Linux. Служба линкует
 //! только `citadel-winnet` (кадры пайпа + WFP-план + маршруты), НЕ движок — меньше attack surface.
 //!
-//! Инкремент 3a (этот файл): named-pipe сервер + config-handshake (получить `TunSetup`, ответить
-//! READY) + чистая оркестрация [`plan`]. WinTUN-адаптер, WFP, packet-pump — заглушки за `TODO(3b/3c)`.
+//! Реализовано целиком: named-pipe сервер + config-handshake (`TunSetup` → READY), чистая
+//! оркестрация [`plan`], WinTUN-адаптер и packet-pump (`windows_svc::Session`/`bring_up`),
+//! WFP-фильтры (`crate::wfp`) — IPv4-kill-switch и fail-closed блок IPv6-утечки (W1). Открытый остаток —
+//! не заглушки, а известные ограничения: L-9 (опознание клиента пайпа по PID→путь образа, без
+//! проверки подписи) и L-12 (фильтры стоят на `ALE_AUTH_CONNECT`, поэтому армирование не рвёт уже
+//! установленные потоки); оба — в `docs/SECURITY-AUDIT-4-2026-08.md §20.3`.
 
 #[cfg_attr(not(windows), allow(dead_code))]
 mod plan;
@@ -1001,8 +1005,8 @@ mod windows_svc {
         killswitch: bool,
     }
 
-    /// Поднять туннель: WinTUN-адаптер → bypass-маршруты (мимо туннеля) → адрес/MTU/маршруты/DNS.
-    /// TODO(3c-2): WFP kill-switch (`plan.wfp`).
+    /// Поднять туннель: WinTUN-адаптер → bypass-маршруты (мимо туннеля) → адрес/MTU/маршруты/DNS
+    /// → WFP (kill-switch и/или блок IPv6-утечки, если они есть в плане).
     fn bring_up(plan: &SessionPlan) -> anyhow::Result<Session> {
         // Грузим wintun.dll (кладётся рядом со службой при упаковке). SAFETY: доверенная DLL WireGuard.
         let wintun =
