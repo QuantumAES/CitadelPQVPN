@@ -431,16 +431,17 @@ class _HomePageState extends State<HomePage> {
                 Navigator.pop(sheetCtx);
               },
             ),
-            // M-8: маскировка таймингов (профиль «высокий риск»). По умолчанию выключена —
-            // платит латентностью и лишним трафиком; включают те, кому важнее анти-корреляция.
-            SwitchListTile(
-              secondary: const Icon(Icons.blur_on_outlined),
+            // M-8/П7: маскировка таймингов — три профиля, а не тумблер. Подпись называет ВЫБРАННЫЙ
+            // профиль и его цену: маскировка стоит трафика и заряда, и человек вправе знать
+            // сколько, прежде чем включать (прежний тумблер не сообщал ни цены, ни того, что в
+            // простое маскировать нечего).
+            ListTile(
+              leading: const Icon(Icons.blur_on_outlined),
               title: Text(t('pacing_title')),
-              subtitle: Text(t('pacing_sub')),
-              value: s.pacing,
-              onChanged: (_) {
-                s.togglePacing();
+              subtitle: Text(t(_pacingSubKey(s.pacing))),
+              onTap: () {
                 Navigator.pop(sheetCtx);
+                _pickPacing();
               },
             ),
             SwitchListTile(
@@ -546,6 +547,49 @@ class _HomePageState extends State<HomePage> {
         ),
       ),
     );
+  }
+
+  /// П7: ключ подписи под выбранным профилем маскировки — она же и есть честная цена настройки.
+  static String _pacingSubKey(String profile) => switch (profile) {
+        kPacingLite => 'pacing_lite_sub',
+        kPacingStrict => 'pacing_strict_sub',
+        _ => 'pacing_off_sub',
+      };
+
+  /// Выбор профиля маскировки таймингов. Три состояния вместо тумблера: у маскировки есть цена в
+  /// мегабайтах и заряде, и она разная. Рядом с выбором — строка о главном свойстве, которое
+  /// раньше нигде не было сказано: маскировка работает, пока идёт трафик, а в простое молчит.
+  Future<void> _pickPacing() async {
+    final picked = await showDialog<String>(
+      context: context,
+      builder: (dctx) => RadioGroup<String>(
+        groupValue: s.pacing,
+        onChanged: (v) => Navigator.pop(dctx, v),
+        child: SimpleDialog(
+          title: Text(Strings.of(dctx)('pacing_title')),
+          children: [
+            for (final (value, titleKey, subKey) in const [
+              (kPacingOff, 'pacing_off', 'pacing_off_sub'),
+              (kPacingLite, 'pacing_lite', 'pacing_lite_sub'),
+              (kPacingStrict, 'pacing_strict', 'pacing_strict_sub'),
+            ])
+              RadioListTile<String>(
+                value: value,
+                title: Text(Strings.of(dctx)(titleKey)),
+                subtitle: Text(Strings.of(dctx)(subKey)),
+              ),
+            Padding(
+              padding: const EdgeInsets.fromLTRB(24, 8, 24, 16),
+              child: Text(
+                Strings.of(dctx)('pacing_note'),
+                style: Theme.of(dctx).textTheme.bodySmall,
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+    if (picked != null && picked != s.pacing) s.setPacing(picked);
   }
 
   /// Выбор языка интерфейса. Языки перечислены на самих себе («Deutsch», «हिन्दी») — человек ищет

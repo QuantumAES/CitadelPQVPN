@@ -1,10 +1,12 @@
 package com.quantumaes.citadelpqvpn
 
 import android.app.Activity
+import android.content.Context
 import android.content.Intent
 import android.net.VpnService
 import android.os.Build
 import android.os.Bundle
+import android.os.PowerManager
 import android.view.WindowManager
 import io.flutter.embedding.android.FlutterFragmentActivity
 import io.flutter.embedding.engine.FlutterEngine
@@ -107,6 +109,13 @@ class MainActivity : FlutterFragmentActivity() {
                         }
                     }
                     result.success(true)
+                }
+                // П8 (маскировка/батарея): система сама говорит, что экономит заряд. Строгий
+                // профиль маскировки на это время понижается до экономного — решение принимает
+                // ядро, здесь только факт от `PowerManager`.
+                "powerSaveMode" -> {
+                    val pm = getSystemService(Context.POWER_SERVICE) as? PowerManager
+                    result.success(pm?.isPowerSaveMode ?: false)
                 }
                 "listInstalledApps" -> {
                     // C8.3: список запускаемых приложений (для split-tunnel picker). Только те, что

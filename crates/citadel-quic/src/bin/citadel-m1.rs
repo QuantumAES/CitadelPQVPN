@@ -767,8 +767,14 @@ async fn server_assign_address(
                 let a = p.alloc().ok_or_else(|| anyhow!("пул адресов exit исчерпан — отказ"))?;
                 (a, p.prefix)
             };
-            let assign_bytes =
-                capsule::encode_address_assign_v4(&capsule::AssignedV4 { request_id: 1, addr, prefix });
+            // П5 (батарея): к назначению прикладываем СВОЙ `max_idle_timeout`. Только по нему
+            // клиент вправе разредить keep-alive: эффективный idle-таймаут — минимум из
+            // объявленных сторонами, и старый exit (15 с) рвал бы редкий маячок в простое.
+            // Старый клиент этот хвост не читает — провод остаётся совместимым.
+            let assign_bytes = capsule::encode_address_assign_v4_hint(
+                &capsule::AssignedV4 { request_id: 1, addr, prefix },
+                Some(citadel_quic::IDLE_TIMEOUT.as_millis() as u64),
+            );
             Ok((assign_bytes, (addr, prefix))) // aux = выделенный адрес (после токена)
         })
         .await

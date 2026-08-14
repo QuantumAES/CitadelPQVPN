@@ -38,7 +38,7 @@ flutter_rust_bridge::frb_generated_boilerplate!(
     default_rust_auto_opaque = RustAutoOpaqueMoi,
 );
 pub(crate) const FLUTTER_RUST_BRIDGE_CODEGEN_VERSION: &str = "2.12.0";
-pub(crate) const FLUTTER_RUST_BRIDGE_CODEGEN_CONTENT_HASH: i32 = -1630234849;
+pub(crate) const FLUTTER_RUST_BRIDGE_CODEGEN_CONTENT_HASH: i32 = 1609869810;
 
 // Section: executor
 
@@ -751,14 +751,14 @@ fn wire__crate__api__citadel__link_summary_dto_default_impl(
         },
     )
 }
-fn wire__crate__api__citadel__pacing_enabled_impl(
+fn wire__crate__api__citadel__pacing_profile_impl(
     ptr_: flutter_rust_bridge::for_generated::PlatformGeneralizedUint8ListPtr,
     rust_vec_len_: i32,
     data_len_: i32,
 ) -> flutter_rust_bridge::for_generated::WireSyncRust2DartSse {
     FLUTTER_RUST_BRIDGE_HANDLER.wrap_sync::<flutter_rust_bridge::for_generated::SseCodec, _>(
         flutter_rust_bridge::for_generated::TaskInfo {
-            debug_name: "pacing_enabled",
+            debug_name: "pacing_profile",
             port: None,
             mode: flutter_rust_bridge::for_generated::FfiCallMode::Sync,
         },
@@ -774,7 +774,7 @@ fn wire__crate__api__citadel__pacing_enabled_impl(
                 flutter_rust_bridge::for_generated::SseDeserializer::new(message);
             deserializer.end();
             transform_result_sse::<_, ()>((move || {
-                let output_ok = Result::<_, ()>::Ok(crate::api::citadel::pacing_enabled())?;
+                let output_ok = Result::<_, ()>::Ok(crate::api::citadel::pacing_profile())?;
                 Ok(output_ok)
             })())
         },
@@ -1048,14 +1048,46 @@ fn wire__crate__api__diag__set_log_file_impl(
         },
     )
 }
-fn wire__crate__api__citadel__set_pacing_impl(
+fn wire__crate__api__citadel__set_pacing_profile_impl(
     ptr_: flutter_rust_bridge::for_generated::PlatformGeneralizedUint8ListPtr,
     rust_vec_len_: i32,
     data_len_: i32,
 ) -> flutter_rust_bridge::for_generated::WireSyncRust2DartSse {
     FLUTTER_RUST_BRIDGE_HANDLER.wrap_sync::<flutter_rust_bridge::for_generated::SseCodec, _>(
         flutter_rust_bridge::for_generated::TaskInfo {
-            debug_name: "set_pacing",
+            debug_name: "set_pacing_profile",
+            port: None,
+            mode: flutter_rust_bridge::for_generated::FfiCallMode::Sync,
+        },
+        move || {
+            let message = unsafe {
+                flutter_rust_bridge::for_generated::Dart2RustMessageSse::from_wire(
+                    ptr_,
+                    rust_vec_len_,
+                    data_len_,
+                )
+            };
+            let mut deserializer =
+                flutter_rust_bridge::for_generated::SseDeserializer::new(message);
+            let api_profile = <String>::sse_decode(&mut deserializer);
+            deserializer.end();
+            transform_result_sse::<_, ()>((move || {
+                let output_ok = Result::<_, ()>::Ok({
+                    crate::api::citadel::set_pacing_profile(api_profile);
+                })?;
+                Ok(output_ok)
+            })())
+        },
+    )
+}
+fn wire__crate__api__citadel__set_power_save_impl(
+    ptr_: flutter_rust_bridge::for_generated::PlatformGeneralizedUint8ListPtr,
+    rust_vec_len_: i32,
+    data_len_: i32,
+) -> flutter_rust_bridge::for_generated::WireSyncRust2DartSse {
+    FLUTTER_RUST_BRIDGE_HANDLER.wrap_sync::<flutter_rust_bridge::for_generated::SseCodec, _>(
+        flutter_rust_bridge::for_generated::TaskInfo {
+            debug_name: "set_power_save",
             port: None,
             mode: flutter_rust_bridge::for_generated::FfiCallMode::Sync,
         },
@@ -1073,7 +1105,7 @@ fn wire__crate__api__citadel__set_pacing_impl(
             deserializer.end();
             transform_result_sse::<_, ()>((move || {
                 let output_ok = Result::<_, ()>::Ok({
-                    crate::api::citadel::set_pacing(api_on);
+                    crate::api::citadel::set_power_save(api_on);
                 })?;
                 Ok(output_ok)
             })())
@@ -2460,41 +2492,41 @@ fn pde_ffi_dispatcher_primary_impl(
         ),
         23 => wire__crate__api__citadel__parse_link_summary_impl(port, ptr, rust_vec_len, data_len),
         24 => wire__crate__api__citadel__run_diagnostics_impl(port, ptr, rust_vec_len, data_len),
-        39 => wire__crate__api__citadel__vault_add_impl(port, ptr, rust_vec_len, data_len),
-        41 => wire__crate__api__citadel__vault_biometric_disable_impl(
+        40 => wire__crate__api__citadel__vault_add_impl(port, ptr, rust_vec_len, data_len),
+        42 => wire__crate__api__citadel__vault_biometric_disable_impl(
             port,
             ptr,
             rust_vec_len,
             data_len,
         ),
-        42 => wire__crate__api__citadel__vault_biometric_enable_impl(
+        43 => wire__crate__api__citadel__vault_biometric_enable_impl(
             port,
             ptr,
             rust_vec_len,
             data_len,
         ),
-        44 => wire__crate__api__citadel__vault_biometric_key_to_wrap_impl(
+        45 => wire__crate__api__citadel__vault_biometric_key_to_wrap_impl(
             port,
             ptr,
             rust_vec_len,
             data_len,
         ),
-        45 => {
+        46 => {
             wire__crate__api__citadel__vault_change_password_impl(port, ptr, rust_vec_len, data_len)
         }
-        46 => wire__crate__api__citadel__vault_create_impl(port, ptr, rust_vec_len, data_len),
-        57 => wire__crate__api__citadel__vault_unlock_impl(port, ptr, rust_vec_len, data_len),
-        58 => wire__crate__api__citadel__vault_unlock_biometric_impl(
+        47 => wire__crate__api__citadel__vault_create_impl(port, ptr, rust_vec_len, data_len),
+        58 => wire__crate__api__citadel__vault_unlock_impl(port, ptr, rust_vec_len, data_len),
+        59 => wire__crate__api__citadel__vault_unlock_biometric_impl(
             port,
             ptr,
             rust_vec_len,
             data_len,
         ),
-        59 => {
+        60 => {
             wire__crate__api__citadel__vpn_activate_profile_impl(port, ptr, rust_vec_len, data_len)
         }
-        60 => wire__crate__api__citadel__vpn_connect_impl(port, ptr, rust_vec_len, data_len),
-        61 => {
+        61 => wire__crate__api__citadel__vpn_connect_impl(port, ptr, rust_vec_len, data_len),
+        62 => {
             wire__crate__api__citadel__vpn_connect_profile_impl(port, ptr, rust_vec_len, data_len)
         }
         _ => unreachable!(),
@@ -2521,34 +2553,35 @@ fn pde_ffi_dispatcher_sync_impl(
         18 => wire__crate__api__citadel__killswitch_enabled_impl(ptr, rust_vec_len, data_len),
         19 => wire__crate__api__citadel__language_impl(ptr, rust_vec_len, data_len),
         20 => wire__crate__api__citadel__link_qr_impl(ptr, rust_vec_len, data_len),
-        22 => wire__crate__api__citadel__pacing_enabled_impl(ptr, rust_vec_len, data_len),
+        22 => wire__crate__api__citadel__pacing_profile_impl(ptr, rust_vec_len, data_len),
         25 => wire__crate__api__citadel__screenshot_block_enabled_impl(ptr, rust_vec_len, data_len),
         26 => wire__crate__api__citadel__set_data_dir_impl(ptr, rust_vec_len, data_len),
         27 => wire__crate__api__citadel__set_debug_enabled_impl(ptr, rust_vec_len, data_len),
         28 => wire__crate__api__citadel__set_killswitch_impl(ptr, rust_vec_len, data_len),
         29 => wire__crate__api__citadel__set_language_impl(ptr, rust_vec_len, data_len),
         30 => wire__crate__api__diag__set_log_file_impl(ptr, rust_vec_len, data_len),
-        31 => wire__crate__api__citadel__set_pacing_impl(ptr, rust_vec_len, data_len),
-        32 => wire__crate__api__citadel__set_screenshot_block_impl(ptr, rust_vec_len, data_len),
-        33 => wire__crate__api__citadel__set_split_config_impl(ptr, rust_vec_len, data_len),
-        34 => wire__crate__api__citadel__set_traffic_meter_impl(ptr, rust_vec_len, data_len),
-        35 => wire__crate__api__citadel__split_config_impl(ptr, rust_vec_len, data_len),
-        36 => wire__crate__api__diag__start_log_capture_impl(ptr, rust_vec_len, data_len),
-        37 => wire__crate__api__citadel__traffic_counters_impl(ptr, rust_vec_len, data_len),
-        38 => wire__crate__api__citadel__traffic_meter_enabled_impl(ptr, rust_vec_len, data_len),
-        40 => wire__crate__api__citadel__vault_biometric_blob_impl(ptr, rust_vec_len, data_len),
-        43 => wire__crate__api__citadel__vault_biometric_enrolled_impl(ptr, rust_vec_len, data_len),
-        47 => wire__crate__api__citadel__vault_exists_impl(ptr, rust_vec_len, data_len),
-        48 => wire__crate__api__citadel__vault_is_unlocked_impl(ptr, rust_vec_len, data_len),
-        49 => wire__crate__api__citadel__vault_list_impl(ptr, rust_vec_len, data_len),
-        50 => wire__crate__api__citadel__vault_location_impl(ptr, rust_vec_len, data_len),
-        51 => wire__crate__api__citadel__vault_lock_impl(ptr, rust_vec_len, data_len),
-        52 => wire__crate__api__citadel__vault_max_name_len_impl(ptr, rust_vec_len, data_len),
-        53 => wire__crate__api__citadel__vault_min_password_len_impl(ptr, rust_vec_len, data_len),
-        54 => wire__crate__api__citadel__vault_move_to_impl(ptr, rust_vec_len, data_len),
-        55 => wire__crate__api__citadel__vault_remove_impl(ptr, rust_vec_len, data_len),
-        56 => wire__crate__api__citadel__vault_rename_impl(ptr, rust_vec_len, data_len),
-        62 => wire__crate__api__citadel__vpn_disconnect_impl(ptr, rust_vec_len, data_len),
+        31 => wire__crate__api__citadel__set_pacing_profile_impl(ptr, rust_vec_len, data_len),
+        32 => wire__crate__api__citadel__set_power_save_impl(ptr, rust_vec_len, data_len),
+        33 => wire__crate__api__citadel__set_screenshot_block_impl(ptr, rust_vec_len, data_len),
+        34 => wire__crate__api__citadel__set_split_config_impl(ptr, rust_vec_len, data_len),
+        35 => wire__crate__api__citadel__set_traffic_meter_impl(ptr, rust_vec_len, data_len),
+        36 => wire__crate__api__citadel__split_config_impl(ptr, rust_vec_len, data_len),
+        37 => wire__crate__api__diag__start_log_capture_impl(ptr, rust_vec_len, data_len),
+        38 => wire__crate__api__citadel__traffic_counters_impl(ptr, rust_vec_len, data_len),
+        39 => wire__crate__api__citadel__traffic_meter_enabled_impl(ptr, rust_vec_len, data_len),
+        41 => wire__crate__api__citadel__vault_biometric_blob_impl(ptr, rust_vec_len, data_len),
+        44 => wire__crate__api__citadel__vault_biometric_enrolled_impl(ptr, rust_vec_len, data_len),
+        48 => wire__crate__api__citadel__vault_exists_impl(ptr, rust_vec_len, data_len),
+        49 => wire__crate__api__citadel__vault_is_unlocked_impl(ptr, rust_vec_len, data_len),
+        50 => wire__crate__api__citadel__vault_list_impl(ptr, rust_vec_len, data_len),
+        51 => wire__crate__api__citadel__vault_location_impl(ptr, rust_vec_len, data_len),
+        52 => wire__crate__api__citadel__vault_lock_impl(ptr, rust_vec_len, data_len),
+        53 => wire__crate__api__citadel__vault_max_name_len_impl(ptr, rust_vec_len, data_len),
+        54 => wire__crate__api__citadel__vault_min_password_len_impl(ptr, rust_vec_len, data_len),
+        55 => wire__crate__api__citadel__vault_move_to_impl(ptr, rust_vec_len, data_len),
+        56 => wire__crate__api__citadel__vault_remove_impl(ptr, rust_vec_len, data_len),
+        57 => wire__crate__api__citadel__vault_rename_impl(ptr, rust_vec_len, data_len),
+        63 => wire__crate__api__citadel__vpn_disconnect_impl(ptr, rust_vec_len, data_len),
         _ => unreachable!(),
     }
 }

@@ -181,6 +181,44 @@ pub mod capsule {
         decode_v4_body(value)
     }
 
+    /// **П5 (батарея): необязательный хвост тела капсулы — `varint(max_idle_timeout в мс)`.**
+    ///
+    /// Зачем на проводе: эффективный idle-таймаут QUIC равен МИНИМУМУ из объявленных сторонами
+    /// (RFC 9000 §10.1), а редкий keep-alive (единственное, что даёт модему уйти в idle между
+    /// маячками) безопасен, только если этот минимум заведомо больше интервала маячка. Своё
+    /// значение сторона знает, чужое — нет: quinn негоциированный таймаут наружу не отдаёт.
+    /// Поэтому каждая сторона называет своё прямо в control-обмене, а редкий режим включается,
+    /// лишь если названное пиром значение достаточно велико (см. `dataplane::keepalive_delay`).
+    ///
+    /// Обратная совместимость в обе стороны: старый пир хвоста не шлёт — новый видит `None` и
+    /// остаётся на частом маячке; старый пир хвост игнорирует ([`decode_v4_body`] читает ровно
+    /// свои 6 байт и не смотрит дальше), поэтому добавление поля не ломает провод.
+    pub fn encode_address_assign_v4_hint(a: &AssignedV4, idle_ms: Option<u64>) -> Vec<u8> {
+        encode(ADDRESS_ASSIGN, &encode_v4_body_hint(a, idle_ms))
+    }
+    pub fn encode_address_request_v4_hint(a: &AssignedV4, idle_ms: Option<u64>) -> Vec<u8> {
+        encode(ADDRESS_REQUEST, &encode_v4_body_hint(a, idle_ms))
+    }
+
+    fn encode_v4_body_hint(a: &AssignedV4, idle_ms: Option<u64>) -> Vec<u8> {
+        let mut v = encode_v4_body(a);
+        if let Some(ms) = idle_ms {
+            v.extend_from_slice(&varint::to_vec(ms));
+        }
+        v
+    }
+
+    /// Прочитать хвост-подсказку из тела капсулы. `None` — пир её не прислал (старая версия)
+    /// либо тело битое.
+    pub fn decode_idle_hint(value: &[u8]) -> Option<u64> {
+        let (_, n) = varint::decode(value)?;
+        let rest = value.get(n..)?;
+        if rest.len() < 6 || rest[0] != 4 {
+            return None;
+        }
+        varint::decode(rest.get(6..)?).map(|(ms, _)| ms)
+    }
+
     #[cfg(test)]
     mod tests {
         use super::*;
@@ -194,6 +232,24 @@ pub mod capsule {
             assert_eq!(t, ADDRESS_ASSIGN);
             assert_eq!(used, cap.len());
             assert_eq!(decode_assigned_v4(val).unwrap(), a);
+        }
+
+        /// П5: хвост-подсказка читается новым пиром и НЕ мешает старому — тот разбирает те же
+        /// адрес и префикс, просто не смотрит дальше своих шести байт. Это и есть условие, при
+        /// котором редкий keep-alive можно катить, не ломая связь с прежними версиями.
+        #[test]
+        fn idle_hint_is_backward_compatible() {
+            let a = AssignedV4 { request_id: 1, addr: [10, 7, 0, 9], prefix: 24 };
+            let cap = encode_address_assign_v4_hint(&a, Some(90_000));
+            let (t, val, used) = decode(&cap).unwrap();
+            assert_eq!(t, ADDRESS_ASSIGN);
+            assert_eq!(used, cap.len());
+            assert_eq!(decode_assigned_v4(val).unwrap(), a, "старый разбор тела не сломан");
+            assert_eq!(decode_idle_hint(val), Some(90_000));
+            // без хвоста — None (пир прежней версии): режим маячка останется частым
+            let plain = encode_address_assign_v4(&a);
+            let (_, val, _) = decode(&plain).unwrap();
+            assert_eq!(decode_idle_hint(val), None);
         }
     }
 }

@@ -10,7 +10,7 @@
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use citadel_masque::{datagram, ip};
@@ -24,11 +24,23 @@ use crate::ratelimit::{RateCfg, RateLimits, TokenBucket};
 pub struct Tunnel {
     conn: quinn::Connection,
     over_tcp: bool,
+    /// П5: `max_idle_timeout`, который пир объявил в control-обмене (капсула адреса, необязательный
+    /// хвост — см. `citadel_masque::capsule::decode_idle_hint`). `None` — пир прежней версии.
+    /// Отсюда pump узнаёт, можно ли перейти на редкий keep-alive, не рискуя разрывом в простое:
+    /// эффективный idle-таймаут QUIC равен минимуму из объявленных сторонами, а quinn наружу его
+    /// не отдаёт.
+    peer_idle: Option<Duration>,
 }
 
 impl Tunnel {
     pub fn new(conn: quinn::Connection, over_tcp: bool) -> Self {
-        Self { conn, over_tcp }
+        Self { conn, over_tcp, peer_idle: None }
+    }
+
+    /// П5: запомнить объявленный пиром idle-таймаут (мс из капсулы). Зовётся один раз, сразу
+    /// после control-обмена, ДО `pump`.
+    pub fn set_peer_idle_ms(&mut self, ms: Option<u64>) {
+        self.peer_idle = ms.map(Duration::from_millis);
     }
 
     /// Доступ к QUIC-соединению (датаграммы/стримы) для вызывающих вне этого модуля.
@@ -273,15 +285,45 @@ impl Inbound {
     }
 }
 
-/// M-8: задержка до следующего keep-alive — РАВНОМЕРНО в `[2, 4]` с, выбирается заново каждый раз.
+/// M-8: задержка до следующего keep-alive — случайная, выбирается заново перед каждой отправкой
+/// (строгого периода в потоке нет ⇒ автокорреляцией маячок не снимается).
 ///
-/// Верхняя граница держится ниже `keep_alive_interval` quinn (5 с), чтобы штатный периодический
-/// PING не срабатывал и не возвращал в поток тот самый строгий период; нижняя — чтобы маячки не
-/// стоили заметного трафика. Обе — сильно ниже `max_idle_timeout` (15 с), так что потеря одного
-/// пакета соединение не рвёт.
-fn keepalive_delay() -> std::time::Duration {
+/// **П5 (батарея).** Диапазон зависит от того, что пир объявил своим `max_idle_timeout`:
+///
+/// * `relaxed = false` — [`KA_STRICT_MS`], прежние 2–4 с. Так мы говорим со старым пиром (он не
+///   прислал подсказку) — у него idle-таймаут 15 с, и редкий маячок просто рвал бы туннель в
+///   простое: эффективный таймаут равен МИНИМУМУ из объявленных сторонами.
+/// * `relaxed = true` — [`KA_RELAXED_MS`]. Пир объявил ≥ [`RELAXED_MIN_IDLE`], значит два-три
+///   пропущенных маячка соединение переживает. Это главный выигрыш в батарее: LTE-модем держит
+///   RRC_CONNECTED ещё 5–10 с после передачи, поэтому пакет раз в 2–4 с не давал ему уйти в idle
+///   ВООБЩЕ, а раз в ~21 с — даёт.
+///
+/// Верхняя граница расслабленного режима намеренно ниже 30 с: у CGNAT UDP-биндинг живёт обычно
+/// 30–60 с, и маячок должен успеть его обновить (RFC 4787 требует обновления по ИСХОДЯЩЕМУ
+/// трафику; на входящий полагаться нельзя). Отсюда же 15–28, а не 20–45 из первоначального
+/// предложения: разница в батарее между ними мала, а риск «телефон разбудили — интернета нет,
+/// пока не отработает watchdog» реален.
+fn keepalive_delay(relaxed: bool) -> std::time::Duration {
     use rand::Rng;
-    std::time::Duration::from_millis(rand::thread_rng().gen_range(2_000..=4_000))
+    let ms = match relaxed {
+        true => rand::thread_rng().gen_range(KA_RELAXED_MS),
+        false => rand::thread_rng().gen_range(KA_STRICT_MS),
+    };
+    std::time::Duration::from_millis(ms)
+}
+
+/// Совместимый режим: пир не подтвердил длинный idle-таймаут (старая версия либо своя политика).
+const KA_STRICT_MS: std::ops::RangeInclusive<u64> = 2_000..=4_000;
+/// П5: редкий маячок — включается только по подсказке пира (см. [`keepalive_delay`]).
+const KA_RELAXED_MS: std::ops::RangeInclusive<u64> = 15_000..=28_000;
+/// Какой объявленный пиром `max_idle_timeout` разрешает редкий маячок. 60 с ⇒ даже верхняя
+/// граница 28 с оставляет запас на два пропущенных маячка подряд.
+const RELAXED_MIN_IDLE: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// П5: разрешён ли редкий keep-alive при таком объявлении пира. Вынесено ради теста —
+/// ошибка здесь проявляется не в лаборатории, а разрывами туннеля в простое у людей.
+fn keepalive_relaxed(peer_idle: Option<std::time::Duration>) -> bool {
+    peer_idle.is_some_and(|d| d >= RELAXED_MIN_IDLE)
 }
 
 /// Длина случайного тела keep-alive: на UDP-пути L1 всё равно добьёт пакет паддингом до общего
@@ -308,6 +350,28 @@ fn keepalive_body_len() -> usize {
 static TRAFFIC_RX: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static TRAFFIC_TX: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
+// ─────────────────── П1: маркер пользовательского трафика для тайминг-шейпинга ────────────────
+// Счётчик inner-датаграмм (`CTX_RAW_IP`) в ОБЕ стороны — единственный источник истины для вопроса
+// «есть ли сейчас что маскировать». До этого chaff взводился любой выпущенной датаграммой, включая
+// собственный keep-alive: простаивающий туннель раз в 2–4 с сам себе открывал окно и слал ~2.2 ГБ
+// мусора в сутки, маскируя ничто (docs/COVER-TRAFFIC-BATTERY-2026-08.md §2.2).
+//
+// Почему это НЕ противоречит no-logs на exit'е (в отличие от TRAFFIC_RX/TX, которые там не
+// ведутся): здесь нет ни байтов, ни адресов, ни разделения по клиентам — одно монотонное число в
+// памяти процесса, из которого шейпер узнаёт только «с прошлого тика что-то прошло». Наружу оно не
+// выходит и в лог не печатается.
+static USER_PKTS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+#[inline]
+pub(crate) fn note_user_packet() {
+    USER_PKTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// П1: снимок маркера пользовательского трафика (см. `obfs_socket::pace_tick`).
+pub(crate) fn user_packets() -> u64 {
+    USER_PKTS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 /// Снимок счётчиков трафика туннеля: `(принято, отправлено)` в байтах полезной нагрузки.
 /// Монотонны за время жизни процесса — вызывающий считает скорость по дельте двух снимков.
 pub fn traffic_bytes() -> (u64, u64) {
@@ -316,8 +380,9 @@ pub fn traffic_bytes() -> (u64, u64) {
 }
 
 /// Окно pump-watchdog и минимум отправленных датаграмм в окне, при котором «0 принятых»
-/// трактуется как мёртвый путь. Окно > keep-alive-интервала (5с), чтобы здоровый простой и
-/// одиночные потери не срабатывали; порог tx отсекает простой (мало шлём — путь не трогаем).
+/// трактуется как мёртвый путь. Простой отсекается порогом tx (мало шлём — путь не трогаем), и
+/// именно поэтому окно не пришлось растягивать под редкий keep-alive (П5): маячок один на 15–28 с
+/// до порога не дотягивает, а под нагрузкой окно набирается за доли секунды.
 const WATCHDOG_INTERVAL: std::time::Duration = std::time::Duration::from_secs(8);
 const WATCHDOG_TX_MIN: u64 = 12;
 
@@ -574,7 +639,8 @@ pub async fn pump(
         };
     }
 
-    let Tunnel { conn, .. } = tunnel;
+    // П5: что пир объявил своим idle-таймаутом — от этого зависит частота маячка (см. ниже).
+    let Tunnel { conn, peer_idle, .. } = tunnel;
     let send_conn = conn.clone();
     let send_tx = tx_count.clone();
     // Сколько inner-пакетов не-IPv4 мы отбросили локально (см. ниже) — для диагностики окна.
@@ -668,6 +734,7 @@ pub async fn pump(
             match send_conn.send_datagram(bytes::Bytes::from(dg)) {
                 Ok(()) => {
                     send_tx.fetch_add(1, Ordering::Relaxed);
+                    note_user_packet(); // П1: это трафик человека — ему и открывать окно chaff
                     if count_traffic {
                         TRAFFIC_TX.fetch_add(pkt.len() as u64, Ordering::Relaxed);
                     }
@@ -706,6 +773,9 @@ pub async fn pump(
                             continue;
                         }
                         if inb.accept(pkt) {
+                            // П1: приём тоже трафик человека — исходящий ACK-поток скачивания
+                            // маскировать надо ровно так же, как отправку.
+                            note_user_packet();
                             if count_traffic {
                                 TRAFFIC_RX.fetch_add(pkt.len() as u64, Ordering::Relaxed);
                             }
@@ -775,6 +845,8 @@ pub async fn pump(
         // F8: предыдущий снимок счётчиков клиентского inbound-фильтра (не-IPv4, чужой dst, без
         // запроса, ICMP-тип) — печатаем дельту за окно, а не итог за сессию.
         let mut seen_fw = (0u64, 0u64, 0u64, 0u64);
+        // Сколько chaff-байт сгенерировала маскировка — предыдущий снимок (см. §6.2 ниже).
+        let mut seen_chaff = crate::shaping_stats().chaff_bytes;
         // Тиковые снимки (быстрая проверка «датаграммы не уходят») — отдельные от оконных: свой шаг.
         let (mut tick_tx, mut tick_rx) = (0u64, 0u64);
         let (mut tick_wire, mut tick_lost, mut tick_acks) =
@@ -1026,6 +1098,24 @@ pub async fn pump(
                     );
                 }
             }
+            // §6.2 документа о маскировке: сколько мусора сгенерировали мы сами. Без этой строки
+            // регрессия «маскировка снова жжёт трафик и батарею» замечается только по счёту за
+            // мобильный интернет. Печатаем ТОЛЬКО когда chaff в этом окне реально шёл (при
+            // выключенной маскировке и в простое — тишина).
+            let sh = crate::shaping_stats();
+            let chaff_delta = sh.chaff_bytes.wrapping_sub(seen_chaff);
+            seen_chaff = sh.chaff_bytes;
+            if wd_client && chaff_delta > 0 {
+                eprintln!(
+                    "[pump] маскировка: chaff {} КБ за {}с ({} пакетов всего, {} пропущено по \
+                     бюджету, {} пробуждений pacer'а)",
+                    chaff_delta / 1024,
+                    WATCHDOG_INTERVAL.as_secs(),
+                    sh.chaff_pkts,
+                    sh.chaff_skipped,
+                    sh.ticks,
+                );
+            }
             // Отдельный сигнал про IPv6: он уходит в blackhole по дизайну (туннель IPv4-only) —
             // без этой строки «интернет не работает» на v6-only ресурсах выглядит как загадка.
             if wd_client && dropped_v6 > 0 {
@@ -1039,23 +1129,34 @@ pub async fn pump(
     });
 
     // M-8/аудит-4: собственный keep-alive со СЛУЧАЙНЫМ интервалом. `keep_alive_interval` у quinn
-    // фиксирован (5,000 с) — в простое туннель превращается в маяк со строгой периодичностью,
-    // который снимается автокорреляцией по десятку интервалов и не маскируется ни паддингом
-    // размеров (I5/C2), ни шифрованием. Здесь интервал выбирается заново перед каждой отправкой
-    // (см. [`keepalive_delay`]), поэтому периода в потоке нет. Пакет — датаграмма `CTX_KEEPALIVE`
+    // фиксирован — в простое туннель превращался бы в маяк со строгой периодичностью, который
+    // снимается автокорреляцией по десятку интервалов и не маскируется ни паддингом размеров
+    // (I5/C2), ни шифрованием. Здесь интервал выбирается заново перед каждой отправкой (см.
+    // [`keepalive_delay`]), поэтому периода в потоке нет. Пакет — датаграмма `CTX_KEEPALIVE`
     // со случайным телом: приёмник её отбрасывает (не `CTX_RAW_IP`), а L1 паддит её до того же
     // распределения длин, что и данные, — на проводе она неотличима от полезного трафика.
     //
     // Отправляем только в ПРОСТОЕ (за окно не ушло ни одной датаграммы) — под нагрузкой канал
     // и так не даёт quinn'у сработать по неактивности, а лишний пакет только жёг бы трафик.
-    // `keep_alive_interval` остаётся страховкой: если эта задача умрёт, соединение не развалится.
+    // `keep_alive_interval` (60 с) остаётся страховкой: он сбрасывается на каждом принятом пакете,
+    // поэтому при живом маячке не срабатывает никогда, а если эта задача умрёт — соединение
+    // продержится до idle-таймаута, а не развалится молча.
+    //
+    // **П5: на EXIT'е маячка нет вовсе.** Держать NAT-биндинг — забота той стороны, что за NAT и
+    // на батарее; клиентский маячок и так сбрасывает idle-таймер обеих сторон. Встречный маячок
+    // exit'а лишь будил бы радио телефона на приём (и вынуждал его отвечать ACK'ом) вдвое чаще,
+    // ничего не добавляя к живости пути. Мёртвого клиента exit убирает по idle-таймауту.
+    let ka_relaxed = keepalive_relaxed(peer_idle);
     let ka_conn = conn.clone();
     let ka_tx = tx_count.clone();
     let ka_stop = stop.clone();
     let keepalive = tokio::spawn(async move {
+        if is_exit {
+            return;
+        }
         let mut seen = ka_tx.load(Ordering::Relaxed);
         loop {
-            tokio::time::sleep(keepalive_delay()).await;
+            tokio::time::sleep(keepalive_delay(ka_relaxed)).await;
             if ka_stop.load(Ordering::Acquire) {
                 break;
             }
@@ -1250,21 +1351,56 @@ mod tests {
         ip::build_ipv4(6, src, dst, &seg)
     }
 
-    /// M-8: интервал keep-alive случаен и ВСЕГДА строго меньше `keep_alive_interval` quinn (5 с) —
-    /// иначе штатный PING успевал бы раньше и возвращал в поток ту самую строгую периодичность,
-    /// ради ухода от которой всё и делалось. И сильно меньше `max_idle_timeout` (15 с), чтобы
-    /// потеря одного маячка не рвала сессию.
+    /// M-8: интервал keep-alive случаен (строгого периода в потоке нет) и в совместимом режиме
+    /// остаётся прежним — 2–4 с. Так мы говорим со старым пиром: у него `max_idle_timeout` 15 с,
+    /// а эффективный таймаут равен минимуму из объявленных, поэтому редкий маячок рвал бы туннель
+    /// в простое.
     #[test]
     fn keepalive_interval_is_random_and_below_quinn_fallback() {
         let mut seen = std::collections::HashSet::new();
         for _ in 0..200 {
-            let d = keepalive_delay();
+            let d = keepalive_delay(false);
             assert!(d >= std::time::Duration::from_secs(2), "слишком часто: {d:?}");
-            assert!(d <= std::time::Duration::from_secs(4), "не успеет до PING quinn: {d:?}");
+            assert!(d <= std::time::Duration::from_secs(4), "не успеет до idle старого пира: {d:?}");
             seen.insert(d);
             assert!(keepalive_body_len() <= 96);
         }
         assert!(seen.len() > 50, "интервал обязан гулять, а не быть константой: {}", seen.len());
+    }
+
+    /// **П5 (батарея): редкий маячок и условия, при которых он вообще допустим.**
+    ///
+    /// Три инварианта, каждый из которых при нарушении даёт разрыв туннеля в простое, а не
+    /// «чуть хуже маскировку»:
+    ///  1. без подсказки пира режим остаётся частым (старый exit с idle 15 с);
+    ///  2. верхняя граница редкого интервала — ниже типового CGNAT-таймаута (30 с), иначе UDP-
+    ///     биндинг умирает между маячками;
+    ///  3. наш собственный `max_idle_timeout` не ниже порога, разрешающего редкий режим, — иначе
+    ///     пир, поверив нашей же подсказке, начал бы слать редко в соединение, которое мы сами
+    ///     закрываем раньше.
+    #[test]
+    fn relaxed_keepalive_requires_peer_confirmation() {
+        use std::time::Duration;
+        assert!(!keepalive_relaxed(None), "старый пир (без подсказки) → частый маячок");
+        assert!(!keepalive_relaxed(Some(Duration::from_secs(15))), "15 с → частый маячок");
+        assert!(keepalive_relaxed(Some(RELAXED_MIN_IDLE)));
+        assert!(keepalive_relaxed(Some(crate::IDLE_TIMEOUT)));
+
+        let mut seen = std::collections::HashSet::new();
+        for _ in 0..200 {
+            let d = keepalive_delay(true);
+            assert!(d >= Duration::from_secs(15), "слишком часто для редкого режима: {d:?}");
+            assert!(d < Duration::from_secs(30), "не успеет обновить CGNAT-биндинг: {d:?}");
+            seen.insert(d);
+        }
+        assert!(seen.len() > 50, "интервал обязан гулять и в редком режиме: {}", seen.len());
+        assert!(
+            crate::IDLE_TIMEOUT >= RELAXED_MIN_IDLE,
+            "мы объявляем idle меньше, чем сами считаем достаточным для редкого маячка"
+        );
+        // Запас на пропуски: даже верхняя граница интервала обязана укладываться в порог с
+        // кратностью ≥2, иначе одна потеря маячка = разрыв.
+        assert!(*KA_RELAXED_MS.end() * 2 <= RELAXED_MIN_IDLE.as_millis() as u64);
     }
 
     /// M-8/F7: датаграмма служебного контекста в TUN не идёт, но ресурсы тратит — она обязана

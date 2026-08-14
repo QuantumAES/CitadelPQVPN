@@ -618,6 +618,9 @@ async fn client_request_address(
     let assigned = capsule::decode_assigned_v4(val)
         .ok_or_else(|| assign(anyhow!("битое тело ADDRESS_ASSIGN")))?;
     validate_assignment(&assigned).map_err(assign)?;
+    // П5: что exit объявил своим idle-таймаутом. Нет хвоста (старый exit) → `None` → маячок
+    // останется частым: разредить его в одностороннем порядке значило бы рвать туннель в простое.
+    tunnel.set_peer_idle_ms(capsule::decode_idle_hint(val));
     Ok(assigned)
 }
 

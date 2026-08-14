@@ -347,45 +347,98 @@ pub fn traffic_meter_enabled() -> bool {
     TRAFFIC_METER.load(Relaxed)
 }
 
-// ─────────────────────── маскировка таймингов (M-8, профиль «высокий риск») ───────────────────
-// Тумблер включает тайминг-шейпинг ИСХОДЯЩЕГО потока (DAITA-стиль: выпуск по слот-сетке + adaptive
-// chaff). До этого профиль существовал только как `Citadel_PACING` — то есть был доступен серверу и
-// консольному клиенту, но не тому, кому он нужен больше всех: пользователю GUI под наблюдением.
+// ─────────────────────── маскировка таймингов (M-8 + П7 «профиль вместо тумблера») ────────────
+// Настройка включает тайминг-шейпинг ИСХОДЯЩЕГО потока (DAITA-стиль: выпуск по слот-сетке +
+// затухающий chaff). До этого профиль существовал только как `Citadel_PACING` — то есть был
+// доступен серверу и консольному клиенту, но не тому, кому он нужен больше всех: пользователю GUI
+// под наблюдением.
+//
+// **П7: это больше не булев тумблер, а три состояния** — `off` | `lite` | `on`. Причина в честности
+// цены: маскировка стоит трафика и батареи, и разные люди готовы платить разное. Прежний тумблер
+// не сообщал ни цены, ни того, что львиную долю расхода в простое создавал вовсе не он (см.
+// `docs/COVER-TRAFFIC-BATTERY-2026-08.md`). Значения — те же строки, что понимает
+// `citadel_quic::pacing_profile`, поэтому файл настройки читается ядром без перевода.
+//
+// Обратная совместимость: раньше в файле лежали «1»/«0» — они читаются как `on`/`off`.
 //
 // **Дефолт ВЫКЛЮЧЕН** и это осознанно: шейпинг платит латентностью и лишним трафиком (chaff), а
 // защищает от корреляции по времени — размен, который пользователь должен сделать сам. Ответное
-// направление шейпит exit своим `Citadel_PACING`: клиентский тумблер маскирует ОТПРАВКУ.
+// направление шейпит exit своим `Citadel_PACING`: клиентская настройка маскирует ОТПРАВКУ.
 
-static PACING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-static PACING_LOADED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+pub const PACING_OFF: &str = "off";
+pub const PACING_LITE: &str = "lite";
+pub const PACING_STRICT: &str = "on";
+
+static PACING: Mutex<Option<String>> = Mutex::new(None);
 
 fn pacing_file() -> PathBuf {
     vault_path().with_file_name("pacing")
 }
 
-/// Сохранить настройку маскировки таймингов (GUI-тумблер). Применяется со СЛЕДУЮЩЕГО подключения.
+/// Нормализация: чужое/старое значение не должно втихую включать маскировку сильнее, чем просил
+/// человек. Всё неизвестное — «выключено».
+fn normalize_pacing(raw: &str) -> String {
+    match raw.trim() {
+        "1" | PACING_STRICT | "strict" => PACING_STRICT, // «1» — формат прежнего тумблера
+        PACING_LITE => PACING_LITE,
+        _ => PACING_OFF,
+    }
+    .to_string()
+}
+
+/// Сохранить профиль маскировки (`off` | `lite` | `on`). Применяется со СЛЕДУЮЩЕГО подключения.
 #[frb(sync)]
-pub fn set_pacing(on: bool) {
-    use std::sync::atomic::Ordering::Relaxed;
-    PACING.store(on, Relaxed);
-    PACING_LOADED.store(true, Relaxed);
+pub fn set_pacing_profile(profile: String) {
+    let value = normalize_pacing(&profile);
     let f = pacing_file();
     if let Some(d) = f.parent() {
         let _ = std::fs::create_dir_all(d);
     }
-    let _ = std::fs::write(f, if on { "1" } else { "0" });
+    let _ = std::fs::write(f, &value);
+    *PACING.lock().unwrap() = Some(value);
 }
 
-/// Сохранённое состояние маскировки таймингов (инициализация тумблера); файла нет → выключено.
+/// Сохранённый профиль маскировки (инициализация настройки); файла нет → `off`.
 #[frb(sync)]
-pub fn pacing_enabled() -> bool {
-    use std::sync::atomic::Ordering::Relaxed;
-    if !PACING_LOADED.swap(true, Relaxed) {
-        if let Ok(s) = std::fs::read_to_string(pacing_file()) {
-            PACING.store(s.trim() == "1", Relaxed);
-        }
+pub fn pacing_profile() -> String {
+    let mut cur = PACING.lock().unwrap();
+    if cur.is_none() {
+        let raw = std::fs::read_to_string(pacing_file()).unwrap_or_default();
+        *cur = Some(normalize_pacing(&raw));
     }
-    PACING.load(Relaxed)
+    cur.clone().unwrap_or_else(|| PACING_OFF.to_string())
+}
+
+// ───────────────────────── П8: энергосбережение устройства (Android) ──────────────────────────
+// После П1 в простое chaff и так равен нулю, поэтому «учитывать состояние устройства» сводится к
+// одному правилу: не жечь батарею сильнее, чем человек сознательно разрешил. Когда система сама
+// говорит «я экономлю заряд», строгий профиль понижается до экономного — тот же алгоритм с
+// вчетверо меньшим потолком расхода. ВЫКЛЮЧЕННУЮ маскировку это не включает, а включённую не
+// выключает: подмена настройки за спиной пользователя была бы хуже честной цены.
+//
+// Значение приходит от платформы (`PowerManager.isPowerSaveMode`) и НЕ персистится: это состояние
+// устройства, а не настройка. Читается в момент подключения.
+
+static POWER_SAVE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Платформа сообщает: устройство в режиме энергосбережения (Android). Зовётся при старте и
+/// перед подключением.
+#[frb(sync)]
+pub fn set_power_save(on: bool) {
+    POWER_SAVE.store(on, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Профиль маскировки, который реально уйдёт в ядро: сохранённый, с поправкой на энергосбережение.
+fn effective_pacing() -> Option<String> {
+    let profile = pacing_profile();
+    if profile == PACING_OFF {
+        return None;
+    }
+    let saving = POWER_SAVE.load(std::sync::atomic::Ordering::Relaxed);
+    Some(match (saving, profile.as_str()) {
+        (true, PACING_STRICT) => PACING_LITE.to_string(),
+        _ => profile,
+    })
 }
 
 /// Снимок счётчиков трафика туннеля (монотонных за время жизни процесса) для расчёта СКОРОСТИ:
@@ -1134,8 +1187,9 @@ fn spawn_controller(
     let mut cfg = link.to_client_config();
     cfg.killswitch = killswitch_enabled(); // C6/M9: kill-switch по GUI-тумблеру (desktop; Android — OS-level)
     cfg.split = load_split_config(); // C8.3: split-tunnel по приложениям/назначениям (Android; desktop игнорит)
-    // M-8: профиль «высокий риск» — шейпинг таймингов исходящего потока по GUI-тумблеру.
-    cfg.pacing = pacing_enabled().then(|| "on".to_string());
+    // M-8/П7: профиль шейпинга таймингов исходящего потока (`off`|`lite`|`on`), с поправкой на
+    // энергосбережение устройства (П8).
+    cfg.pacing = effective_pacing();
     // Остановить прошлую сессию перед новой (анти-double-connect): её loop глушим, иначе он продолжит
     // держать/реконнектить старый туннель параллельно новому. Берём Arc и disconnect() вне лока.
     let prev = ACTIVE.lock().unwrap().take();

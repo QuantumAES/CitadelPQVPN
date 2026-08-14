@@ -29,6 +29,11 @@ class AndroidVpn {
   static Future<void> setSecureFlag(bool on) =>
       _ch.invokeMethod('setSecureFlag', {'on': on});
 
+  /// П8: включён ли на устройстве режим энергосбережения (`PowerManager.isPowerSaveMode`).
+  /// Пока он включён, строгий профиль маскировки понижается ядром до экономного.
+  static Future<bool> powerSaveMode() async =>
+      (await _ch.invokeMethod<bool>('powerSaveMode')) ?? false;
+
   /// Тексты постоянной нотификации VPN на языке ПРИЛОЖЕНИЯ (нотификация — тот же интерфейс, а
   /// системная локаль устройства может быть другой). Зовётся на старте и при смене языка.
   static Future<void> setNotifStrings({

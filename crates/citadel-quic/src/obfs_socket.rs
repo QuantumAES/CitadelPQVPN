@@ -11,13 +11,24 @@
 //! не пишутся сразу, а буферизуются и выпускаются фоновым pacer'ом по слот-сетке; в пустые
 //! слоты подмешивается chaff (`TYPE_PAD`), маскируя паузы/хвосты потока. Приёмник chaff дропает.
 //! По умолчанию выключено (пейсинг торгует латентностью) — включается env `Citadel_PACING`.
+//!
+//! **Батарея (заход «маскировка/батарея», см. `docs/COVER-TRAFFIC-BATTERY-2026-08.md`).** В первой
+//! редакции chaff взводился ЛЮБОЙ выпущенной датаграммой, включая собственный keep-alive: маячок
+//! раз в 2–4 с сам себе открывал окно, и простаивающий туннель гнал ~2.2 ГБ мусора в сутки,
+//! маскируя ничто. Здесь это исправлено четырьмя связанными вещами:
+//!   * **П1** — окно chaff взводит только ПОЛЬЗОВАТЕЛЬСКИЙ трафик ([`crate::dataplane::user_packets`]);
+//!   * **П2** — pacer не тикает в простое (спит на [`tokio::sync::Notify`], а не 200 раз/с);
+//!   * **П3** — у chaff есть байтовый бюджет (token bucket), т.е. предсказуемый потолок расхода;
+//!   * **П4** — хвост chaff затухает геометрически (5→10→…→320 мс), а не льёт 200 пак/с ровным окном;
+//!   * **П6** — длины chaff берутся из эмпирических длин реального провода, а не из своего
+//!     распределения (иначе chaff — собственная сигнатура: см. §2.4 того же документа).
 
 use std::collections::VecDeque;
 use std::fmt;
 use std::io::{self, IoSliceMut};
 use std::net::SocketAddr;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 use std::task::{Context, Poll, Waker};
 use std::time::{Duration, Instant};
@@ -28,6 +39,8 @@ use quinn::udp::{RecvMeta, Transmit};
 use quinn::{AsyncUdpSocket, UdpPoller};
 use rand::RngCore;
 use tokio::io::ReadBuf;
+
+use crate::ratelimit::{RateCfg, TokenBucket};
 
 /// Потолок очереди отправки при пейсинге: переполнение → дроп пакета (= потеря UDP,
 /// QUIC ретрансмитит). Защита от OOM (STRIDE D2), как у datagram-каналов.
@@ -149,44 +162,91 @@ pub enum Pacing {
     /// Выключено: синхронная отправка как есть (дефолт; пейсинг торгует латентностью).
     None,
     /// Пакеты выпускаются на тиках сетки `slot`; за тик — до `burst` реальных пакетов;
-    /// в пустой слот подмешивается dummy по политике `chaff`.
-    Slotted { slot: Duration, burst: usize, chaff: Chaff },
+    /// в пустой слот подмешивается dummy по политике `chaff`, но не быстрее, чем позволяет
+    /// `budget` (П3: у маскировки обязан быть предсказуемый потолок расхода).
+    Slotted { slot: Duration, burst: usize, chaff: Chaff, budget: Option<RateCfg> },
 }
 
 #[derive(Clone, Copy, Debug)]
 pub enum Chaff {
     /// Без dummy-трафика — пейсинг только квантует тайминги реальных пакетов.
     Off,
-    /// Dummy в пустой слот, только если реальный трафик был в пределах `window` (WTF-PAD-стиль):
+    /// Dummy после пользовательского трафика, затухающим хвостом длиной `window` (WTF-PAD-стиль):
     /// маскирует паузы/хвосты потока, не гоня вечный chaff в простаивающем туннеле.
     Adaptive { window: Duration },
     /// Dummy в каждый пустой слот (constant-rate; дороже по трафику, для high-threat).
     Always,
 }
 
-/// Чистое решение «слать ли chaff в этот пустой слот» — вынесено для детерминированных юнит-тестов.
-fn chaff_decision(chaff: Chaff, had_real_traffic: bool, idle: Duration) -> bool {
-    if !had_real_traffic {
-        return false; // до первого реального пакета молчим (некуда и незачем)
+/// П4: потолок шага затухания хвоста. Ценность chaff максимальна сразу после всплеска (он прячет,
+/// где всплеск кончился); дальше плотность можно ронять почти без потери неопределённости.
+const CHAFF_STEP_MAX: Duration = Duration::from_millis(320);
+
+/// П4: длина хвоста chaff по умолчанию. Больше прежних 500 мс — при геометрическом затухании
+/// хвост в 2 с стоит ~11 пакетов вместо 100, то есть длиннее и при этом в разы дешевле.
+const CHAFF_WINDOW: Duration = Duration::from_millis(2_000);
+
+/// П3: бюджеты профилей в КиБ/мин. «Экономно» — примерно один затухающий хвост на всплеск раз в
+/// полминуты; «строго» — вчетверо больше. Всплеск разрешаем на полминуты бюджета вперёд
+/// (`burst`), иначе первый же хвост упёрся бы в потолок и маскировка не состоялась бы.
+const BUDGET_LITE_KIB_MIN: f64 = 32.0;
+const BUDGET_STRICT_KIB_MIN: f64 = 128.0;
+
+fn budget(kib_per_min: f64) -> RateCfg {
+    let rate = kib_per_min * 1024.0 / 60.0;
+    RateCfg { rate, burst: rate * 30.0 }
+}
+
+/// Чистое решение «слать ли chaff в этот пустой слот» + новый шаг затухания (П4).
+/// `Some(step)` — слать, следующий chaff не раньше чем через `step`. Вынесено из состояния
+/// сокета ради детерминированных юнит-тестов.
+///
+/// `saw_user` — был ли за жизнь сокета хоть один пользовательский пакет (до этого маскировать
+/// нечего и некуда); `tail` — сколько прошло с последнего пользовательского трафика (**П1**:
+/// собственный keep-alive сюда не входит); `due` — истёк ли текущий шаг затухания.
+fn chaff_step_decision(
+    chaff: Chaff,
+    saw_user: bool,
+    tail: Duration,
+    due: bool,
+    step: Duration,
+    slot: Duration,
+) -> Option<Duration> {
+    if !saw_user {
+        return None; // до первого пользовательского пакета молчим (некуда и незачем)
     }
     match chaff {
-        Chaff::Off => false,
-        Chaff::Always => true,
-        Chaff::Adaptive { window } => idle <= window,
+        Chaff::Off => None,
+        Chaff::Always => due.then_some(slot), // constant-rate: каждый пустой слот
+        Chaff::Adaptive { window } => {
+            if tail > window || !due {
+                return None;
+            }
+            Some((step * 2).min(CHAFF_STEP_MAX))
+        }
     }
 }
 
-/// Разбор политики из строки: `off`(дефолт) | `on` | `<slot_ms>:<burst>:<off|adaptive|always>`.
+/// Разбор политики из строки. Профили: `off`(дефолт) | `lite` | `on` | `max`; ручная форма —
+/// `<slot_ms>:<burst>:<off|adaptive|always>[:<КиБ/мин|none>]` (для стендов и операторов exit'а:
+/// бюджет там по умолчанию НЕ навязывается — раз задают вручную, значит знают цену).
 /// Чистая функция (от `&str`) — тестируется без глобального env.
 fn parse_pacing(raw: &str) -> Pacing {
-    let default_window = Duration::from_millis(500);
+    let profile = |chaff, budget| Pacing::Slotted {
+        slot: Duration::from_millis(5),
+        burst: 32,
+        chaff,
+        budget,
+    };
+    let adaptive = Chaff::Adaptive { window: CHAFF_WINDOW };
     match raw.trim() {
         "" | "off" | "none" | "0" => Pacing::None,
-        "on" => Pacing::Slotted {
-            slot: Duration::from_millis(5),
-            burst: 32,
-            chaff: Chaff::Adaptive { window: default_window },
-        },
+        // «Экономно»: тот же алгоритм, вчетверо меньший потолок расхода.
+        "lite" => profile(adaptive, Some(budget(BUDGET_LITE_KIB_MIN))),
+        // «Строго» (историческое имя `on` — его пишет прежний GUI-тумблер и стенды).
+        "on" | "strict" => profile(adaptive, Some(budget(BUDGET_STRICT_KIB_MIN))),
+        // Constant-rate: только явным выбором и без бюджета — это осознанные ~13 ГБ/сутки.
+        "max" | "always" => profile(Chaff::Always, None),
         s => {
             let mut it = s.split(':');
             let slot_ms: u64 = it.next().and_then(|x| x.parse().ok()).unwrap_or(5);
@@ -194,12 +254,18 @@ fn parse_pacing(raw: &str) -> Pacing {
             let chaff = match it.next().unwrap_or("adaptive") {
                 "off" => Chaff::Off,
                 "always" => Chaff::Always,
-                _ => Chaff::Adaptive { window: default_window },
+                _ => adaptive,
             };
+            let budget = it
+                .next()
+                .and_then(|x| x.trim().parse::<f64>().ok())
+                .filter(|k| *k > 0.0)
+                .map(budget);
             Pacing::Slotted {
                 slot: Duration::from_millis(slot_ms.max(1)),
                 burst: burst.max(1),
                 chaff,
+                budget,
             }
         }
     }
@@ -254,6 +320,76 @@ impl ReplayGuard {
     }
 }
 
+/// П6: сколько последних размеров РЕАЛЬНОГО провода помним, чтобы chaff брал длины оттуда.
+/// 64 хватает, чтобы догнать смену режима (пошла закачка — длины подтянулись за доли секунды),
+/// и мало, чтобы не тащить историю прошлой активности в текущую маскировку.
+const WIRE_HIST: usize = 64;
+
+/// Кольцо последних длин реального провода (П6). `u16` — потолок провода 1255 Б (`WIRE_CAP`).
+#[derive(Debug)]
+struct WireHist {
+    buf: [u16; WIRE_HIST],
+    len: usize,
+    pos: usize,
+}
+
+impl Default for WireHist {
+    fn default() -> Self {
+        Self { buf: [0; WIRE_HIST], len: 0, pos: 0 }
+    }
+}
+
+impl WireHist {
+    fn push(&mut self, wire: usize) {
+        self.buf[self.pos] = wire.min(u16::MAX as usize) as u16;
+        self.pos = (self.pos + 1) % WIRE_HIST;
+        self.len = (self.len + 1).min(WIRE_HIST);
+    }
+
+    /// Случайная запомненная длина; `None` — истории ещё нет (chaff до первых данных).
+    fn pick(&self, rnd: usize) -> Option<usize> {
+        (self.len > 0).then(|| self.buf[rnd % self.len] as usize)
+    }
+}
+
+/// П4: состояние затухающего хвоста chaff. Живёт под одним замком — читается и правится
+/// исключительно в `pace_tick` (одна задача), так что конкуренции здесь нет.
+#[derive(Debug)]
+struct ChaffTail {
+    /// Текущий шаг затухания (удваивается на каждом выпущенном chaff до [`CHAFF_STEP_MAX`]).
+    step: Duration,
+    /// Раньше этого момента следующий chaff не выпускаем.
+    next: Instant,
+}
+
+// ─────────────── диагностика шейпинга (§6.2 документа: иначе регрессия «маскировка снова жжёт»
+// замечается только по разряженной батарее). Счётчики процессные и монотонные; ни адресов, ни
+// содержимого — только «сколько мусора мы сами сгенерировали».
+static PACE_TICKS: AtomicU64 = AtomicU64::new(0);
+static CHAFF_PKTS: AtomicU64 = AtomicU64::new(0);
+static CHAFF_BYTES: AtomicU64 = AtomicU64::new(0);
+static CHAFF_SKIPPED: AtomicU64 = AtomicU64::new(0);
+
+/// Снимок счётчиков тайминг-шейпинга (для лога диагностики и тестов).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ShapingStats {
+    /// Сколько раз просыпался pacer (после П2 в простое не растёт).
+    pub ticks: u64,
+    pub chaff_pkts: u64,
+    pub chaff_bytes: u64,
+    /// Сколько chaff-пакетов не выпущено из-за исчерпанного бюджета (П3).
+    pub chaff_skipped: u64,
+}
+
+pub fn shaping_stats() -> ShapingStats {
+    ShapingStats {
+        ticks: PACE_TICKS.load(Ordering::Relaxed),
+        chaff_pkts: CHAFF_PKTS.load(Ordering::Relaxed),
+        chaff_bytes: CHAFF_BYTES.load(Ordering::Relaxed),
+        chaff_skipped: CHAFF_SKIPPED.load(Ordering::Relaxed),
+    }
+}
+
 pub struct ObfsUdpSocket {
     /// Внутренний UDP-сокет, атомарно сменяемый при миграции пути (rebind) — lock-free на hot path.
     inner: ArcSwap<tokio::net::UdpSocket>,
@@ -280,10 +416,33 @@ pub struct ObfsUdpSocket {
     queue: Mutex<VecDeque<(Vec<u8>, SocketAddr)>>,
     /// Последнее назначение реального пакета — куда слать chaff.
     last_dst: Mutex<Option<SocketAddr>>,
-    /// Момент последней реальной отправки — для adaptive chaff (окно активности).
-    last_real: Mutex<Instant>,
+    /// **П1:** момент последнего ПОЛЬЗОВАТЕЛЬСКОГО трафика — от него живёт хвост chaff.
+    /// Собственный keep-alive его не двигает: маскировать маячок не от кого (он не несёт
+    /// информации о поведении человека), а раньше именно он в простое и взводил окно chaff.
+    last_user: Mutex<Instant>,
+    /// П1: снимок [`crate::dataplane::user_packets`] на прошлом тике — сдвинулся, значит трафик был.
+    user_seen: AtomicU64,
+    /// П1: был ли пользовательский трафик хоть раз (до этого chaff не с чем смешивать).
+    saw_user: AtomicBool,
+    /// П4: затухающий хвост chaff.
+    tail: Mutex<ChaffTail>,
+    /// П3: бюджет chaff; `None` — без лимита (ручной профиль/`max`).
+    chaff_budget: Option<Mutex<TokenBucket>>,
+    /// П6: длины последних реальных пакетов на проводе — из них chaff берёт свою длину.
+    wire_hist: Mutex<WireHist>,
+    /// П2: будильник pacer'а. Его дёргают постановка в очередь и `Drop` сокета; пока работы нет,
+    /// pacer спит на нём БЕЗ таймера (вместо 200 пробуждений в секунду).
+    notify: Arc<tokio::sync::Notify>,
     /// Waker задачи poll_recv — при rebind будим её, чтобы перерегистрировалась на новом сокете.
     recv_waker: Mutex<Option<Waker>>,
+}
+
+impl Drop for ObfsUdpSocket {
+    fn drop(&mut self) {
+        // П2: разбудить запаркованный pacer, иначе он остался бы спать на `Notify` навсегда —
+        // задача на каждый умерший endpoint (а их создаёт каждый реконнект).
+        self.notify.notify_one();
+    }
 }
 
 impl fmt::Debug for ObfsUdpSocket {
@@ -298,6 +457,11 @@ impl ObfsUdpSocket {
         let inner = tokio::net::UdpSocket::from_std(std_sock)?;
         let mut sid = [0u8; citadel_obfs::SID_LEN];
         rand::thread_rng().fill_bytes(&mut sid);
+        let now = Instant::now();
+        let (slot, chaff_budget) = match pacing {
+            Pacing::Slotted { slot, budget, .. } => (slot, budget),
+            Pacing::None => (Duration::from_millis(5), None),
+        };
         Ok(Self {
             inner: ArcSwap::from_pointee(inner),
             psk,
@@ -315,7 +479,15 @@ impl ObfsUdpSocket {
             pacing,
             queue: Mutex::new(VecDeque::new()),
             last_dst: Mutex::new(None),
-            last_real: Mutex::new(Instant::now()),
+            last_user: Mutex::new(now),
+            // П1: отсчитываем от ТЕКУЩЕГО значения счётчика — сокет мог подняться посреди жизни
+            // процесса (реконнект), и чужая история трафика не должна выглядеть как наша.
+            user_seen: AtomicU64::new(crate::dataplane::user_packets()),
+            saw_user: AtomicBool::new(false),
+            tail: Mutex::new(ChaffTail { step: slot, next: now }),
+            chaff_budget: chaff_budget.map(|cfg| Mutex::new(TokenBucket::new(cfg, now))),
+            wire_hist: Mutex::new(WireHist::default()),
+            notify: Arc::new(tokio::sync::Notify::new()),
             recv_waker: Mutex::new(None),
         })
     }
@@ -367,7 +539,10 @@ impl ObfsUdpSocket {
         // на проводе всё равно псевдослучайный шифртекст.
         let padding = vec![0u8; self.pad_len(quic.len())];
         let inner = citadel_obfs::build_inner(citadel_obfs::TYPE_DATA, None, None, &padding, quic);
-        self.sealer_for(dst).seal(pid, &nonce, &inner)
+        let sealed = self.sealer_for(dst).seal(pid, &nonce, &inner);
+        // П6: запоминаем длину РЕАЛЬНОГО пакета — из этих длин chaff и будет брать свою.
+        self.wire_hist.lock().unwrap().push(sealed.len());
+        sealed
     }
 
     /// H-3: попытка открыть пакет ключами принимаемых эпох (свежайшая первой) плюс теми, по
@@ -424,17 +599,28 @@ impl ObfsUdpSocket {
         }
     }
 
-    /// Chaff-пакет (`TYPE_PAD`): случайный размер на проводе в `[floor, cap]` (совпадает с
-    /// распределением DATA при Random-паддинге, C2) → на проводе неотличим от реального трафика.
-    fn seal_chaff(&self, dst: SocketAddr) -> Vec<u8> {
-        let pid = self.send_ctr.fetch_add(1, Ordering::Relaxed);
-        let mut nonce = [0u8; 12];
-        rand::thread_rng().fill_bytes(&mut nonce);
+    /// **П6:** длина chaff на проводе — случайная из ЭМПИРИЧЕСКИХ длин реального трафика этой
+    /// сессии. Прежняя версия брала равномерное `[floor, cap]` и комментарий утверждал, что это
+    /// совпадает с распределением DATA. Не совпадало: мелкие DATA-пакеты (а в простое они все
+    /// такие) живут в `256…768`, chaff — в `256…1255`, то есть маскировка была сама себе
+    /// сигнатурой. Истории ещё нет (chaff до первых данных) → прежнее равномерное поведение.
+    fn chaff_wire_len(&self) -> usize {
         let (floor, cap) = match self.padding {
             citadel_obfs::Padding::Random { floor, cap, .. } => (floor, cap),
             _ => (256, citadel_obfs::WIRE_CAP), // не выше того, что мог бы отправить сам QUIC (MTU)
         };
-        let wire = floor + (rand::thread_rng().next_u32() as usize) % (cap - floor + 1);
+        let rnd = rand::thread_rng().next_u32() as usize;
+        match self.wire_hist.lock().unwrap().pick(rnd) {
+            Some(w) => w.clamp(floor, cap),
+            None => floor + rnd % (cap - floor + 1),
+        }
+    }
+
+    /// Chaff-пакет (`TYPE_PAD`) заданной длины на проводе → неотличим от реального трафика.
+    fn seal_chaff(&self, dst: SocketAddr, wire: usize) -> Vec<u8> {
+        let pid = self.send_ctr.fetch_add(1, Ordering::Relaxed);
+        let mut nonce = [0u8; 12];
+        rand::thread_rng().fill_bytes(&mut nonce);
         let pad = wire.saturating_sub(citadel_obfs::FRAMING_OVERHEAD);
         let inner = citadel_obfs::build_chaff(&vec![0u8; pad]);
         self.sealer_for(dst).seal(pid, &nonce, &inner)
@@ -446,15 +632,37 @@ impl ObfsUdpSocket {
         if q.len() < SEND_QUEUE_CAP {
             q.push_back((quic.to_vec(), dst));
         }
+        drop(q);
+        // П2: разбудить запаркованный pacer. Он не отправит пакет немедленно — только доспит до
+        // ближайшей границы слот-сетки, поэтому квантование таймингов (ради которого всё и есть)
+        // сохраняется, а в простое сетка не тикает вхолостую.
+        self.notify.notify_one();
+    }
+
+    /// **П1:** заметить пользовательский трафик туннеля. Сдвинулся счётчик inner-датаграмм —
+    /// значит, был трафик человека (в любую сторону: скачивание маскируется своим ACK-потоком
+    /// ровно так же, как отправка). Возвращает `true`, если хвост chaff надо взвести заново.
+    fn note_user_traffic(&self, slot: Duration, now: Instant) -> bool {
+        let user = crate::dataplane::user_packets();
+        if self.user_seen.swap(user, Ordering::Relaxed) == user {
+            return false;
+        }
+        self.saw_user.store(true, Ordering::Relaxed);
+        *self.last_user.lock().unwrap() = now;
+        let mut tail = self.tail.lock().unwrap();
+        tail.step = slot; // хвост начинается заново — с самого плотного шага
+        tail.next = now;
+        true
     }
 
     /// Один тик pacer'а: слить из очереди до `burst` реальных пакетов; если очередь была пуста —
-    /// при разрешении политикой подмешать один chaff на последнее назначение.
+    /// при разрешении политикой (и бюджетом) подмешать один chaff на последнее назначение.
     fn pace_tick(&self) {
-        let (burst, chaff) = match self.pacing {
-            Pacing::Slotted { burst, chaff, .. } => (burst, chaff),
+        let (slot, burst, chaff) = match self.pacing {
+            Pacing::Slotted { slot, burst, chaff, .. } => (slot, burst, chaff),
             Pacing::None => return,
         };
+        PACE_TICKS.fetch_add(1, Ordering::Relaxed);
         let mut sent_real = 0usize;
         while sent_real < burst {
             let item = self.queue.lock().unwrap().pop_front();
@@ -462,36 +670,119 @@ impl ObfsUdpSocket {
             let sealed = self.seal(&quic, dst);
             let _ = self.inner.load().try_send_to(&sealed, dst);
             *self.last_dst.lock().unwrap() = Some(dst);
-            *self.last_real.lock().unwrap() = Instant::now();
             sent_real += 1;
         }
-        if sent_real == 0 {
-            let dst = *self.last_dst.lock().unwrap();
-            let idle = self.last_real.lock().unwrap().elapsed();
-            if let Some(dst) = dst {
-                if chaff_decision(chaff, true, idle) {
-                    let sealed = self.seal_chaff(dst);
-                    let _ = self.inner.load().try_send_to(&sealed, dst);
-                }
+        let now = Instant::now();
+        self.note_user_traffic(slot, now);
+        if sent_real > 0 {
+            return; // слот занят реальным трафиком — маскировать нечего
+        }
+        let Some(dst) = *self.last_dst.lock().unwrap() else { return };
+        let tail_age = now.saturating_duration_since(*self.last_user.lock().unwrap());
+        let mut tail = self.tail.lock().unwrap();
+        let step = chaff_step_decision(
+            chaff,
+            self.saw_user.load(Ordering::Relaxed),
+            tail_age,
+            now >= tail.next,
+            tail.step,
+            slot,
+        );
+        let Some(step) = step else { return };
+        tail.step = step;
+        tail.next = now + step;
+        drop(tail);
+        // П3: длину знаем до seal — бюджет проверяем по ней, чтобы не тратить AEAD впустую.
+        let wire = self.chaff_wire_len();
+        if let Some(b) = &self.chaff_budget {
+            if !b.lock().unwrap().allow(TokenBucket::packet_cost(wire), now) {
+                CHAFF_SKIPPED.fetch_add(1, Ordering::Relaxed);
+                return;
             }
+        }
+        let sealed = self.seal_chaff(dst, wire);
+        let _ = self.inner.load().try_send_to(&sealed, dst);
+        CHAFF_PKTS.fetch_add(1, Ordering::Relaxed);
+        CHAFF_BYTES.fetch_add(sealed.len() as u64, Ordering::Relaxed);
+    }
+
+    /// **П2:** нечего делать — pacer может спать без таймера. Очередь пуста И хвост chaff
+    /// исчерпан (либо chaff вовсе не предусмотрен политикой). Разбудит [`Self::enqueue`]:
+    /// пользовательский трафик в любую сторону порождает исходящий пакет (данные либо ACK).
+    fn pace_parked(&self) -> bool {
+        if !self.queue.lock().unwrap().is_empty() {
+            return false;
+        }
+        match self.pacing {
+            Pacing::None => true,
+            Pacing::Slotted { chaff, .. } => match chaff {
+                Chaff::Off => true,
+                Chaff::Always => !self.saw_user.load(Ordering::Relaxed),
+                // До первого пользовательского пакета маскировать нечего — спим (иначе сетка
+                // крутилась бы вхолостую всё время хендшейка и первых секунд сессии).
+                Chaff::Adaptive { window } => {
+                    !self.saw_user.load(Ordering::Relaxed)
+                        || self.last_user.lock().unwrap().elapsed() > window
+                }
+            },
         }
     }
 }
 
+/// П2: ближайшая граница слот-сетки не раньше `now`. Сетка привязана к якорю запуска pacer'а,
+/// поэтому парковка в простое не сдвигает фазу: моменты выпуска остаются кратны `slot`, то есть
+/// квантование таймингов (ради которого пейсинг и существует) от сна не страдает.
+/// Чистая функция — тестируется без часов.
+fn next_slot(next: Instant, now: Instant, slot: Duration) -> Instant {
+    if next > now {
+        return next;
+    }
+    let behind = (now - next).as_nanos() / slot.as_nanos().max(1) + 1;
+    next + Duration::from_nanos((behind as u64).saturating_mul(slot.as_nanos() as u64))
+}
+
+/// **П2:** страховочный интервал парковки. Штатно pacer будят `enqueue` и `Drop` сокета; этот
+/// таймер существует на случай, если разбудить забыли, — два пробуждения в минуту против прежних
+/// 200 в секунду ничего не стоят, а вечно спящая задача была бы утечкой.
+const PACE_PARK_GUARD: Duration = Duration::from_secs(30);
+
 /// Фоновый pacer: на тиках слот-сетки выпускает накопленные пакеты + chaff.
 /// Держит `Weak` — когда endpoint (и его `Arc<ObfsUdpSocket>`) дропнут, задача сама завершается.
+///
+/// **П2:** в простое задача СПИТ на `Notify`, а не крутит `interval(5 мс)`. Прежний вариант давал
+/// 200 пробуждений в секунду у процесса с foreground-сервисом (Doze его не усыпляет) — работы на
+/// тик почти нет, но такой таймер не даёт ядру уходить в глубокие C-состояния. Важно, что `Notify`
+/// хранит permit: разбудить «до `await`» не значит потерять сигнал.
 async fn pace_loop(weak: Weak<ObfsUdpSocket>) {
-    let slot = match weak.upgrade().map(|s| s.pacing) {
-        Some(Pacing::Slotted { slot, .. }) => slot,
-        _ => return,
+    let (slot, notify) = match weak.upgrade() {
+        Some(s) => match s.pacing {
+            Pacing::Slotted { slot, .. } => (slot, s.notify.clone()),
+            Pacing::None => return,
+        },
+        None => return,
     };
-    let mut iv = tokio::time::interval(slot);
-    iv.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    // Якорь сетки: моменты выпуска — `anchor + k·slot`, независимо от того, сколько мы спали.
+    let anchor = tokio::time::Instant::now();
+    let mut next = anchor + slot;
     loop {
-        iv.tick().await;
+        let parked = match weak.upgrade() {
+            Some(s) => s.pace_parked(),
+            None => break, // сокет дропнут → выходим
+        };
+        if parked {
+            // Держать `Arc` тут нельзя: он не дал бы сокету умереть, а задача — проснуться.
+            let _ = tokio::time::timeout(PACE_PARK_GUARD, notify.notified()).await;
+        }
+        next = tokio::time::Instant::from_std(next_slot(
+            next.into_std(),
+            tokio::time::Instant::now().into_std(),
+            slot,
+        ));
+        tokio::time::sleep_until(next).await;
+        next += slot;
         match weak.upgrade() {
             Some(s) => s.pace_tick(),
-            None => break, // сокет дропнут → выходим
+            None => break,
         }
     }
 }
@@ -693,6 +984,11 @@ pub fn client_endpoint_plain() -> Result<quinn::Endpoint> {
 mod tests {
     use super::*;
 
+    /// П1 опирается на ПРОЦЕССНЫЙ счётчик пользовательских датаграмм, поэтому тесты, которые его
+    /// двигают (или ждут его неподвижности), обязаны идти по одному: `cargo test` гонит тесты
+    /// потоками одного процесса, и чужой инкремент выглядел бы как «пошёл трафик человека».
+    static USER_TRAFFIC_TESTS: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
     /// C3: анти-реплей — свежий nonce проходит, повтор режется; скользящее двух-поколенное окно.
     #[test]
     fn replay_guard_detects_and_windows() {
@@ -712,19 +1008,50 @@ mod tests {
         assert!(g.check(n(1)), "1 давно вне окна → снова свежий (скользящее окно — ок для probing)");
     }
 
+    /// Таблица решений о chaff. Главное здесь — первая строка (**П1**): без пользовательского
+    /// трафика chaff не идёт НИКОГДА, даже в constant-rate профиле. Именно её отсутствие (точнее,
+    /// то, что в роли «реального трафика» выступал собственный keep-alive) и стоило 2.2 ГБ/сутки.
     #[test]
     fn chaff_decision_table() {
-        let w = Duration::from_millis(500);
-        // нет реального трафика → никогда (даже Always)
-        assert!(!chaff_decision(Chaff::Always, false, Duration::ZERO));
-        assert!(!chaff_decision(Chaff::Adaptive { window: w }, false, Duration::ZERO));
+        let w = Duration::from_millis(2_000);
+        let slot = Duration::from_millis(5);
+        let d = |chaff, saw_user, tail_ms, due| {
+            chaff_step_decision(chaff, saw_user, Duration::from_millis(tail_ms), due, slot, slot)
+        };
+        // нет пользовательского трафика → никогда (даже Always)
+        assert!(d(Chaff::Always, false, 0, true).is_none());
+        assert!(d(Chaff::Adaptive { window: w }, false, 0, true).is_none());
         // Off → никогда
-        assert!(!chaff_decision(Chaff::Off, true, Duration::ZERO));
-        // Always → всегда (когда трафик был)
-        assert!(chaff_decision(Chaff::Always, true, Duration::from_secs(10)));
-        // Adaptive → в окне да, вне окна нет
-        assert!(chaff_decision(Chaff::Adaptive { window: w }, true, Duration::from_millis(100)));
-        assert!(!chaff_decision(Chaff::Adaptive { window: w }, true, Duration::from_millis(600)));
+        assert!(d(Chaff::Off, true, 0, true).is_none());
+        // Always → в каждом пустом слоте (когда трафик был)
+        assert!(d(Chaff::Always, true, 10_000, true).is_some());
+        // Adaptive → внутри хвоста да, за хвостом нет
+        assert!(d(Chaff::Adaptive { window: w }, true, 100, true).is_some());
+        assert!(d(Chaff::Adaptive { window: w }, true, 2_500, true).is_none());
+        // шаг затухания ещё не истёк → пропускаем слот, даже внутри хвоста
+        assert!(d(Chaff::Adaptive { window: w }, true, 100, false).is_none());
+    }
+
+    /// П4: хвост затухает геометрически и упирается в потолок. Считаем, во что обходится один
+    /// всплеск: было 100 пакетов на 500 мс ровным окном, стало ~11 на 2 с — при том, что хвост
+    /// СТАЛ ДЛИННЕЕ (наблюдателю неопределённость важна там, где всплеск кончился).
+    #[test]
+    fn chaff_tail_decays_geometrically() {
+        let slot = Duration::from_millis(5);
+        let window = Duration::from_millis(2_000);
+        let mut step = slot;
+        let mut tail = Duration::ZERO;
+        let mut pkts = 0;
+        while let Some(next) =
+            chaff_step_decision(Chaff::Adaptive { window }, true, tail, true, step, slot)
+        {
+            pkts += 1;
+            step = next;
+            tail += next;
+            assert!(step <= CHAFF_STEP_MAX, "шаг не должен расти выше потолка");
+        }
+        assert!((8..=14).contains(&pkts), "ожидался хвост в ~11 пакетов, получилось {pkts}");
+        assert_eq!(step, CHAFF_STEP_MAX, "к концу хвоста шаг обязан упереться в потолок");
     }
 
     /// M-8: явный профиль клиента (GUI-тумблер) обязан побеждать env — иначе тумблер «маскировка
@@ -744,10 +1071,11 @@ mod tests {
         assert!(matches!(parse_pacing("off"), Pacing::None));
         assert!(matches!(parse_pacing("on"), Pacing::Slotted { .. }));
         match parse_pacing("10:8:always") {
-            Pacing::Slotted { slot, burst, chaff } => {
+            Pacing::Slotted { slot, burst, chaff, budget } => {
                 assert_eq!(slot, Duration::from_millis(10));
                 assert_eq!(burst, 8);
                 assert!(matches!(chaff, Chaff::Always));
+                assert!(budget.is_none(), "ручная форма без 4-го поля — без бюджета");
             }
             _ => panic!("ожидался Slotted"),
         }
@@ -755,8 +1083,73 @@ mod tests {
             Pacing::Slotted { chaff, .. } => assert!(matches!(chaff, Chaff::Off)),
             _ => panic!("ожидался Slotted"),
         }
+        // ручной бюджет (КиБ/мин) — 4-е поле
+        match parse_pacing("5:32:adaptive:64") {
+            Pacing::Slotted { budget: Some(b), .. } => {
+                assert!((b.rate - 64.0 * 1024.0 / 60.0).abs() < 1e-6)
+            }
+            _ => panic!("ожидался Slotted с бюджетом"),
+        }
         // мусорные/частичные значения → дефолты, не паника
         assert!(matches!(parse_pacing("xyz"), Pacing::Slotted { .. }));
+    }
+
+    /// **П3:** у профилей есть потолок расхода, и он именно такой, как обещает интерфейс. Без
+    /// этого «маскировка» остаётся статьёй расхода без верхней границы — на мобильном тарифе это
+    /// неоплачиваемый счёт, а не настройка приватности.
+    #[test]
+    fn profiles_carry_a_budget() {
+        let kib_min = |p: Pacing| match p {
+            Pacing::Slotted { budget: Some(b), .. } => b.rate * 60.0 / 1024.0,
+            _ => panic!("у профиля обязан быть бюджет"),
+        };
+        assert!((kib_min(parse_pacing("lite")) - BUDGET_LITE_KIB_MIN).abs() < 1e-6);
+        assert!((kib_min(parse_pacing("on")) - BUDGET_STRICT_KIB_MIN).abs() < 1e-6);
+        // constant-rate — только явным выбором и осознанно, бюджет там был бы самообманом
+        assert!(matches!(
+            parse_pacing("max"),
+            Pacing::Slotted { chaff: Chaff::Always, budget: None, .. }
+        ));
+    }
+
+    /// **П6:** длины chaff берутся из эмпирических длин реального провода. Прежняя равномерная
+    /// `[256, 1255]` делала chaff отдельным «горбом» в гистограмме длин — то есть собственной
+    /// сигнатурой маскировки.
+    #[test]
+    fn chaff_length_follows_real_traffic() {
+        let mut h = WireHist::default();
+        assert_eq!(h.pick(0), None, "истории нет → прежнее поведение (равномерно)");
+        for _ in 0..10 {
+            h.push(300);
+        }
+        assert_eq!(h.pick(7), Some(300));
+        // кольцо не растёт и вытесняет старое
+        for i in 0..WIRE_HIST * 2 {
+            h.push(1000 + i % 3);
+        }
+        assert_eq!(h.len, WIRE_HIST);
+        for r in 0..WIRE_HIST {
+            let w = h.pick(r).unwrap();
+            assert!((1000..=1002).contains(&w), "старые длины обязаны вытесняться, вижу {w}");
+        }
+    }
+
+    /// **П2:** сетка слотов не сползает от парковки. Если бы она сползала, моменты выпуска после
+    /// каждого простоя оказывались бы привязаны к моменту пробуждения — то есть к тому самому
+    /// пользовательскому событию, которое пейсинг и должен размазывать.
+    #[test]
+    fn slot_grid_survives_parking() {
+        let slot = Duration::from_millis(5);
+        let anchor = Instant::now();
+        let next = anchor + slot;
+        // не проспали — момент не двигается
+        assert_eq!(next_slot(next, anchor, slot), next);
+        // проспали 8 с (парковка): следующая граница кратна slot от якоря и строго в будущем
+        let now = anchor + Duration::from_secs(8);
+        let aligned = next_slot(next, now, slot);
+        assert!(aligned > now);
+        assert!(aligned - now <= slot);
+        assert_eq!((aligned - anchor).as_nanos() % slot.as_nanos(), 0, "фаза сетки сохранена");
     }
 
     /// Интеграционный: фоновый pacer на loopback реально выпускает очередь и подмешивает chaff.
@@ -764,6 +1157,7 @@ mod tests {
     /// нельзя проверить чистыми юнит-тестами и который недоступен локально через QUIC/туннель.
     #[tokio::test]
     async fn pacer_delivers_real_and_chaff_over_loopback() {
+        let _serial = USER_TRAFFIC_TESTS.lock().await;
         let psk = [7u8; 32];
         let rx = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let rx_addr = rx.local_addr().unwrap();
@@ -773,10 +1167,13 @@ mod tests {
             slot: Duration::from_millis(5),
             burst: 8,
             chaff: Chaff::Always,
+            budget: None,
         };
         let sock = Arc::new(ObfsUdpSocket::new(tx_std, PskSource::Fixed(psk), pacing).unwrap());
         tokio::spawn(pace_loop(Arc::downgrade(&sock)));
 
+        // П1: chaff идёт только вслед пользовательскому трафику — а он здесь и есть.
+        crate::dataplane::note_user_packet();
         sock.enqueue(b"hello-quic", rx_addr);
 
         let mut got_real = false;
@@ -803,6 +1200,110 @@ mod tests {
         }
         assert!(got_real, "pacer не доставил реальный пакет");
         assert!(got_chaff, "pacer не сгенерировал chaff");
+    }
+
+    /// **П1 — главный тест захода: собственный keep-alive НЕ считается реальным трафиком.**
+    ///
+    /// Раньше `last_real` двигала любая выпущенная датаграмма, включая маячок. В простое это
+    /// значило: раз в 2–4 с маячок сам себе открывает окно chaff, 100 пустых слотов подряд
+    /// заполняются мусором — ~2.2 ГБ в сутки на туннеле, по которому не идёт НИЧЕГО. Здесь
+    /// проверяется ровно это: пакет, не сопровождённый пользовательским трафиком, хвоста не
+    /// открывает, а настоящий — открывает.
+    #[tokio::test]
+    async fn keepalive_does_not_trigger_chaff() {
+        let _serial = USER_TRAFFIC_TESTS.lock().await;
+        let psk = [11u8; 32];
+        let rx = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let rx_addr = rx.local_addr().unwrap();
+        let pacing = Pacing::Slotted {
+            slot: Duration::from_millis(5),
+            burst: 8,
+            chaff: Chaff::Adaptive { window: CHAFF_WINDOW },
+            budget: None,
+        };
+        let sock = Arc::new(
+            ObfsUdpSocket::new(
+                std::net::UdpSocket::bind("127.0.0.1:0").unwrap(),
+                PskSource::Fixed(psk),
+                pacing,
+            )
+            .unwrap(),
+        );
+        tokio::spawn(pace_loop(Arc::downgrade(&sock)));
+
+        // Считаем, что приехало за окно: chaff — это TYPE_PAD.
+        async fn drain(rx: &tokio::net::UdpSocket, psk: [u8; 32], for_: Duration) -> (u32, u32) {
+            let (mut real, mut chaff) = (0, 0);
+            let deadline = tokio::time::Instant::now() + for_;
+            let mut buf = [0u8; 2048];
+            while let Ok(Ok((n, _))) =
+                tokio::time::timeout_at(deadline, rx.recv_from(&mut buf)).await
+            {
+                let opened = citadel_obfs::open(&psk, &buf[..n]).unwrap();
+                match citadel_obfs::parse_inner(&opened.inner) {
+                    Some((citadel_obfs::TYPE_PAD, _)) => chaff += 1,
+                    Some((citadel_obfs::TYPE_DATA, _)) => real += 1,
+                    _ => {}
+                }
+            }
+            (real, chaff)
+        }
+
+        // Фаза 1: «маячок» — датаграмма есть, пользовательского трафика нет.
+        sock.enqueue(b"keepalive", rx_addr);
+        let (real, chaff) = drain(&rx, psk, Duration::from_millis(400)).await;
+        assert_eq!(real, 1, "сам маячок обязан уйти");
+        assert_eq!(chaff, 0, "маячок не должен открывать хвост chaff (П1)");
+
+        // Фаза 2: настоящий пользовательский пакет — хвост обязан открыться.
+        crate::dataplane::note_user_packet();
+        sock.enqueue(b"user-data", rx_addr);
+        let (real, chaff) = drain(&rx, psk, Duration::from_millis(400)).await;
+        assert_eq!(real, 1);
+        assert!(chaff > 0, "после пользовательского трафика chaff обязан пойти");
+    }
+
+    /// **П3:** исчерпанный бюджет останавливает chaff, а не «замедляет» его задним числом.
+    /// Бюджета здесь хватает ровно на один-два пакета — дальше слоты обязаны пропускаться.
+    #[tokio::test]
+    async fn chaff_budget_caps_the_flood() {
+        let _serial = USER_TRAFFIC_TESTS.lock().await;
+        let psk = [12u8; 32];
+        let rx = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let rx_addr = rx.local_addr().unwrap();
+        let pacing = Pacing::Slotted {
+            slot: Duration::from_millis(5),
+            burst: 8,
+            chaff: Chaff::Always, // без затухания — проверяем именно бюджет
+            // Пополнение почти нулевое, запас — на пару пакетов (chaff берёт длины реального
+            // провода, т.е. сотни байт; см. П6), поэтому поток обязан оборваться сразу.
+            budget: Some(RateCfg { rate: 1.0, burst: 1500.0 }),
+        };
+        let sock = Arc::new(
+            ObfsUdpSocket::new(
+                std::net::UdpSocket::bind("127.0.0.1:0").unwrap(),
+                PskSource::Fixed(psk),
+                pacing,
+            )
+            .unwrap(),
+        );
+        tokio::spawn(pace_loop(Arc::downgrade(&sock)));
+        crate::dataplane::note_user_packet();
+        sock.enqueue(b"user-data", rx_addr);
+
+        let mut chaff = 0;
+        let mut buf = [0u8; 2048];
+        let deadline = tokio::time::Instant::now() + Duration::from_millis(300);
+        while let Ok(Ok((n, _))) = tokio::time::timeout_at(deadline, rx.recv_from(&mut buf)).await {
+            let opened = citadel_obfs::open(&psk, &buf[..n]).unwrap();
+            if let Some((citadel_obfs::TYPE_PAD, _)) = citadel_obfs::parse_inner(&opened.inner) {
+                chaff += 1;
+            }
+        }
+        // Без бюджета за 300 мс ушло бы ~60 пакетов (200 слотов/с); бюджета хватает на ~1500 байт.
+        assert!(chaff >= 1, "первый chaff обязан пройти — бюджет не запрет, а потолок");
+        assert!(chaff <= 6, "бюджет обязан оборвать поток chaff, ушло {chaff}");
+        assert!(shaping_stats().chaff_skipped > 0, "пропуски по бюджету обязаны считаться");
     }
 
     /// **H-3, главное свойство:** exit принимает ТОЛЬКО ключи эпохи (текущей и прошлой), а

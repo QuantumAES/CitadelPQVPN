@@ -26,8 +26,8 @@ pub mod ratelimit;
 pub mod tcp_obfs;
 pub mod vpn;
 pub use obfs_socket::{
-    client_endpoint_obfs, client_endpoint_plain, pacing_profile, server_endpoint_obfs, Pacing,
-    PskSource,
+    client_endpoint_obfs, client_endpoint_plain, pacing_profile, server_endpoint_obfs,
+    shaping_stats, Pacing, PskSource, ShapingStats,
 };
 pub use obfs_tcp::{client_endpoint_obfs_tcp, server_endpoint_obfs_tcp};
 pub use protect::{clear_socket_protector, set_socket_protector, SocketProtector};
@@ -196,21 +196,40 @@ pub fn self_signed_ed25519() -> Result<(CertificateDer<'static>, PrivateKeyDer<'
     Ok((cert_der, key_der))
 }
 
+/// **П5: `max_idle_timeout`, который объявляем мы сами.**
+///
+/// Было 15 с — «быстрее детектим мёртвое соединение при смене сети». Практика показала, что
+/// мёртвый путь ловят не idle-таймер, а data-path watchdog (4 с затора, 16 с односторонней дыры)
+/// и Android-watchdog смены сети (C6/S1) — и ловят раньше. Платой же за короткий idle был
+/// маячок раз в 2–4 с: LTE-модем после каждой передачи держит RRC_CONNECTED ещё 5–10 с, поэтому
+/// он не уходил в idle никогда, и это — главный расход батареи в простое (десятки процентов
+/// заряда в сутки только за удержание канала).
+///
+/// 90 с позволяют маячку разредиться до 15–28 с. Ценой того, что мёртвая сессия в ПРОСТОЕ
+/// замечается позже: на exit'е она до полутора минут держит адрес пула (пул раздаётся только под
+/// токен эпохи, поэтому «набить» его без квоты нельзя), а на клиенте простой никто не наблюдает.
+///
+/// Значение обязано быть ≥ `RELAXED_MIN_IDLE` (60 с) на ОБЕИХ сторонах, иначе редкий маячок не
+/// включится: эффективный idle-таймаут равен минимуму из объявленных (RFC 9000 §10.1). Оно же
+/// уходит пиру подсказкой в капсуле адреса — держится тестом `idle_timeout_allows_relaxed_ka`.
+pub const IDLE_TIMEOUT: Duration = Duration::from_secs(90);
+
 // QUIC-транспорт с включёнными датаграммами + keepalive (для удержания туннеля).
 fn transport() -> Arc<quinn::TransportConfig> {
     let mut tc = quinn::TransportConfig::default();
     tc.datagram_receive_buffer_size(Some(1 << 20));
     tc.datagram_send_buffer_size(1 << 20);
     // M-8/аудит-4: это СТРАХОВКА, а не основной keep-alive. Штатно туннель держит собственный
-    // маячок со случайным интервалом 2–4 с (`dataplane::keepalive_delay`) — он всегда успевает
-    // раньше, поэтому периодический PING quinn'а в поток не попадает и не даёт цензору строгую
-    // 5-секундную периодичность для автокорреляции. Если задача keep-alive умрёт (или пир —
-    // старой версии), соединение всё равно не развалится: сработает вот это.
-    tc.keep_alive_interval(Some(Duration::from_secs(5)));
-    // 15с (не 30): быстрее детектим мёртвое соединение при смене сети (WiFi↔LTE/toggle) → быстрее
-    // авто-реконнект. Эффективный idle = min(client, server) ⇒ снижение только на клиенте уже
-    // даёт 15с без передеплоя сервера. Keepalive 5с ⇒ 2 пропущенных ⇒ close.
-    tc.max_idle_timeout(Some(Duration::from_secs(15).try_into().unwrap()));
+    // маячок со случайным интервалом (`dataplane::keepalive_delay`) — он всегда успевает раньше,
+    // поэтому периодический PING quinn'а в поток не попадает и не даёт цензору строгую
+    // периодичность для автокорреляции.
+    //
+    // П5: 60 с (было 5). Таймер quinn'а сбрасывается на КАЖДОМ принятом пакете, а наш маячок
+    // всегда вызывает ответный ACK — значит, при живом маячке этот PING не срабатывает вообще,
+    // и 5 секунд здесь означали бы ровно ту строгую периодичность, от которой мы уходили. При
+    // этом 60 < 90 (idle): если задача маячка умрёт, соединение всё же попробуют оживить.
+    tc.keep_alive_interval(Some(Duration::from_secs(60)));
+    tc.max_idle_timeout(Some(IDLE_TIMEOUT.try_into().unwrap()));
     // Фиксируем MTU: запас под obfs-оверхед L1 (M3), без агрессивного discovery до 1500.
     // Значение синхронизировано с `citadel_obfs::MAX_QUIC_PACKET` (потолок провода L1) — см.
     // тест `obfs_wire_cap_matches_quic_mtu`: иначе паддинг L1 раздувает пакет выше того, что

@@ -77,7 +77,13 @@ const Map<String, String> langIt = {
   'traffic_meter_title': 'Mostra l’indicatore di traffico',
   'traffic_meter_sub': 'Velocità attuale in ricezione e invio sulla scheda di connessione',
   'pacing_title': 'Mascheramento dei tempi',
-  'pacing_sub': 'Uniforma e riempie il traffico in uscita (più lento, ma più difficile da correlare); dalla prossima sessione',
+  'pacing_off': 'Disattivato',
+  'pacing_off_sub': 'Nessun traffico né consumo di batteria aggiuntivi',
+  'pacing_lite': 'Economico',
+  'pacing_lite_sub': 'Fino a 2 MB all’ora di traffico aggiuntivo; nettamente più leggero per la batteria',
+  'pacing_strict': 'Rigoroso',
+  'pacing_strict_sub': 'Fino a 8 MB all’ora di traffico aggiuntivo; consumo di batteria evidente',
+  'pacing_note': 'Il mascheramento agisce finché c’è traffico: a riposo tace e non costa nulla. Si applica dalla prossima sessione.',
   // ── C9 ──
   'biometric_title': 'Sblocco con impronta',
   'biometric_sub':
