@@ -38,6 +38,8 @@ const Map<String, String> langMy = {
   'err_no_vpn_permission_hint': 'စနစ်၏ ဒိုင်ယာလော့ဂ်တွင် ချိတ်ဆက်မှုကို ခွင့်ပြုပါ',
   'err_activation_failed': 'လင့်ခ်ကို အသက်သွင်း၍မရပါ',
   'err_activation_failed_hint': 'စီမံခန့်ခွဲသူထံမှ လင့်ခ်အသစ် တောင်းပါ — ပထမလင့်ခ်သည် တစ်ကြိမ်သာ၊ အချိန်ကန့်သတ်ချက်ဖြင့်သာ အသက်ဝင်သည်',
+  'err_ipv6_required': 'ဥမင် မတည်ဆောက်နိုင်ပါ — IPv6 ကို မဖမ်းယူနိုင်ပါ',
+  'err_ipv6_required_hint': 'တင်းကျပ် IPv6 ဖွင့်ထားသည် — ဆက်တင်တွင် ပိတ်ပါ သို့မဟုတ် အမြဲဖွင့် VPN ကို ဖွင့်ပါ',
 
   'switch_title': 'ချိတ်ဆက်မှု ပြောင်းမလား?',
   'switch_body': 'ယခု “{current}” ချိတ်ဆက်ထားသည်။ ၎င်းကို ဖြတ်ပြီး “{name}” သို့ ချိတ်ဆက်မလား?',
@@ -102,9 +104,18 @@ const Map<String, String> langMy = {
   'killswitch_sub': 'ဥမင်အပြင်ဘက် ဒေတာကို ပိတ်ရန် (fail-closed)၊ နောက်ဆက်ရှင်မှစ၍',
   'killswitch_android_title': 'Kill switch (always-on)',
   'killswitch_android_sub': 'စနစ်၏ VPN ဆက်တင်များတွင် ပြင်ဆင်ပါ',
+  'strict_ipv6_title': 'တင်းကျပ် IPv6',
+  'strict_ipv6_sub': 'စက်က IPv6 ကို ဥမင်ထဲသို့ မပို့နိုင်ပါက မချိတ်ဆက်ပါ',
   'split_title': 'ခွဲထားသော ဥမင်',
   'split_sub_android': 'အက်ပ်နှင့် လိပ်စာအလိုက်− ဥမင်မှ / ဥမင်ကို ကျော်၍',
   'split_sub_desktop': 'ဦးတည်လိပ်စာအလိုက်− ဥမင်မှ / ဥမင်ကို ကျော်၍',
+  'autolock_title': 'သိုလှောင်ခန်း အလိုအလျောက် သော့ခတ်ခြင်း',
+  'autolock_sub_off': 'ပိတ်ထား — အက်ပ်မှ ထွက်သည်အထိ သိုလှောင်ခန်း ဖွင့်နေမည်',
+  'autolock_sub_on': 'လှုပ်ရှားမှုမရှိသည့် {min} မိနစ်အကြာတွင် သော့ခတ်ပါ',
+  'autolock_off': 'ပိတ်ထား',
+  'autolock_minutes': '{min} မိနစ်',
+  'autolock_note': 'သော့ခတ်ခြင်းသည် ပရိုဖိုင်များနှင့် မာစတာလင့်ခ်ကို ဖန်သားပြင်နှင့် မှတ်ဉာဏ်မှ ဖယ်ရှားသည်။ '
+      'အသုံးပြုနေသော ဥမင်ကို မထိပါ; လက်ဗွေ သို့မဟုတ် မာစတာစကားဝှက်ဖြင့် ပြန်ဝင်ပါ။',
   'vault_location_title': 'ပရိုဖိုင် သိုလှောင်ခန်း',
   'vault_path_copied': 'သိုလှောင်ခန်း လမ်းကြောင်း ကူးယူပြီး',
   'language_title': 'အက်ပ် ဘာသာစကား',
@@ -127,6 +138,15 @@ const Map<String, String> langMy = {
       '• အမြဲဖွင့် VPN (Always-on VPN)\n'
       '• VPN မပါဘဲ ချိတ်ဆက်မှုများကို ပိတ်ရန်',
   'open_settings': 'ဆက်တင်များ ဖွင့်ရန်',
+  'ipv6_warn': 'IPv6 သည် ဥမင်ပြင်ပမှ သွားနေသည် — အသေးစိတ်',
+  'ipv6_warn_title': 'IPv6 ကို မဖမ်းယူနိုင်ပါ',
+  'ipv6_warn_body': 'ဤစက်သည် IPv6 ကို ဥမင်ထဲသို့ ယူဆောင်ခြင်းကို ငြင်းပယ်ခဲ့သည်။ ဥမင်မှာ အလုပ်လုပ်နေသော်လည်း '
+      'IPv6 ဒေတာ (နှင့် IPv6 DNS) သည် ဥမင်ကို ကျော်ကာ တိုက်ရိုက်သွားနေသည် — IPv6 ရှိသော '
+      'ကွန်ရက်တွင် ၎င်းက သင့်လိပ်စာကို ဖော်ပြသည်။\n\n'
+      'ဘာလုပ်ရမလဲ:\n'
+      '• CitadelPQVPN အတွက် „အမြဲဖွင့် VPN“ နှင့် „VPN မပါဘဲ ချိတ်ဆက်မှုကို ပိတ်ရန်“ ကို ဖွင့်ပါ — '
+      'ထိုအခါ စနစ်ကိုယ်တိုင် ဥမင်ပြင်ပ ဒေတာအားလုံးကို ဖြတ်တောက်သည်;\n'
+      '• သို့မဟုတ် ဆက်တင်တွင် „တင်းကျပ် IPv6“ ကို ဖွင့်ပါ — IPv6 မဖမ်းယူရမချင်း ဥမင် မတက်တော့ပါ။',
 
   'new_profile': 'ပရိုဖိုင်အသစ်',
   'link_label': 'citadel:// လင့်ခ်',
@@ -216,6 +236,7 @@ const Map<String, String> langMy = {
   'issued_title_named': 'ခွင့်ပြုချက် ထုတ်ပေးပြီး− {label}',
   'copy_link': 'လင့်ခ် ကူးယူရန်',
   'link_copied': 'လင့်ခ် ကူးယူပြီး',
+  'clipboard_autoclear': 'ကလစ်ဘုတ် အလိုအလျောက် ရှင်းလင်းမည်',
   'verify_code_label': 'Kod pengesahan daripada pentadbir',
   'verify_code_hint': '6 aksara',
   'verify_code_help': 'Pentadbir menyebutnya berasingan daripada pautan (secara lisan, bersemuka). Jika sepadan, pautan tidak diubah dalam perjalanan.',

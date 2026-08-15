@@ -1,11 +1,11 @@
 import 'dart:async';
 
 import 'package:flutter/material.dart';
-import 'package:flutter/services.dart';
 
 import 'package:app/app_state.dart';
 import 'package:app/errors.dart';
 import 'package:app/l10n/strings.dart';
+import 'package:app/sensitive_clipboard.dart';
 import 'package:app/src/rust/api/admin.dart';
 import 'package:app/src/rust/api/citadel.dart';
 
@@ -308,9 +308,12 @@ class _SubscribersPageState extends State<SubscribersPage> {
               const SizedBox(height: 16),
               FilledButton.icon(
                 onPressed: () {
-                  Clipboard.setData(ClipboardData(text: issued.uri));
-                  ScaffoldMessenger.of(sheetCtx).showSnackBar(
-                      SnackBar(content: Text(t('link_copied'))));
+                  // N-3: ссылка — секрет: в буфере она живёт ограниченное время и не светится
+                  // в системном превью буфера (Android 13+).
+                  SensitiveClipboard.copy(issued.uri);
+                  ScaffoldMessenger.of(sheetCtx).showSnackBar(SnackBar(
+                      content: Text(
+                          '${t('link_copied')} · ${t('clipboard_autoclear')}')));
                 },
                 icon: const Icon(Icons.copy),
                 label: Text(t('copy_link')),
@@ -525,9 +528,12 @@ class _SubscribersPageState extends State<SubscribersPage> {
                 )
               : null,
           onTap: () {
-            Clipboard.setData(ClipboardData(text: e.clientIdHex));
-            ScaffoldMessenger.of(context).showSnackBar(
-                SnackBar(content: Text(t('client_id_copied'))));
+            // N-3: `client_id` — псевдоним абонента в реестре; в буфере ему тоже не место дольше
+            // необходимого (и в превью буфера — тем более).
+            SensitiveClipboard.copy(e.clientIdHex);
+            ScaffoldMessenger.of(context).showSnackBar(SnackBar(
+                content: Text(
+                    '${t('client_id_copied')} · ${t('clipboard_autoclear')}')));
           },
         );
       },

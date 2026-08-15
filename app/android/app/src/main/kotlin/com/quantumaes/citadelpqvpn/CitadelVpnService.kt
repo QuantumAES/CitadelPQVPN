@@ -54,6 +54,14 @@ class CitadelVpnService : VpnService() {
         const val CHANNEL_ID = "citadel_vpn"
         const val NOTIF_ID = 1
 
+        // S2.2/A2: чем кончилась попытка захватить IPv6 в туннель (см. establishTun). Ядро
+        // спрашивает это ПОСЛЕ каждого establish (`ipv6State`) и, если захвата нет, говорит об
+        // этом человеку: молчаливый фолбэк оставлял нативный IPv6 мимо туннеля, а на экране
+        // по-прежнему горело «Защищено» (находка N-1 сверки 2026-08-14).
+        const val IPV6_CAPTURED = 0 // blackhole поставлен: весь v6 уходит в туннель
+        const val IPV6_FALLBACK = 1 // устройство отвергло v6-адрес/маршрут → туннель БЕЗ blackhole
+        const val IPV6_SPLIT = 2 // не full-tunnel (split-include): v6 идёт напрямую ПО ВЫБОРУ человека
+
         // Тексты постоянной нотификации по состоянию сессии. Она — единственное, что видно о VPN
         // при закрытом окне, поэтому «туннель активен» в ней должно означать ровно то, что сказано:
         // при пропаже сети движок уходит в переподключение, и нотификация обязана это показать.
@@ -172,12 +180,25 @@ class CitadelVpnService : VpnService() {
         startForegroundNotif()
     }
 
+    /** Итог последней попытки захватить IPv6 (одна из `IPV6_*`). Читает ядро сразу после
+     *  establishTun по JNI. `@Volatile`: пишет поток нативного connect-loop, читает он же, но
+     *  через границу JNI — видимость обязана быть явной. */
+    @Volatile
+    private var ipv6State: Int = IPV6_SPLIT
+
+    /** JNI-геттер для ядра (см. [ipv6State]). */
+    fun ipv6State(): Int = ipv6State
+
     /** Построить TUN по параметрам, назначенным движком, вернуть detached fd для Rust. Зовётся из
      *  Rust через JNI (`AndroidTunProvider::configure` в нативном connect-loop) на КАЖДЫЙ (ре)коннект,
-     *  НЕ из Dart. routes/dns приходят строкой через пробел (Rust шлёт TunParams как есть, без массивов). */
+     *  НЕ из Dart. routes/dns приходят строкой через пробел (Rust шлёт TunParams как есть, без массивов).
+     *
+     *  `requireV6` — строгий режим (настройка «Не подключаться без захвата IPv6»): туннель без
+     *  IPv6-blackhole не поднимается вовсе, вместо тихого фолбэка ядро получает исключение. */
     fun establishTun(
         addr: String, prefix: Int, routes: String, dns: String, mtu: Int,
         appMode: String, apps: String, destMode: String, destRoutes: String,
+        requireV6: Boolean,
     ): Int {
         val linkRoutes = routes.split(" ").filter { it.isNotEmpty() }
         val appList = apps.split(" ").filter { it.isNotEmpty() }
@@ -292,13 +313,28 @@ class CitadelVpnService : VpnService() {
         // или ::/0 на VpnService — тогда establish() бросает («Cannot set address») ЛИБО возвращает
         // null; в этом случае пересобираем БЕЗ blackhole (fallback → системный always-on lockdown,
         // который тоже режет не-VPN трафик). Так establish не ломается там, где v6 не поддержан.
+        //
+        // N-1: сам фолбэк нужен (без него на таких устройствах туннель не поднимется вовсе), но
+        // МОЛЧАТЬ о нём нельзя — на dual-stack он означает нативный IPv6 мимо туннеля. Поэтому
+        // итог фиксируется в [ipv6State] (ядро покажет предупреждение), а в строгом режиме
+        // (`requireV6`) отказ захвата вообще не даёт поднять туннель.
+        ipv6State = if (fullTunnel) IPV6_FALLBACK else IPV6_SPLIT
         if (fullTunnel) {
+            var why = "establish с IPv6-blackhole вернул null"
             try {
                 val fd = build(true)
-                if (fd != null) return fd.detachFd()
-                android.util.Log.w("CitadelVpn", "S2.2/A2: establish с IPv6-blackhole вернул null — пробую без него")
+                if (fd != null) {
+                    ipv6State = IPV6_CAPTURED
+                    return fd.detachFd()
+                }
             } catch (e: Exception) {
-                android.util.Log.w("CitadelVpn", "S2.2/A2: IPv6-blackhole отвергнут устройством (${e.message}); fallback без него (OS lockdown)")
+                why = "IPv6-blackhole отвергнут устройством (${e.message})"
+            }
+            android.util.Log.w("CitadelVpn", "S2.2/A2: $why")
+            if (requireV6) {
+                // Строгий режим: лучше отсутствие туннеля, чем туннель с утечкой v6 мимо него.
+                // Текст уезжает в ядро как причина отказа и доходит до экрана — см. `_classify`.
+                throw IllegalStateException("IPv6 не захвачен в туннель, строгий режим: $why")
             }
         }
         val fd = build(false) ?: throw IllegalStateException("VpnService.establish() == null (нет разрешения VPN?)")

@@ -150,9 +150,28 @@ class MainActivity : FlutterFragmentActivity() {
                         result.success(false)
                     }
                 }
+                // N-3: копирование ЧУВСТВИТЕЛЬНОГО в буфер обмена (ссылка абонента, client_id).
+                // Две вещи, которых не делает `Clipboard.setData` из Dart:
+                //   * пометка `EXTRA_IS_SENSITIVE` (Android 13+) — системное превью буфера
+                //     показывает «•••» вместо самой ссылки (её иначе видно на весь экран);
+                //   * автоочистка через `ttl` секунд, чтобы ссылка не жила в буфере до перезагрузки.
+                // Очистка идёт с Handler'а процесса, а не из Dart-таймера: изолят UI может умереть
+                // вместе с окном, а процесс живёт дальше (foreground-сервис).
+                "copySensitive" -> {
+                    val text = call.argument<String>("text") ?: ""
+                    val ttl = (call.argument<Int>("ttlSeconds") ?: 90).coerceIn(5, 600)
+                    result.success(SensitiveClipboard.copy(this, text, ttl))
+                }
                 else -> result.notImplemented()
             }
         }
+    }
+
+    /** N-3: доочистить буфер обмена, если срок вышел, пока приложение было в фоне (с Android 10
+     *  менять буфер без фокуса система не даёт — из фона очистка молча не срабатывает). */
+    override fun onResume() {
+        super.onResume()
+        SensitiveClipboard.onResume(this)
     }
 
     @Deprecated("compat: onActivityResult для VpnService.prepare consent")

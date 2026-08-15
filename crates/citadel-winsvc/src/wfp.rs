@@ -27,6 +27,10 @@ static ENGINE: Mutex<Option<Engine>> = Mutex::new(None);
 
 /// Армировать WFP kill-switch по плану. `tun_luid` — LUID WinTUN-адаптера (permit трафика в туннель).
 pub fn arm(filters: &[WfpFilter], tun_luid: u64) -> anyhow::Result<()> {
+    // N-9: план проверяем ЦЕЛИКОМ до первого фильтра — половина армированного плана хуже, чем
+    // честный отказ с названной причиной (прежний разбор молча ставил permit для 0.0.0.0, и
+    // оператор видел «интернета нет» без единой строки в журнале).
+    citadel_winnet::check_wfp_plan(filters)?;
     let mut guard = ENGINE.lock().unwrap();
     // идемпотентность: снять прошлый набор (в т.ч. осиротевший после аварийного разрыва)
     if let Some(old) = guard.take() {
@@ -123,7 +127,8 @@ fn add_filter(engine: HANDLE, f: &WfpFilter, tun_luid: u64) -> anyhow::Result<()
             conds.push(c);
         },
         WfpMatch::RemoteHost(cidr) => unsafe {
-            let (addr, mask) = parse_v4(cidr);
+            // N-9: неразобранная строка — ошибка армирования, а не тихий permit для 0.0.0.0.
+            let (addr, mask) = citadel_winnet::parse_v4_cidr(cidr)?;
             let mut c: FWPM_FILTER_CONDITION0 = std::mem::zeroed();
             c.fieldKey = FWPM_CONDITION_IP_REMOTE_ADDRESS;
             c.matchType = FWP_MATCH_EQUAL;
@@ -183,13 +188,5 @@ fn add_filter(engine: HANDLE, f: &WfpFilter, tun_luid: u64) -> anyhow::Result<()
     Ok(())
 }
 
-/// `a.b.c.d` или `a.b.c.d/p` → (адрес, маска) в HOST-порядке (WFP ждёт host-byte-order для IP-условий).
-fn parse_v4(cidr: &str) -> (u32, u32) {
-    let (ip, prefix) = match cidr.split_once('/') {
-        Some((a, p)) => (a, p.parse::<u8>().unwrap_or(32)),
-        None => (cidr, 32),
-    };
-    let addr = ip.parse::<std::net::Ipv4Addr>().map(u32::from).unwrap_or(0);
-    let mask = if prefix == 0 { 0 } else { u32::MAX << (32 - prefix as u32) };
-    (addr, mask)
-}
+// N-9: разбор `a.b.c.d[/p]` живёт в `citadel_winnet::parse_v4_cidr` — одной дверью с валидацией
+// на границе привилегий (`TunSetup::validate`) и с `Result` вместо молчаливого `0.0.0.0`.

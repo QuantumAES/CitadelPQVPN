@@ -109,6 +109,10 @@ pub struct AndroidStatusDto {
     pub transport: String,
     pub cidr: String,
     pub profile_id: String,
+    /// N-1: туннель поднят БЕЗ IPv6-blackhole (устройство отвергло его) — нативный IPv6 идёт мимо
+    /// туннеля. Часть снимка, а не только событие: перезапуск окна над живой сессией обязан
+    /// увидеть предупреждение, а не чистый экран «Защищено».
+    pub ipv6_uncaptured: bool,
 }
 
 // ───────────────────────────── глобальное состояние ─────────────────────────────
@@ -134,6 +138,8 @@ struct AndroidStatus {
     transport: String,
     cidr: String,
     profile_id: String,
+    /// N-1: последний establish прошёл без IPv6-blackhole (см. [`report_ipv6_state`]).
+    ipv6_uncaptured: bool,
 }
 impl AndroidStatus {
     const fn idle() -> Self {
@@ -143,6 +149,7 @@ impl AndroidStatus {
             transport: String::new(),
             cidr: String::new(),
             profile_id: String::new(),
+            ipv6_uncaptured: false,
         }
     }
 }
@@ -192,6 +199,51 @@ pub fn killswitch_enabled() -> bool {
         }
     }
     KILLSWITCH.load(Relaxed)
+}
+
+// ───────────── N-1: строгий IPv6 (Android) — не поднимать туннель без захвата IPv6 ─────────────
+// Туннель IPv4-only, поэтому весь IPv6 захватывается в него dummy-ULA + `::/0` (S2.2/A2). Часть
+// устройств отвергает v6-адрес на `VpnService`, и клиент поднимает туннель БЕЗ blackhole — на
+// dual-stack это означает нативный IPv6 (данные и IPv6-DNS) мимо туннеля. Фолбэк нужен (иначе на
+// таких устройствах туннеля не будет вовсе), но человек обязан знать цену; кому цена неприемлема —
+// этот тумблер: без захвата IPv6 туннель не поднимается.
+//
+// **Дефолт ВЫКЛЮЧЕН** осознанно: включённый по умолчанию, он превратил бы «часть устройств теряет
+// IPv6-скрытность» в «часть устройств не подключается вовсе» — регрессию доступности за спиной
+// пользователя. Предупреждение показывается в любом случае (см. [`AndroidTunProvider::configure`]).
+
+static STRICT_IPV6: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static STRICT_IPV6_LOADED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+fn strict_ipv6_file() -> PathBuf {
+    vault_path().with_file_name("strict_ipv6")
+}
+
+/// Сохранить настройку «не подключаться без захвата IPv6». Применяется со СЛЕДУЮЩЕГО подключения.
+#[frb(sync)]
+pub fn set_strict_ipv6(on: bool) {
+    use std::sync::atomic::Ordering::Relaxed;
+    STRICT_IPV6.store(on, Relaxed);
+    STRICT_IPV6_LOADED.store(true, Relaxed);
+    let f = strict_ipv6_file();
+    if let Some(d) = f.parent() {
+        let _ = std::fs::create_dir_all(d);
+    }
+    let _ = std::fs::write(f, if on { "1" } else { "0" });
+}
+
+/// Сохранённое состояние строгого IPv6 (инициализация тумблера + чтение из нативного connect-loop,
+/// где Dart может и не быть). Ленивая подгрузка; файла нет → **дефолт false**.
+#[frb(sync)]
+pub fn strict_ipv6_enabled() -> bool {
+    use std::sync::atomic::Ordering::Relaxed;
+    if !STRICT_IPV6_LOADED.swap(true, Relaxed) {
+        if let Ok(s) = std::fs::read_to_string(strict_ipv6_file()) {
+            STRICT_IPV6.store(s.trim() == "1", Relaxed);
+        }
+    }
+    STRICT_IPV6.load(Relaxed)
 }
 
 /// Режим отладки (журнал ядра + диагностика в UI). Персистится в файл рядом с vault (как kill-switch),
@@ -770,6 +822,68 @@ pub fn vault_lock() {
     *VAULT.lock().unwrap() = None;
 }
 
+// ─────────────────────── N-2: автозамок хранилища (таймаут простоя) ───────────────────────
+// В хранилище лежит мастер-ссылка администратора, то есть admin-плоскость сервера целиком. Замок
+// был только ручной, и открытое хранилище жило в памяти до закрытия приложения — короткий
+// физический доступ к разблокированному устройству давал управление сервером. Само срабатывание
+// живёт в UI (`AutoLock` в Dart: он видит фон и касания), ядро хранит НАСТРОЙКУ — рядом с vault,
+// как и остальные.
+//
+// **Дефолт — 5 минут**, а не «выключено»: цена ошибки в обе стороны несимметрична. Забытый
+// автозамок стоит одного касания пальцем (заход 10), забытое открытое хранилище — всей
+// admin-плоскости. Ноль (выключено) остаётся доступным, но выбирает его человек явно.
+
+/// Значения, которые предлагает интерфейс: 0 (выкл) | 1 | 5 | 15 минут.
+pub const AUTOLOCK_CHOICES: [u32; 4] = [0, 1, 5, 15];
+/// Дефолт, если файла нет либо в нём мусор.
+pub const AUTOLOCK_DEFAULT_MIN: u32 = 5;
+
+static AUTOLOCK: Mutex<Option<u32>> = Mutex::new(None);
+
+fn autolock_file() -> PathBuf {
+    vault_path().with_file_name("autolock")
+}
+
+/// Нормализация: незнакомое значение — это НЕ повод остаться без автозамка (иначе испорченный
+/// файл настройки молча снимал бы защиту), поэтому мусор читается как дефолт, а не как «выкл».
+/// Ноль — единственный способ выключить, и он должен быть записан явно.
+fn normalize_autolock(raw: &str) -> u32 {
+    match raw.trim().parse::<u32>() {
+        Ok(v) if AUTOLOCK_CHOICES.contains(&v) => v,
+        _ => AUTOLOCK_DEFAULT_MIN,
+    }
+}
+
+/// Сохранить таймаут автозамка в минутах (0 — выключить). Незнакомые значения приводятся к
+/// ближайшему разрешённому (см. [`AUTOLOCK_CHOICES`]).
+#[frb(sync)]
+pub fn set_vault_autolock_minutes(minutes: u32) {
+    let value = if AUTOLOCK_CHOICES.contains(&minutes) {
+        minutes
+    } else {
+        AUTOLOCK_DEFAULT_MIN
+    };
+    let f = autolock_file();
+    if let Some(d) = f.parent() {
+        let _ = std::fs::create_dir_all(d);
+    }
+    let _ = std::fs::write(f, value.to_string());
+    *AUTOLOCK.lock().unwrap() = Some(value);
+}
+
+/// Таймаут автозамка в минутах (0 — выключен). Файла нет → [`AUTOLOCK_DEFAULT_MIN`].
+#[frb(sync)]
+pub fn vault_autolock_minutes() -> u32 {
+    let mut cur = AUTOLOCK.lock().unwrap();
+    if cur.is_none() {
+        *cur = Some(match std::fs::read_to_string(autolock_file()) {
+            Ok(s) => normalize_autolock(&s),
+            Err(_) => AUTOLOCK_DEFAULT_MIN,
+        });
+    }
+    cur.unwrap_or(AUTOLOCK_DEFAULT_MIN)
+}
+
 /// Где лежит файл хранилища (диагностика в UI: «нет доступа» без пути — бесполезное сообщение).
 #[frb(sync)]
 pub fn vault_location() -> String {
@@ -1306,10 +1420,15 @@ impl TunProvider for AndroidTunProvider {
     fn configure(&self, p: &TunParams) -> Result<Arc<dyn TunIo>> {
         #[cfg(target_os = "android")]
         {
-            let fd = crate::android_jni::establish_tun(p)?;
+            // N-1: строгий режим читаем ЗДЕСЬ, а не при старте сессии, — реконнект после смены
+            // настройки обязан идти по новому правилу, и нативный loop живёт дольше Dart-изолята.
+            let fd = crate::android_jni::establish_tun(p, strict_ipv6_enabled())?;
             if fd < 0 {
                 return Err(anyhow!("VpnService.establish() не выдал TUN-fd (нет разрешения VPN?)"));
             }
+            // Захвачен ли IPv6 в туннель — спрашиваем на КАЖДЫЙ (ре)коннект: параметры туннеля
+            // между попытками меняются (split-профиль, другая сеть), и вчерашний ответ не годится.
+            report_ipv6_state(crate::android_jni::ipv6_state());
             // SAFETY: fd получен от VpnService.establish() (detachFd) — владеем им единолично.
             Ok(unsafe { citadel_client::tun_from_fd(fd) })
         }
@@ -1320,6 +1439,46 @@ impl TunProvider for AndroidTunProvider {
             let _ = p;
             Err(anyhow!("AndroidTunProvider доступен только на Android"))
         }
+    }
+}
+
+/// N-1: разнести по системе итог захвата IPv6 — в журнал ядра, в снимок статуса (переживает
+/// смерть UI-изолята) и событием в текущий изолят.
+///
+/// Событие шлём и в положительном случае (`state=ok`): предупреждение обязано СНИМАТЬСЯ само,
+/// когда следующий establish захватил IPv6 (сменилась сеть, выключили split) — иначе однажды
+/// показанная плашка «IPv6 мимо туннеля» осталась бы висеть над уже здоровым туннелем и научила
+/// бы её игнорировать.
+#[cfg(target_os = "android")]
+fn report_ipv6_state(state: i32) {
+    use crate::android_jni::{IPV6_CAPTURED, IPV6_FALLBACK};
+    let uncaptured = state == IPV6_FALLBACK;
+    if uncaptured {
+        eprintln!(
+            "[vpn] S2.2/A2: туннель поднят БЕЗ IPv6-blackhole — нативный IPv6 идёт мимо туннеля. \
+             Включите системный always-on + «Блокировать соединения без VPN» либо настройку \
+             «Не подключаться без захвата IPv6»"
+        );
+    } else if state == IPV6_CAPTURED {
+        eprintln!("[vpn] S2.2/A2: IPv6 захвачен в туннель");
+    }
+    ANDROID_STATUS.lock().unwrap().ipv6_uncaptured = uncaptured;
+    let guard = ANDROID_SINK.lock().unwrap();
+    if let Some(s) = guard.as_ref() {
+        let _ = s.add(ipv6_dto(uncaptured));
+    }
+}
+
+/// Событие «состояние захвата IPv6» для UI (`kind=ipv6`). Отдельный вид, а не `error`: туннель
+/// работает, это предупреждение о качестве защиты, и путать его с отказом подключения нельзя.
+fn ipv6_dto(uncaptured: bool) -> VpnEventDto {
+    VpnEventDto {
+        kind: "ipv6".into(),
+        state: if uncaptured { "uncaptured" } else { "ok" }.into(),
+        exit: String::new(),
+        transport: String::new(),
+        cidr: String::new(),
+        error: String::new(),
     }
 }
 
@@ -1387,6 +1546,7 @@ pub fn android_session_status() -> AndroidStatusDto {
         transport: st.transport.clone(),
         cidr: st.cidr.clone(),
         profile_id: st.profile_id.clone(),
+        ipv6_uncaptured: st.ipv6_uncaptured,
     }
 }
 
@@ -1397,6 +1557,11 @@ pub fn android_attach_events(sink: StreamSink<VpnEventDto>) -> Result<()> {
     {
         let st = ANDROID_STATUS.lock().unwrap();
         let _ = sink.add(state_dto(st.state));
+        // N-1: предупреждение о незахваченном IPv6 — часть праймящего снимка: иначе перезапуск
+        // окна над живой сессией показал бы «Защищено» без оговорки, которая уже верна.
+        if st.ipv6_uncaptured {
+            let _ = sink.add(ipv6_dto(true));
+        }
         if !st.exit.is_empty() {
             let _ = sink.add(VpnEventDto {
                 kind: "connected".into(),
@@ -1620,6 +1785,25 @@ mod tests {
 
         // Не оставляем сессию в статике: следующие тесты в этом процессе видят чистое состояние.
         *ACTIVE.lock().unwrap() = None;
+    }
+
+    /// N-2: настройка автозамка приходит из файла, а файл может оказаться пустым, обрезанным или
+    /// чужим. Направление разбора выбрано так, чтобы порча файла НЕ снимала защиту: мусор читается
+    /// как дефолт, а выключить автозамок можно только явным нулём.
+    #[test]
+    fn autolock_garbage_never_disables_the_lock() {
+        assert_eq!(normalize_autolock("0"), 0, "явный ноль — единственный способ выключить");
+        for ok in AUTOLOCK_CHOICES {
+            assert_eq!(normalize_autolock(&format!("{ok}")), ok);
+            assert_eq!(normalize_autolock(&format!(" {ok}\n")), ok, "пробелы/перевод строки");
+        }
+        for bad in ["", "-1", "7", "99999", "5m", "off", "нет", "1\u{0}"] {
+            assert_eq!(
+                normalize_autolock(bad),
+                AUTOLOCK_DEFAULT_MIN,
+                "{bad:?} обязан читаться как дефолт, а не как «выключено»"
+            );
+        }
     }
 
     /// Обратная сторона того же инварианта: `vpn_disconnect` — единственная дверь, через которую

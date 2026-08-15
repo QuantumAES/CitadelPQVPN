@@ -178,6 +178,43 @@ impl GateState {
         }) else {
             return false;
         };
+        self.evict_at(pos);
+        true
+    }
+
+    /// N-6: вытеснение при упоре в ГЛОБАЛЬНЫЙ потолок — по нагрузке адреса, а не по возрасту.
+    ///
+    /// «Самое старое вообще» защищает от одиночного источника (персональный лимит уже сделал это
+    /// раньше), но не от распределённого флуда: там самым старым с высокой вероятностью окажется
+    /// честный медленный мобильный хендшейк, а не одно из сотни паразитных соединений. Поэтому
+    /// жертву ищем у адреса, занявшего БОЛЬШЕ ВСЕХ слотов (max-min fairness), и среди его
+    /// соединений берём самое старое.
+    ///
+    /// Когда все адреса держат по одному слоту (в том числе идеально распределённый ботнет),
+    /// максимум равен единице и правило вырождается в прежнее «самое старое вообще» — лучшего
+    /// выбора в этом случае просто нет, зато одиночный честный клиент перестаёт быть жертвой
+    /// первого выбора, пока в очереди есть хоть один адрес с двумя соединениями.
+    fn evict_fair(&mut self) -> bool {
+        let mut weight: HashMap<IpAddr, usize> = HashMap::new();
+        for l in self.live.iter().filter(|l| l.sock.is_some()) {
+            *weight.entry(l.ip).or_insert(0) += 1;
+        }
+        let Some(max) = weight.values().copied().max() else {
+            return false; // вытеснять нечего: все записи без дескриптора
+        };
+        let Some(pos) = self
+            .live
+            .iter()
+            .position(|l| l.sock.is_some() && weight.get(&l.ip) == Some(&max))
+        else {
+            return false;
+        };
+        self.evict_at(pos);
+        true
+    }
+
+    /// Убрать запись по позиции: снять с учёта и закрыть сокет.
+    fn evict_at(&mut self, pos: usize) {
         let victim = self.live.remove(pos).expect("позиция получена из этого же дека");
         self.forget(victim.ip);
         if let Some(s) = victim.sock {
@@ -185,7 +222,6 @@ impl GateState {
             // и дропнет свой Pass; release по id уже ничего не найдёт (двойного учёта нет).
             let _ = s.shutdown(std::net::Shutdown::Both);
         }
-        true
     }
 
     /// Снять один слот с учёта (общий счётчик + per-ip, с уборкой пустых записей).
@@ -252,7 +288,9 @@ impl Gate {
         {
             return None;
         }
-        if st.total >= self.max_total && !st.evict_oldest(None) {
+        // N-6: глобальный потолок — жертву выбирает нагрузка адреса, а не возраст соединения
+        // (иначе распределённый флуд выбивает как раз честный медленный хендшейк).
+        if st.total >= self.max_total && !st.evict_fair() {
             return None;
         }
         st.next_id += 1;
@@ -886,6 +924,198 @@ type QuotaMap = HashMap<[u8; 32], (u64, u32)>;
 /// который видит его при Layer-1).
 type LeaseMap = HashMap<[u8; 32], u64>;
 
+/// N-5: квоты и аренды, **переживающие рестарт издателя**.
+///
+/// До этого обе карты жили только в RAM, и рестарт процесса (передеплой, крэш, OOM) обнулял их:
+/// квота A6 «64 токена на абонента в эпоху» начиналась заново, а мягкий single-session (задача
+/// 4/B) забывал все аренды. Снаружи это выглядит как штатная работа — тихое умножение выдачи на
+/// число рестартов, ровно тот же класс, что закрытый на exit'е L-3 (`spent.bin`).
+///
+/// **Что появляется на диске и почему это приемлемо.** Записи вида `client_id → (эпоха, счётчик)`
+/// и `client_id → истечение аренды`. `client_id` на диске издателя УЖЕ есть — это реестр абонентов,
+/// без которого выдача не работает вовсе; нового класса данных здесь не заводится. Новое здесь
+/// одно: грубая отметка активности абонента. Поэтому горизонт жёстко ограничен — квоты живут одну
+/// эпоху (при старте записи чужих эпох отбрасываются), аренды — своё окно (`Citadel_TOKEN_LEASE_SECS`,
+/// по умолчанию механизм выключен и записей нет вовсе). Ни адресов, ни назначений, ни объёмов
+/// трафика тут нет и быть не может — издатель их не знает.
+///
+/// Оператору, которому и этот след не нужен, оставлена дверь: `Citadel_ISSUANCE_LOG=off` —
+/// осознанный возврат к прежнему поведению (рестарт обнуляет квоты).
+///
+/// Приём с дескриптором тот же, что у `spent.bin` на exit'е: файл открывается ОДИН раз при старте
+/// (правами проверяется `open`, а не `write`), поэтому дальнейшая запись переживает любой сброс
+/// привилегий. Формат записи фиксированной длины: `tag(1) ‖ client_id(32) ‖ a(8 BE) ‖ b(4 BE)`,
+/// где для квоты `a` — эпоха и `b` — счётчик, для аренды `a` — время истечения и `b` = 0.
+/// Последняя запись про один и тот же `client_id` побеждает (журнал append-only, компактится
+/// перезаписью при старте и при смене эпохи).
+struct IssuanceStore {
+    quota: QuotaMap,
+    lease: LeaseMap,
+    /// Журнал; `None` — только RAM (оператор отключил либо файл недоступен).
+    log: Option<std::fs::File>,
+}
+
+const ISSUANCE_REC: usize = 1 + 32 + 8 + 4;
+const ISSUANCE_QUOTA: u8 = 1;
+const ISSUANCE_LEASE: u8 = 2;
+
+impl IssuanceStore {
+    fn ram_only() -> Self {
+        Self { quota: HashMap::new(), lease: HashMap::new(), log: None }
+    }
+
+    /// Поднять состояние из уже открытого дескриптора. Отбрасываем всё, что уже не имеет силы:
+    /// квоты чужих эпох (счётчик per-epoch — записи прошлой эпохи ничего не ограничивают) и
+    /// истёкшие аренды. Если что-то отброшено — сразу компактим файл, чтобы след не рос.
+    fn open(mut log: std::fs::File, epoch: u64, now: u64) -> Self {
+        use std::io::Read;
+        let mut raw = Vec::new();
+        let read_ok = log.read_to_end(&mut raw).is_ok();
+        let mut s = Self { quota: HashMap::new(), lease: HashMap::new(), log: Some(log) };
+        let mut total = 0usize;
+        for rec in raw.chunks_exact(ISSUANCE_REC) {
+            total += 1;
+            let id: [u8; 32] = rec[1..33].try_into().expect("32 байта");
+            let a = u64::from_be_bytes(rec[33..41].try_into().expect("8 байт"));
+            let b = u32::from_be_bytes(rec[41..].try_into().expect("4 байта"));
+            match rec[0] {
+                ISSUANCE_QUOTA if a == epoch => {
+                    s.quota.insert(id, (a, b));
+                }
+                ISSUANCE_LEASE if a > now => {
+                    s.lease.insert(id, a);
+                }
+                _ => {} // запись чужой эпохи либо истёкшая аренда — силы не имеет
+            }
+        }
+        let kept = s.quota.len() + s.lease.len();
+        if !read_ok {
+            eprintln!("[issuer] ⚠ N-5: журнал выдачи не читается — продолжаю только в RAM");
+            s.log = None;
+            return s;
+        }
+        if kept != total {
+            s.rewrite(); // отброшенное не должно оставаться на диске
+        }
+        eprintln!(
+            "[issuer] N-5: журнал выдачи подхвачен (квот {}, аренд {}) — рестарт больше не \
+             обнуляет квоту эпохи",
+            s.quota.len(),
+            s.lease.len()
+        );
+        s
+    }
+
+    /// Переписать файл целиком по текущему состоянию (компактизация + ротация эпохи).
+    fn rewrite(&mut self) {
+        let Some(f) = self.log.as_mut() else { return };
+        use std::io::{Seek, Write};
+        let mut buf = Vec::with_capacity((self.quota.len() + self.lease.len()) * ISSUANCE_REC);
+        for (id, (epoch, count)) in &self.quota {
+            buf.extend_from_slice(&issuance_rec(ISSUANCE_QUOTA, id, *epoch, *count));
+        }
+        for (id, expiry) in &self.lease {
+            buf.extend_from_slice(&issuance_rec(ISSUANCE_LEASE, id, *expiry, 0));
+        }
+        let ok = f.set_len(0).is_ok()
+            && f.seek(std::io::SeekFrom::Start(0)).is_ok()
+            && f.write_all(&buf).is_ok();
+        if !ok {
+            eprintln!("[issuer] ⚠ N-5: журнал выдачи не перезаписан — дальше только RAM");
+            self.log = None;
+        }
+    }
+
+    /// Дописать запись. Отказ записи выдачу НЕ отменяет: журнал — страховка от обнуления квоты на
+    /// рестарте, а не условие доступа, и ронять из-за него живых абонентов незачем. `fsync` нет
+    /// по той же причине, что и в `spent.bin`: потеря последних записей при внезапном питании
+    /// возвращает ровно прежнее (RAM-only) поведение.
+    fn append(&mut self, tag: u8, id: &[u8; 32], a: u64, b: u32) {
+        let Some(f) = self.log.as_mut() else { return };
+        use std::io::Write;
+        if f.write_all(&issuance_rec(tag, id, a, b)).is_err() {
+            eprintln!("[issuer] ⚠ N-5: журнал выдачи недоступен на запись — дальше только RAM");
+            self.log = None;
+        }
+    }
+
+    /// A6: выдать ещё один токен в квоту (см. [`quota_grant`]) и запомнить это на диске.
+    /// Смена эпохи compact'ит журнал: счётчики прошлой эпохи силы не имеют и на диске не нужны.
+    fn take_quota(&mut self, client_id: [u8; 32], epoch: u64, max: u32) -> bool {
+        let stale = self.quota.values().any(|(e, _)| *e != epoch);
+        if stale {
+            self.quota.retain(|_, (e, _)| *e == epoch);
+            self.rewrite();
+        }
+        if !quota_grant(&mut self.quota, client_id, epoch, max) {
+            return false;
+        }
+        let count = self.quota.get(&client_id).map(|(_, n)| *n).unwrap_or(0);
+        self.append(ISSUANCE_QUOTA, &client_id, epoch, count);
+        true
+    }
+
+    /// Задача 4/B: взять аренду (см. [`lease_grant`]) и запомнить её на диске. Истёкшие аренды
+    /// вычищаются здесь же — иначе карта и файл росли бы со всеми когда-либо обслуженными.
+    fn take_lease(&mut self, client_id: [u8; 32], now: u64, lease_secs: u64) -> bool {
+        if lease_secs == 0 {
+            return true; // механизм выключен — ни карты, ни записей
+        }
+        let stale = self.lease.values().any(|&e| e <= now);
+        if stale {
+            self.lease.retain(|_, &mut e| e > now);
+            self.rewrite();
+        }
+        if !lease_grant(&mut self.lease, client_id, now, lease_secs) {
+            return false;
+        }
+        self.append(ISSUANCE_LEASE, &client_id, now + lease_secs, 0);
+        true
+    }
+}
+
+fn issuance_rec(tag: u8, id: &[u8; 32], a: u64, b: u32) -> [u8; ISSUANCE_REC] {
+    let mut rec = [0u8; ISSUANCE_REC];
+    rec[0] = tag;
+    rec[1..33].copy_from_slice(id);
+    rec[33..41].copy_from_slice(&a.to_be_bytes());
+    rec[41..].copy_from_slice(&b.to_be_bytes());
+    rec
+}
+
+/// N-5: где вести журнал выдачи. `Citadel_ISSUANCE_LOG` — явный путь (пустое значение или `off` =
+/// осознанный отказ, только RAM); иначе `<каталог ключей эпохи>/issuance.bin`, рядом со `spent.bin`
+/// exit'а. Открываем сразу на чтение+запись: дальше дескриптор живёт до конца процесса.
+fn open_issuance_store(dir: &str, epoch: u64, now: u64) -> IssuanceStore {
+    let path = match std::env::var("Citadel_ISSUANCE_LOG") {
+        Ok(v) if v.trim().is_empty() || v.trim() == "off" => {
+            eprintln!("[issuer] N-5: журнал выдачи выключен оператором — квоты только в RAM");
+            return IssuanceStore::ram_only();
+        }
+        Ok(v) => std::path::PathBuf::from(v),
+        Err(_) => std::path::Path::new(dir).join("issuance.bin"),
+    };
+    match std::fs::OpenOptions::new().read(true).write(true).create(true).truncate(false).open(&path)
+    {
+        Ok(f) => {
+            // Счётчики выдачи — не публичное чтение: файл виден только владельцу-издателю.
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
+            }
+            IssuanceStore::open(f, epoch, now)
+        }
+        Err(e) => {
+            eprintln!(
+                "[issuer] ⚠ N-5: {} не открыть ({e}) — квоты только в RAM (рестарт их обнулит)",
+                path.display()
+            );
+            IssuanceStore::ram_only()
+        }
+    }
+}
+
 /// Положить ключ эпохи (`issuer-<epoch>.key`) + `issuer.key` (= current) на общий том — оттуда его
 /// читает exit, стоящий на ТОЙ ЖЕ машине.
 ///
@@ -1078,7 +1308,6 @@ fn run_issuer() -> Result<()> {
     // (default 64 — с запасом на реконнекты нормального абонента, но режет массовую раздачу).
     let max_per_epoch: u32 =
         std::env::var("Citadel_TOKEN_QUOTA").ok().and_then(|s| s.parse().ok()).unwrap_or(64);
-    let quota: Arc<Mutex<QuotaMap>> = Arc::new(Mutex::new(HashMap::new()));
     eprintln!("[issuer] квота выдачи: {max_per_epoch} токен(ов) на абонента в эпоху (A6)");
 
     // Задача 4 (вариант B): мягкий single-session — client_id получает новую выдачу не чаще раза в
@@ -1086,11 +1315,18 @@ fn run_issuer() -> Result<()> {
     // компромисс — реконнект в пределах окна ждёт истечения аренды (см. `lease_grant`).
     let lease_secs: u64 =
         std::env::var("Citadel_TOKEN_LEASE_SECS").ok().and_then(|s| s.parse().ok()).unwrap_or(0);
-    let lease: Arc<Mutex<LeaseMap>> = Arc::new(Mutex::new(HashMap::new()));
     eprintln!(
         "[issuer] single-session (задача 4/B): {}",
         if lease_secs == 0 { "выкл".into() } else { format!("аренда {lease_secs}с на абонента") }
     );
+
+    // N-5: квоты и аренды переживают рестарт. Дескриптор открываем ЗДЕСЬ — до любых потоков и до
+    // возможного сброса привилегий (тот же приём, что у `spent.bin` на exit'е).
+    let issuance = Arc::new(Mutex::new(open_issuance_store(
+        &dir,
+        citadel_token::current_epoch(epoch_secs),
+        now_unix(),
+    )));
 
     let listen = std::env::var("Citadel_TOKEN_LISTEN").unwrap_or_else(|_| "0.0.0.0:7000".into());
     let listener = TcpListener::bind(&listen).with_context(|| format!("bind {listen}"))?;
@@ -1119,8 +1355,8 @@ fn run_issuer() -> Result<()> {
     );
     accept_loop(listener, "выдача токенов", gate, PeerAllow::default(), move |stream, pass, ctl| {
         if let Err(e) = serve_client(
-            stream, pass, ctl, scfg.clone(), &pq, &cert_pin, &state, &dir, &quota, max_per_epoch,
-            &lease, lease_secs, obfs_psk, keysync_id.as_ref(), obfs_master, epoch_secs,
+            stream, pass, ctl, scfg.clone(), &pq, &cert_pin, &state, &dir, &issuance,
+            max_per_epoch, lease_secs, obfs_psk, keysync_id.as_ref(), obfs_master, epoch_secs,
         ) {
             citadel_token::dlog!("[issuer] соединение завершено: {e}");
         }
@@ -1180,9 +1416,9 @@ fn serve_client(
     cert_pin: &[u8; 32],
     state: &Mutex<EpochState>,
     dir: &str,
-    quota: &Mutex<QuotaMap>,
+    // N-5: квоты A6 и аренды 4/B в одном хранилище — оно же ведёт журнал, переживающий рестарт.
+    issuance: &Mutex<IssuanceStore>,
     max_per_epoch: u32,
-    lease: &Mutex<LeaseMap>,
     lease_secs: u64,
     obfs_psk: Option<[u8; 32]>,
     keysync_id: Option<&[u8; 32]>,
@@ -1259,7 +1495,7 @@ fn serve_client(
     // (второе устройство с той же ссылки / слишком частый реконнект). Клиент получит 0 токенов →
     // establish без токена → exit откажет → клиент подождёт истечения аренды и переподключится.
     // Закрываем соединение ДО отправки epoch-pub (ничего лишнего не раскрываем).
-    if !lease_grant(&mut lease.lock().unwrap(), client_id, now_unix(), lease_secs) {
+    if !issuance.lock().unwrap().take_lease(client_id, now_unix(), lease_secs) {
         citadel_token::dlog!(
             "[issuer] single-session (4/B): {}… держит активную аренду — новая сессия отклонена",
             &hex::encode(client_id)[..12]
@@ -1312,7 +1548,7 @@ fn serve_client(
             let s = state.lock().unwrap();
             (s.0, s.1.clone())
         };
-        if !quota_grant(&mut quota.lock().unwrap(), client_id, cur_epoch, max_per_epoch) {
+        if !issuance.lock().unwrap().take_quota(client_id, cur_epoch, max_per_epoch) {
             citadel_token::dlog!(
                 "[issuer] квота исчерпана: {}… уже получил {max_per_epoch} токен(ов) в эпоху {cur_epoch} — стоп",
                 &hex::encode(client_id)[..12]
@@ -1761,6 +1997,79 @@ mod tests {
         assert!(off.is_empty());
     }
 
+    /// N-5: квота A6 и аренда 4/B переживают рестарт издателя. До этого обе жили только в RAM, и
+    /// каждый передеплой/крэш начинал квоту эпохи заново — то есть выдача умножалась на число
+    /// рестартов при внешне штатной работе. Проверяем и обратную сторону: записи, потерявшие силу
+    /// (чужая эпоха, истёкшая аренда), не должны оставаться на диске.
+    #[test]
+    fn issuance_log_survives_restart_and_prunes_stale_records() {
+        use super::{IssuanceStore, ISSUANCE_REC};
+        let path = std::env::temp_dir().join(format!("citadel-issuance-{}.bin", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let reopen = |epoch: u64, now: u64| {
+            let f = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create(true)
+                .truncate(false)
+                .open(&path)
+                .expect("журнал выдачи");
+            IssuanceStore::open(f, epoch, now)
+        };
+        let (a, b) = ([0xa1u8; 32], [0xb2u8; 32]);
+
+        // «Первый запуск»: абонент `a` выбрал квоту эпохи 100 целиком и взял аренду.
+        {
+            let mut st = reopen(100, 1_000);
+            for i in 0..3 {
+                assert!(st.take_quota(a, 100, 3), "выдача {i} в пределах квоты");
+            }
+            assert!(!st.take_quota(a, 100, 3), "четвёртая — уже сверх квоты");
+            assert!(st.take_lease(a, 1_000, 300));
+            assert!(!st.take_lease(a, 1_100, 300), "аренда ещё активна");
+        }
+        // «Рестарт» в той же эпохе: и квота, и аренда обязаны подняться с диска.
+        {
+            let mut st = reopen(100, 1_100);
+            assert!(!st.take_quota(a, 100, 3), "рестарт обнулил квоту эпохи");
+            assert!(!st.take_lease(a, 1_100, 300), "рестарт забыл активную аренду");
+            assert!(st.take_quota(b, 100, 3), "чужая квота не задета");
+        }
+        // Аренда истекла — она уходит и из карты, и с диска; квота эпохи ещё жива.
+        {
+            let mut st = reopen(100, 1_400);
+            assert!(st.take_lease(a, 1_400, 300), "истёкшая аренда больше не держит");
+            assert!(!st.take_quota(a, 100, 3), "квота эпохи 100 по-прежнему исчерпана");
+        }
+        // Новая эпоха: счётчики прошлой силы не имеют — квота начинается заново.
+        {
+            let mut st = reopen(101, 2_000);
+            assert!(st.take_quota(a, 101, 3), "в новой эпохе квота своя");
+            let raw = std::fs::read(&path).expect("файл журнала");
+            assert_eq!(raw.len() % ISSUANCE_REC, 0, "формат записи фиксированной длины");
+            assert!(
+                raw.chunks_exact(ISSUANCE_REC).all(|r| {
+                    let epoch_or_expiry = u64::from_be_bytes(r[33..41].try_into().unwrap());
+                    r[0] != super::ISSUANCE_QUOTA || epoch_or_expiry == 101
+                }),
+                "счётчики прошлой эпохи не должны оставаться на диске"
+            );
+        }
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// Оператор вправе отказаться от журнала целиком (`Citadel_ISSUANCE_LOG=off`) — тогда
+    /// поведение ровно прежнее: всё в RAM, файла нет.
+    #[test]
+    fn issuance_store_ram_only_writes_nothing() {
+        use super::IssuanceStore;
+        let mut st = IssuanceStore::ram_only();
+        assert!(st.take_quota([7u8; 32], 5, 2));
+        assert!(st.take_quota([7u8; 32], 5, 2));
+        assert!(!st.take_quota([7u8; 32], 5, 2), "квота работает и без журнала");
+        assert!(st.log.is_none());
+    }
+
     // ───────────────── H-1 (аудит-4): гейт pre-auth соединений издателя ─────────────────
 
     fn ip(n: u8) -> std::net::IpAddr {
@@ -1857,6 +2166,48 @@ mod tests {
         assert_eq!(flood_peers[0].read(&mut buf).ok(), Some(0), "вытесненное соединение закрыто");
         // Соседние соединения флудера при этом живы — вытесняется ровно одно, самое старое.
         assert_eq!(g.state.lock().unwrap().per_ip.get(&shared).copied(), Some(4));
+    }
+
+    /// N-6: при упоре в ГЛОБАЛЬНЫЙ потолок жертву выбирает нагрузка адреса, а не возраст. Сценарий
+    /// — распределённый флуд: пятнадцать соединений с трёх адресов и один честный медленный
+    /// хендшейк, пришедший ПЕРВЫМ. По прежнему правилу («самое старое вообще») он и вытеснялся
+    /// первым — то есть флуд с нескольких адресов гарантированно выбивал именно честного клиента.
+    #[test]
+    fn gate_evicts_the_heaviest_address_not_the_slowest_client() {
+        use super::Gate;
+        let g = Gate::new(16, 16); // персональный лимит не мешает: проверяем ГЛОБАЛЬНЫЙ потолок
+        let mut peers = Vec::new();
+        let mut passes = Vec::new();
+
+        // Честный клиент — первый в очереди, единственный со своего адреса.
+        let (honest_peer, honest_sock) = sock_pair();
+        let honest = g.admit(ip(1), Some(honest_sock)).expect("честный слот");
+        peers.push(honest_peer);
+
+        // Флуд: три адреса по пять соединений — потолок занят целиком.
+        for n in 2..=4u8 {
+            for _ in 0..5 {
+                let (peer, s) = sock_pair();
+                passes.push(g.admit(ip(n), Some(s)).expect("слот флудера"));
+                peers.push(peer);
+            }
+        }
+        assert_eq!(g.state.lock().unwrap().total, 16, "потолок занят");
+
+        // Шестнадцать заняты — новое соединение обязано вытеснить кого-то из ТЯЖЁЛЫХ адресов.
+        let (_new_peer, new_sock) = sock_pair();
+        let fresh = g.admit(ip(9), Some(new_sock)).expect("новое соединение проходит");
+        {
+            let st = g.state.lock().unwrap();
+            assert!(
+                st.live.iter().any(|l| l.id == honest.id),
+                "честный одиночный хендшейк не должен становиться жертвой первого выбора"
+            );
+            assert_eq!(st.per_ip.get(&ip(2)).copied(), Some(4), "вытеснено у самого нагруженного");
+            assert_eq!(st.total, 16, "потолок не превышен");
+        }
+        drop(fresh);
+        drop(honest);
     }
 
     /// Карта адресов не растёт: запись убирается, когда её счётчик обнуляется (иначе долгий

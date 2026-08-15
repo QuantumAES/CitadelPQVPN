@@ -38,6 +38,8 @@ const Map<String, String> langDe = {
   'err_no_vpn_permission_hint': 'Erlauben Sie die Verbindung im Systemdialog',
   'err_activation_failed': 'Der Link konnte nicht aktiviert werden',
   'err_activation_failed_hint': 'bitten Sie den Administrator um einen neuen Link: ein Erstlink wird einmal und nur begrenzte Zeit aktiviert',
+  'err_ipv6_required': 'Tunnel nicht aufgebaut: IPv6 nicht erfasst',
+  'err_ipv6_required_hint': 'striktes IPv6 ist aktiv — schalten Sie es in den Einstellungen ab oder aktivieren Sie ein immer aktives VPN',
 
   'switch_title': 'Verbindung wechseln?',
   'switch_body': 'Aktuell ist „{current}“ verbunden. Trennen und mit „{name}“ verbinden?',
@@ -104,9 +106,19 @@ const Map<String, String> langDe = {
   'killswitch_sub': 'Verkehr außerhalb des Tunnels blockieren (fail-closed); ab der nächsten Sitzung',
   'killswitch_android_title': 'Kill-Switch (Always-on)',
   'killswitch_android_sub': 'In den System-VPN-Einstellungen konfigurieren',
+  'strict_ipv6_title': 'Striktes IPv6',
+  'strict_ipv6_sub': 'Nicht verbinden, wenn das Gerät IPv6 nicht in den Tunnel leiten lässt',
   'split_title': 'Split-Tunnel',
   'split_sub_android': 'Nach Apps und Adressen: durch den Tunnel / daran vorbei',
   'split_sub_desktop': 'Nach Zieladressen: durch den Tunnel / daran vorbei',
+  'autolock_title': 'Automatische Tresorsperre',
+  'autolock_sub_off': 'Aus — der Tresor bleibt bis zum Beenden der App offen',
+  'autolock_sub_on': 'Nach {min} Min. ohne Aktivität sperren',
+  'autolock_off': 'Aus',
+  'autolock_minutes': '{min} Min.',
+  'autolock_note': 'Die Sperre nimmt Profile und Master-Link vom Bildschirm und aus dem '
+      'Speicher. Einen aktiven Tunnel rührt sie nicht an; zurück geht es per '
+      'Fingerabdruck oder Master-Passwort.',
   'vault_location_title': 'Profilspeicher',
   'vault_path_copied': 'Speicherpfad kopiert',
   'language_title': 'App-Sprache',
@@ -130,6 +142,16 @@ const Map<String, String> langDe = {
       '• Immer aktives VPN (Always-on VPN)\n'
       '• Verbindungen ohne VPN blockieren',
   'open_settings': 'Einstellungen öffnen',
+  'ipv6_warn': 'IPv6 läuft am Tunnel vorbei — Details',
+  'ipv6_warn_title': 'IPv6 nicht erfasst',
+  'ipv6_warn_body': 'Dieses Gerät hat die Erfassung von IPv6 im Tunnel abgelehnt. Der Tunnel arbeitet, aber '
+      'IPv6-Verkehr (und IPv6-DNS) läuft direkt daran vorbei — in einem IPv6-Netz gibt das '
+      'Ihre Adresse preis.\n\n'
+      'Was tun:\n'
+      '• für CitadelPQVPN „Immer aktives VPN“ und „Verbindungen ohne VPN blockieren“ '
+      'einschalten — dann sperrt das System jeden Verkehr außerhalb des Tunnels;\n'
+      '• oder „Striktes IPv6“ in den Einstellungen aktivieren — dann kommt der Tunnel '
+      'ohne erfasstes IPv6 gar nicht erst hoch.',
 
   'new_profile': 'Neues Profil',
   'link_label': 'citadel://-Link',
@@ -220,6 +242,7 @@ const Map<String, String> langDe = {
   'issued_title_named': 'Zugang ausgestellt: {label}',
   'copy_link': 'Link kopieren',
   'link_copied': 'Link kopiert',
+  'clipboard_autoclear': 'die Zwischenablage leert sich selbst',
   'verify_code_label': 'Prüfcode vom Administrator',
   'verify_code_hint': '6 Zeichen',
   'verify_code_help': 'Der Administrator nennt ihn getrennt vom Link (mündlich, persönlich). Stimmt er überein, wurde der Link unterwegs nicht verändert.',

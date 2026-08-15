@@ -38,6 +38,8 @@ const Map<String, String> langEn = {
   'err_no_vpn_permission_hint': 'allow the connection in the system dialog',
   'err_activation_failed': 'The link could not be activated',
   'err_activation_failed_hint': 'ask the administrator for a new link: a first-use link activates once and only for a limited time',
+  'err_ipv6_required': 'Tunnel not established: IPv6 not captured',
+  'err_ipv6_required_hint': 'strict IPv6 is on — turn it off in the settings or enable always-on VPN',
 
   'switch_title': 'Switch connection?',
   'switch_body': '“{current}” is currently connected. Disconnect it and connect to “{name}”?',
@@ -102,9 +104,19 @@ const Map<String, String> langEn = {
   'killswitch_sub': 'Block traffic outside the tunnel (fail-closed); from the next session',
   'killswitch_android_title': 'Kill switch (always-on)',
   'killswitch_android_sub': 'Configure in the system VPN settings',
+  'strict_ipv6_title': 'Strict IPv6',
+  'strict_ipv6_sub': 'Do not connect if the device will not route IPv6 into the tunnel',
   'split_title': 'Split tunnel',
   'split_sub_android': 'By apps and addresses: through the tunnel / bypass',
   'split_sub_desktop': 'By destination addresses: through the tunnel / bypass',
+  'autolock_title': 'Vault auto-lock',
+  'autolock_sub_off': 'Off — the vault stays open until you quit the app',
+  'autolock_sub_on': 'Lock after {min} min of inactivity',
+  'autolock_off': 'Off',
+  'autolock_minutes': '{min} min',
+  'autolock_note': 'Locking removes the profiles and the master link from the screen and from '
+      'memory. It does not touch an active tunnel; come back with a fingerprint '
+      'or the master password.',
   'vault_location_title': 'Profile vault',
   'vault_path_copied': 'Vault path copied',
   'language_title': 'App language',
@@ -128,6 +140,16 @@ const Map<String, String> langEn = {
       '• Always-on VPN\n'
       '• Block connections without VPN',
   'open_settings': 'Open settings',
+  'ipv6_warn': 'IPv6 goes outside the tunnel — details',
+  'ipv6_warn_title': 'IPv6 not captured',
+  'ipv6_warn_body': 'This device refused to route IPv6 into the tunnel. The tunnel works, but IPv6 traffic '
+      '(and IPv6 DNS) goes directly, bypassing it — on an IPv6 network that reveals your '
+      'address.\n\n'
+      'What to do:\n'
+      '• enable “Always-on VPN” and “Block connections without VPN” for CitadelPQVPN — '
+      'the system then blocks all traffic outside the tunnel;\n'
+      '• or turn on “Strict IPv6” in the settings — the tunnel will not come up until '
+      'IPv6 is captured.',
 
   'new_profile': 'New profile',
   'link_label': 'citadel:// link',
@@ -217,6 +239,7 @@ const Map<String, String> langEn = {
   'issued_title_named': 'Access issued: {label}',
   'copy_link': 'Copy link',
   'link_copied': 'Link copied',
+  'clipboard_autoclear': 'the clipboard clears itself',
   'verify_code_label': 'Verification code from the administrator',
   'verify_code_hint': '6 characters',
   'verify_code_help': 'The administrator reads it out separately from the link (by voice, in person). If it matches, the link was not tampered with in transit.',

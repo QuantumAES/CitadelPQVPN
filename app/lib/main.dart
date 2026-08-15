@@ -94,7 +94,8 @@ class CitadelApp extends StatefulWidget {
   State<CitadelApp> createState() => _CitadelAppState();
 }
 
-class _CitadelAppState extends State<CitadelApp> with WindowListener {
+class _CitadelAppState extends State<CitadelApp>
+    with WindowListener, WidgetsBindingObserver {
   final AppState state = AppState();
   final GlobalKey<NavigatorState> _navKey = GlobalKey<NavigatorState>();
 
@@ -105,6 +106,10 @@ class _CitadelAppState extends State<CitadelApp> with WindowListener {
   @override
   void initState() {
     super.initState();
+    // N-2: автозамку нужны переходы «свернули/погасили экран» — их даёт только наблюдатель
+    // жизненного цикла. Ставим его выше всего дерева: экран разблокировки и главный экран
+    // сменяют друг друга, а отсчёт простоя обязан пережить смену экрана.
+    WidgetsBinding.instance.addObserver(this);
     if (_isDesktop) {
       windowManager.addListener(this);
       // #5.5: системный трей — только Windows (нативный). Пункт «Отключить» в меню зависит от
@@ -123,7 +128,13 @@ class _CitadelAppState extends State<CitadelApp> with WindowListener {
   }
 
   @override
+  void didChangeAppLifecycleState(AppLifecycleState lifecycle) {
+    state.autoLock.onLifecycle(lifecycle);
+  }
+
+  @override
   void dispose() {
+    WidgetsBinding.instance.removeObserver(this);
     if (_isDesktop) {
       windowManager.removeListener(this);
       if (WindowsTray.supported) state.removeListener(_syncTray);
@@ -180,11 +191,21 @@ class _CitadelAppState extends State<CitadelApp> with WindowListener {
 
   // ── видимость окна: гасим отрисовку, когда смотреть некому (см. window_visibility.dart) ──
 
+  // Сворачивание/разворачивание окна на десктопе — это тот же «ушёл/вернулся», что фон на
+  // телефоне, но приходит оно от оконного менеджера, а не жизненным циклом. Отдаём автозамку тем
+  // же событием (N-2): свёрнутое в трей окно с открытым хранилищем — ровно тот случай, ради
+  // которого автозамок и сделан.
   @override
-  void onWindowMinimize() => windowVisible.value = false;
+  void onWindowMinimize() {
+    windowVisible.value = false;
+    state.autoLock.onLifecycle(AppLifecycleState.paused);
+  }
 
   @override
-  void onWindowRestore() => windowVisible.value = true;
+  void onWindowRestore() {
+    windowVisible.value = true;
+    state.autoLock.onLifecycle(AppLifecycleState.resumed);
+  }
 
   /// Страховка на случай, если окно показали/спрятали мимо наших вызовов (жест ОС, плагин):
   /// `window_manager` шлёт сюда имя события, и `hide`/`show` мы обязаны заметить.
@@ -193,10 +214,12 @@ class _CitadelAppState extends State<CitadelApp> with WindowListener {
     switch (eventName) {
       case 'hide':
         windowVisible.value = false;
+        state.autoLock.onLifecycle(AppLifecycleState.paused);
       case 'show':
       case 'restore':
       case 'focus':
         windowVisible.value = true;
+        state.autoLock.onLifecycle(AppLifecycleState.resumed);
     }
   }
 
@@ -285,10 +308,17 @@ class _CitadelAppState extends State<CitadelApp> with WindowListener {
         // над всем деревом останавливает анимации — прежде всего бесконечный индикатор
         // «Подключение…», который крутится столько же, сколько движок ретраит недоступный сервер.
         // Работу самого движка это не трогает, только отрисовку.
-        builder: (ctx, child) => ValueListenableBuilder<bool>(
-          valueListenable: windowVisible,
-          child: child ?? const SizedBox.shrink(),
-          builder: (_, visible, inner) => TickerMode(enabled: visible, child: inner!),
+        // N-2: любое касание/клик — признак, что человек здесь, и отсчёт простоя начинается
+        // заново. `translucent` + отсутствие обработчиков жестов: слушаем, но никому не мешаем.
+        builder: (ctx, child) => Listener(
+          behavior: HitTestBehavior.translucent,
+          onPointerDown: (_) => state.autoLock.poke(),
+          onPointerSignal: (_) => state.autoLock.poke(),
+          child: ValueListenableBuilder<bool>(
+            valueListenable: windowVisible,
+            child: child ?? const SizedBox.shrink(),
+            builder: (_, visible, inner) => TickerMode(enabled: visible, child: inner!),
+          ),
         ),
         navigatorKey: _navKey,
         title: 'CitadelPQVPN',

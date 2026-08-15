@@ -38,6 +38,8 @@ const Map<String, String> langHi = {
   'err_no_vpn_permission_hint': 'सिस्टम डायलॉग में कनेक्शन की अनुमति दें',
   'err_activation_failed': 'लिंक सक्रिय नहीं हो सका',
   'err_activation_failed_hint': 'व्यवस्थापक से नया लिंक माँगें: पहला लिंक एक ही बार और सीमित समय के लिए सक्रिय होता है',
+  'err_ipv6_required': 'टनल नहीं बना: IPv6 कैप्चर नहीं हुआ',
+  'err_ipv6_required_hint': 'सख़्त IPv6 चालू है — इसे सेटिंग्स में बंद करें या हमेशा चालू VPN सक्षम करें',
 
   'switch_title': 'कनेक्शन बदलें?',
   'switch_body': 'अभी “{current}” कनेक्ट है। उसे डिस्कनेक्ट करके “{name}” से जुड़ें?',
@@ -102,9 +104,18 @@ const Map<String, String> langHi = {
   'killswitch_sub': 'टनल के बाहर का ट्रैफ़िक रोकें (fail-closed); अगले सत्र से',
   'killswitch_android_title': 'किल-स्विच (always-on)',
   'killswitch_android_sub': 'सिस्टम की VPN सेटिंग्स में कॉन्फ़िगर करें',
+  'strict_ipv6_title': 'सख़्त IPv6',
+  'strict_ipv6_sub': 'यदि डिवाइस IPv6 को टनल में नहीं भेजने देता, तो कनेक्ट न करें',
   'split_title': 'स्प्लिट टनल',
   'split_sub_android': 'ऐप और पतों के अनुसार: टनल से / टनल के बाहर',
   'split_sub_desktop': 'गंतव्य पतों के अनुसार: टनल से / टनल के बाहर',
+  'autolock_title': 'वॉल्ट का स्वतः लॉक',
+  'autolock_sub_off': 'बंद — ऐप से बाहर निकलने तक वॉल्ट खुला रहता है',
+  'autolock_sub_on': '{min} मिनट निष्क्रियता के बाद लॉक करें',
+  'autolock_off': 'बंद',
+  'autolock_minutes': '{min} मिनट',
+  'autolock_note': 'लॉक प्रोफ़ाइल और मास्टर लिंक को स्क्रीन तथा मेमोरी से हटा देता है। यह चालू टनल को '
+      'नहीं छूता; वापसी फ़िंगरप्रिंट या मास्टर पासवर्ड से होती है।',
   'vault_location_title': 'प्रोफ़ाइल वॉल्ट',
   'vault_path_copied': 'वॉल्ट का पथ कॉपी किया गया',
   'language_title': 'ऐप की भाषा',
@@ -127,6 +138,14 @@ const Map<String, String> langHi = {
       '• हमेशा चालू VPN (Always-on VPN)\n'
       '• VPN के बिना कनेक्शन रोकें',
   'open_settings': 'सेटिंग्स खोलें',
+  'ipv6_warn': 'IPv6 टनल के बाहर जा रहा है — विवरण',
+  'ipv6_warn_title': 'IPv6 कैप्चर नहीं हुआ',
+  'ipv6_warn_body': 'इस डिवाइस ने IPv6 को टनल में लेने से मना कर दिया। टनल काम कर रहा है, पर IPv6 ट्रैफ़िक '
+      '(और IPv6 DNS) सीधे, उसके बाहर से जाता है — IPv6 वाले नेटवर्क में इससे आपका पता खुल जाता है।\n\n'
+      'क्या करें:\n'
+      '• CitadelPQVPN के लिए «हमेशा चालू VPN» और «VPN के बिना कनेक्शन रोकें» चालू करें — '
+      'तब सिस्टम स्वयं टनल के बाहर का सारा ट्रैफ़िक रोक देता है;\n'
+      '• या सेटिंग्स में «सख़्त IPv6» चालू करें — तब IPv6 कैप्चर हुए बिना टनल उठेगा ही नहीं।',
 
   'new_profile': 'नई प्रोफ़ाइल',
   'link_label': 'citadel:// लिंक',
@@ -215,6 +234,7 @@ const Map<String, String> langHi = {
   'issued_title_named': 'एक्सेस जारी किया गया: {label}',
   'copy_link': 'लिंक कॉपी करें',
   'link_copied': 'लिंक कॉपी किया गया',
+  'clipboard_autoclear': 'क्लिपबोर्ड स्वयं साफ़ हो जाएगा',
   'verify_code_label': 'व्यवस्थापक से सत्यापन कोड',
   'verify_code_hint': '6 वर्ण',
   'verify_code_help': 'व्यवस्थापक इसे लिंक से अलग (आवाज़ से, आमने-सामने) बताता है। मेल खाया — तो रास्ते में लिंक बदला नहीं गया।',

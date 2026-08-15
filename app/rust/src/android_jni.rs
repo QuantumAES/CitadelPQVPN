@@ -177,12 +177,48 @@ pub fn set_status(state: &str) {
     }
 }
 
+// Итог захвата IPv6 в туннель — те же значения, что константы `IPV6_*` в `CitadelVpnService`.
+/// blackhole поставлен: весь IPv6 уходит в туннель (и там дропается exit'ом).
+pub const IPV6_CAPTURED: i32 = 0;
+/// Устройство отвергло v6-адрес/маршрут — туннель поднят БЕЗ blackhole (нативный IPv6 мимо него).
+pub const IPV6_FALLBACK: i32 = 1;
+/// Захват неприменим: не full-tunnel (split-include) — IPv6 идёт напрямую по выбору человека.
+pub const IPV6_SPLIT: i32 = 2;
+
+/// Итог последней попытки захватить IPv6 (`CitadelVpnService.ipv6State()`, S2.2/A2). Спрашивается
+/// сразу после [`establish_tun`]: молчаливый фолбэк без blackhole означает нативный IPv6 мимо
+/// туннеля на dual-stack, и человек обязан это увидеть (находка N-1).
+///
+/// Мост не дался → отвечаем [`IPV6_SPLIT`] («предупреждать не о чем»): выдумывать утечку там, где
+/// мы просто не смогли спросить, значит приучать человека игнорировать предупреждение.
+pub fn ipv6_state() -> i32 {
+    let Some(vm) = VM.get() else { return IPV6_SPLIT };
+    let Some(service) = SERVICE.lock().unwrap().clone() else {
+        return IPV6_SPLIT;
+    };
+    let Ok(mut env) = vm.attach_current_thread() else {
+        return IPV6_SPLIT;
+    };
+    let res = env.call_method(service.as_obj(), "ipv6State", "()I", &[]);
+    // Висящее Java-исключение обязано быть очищено ДО дропа env (иначе detach валит процесс).
+    if env.exception_check().unwrap_or(false) {
+        let _ = env.exception_clear();
+    }
+    match res.and_then(|v| v.i()) {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("[jni] CitadelVpnService.ipv6State: {e}");
+            IPV6_SPLIT
+        }
+    }
+}
+
 /// Построить TUN через `CitadelVpnService.establishTun(...)` (JNI, Rust→Kotlin) → detached fd.
 /// Зовётся из `AndroidTunProvider::configure` в нативном `VpnController::connect`-loop
 /// (tokio-поток, НЕ Java-поток → `attach_current_thread`, как `protectFd`). routes/dns передаём
 /// строкой через пробел (Kotlin делит) — так не строим jobjectArray. Возврат: fd (≥0) либо `Err`
 /// (сервис не зарегистрирован / establish бросил / вернул невалидный fd).
-pub fn establish_tun(p: &TunParams) -> anyhow::Result<i32> {
+pub fn establish_tun(p: &TunParams, require_v6: bool) -> anyhow::Result<i32> {
     let vm = VM
         .get()
         .ok_or_else(|| anyhow::anyhow!("нет JavaVM — CitadelVpnService не зарегистрирован"))?;
@@ -208,7 +244,7 @@ pub fn establish_tun(p: &TunParams) -> anyhow::Result<i32> {
     let res = env.call_method(
         service.as_obj(),
         "establishTun",
-        "(Ljava/lang/String;ILjava/lang/String;Ljava/lang/String;ILjava/lang/String;Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;)I",
+        "(Ljava/lang/String;ILjava/lang/String;Ljava/lang/String;ILjava/lang/String;Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;Z)I",
         &[
             JValue::Object(&addr_j),
             JValue::Int(p.prefix as i32),
@@ -219,12 +255,14 @@ pub fn establish_tun(p: &TunParams) -> anyhow::Result<i32> {
             JValue::Object(&apps_j),
             JValue::Object(&dest_mode_j),
             JValue::Object(&dest_routes_j),
+            JValue::Bool(u8::from(require_v6)),
         ],
     );
     // Очистить любое ожидающее Java-исключение ДО дропа env (detach потока с висящим исключением →
     // ART abort «JNI DETECTED ERROR»), извлекая текст в лог: иначе establishTun молча вернёт ошибку
     // и не понять, почему нет TUN (нет VPN-разрешения / кривые маршруты / …). Тот же порядок, что в
     // `JniProtector::protect`: exception_clear ДО любых других JNI-вызовов.
+    let mut thrown_text = String::new();
     if env.exception_check().unwrap_or(false) {
         let thrown = env.exception_occurred();
         let _ = env.exception_clear();
@@ -232,7 +270,8 @@ pub fn establish_tun(p: &TunParams) -> anyhow::Result<i32> {
             if let Ok(v) = env.call_method(&ex, "toString", "()Ljava/lang/String;", &[]) {
                 if let Ok(obj) = v.l() {
                     if let Ok(s) = env.get_string(&JString::from(obj)) {
-                        eprintln!("[jni] establishTun бросил: {}", s.to_string_lossy());
+                        thrown_text = s.to_string_lossy().into_owned();
+                        eprintln!("[jni] establishTun бросил: {thrown_text}");
                     }
                 }
             }
@@ -240,6 +279,11 @@ pub fn establish_tun(p: &TunParams) -> anyhow::Result<i32> {
     }
     match res {
         Ok(v) => Ok(v.i()?),
-        Err(e) => Err(anyhow::anyhow!("VpnService.establishTun: {e}")),
+        // Текст Java-исключения кладём В САМУ ошибку, а не только в лог: причина отказа доходит до
+        // экрана (UI разбирает её в `AppState._classify` — например, отказ строгого IPv6, N-1), а
+        // при выключенном режиме отладки журнала попросту нет. `{e}` в jni-rs — это «Java exception
+        // was thrown» без единого слова о том, какое именно.
+        Err(e) if thrown_text.is_empty() => Err(anyhow::anyhow!("VpnService.establishTun: {e}")),
+        Err(_) => Err(anyhow::anyhow!("VpnService.establishTun: {thrown_text}")),
     }
 }

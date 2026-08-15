@@ -401,11 +401,33 @@ if ((${#pkgs[@]})); then
 fi
 
 # ─── 2. Docker: CLI+compose v2 (нет → авто-install) И запущенный ДЕМОН (лежит → старт) ───
+# N-7 (supply chain): ставим из РЕПОЗИТОРИЯ ДИСТРИБУТИВА — пакеты подписаны, подпись проверяет сам
+# apt/dnf. Прежний путь (`curl https://get.docker.com | sh`) исполнял на свежей машине скачанный
+# скрипт без единой проверки — планка ниже, чем у собственных бинарей проекта, которые тут же
+# рядом верифицируются minisign'ом по вшитому ключу.
+#
+# Если в дистрибутиве нет compose v2, установка НЕ уходит молча на сторонний скрипт: это решение
+# оператора, и принимается оно явно — `CITADEL_ALLOW_DOCKER_SCRIPT=1`.
 if ! docker compose version >/dev/null 2>&1; then
-  log "Docker не найден — авто-установка (get.docker.com)…"
-  curl -fsSL https://get.docker.com | sh || die "установка Docker не удалась (дистрибутив не поддержан?)"
+  log "Docker не найден — ставлю из репозитория дистрибутива (подпись проверяет пакетный менеджер)…"
+  if   command -v apt-get >/dev/null; then
+    apt-get update -qq && apt-get install -y -qq docker.io docker-compose-v2 || true
+  elif command -v dnf >/dev/null; then
+    dnf install -y -q moby-engine docker-compose || true
+  fi
   systemctl enable --now docker 2>/dev/null || true
-  docker compose version >/dev/null 2>&1 || die "docker compose недоступен после установки"
+  if ! docker compose version >/dev/null 2>&1; then
+    if [[ "${CITADEL_ALLOW_DOCKER_SCRIPT:-0}" == 1 ]]; then
+      log "⚠ compose v2 нет в репозитории дистрибутива — по явному разрешению ставлю get.docker.com"
+      curl -fsSL https://get.docker.com | sh || die "установка Docker не удалась"
+      systemctl enable --now docker 2>/dev/null || true
+    else
+      die "нет docker с compose v2. Поставь его из репозитория дистрибутива (docker.io + \
+docker-compose-v2 / moby-engine + docker-compose) либо из официального репозитория Docker с GPG. \
+Если осознанно согласен на исполнение скачанного скрипта get.docker.com — CITADEL_ALLOW_DOCKER_SCRIPT=1"
+    fi
+    docker compose version >/dev/null 2>&1 || die "docker compose недоступен после установки"
+  fi
 fi
 # CLI может отвечать, а демон быть остановлен → `docker info` это ловит (иначе `up` падает невнятно)
 if ! docker info >/dev/null 2>&1; then
@@ -602,8 +624,30 @@ REGISTER_PUBS="$CLIENT_PUB"
 # Публичный адрес машины. Определяем ЗДЕСЬ, а не перед печатью ссылки: он нужен уже entrypoint'у
 # exit'а (G1: свой публичный адрес из туннеля недостижим). Заодно установка падает до сборки
 # образа, а не после неё, если адрес не определить.
+#
+# N-8: спрашиваем СНАЧАЛА у самой машины (адрес интерфейса, через который уходит маршрут по
+# умолчанию). Обращение к чужому сервису — только если локальный адрес непубличный (NAT/CGNAT):
+# оно сообщает третьей стороне факт и время установки, а при недоступности сервиса ещё и роняет
+# установку на ровном месте. `CITADEL_NO_EXTERNAL_IP=1` запрещает такой запрос совсем.
+is_public_ip() {
+  case "$1" in
+    ""|10.*|127.*|169.254.*|192.168.*|172.1[6-9].*|172.2[0-9].*|172.3[01].*) return 1 ;;
+    100.6[4-9].*|100.[7-9][0-9].*|100.1[01][0-9].*|100.12[0-7].*) return 1 ;;  # CGNAT 100.64/10
+    *) return 0 ;;
+  esac
+}
 if [[ -z "$SERVER_HOST" ]]; then
-  SERVER_HOST="$(curl -fsS --max-time 8 https://api.ipify.org 2>/dev/null || true)"
+  SERVER_HOST="$(ip -4 route get 1.1.1.1 2>/dev/null |
+    awk '{for(i=1;i<=NF;i++) if($i=="src"){print $(i+1); exit}}')"
+  if is_public_ip "$SERVER_HOST"; then
+    log "публичный адрес взят с интерфейса машины: $SERVER_HOST"
+  elif [[ "${CITADEL_NO_EXTERNAL_IP:-0}" == 1 ]]; then
+    die "локальный адрес непубличный (${SERVER_HOST:-нет}), а внешний запрос запрещён \
+(CITADEL_NO_EXTERNAL_IP=1) — задай CITADEL_SERVER_HOST=<ip/host>"
+  else
+    log "локальный адрес непубличный (${SERVER_HOST:-нет}) — спрашиваю внешний сервис"
+    SERVER_HOST="$(curl -fsS --max-time 8 https://api.ipify.org 2>/dev/null || true)"
+  fi
 fi
 [[ -n "$SERVER_HOST" ]] || die "не удалось определить публичный IP — задай CITADEL_SERVER_HOST=<ip/host>"
 

@@ -6,7 +6,7 @@
 import '../frb_generated.dart';
 import 'package:flutter_rust_bridge/flutter_rust_bridge_for_generated.dart';
 
-// These functions are ignored because they are not marked as `pub`: `android_start`, `debug_flag_file`, `device_seed_of`, `dto_to_split`, `effective_pacing`, `first_line`, `guarded_parse_link`, `idle`, `io_kind_in_chain`, `is_not_found`, `is_permission_denied`, `killswitch_file`, `language_file`, `link_from`, `load_split_config`, `normalize_pacing`, `off`, `pacing_file`, `parse_split`, `profile_to_dto`, `profile_uri`, `read_error`, `rt`, `screenshot_block_file`, `serialize_split`, `spawn_controller`, `split_file`, `start_connect`, `state_dto`, `to_dto`, `traffic_meter_file`, `update_android_status`, `update_last_exit`, `valid_lang`, `vault_error`, `vault_path`, `vpn_state_str`, `with_vault`, `write_error`, `xdg_store_path`
+// These functions are ignored because they are not marked as `pub`: `android_start`, `autolock_file`, `debug_flag_file`, `device_seed_of`, `dto_to_split`, `effective_pacing`, `first_line`, `guarded_parse_link`, `idle`, `io_kind_in_chain`, `ipv6_dto`, `is_not_found`, `is_permission_denied`, `killswitch_file`, `language_file`, `link_from`, `load_split_config`, `normalize_autolock`, `normalize_pacing`, `off`, `pacing_file`, `parse_split`, `profile_to_dto`, `profile_uri`, `read_error`, `rt`, `screenshot_block_file`, `serialize_split`, `spawn_controller`, `split_file`, `start_connect`, `state_dto`, `strict_ipv6_file`, `to_dto`, `traffic_meter_file`, `update_android_status`, `update_last_exit`, `valid_lang`, `vault_error`, `vault_path`, `vpn_state_str`, `with_vault`, `write_error`, `xdg_store_path`
 // These types are ignored because they are neither used by any `pub` functions nor (for structs and enums) marked `#[frb(unignore)]`: `AndroidStatus`, `AndroidTunProvider`
 // These function are ignored because they are on traits that is not defined in current crate (put an empty `#[frb]` on it to unignore): `clone`, `configure`
 
@@ -22,6 +22,15 @@ void setKillswitch({required bool on_}) =>
 /// при первом обращении — персист между запусками.
 bool killswitchEnabled() =>
     RustLib.instance.api.crateApiCitadelKillswitchEnabled();
+
+/// Сохранить настройку «не подключаться без захвата IPv6». Применяется со СЛЕДУЮЩЕГО подключения.
+void setStrictIpv6({required bool on_}) =>
+    RustLib.instance.api.crateApiCitadelSetStrictIpv6(on_: on_);
+
+/// Сохранённое состояние строгого IPv6 (инициализация тумблера + чтение из нативного connect-loop,
+/// где Dart может и не быть). Ленивая подгрузка; файла нет → **дефолт false**.
+bool strictIpv6Enabled() =>
+    RustLib.instance.api.crateApiCitadelStrictIpv6Enabled();
 
 /// Сохранить настройку режима отладки (GUI-тумблер) на диск — переживает рестарт приложения.
 void setDebugEnabled({required bool on_}) =>
@@ -114,6 +123,15 @@ bool vaultIsUnlocked() => RustLib.instance.api.crateApiCitadelVaultIsUnlocked();
 /// раньше «Заблокировать хранилище» на поднятом туннеле обрывало связь (Dart звал `disconnect()`),
 /// хотя пользователь просил ровно обратное — убрать профили с глаз, а не выйти из VPN.
 void vaultLock() => RustLib.instance.api.crateApiCitadelVaultLock();
+
+/// Сохранить таймаут автозамка в минутах (0 — выключить). Незнакомые значения приводятся к
+/// ближайшему разрешённому (см. [`AUTOLOCK_CHOICES`]).
+void setVaultAutolockMinutes({required int minutes}) => RustLib.instance.api
+    .crateApiCitadelSetVaultAutolockMinutes(minutes: minutes);
+
+/// Таймаут автозамка в минутах (0 — выключен). Файла нет → [`AUTOLOCK_DEFAULT_MIN`].
+int vaultAutolockMinutes() =>
+    RustLib.instance.api.crateApiCitadelVaultAutolockMinutes();
 
 /// Где лежит файл хранилища (диагностика в UI: «нет доступа» без пути — бесполезное сообщение).
 String vaultLocation() => RustLib.instance.api.crateApiCitadelVaultLocation();
@@ -306,12 +324,18 @@ class AndroidStatusDto {
   final String cidr;
   final String profileId;
 
+  /// N-1: туннель поднят БЕЗ IPv6-blackhole (устройство отвергло его) — нативный IPv6 идёт мимо
+  /// туннеля. Часть снимка, а не только событие: перезапуск окна над живой сессией обязан
+  /// увидеть предупреждение, а не чистый экран «Защищено».
+  final bool ipv6Uncaptured;
+
   const AndroidStatusDto({
     required this.state,
     required this.exit,
     required this.transport,
     required this.cidr,
     required this.profileId,
+    required this.ipv6Uncaptured,
   });
 
   @override
@@ -320,7 +344,8 @@ class AndroidStatusDto {
       exit.hashCode ^
       transport.hashCode ^
       cidr.hashCode ^
-      profileId.hashCode;
+      profileId.hashCode ^
+      ipv6Uncaptured.hashCode;
 
   @override
   bool operator ==(Object other) =>
@@ -331,7 +356,8 @@ class AndroidStatusDto {
           exit == other.exit &&
           transport == other.transport &&
           cidr == other.cidr &&
-          profileId == other.profileId;
+          profileId == other.profileId &&
+          ipv6Uncaptured == other.ipv6Uncaptured;
 }
 
 /// Один шаг прогона диагностики для UI.

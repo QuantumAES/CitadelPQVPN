@@ -38,7 +38,7 @@ flutter_rust_bridge::frb_generated_boilerplate!(
     default_rust_auto_opaque = RustAutoOpaqueMoi,
 );
 pub(crate) const FLUTTER_RUST_BRIDGE_CODEGEN_VERSION: &str = "2.12.0";
-pub(crate) const FLUTTER_RUST_BRIDGE_CODEGEN_CONTENT_HASH: i32 = 1609869810;
+pub(crate) const FLUTTER_RUST_BRIDGE_CODEGEN_CONTENT_HASH: i32 = 913839949;
 
 // Section: executor
 
@@ -1176,6 +1176,38 @@ fn wire__crate__api__citadel__set_split_config_impl(
         },
     )
 }
+fn wire__crate__api__citadel__set_strict_ipv6_impl(
+    ptr_: flutter_rust_bridge::for_generated::PlatformGeneralizedUint8ListPtr,
+    rust_vec_len_: i32,
+    data_len_: i32,
+) -> flutter_rust_bridge::for_generated::WireSyncRust2DartSse {
+    FLUTTER_RUST_BRIDGE_HANDLER.wrap_sync::<flutter_rust_bridge::for_generated::SseCodec, _>(
+        flutter_rust_bridge::for_generated::TaskInfo {
+            debug_name: "set_strict_ipv6",
+            port: None,
+            mode: flutter_rust_bridge::for_generated::FfiCallMode::Sync,
+        },
+        move || {
+            let message = unsafe {
+                flutter_rust_bridge::for_generated::Dart2RustMessageSse::from_wire(
+                    ptr_,
+                    rust_vec_len_,
+                    data_len_,
+                )
+            };
+            let mut deserializer =
+                flutter_rust_bridge::for_generated::SseDeserializer::new(message);
+            let api_on = <bool>::sse_decode(&mut deserializer);
+            deserializer.end();
+            transform_result_sse::<_, ()>((move || {
+                let output_ok = Result::<_, ()>::Ok({
+                    crate::api::citadel::set_strict_ipv6(api_on);
+                })?;
+                Ok(output_ok)
+            })())
+        },
+    )
+}
 fn wire__crate__api__citadel__set_traffic_meter_impl(
     ptr_: flutter_rust_bridge::for_generated::PlatformGeneralizedUint8ListPtr,
     rust_vec_len_: i32,
@@ -1202,6 +1234,38 @@ fn wire__crate__api__citadel__set_traffic_meter_impl(
             transform_result_sse::<_, ()>((move || {
                 let output_ok = Result::<_, ()>::Ok({
                     crate::api::citadel::set_traffic_meter(api_on);
+                })?;
+                Ok(output_ok)
+            })())
+        },
+    )
+}
+fn wire__crate__api__citadel__set_vault_autolock_minutes_impl(
+    ptr_: flutter_rust_bridge::for_generated::PlatformGeneralizedUint8ListPtr,
+    rust_vec_len_: i32,
+    data_len_: i32,
+) -> flutter_rust_bridge::for_generated::WireSyncRust2DartSse {
+    FLUTTER_RUST_BRIDGE_HANDLER.wrap_sync::<flutter_rust_bridge::for_generated::SseCodec, _>(
+        flutter_rust_bridge::for_generated::TaskInfo {
+            debug_name: "set_vault_autolock_minutes",
+            port: None,
+            mode: flutter_rust_bridge::for_generated::FfiCallMode::Sync,
+        },
+        move || {
+            let message = unsafe {
+                flutter_rust_bridge::for_generated::Dart2RustMessageSse::from_wire(
+                    ptr_,
+                    rust_vec_len_,
+                    data_len_,
+                )
+            };
+            let mut deserializer =
+                flutter_rust_bridge::for_generated::SseDeserializer::new(message);
+            let api_minutes = <u32>::sse_decode(&mut deserializer);
+            deserializer.end();
+            transform_result_sse::<_, ()>((move || {
+                let output_ok = Result::<_, ()>::Ok({
+                    crate::api::citadel::set_vault_autolock_minutes(api_minutes);
                 })?;
                 Ok(output_ok)
             })())
@@ -1263,6 +1327,35 @@ fn wire__crate__api__diag__start_log_capture_impl(
                 let output_ok = Result::<_, ()>::Ok({
                     crate::api::diag::start_log_capture();
                 })?;
+                Ok(output_ok)
+            })())
+        },
+    )
+}
+fn wire__crate__api__citadel__strict_ipv6_enabled_impl(
+    ptr_: flutter_rust_bridge::for_generated::PlatformGeneralizedUint8ListPtr,
+    rust_vec_len_: i32,
+    data_len_: i32,
+) -> flutter_rust_bridge::for_generated::WireSyncRust2DartSse {
+    FLUTTER_RUST_BRIDGE_HANDLER.wrap_sync::<flutter_rust_bridge::for_generated::SseCodec, _>(
+        flutter_rust_bridge::for_generated::TaskInfo {
+            debug_name: "strict_ipv6_enabled",
+            port: None,
+            mode: flutter_rust_bridge::for_generated::FfiCallMode::Sync,
+        },
+        move || {
+            let message = unsafe {
+                flutter_rust_bridge::for_generated::Dart2RustMessageSse::from_wire(
+                    ptr_,
+                    rust_vec_len_,
+                    data_len_,
+                )
+            };
+            let mut deserializer =
+                flutter_rust_bridge::for_generated::SseDeserializer::new(message);
+            deserializer.end();
+            transform_result_sse::<_, ()>((move || {
+                let output_ok = Result::<_, ()>::Ok(crate::api::citadel::strict_ipv6_enabled())?;
                 Ok(output_ok)
             })())
         },
@@ -1359,6 +1452,35 @@ fn wire__crate__api__citadel__vault_add_impl(
                     })(),
                 )
             }
+        },
+    )
+}
+fn wire__crate__api__citadel__vault_autolock_minutes_impl(
+    ptr_: flutter_rust_bridge::for_generated::PlatformGeneralizedUint8ListPtr,
+    rust_vec_len_: i32,
+    data_len_: i32,
+) -> flutter_rust_bridge::for_generated::WireSyncRust2DartSse {
+    FLUTTER_RUST_BRIDGE_HANDLER.wrap_sync::<flutter_rust_bridge::for_generated::SseCodec, _>(
+        flutter_rust_bridge::for_generated::TaskInfo {
+            debug_name: "vault_autolock_minutes",
+            port: None,
+            mode: flutter_rust_bridge::for_generated::FfiCallMode::Sync,
+        },
+        move || {
+            let message = unsafe {
+                flutter_rust_bridge::for_generated::Dart2RustMessageSse::from_wire(
+                    ptr_,
+                    rust_vec_len_,
+                    data_len_,
+                )
+            };
+            let mut deserializer =
+                flutter_rust_bridge::for_generated::SseDeserializer::new(message);
+            deserializer.end();
+            transform_result_sse::<_, ()>((move || {
+                let output_ok = Result::<_, ()>::Ok(crate::api::citadel::vault_autolock_minutes())?;
+                Ok(output_ok)
+            })())
         },
     )
 }
@@ -2172,12 +2294,14 @@ impl SseDecode for crate::api::citadel::AndroidStatusDto {
         let mut var_transport = <String>::sse_decode(deserializer);
         let mut var_cidr = <String>::sse_decode(deserializer);
         let mut var_profileId = <String>::sse_decode(deserializer);
+        let mut var_ipv6Uncaptured = <bool>::sse_decode(deserializer);
         return crate::api::citadel::AndroidStatusDto {
             state: var_state,
             exit: var_exit,
             transport: var_transport,
             cidr: var_cidr,
             profile_id: var_profileId,
+            ipv6_uncaptured: var_ipv6Uncaptured,
         };
     }
 }
@@ -2492,41 +2616,41 @@ fn pde_ffi_dispatcher_primary_impl(
         ),
         23 => wire__crate__api__citadel__parse_link_summary_impl(port, ptr, rust_vec_len, data_len),
         24 => wire__crate__api__citadel__run_diagnostics_impl(port, ptr, rust_vec_len, data_len),
-        40 => wire__crate__api__citadel__vault_add_impl(port, ptr, rust_vec_len, data_len),
-        42 => wire__crate__api__citadel__vault_biometric_disable_impl(
+        43 => wire__crate__api__citadel__vault_add_impl(port, ptr, rust_vec_len, data_len),
+        46 => wire__crate__api__citadel__vault_biometric_disable_impl(
             port,
             ptr,
             rust_vec_len,
             data_len,
         ),
-        43 => wire__crate__api__citadel__vault_biometric_enable_impl(
+        47 => wire__crate__api__citadel__vault_biometric_enable_impl(
             port,
             ptr,
             rust_vec_len,
             data_len,
         ),
-        45 => wire__crate__api__citadel__vault_biometric_key_to_wrap_impl(
+        49 => wire__crate__api__citadel__vault_biometric_key_to_wrap_impl(
             port,
             ptr,
             rust_vec_len,
             data_len,
         ),
-        46 => {
+        50 => {
             wire__crate__api__citadel__vault_change_password_impl(port, ptr, rust_vec_len, data_len)
         }
-        47 => wire__crate__api__citadel__vault_create_impl(port, ptr, rust_vec_len, data_len),
-        58 => wire__crate__api__citadel__vault_unlock_impl(port, ptr, rust_vec_len, data_len),
-        59 => wire__crate__api__citadel__vault_unlock_biometric_impl(
+        51 => wire__crate__api__citadel__vault_create_impl(port, ptr, rust_vec_len, data_len),
+        62 => wire__crate__api__citadel__vault_unlock_impl(port, ptr, rust_vec_len, data_len),
+        63 => wire__crate__api__citadel__vault_unlock_biometric_impl(
             port,
             ptr,
             rust_vec_len,
             data_len,
         ),
-        60 => {
+        64 => {
             wire__crate__api__citadel__vpn_activate_profile_impl(port, ptr, rust_vec_len, data_len)
         }
-        61 => wire__crate__api__citadel__vpn_connect_impl(port, ptr, rust_vec_len, data_len),
-        62 => {
+        65 => wire__crate__api__citadel__vpn_connect_impl(port, ptr, rust_vec_len, data_len),
+        66 => {
             wire__crate__api__citadel__vpn_connect_profile_impl(port, ptr, rust_vec_len, data_len)
         }
         _ => unreachable!(),
@@ -2564,24 +2688,30 @@ fn pde_ffi_dispatcher_sync_impl(
         32 => wire__crate__api__citadel__set_power_save_impl(ptr, rust_vec_len, data_len),
         33 => wire__crate__api__citadel__set_screenshot_block_impl(ptr, rust_vec_len, data_len),
         34 => wire__crate__api__citadel__set_split_config_impl(ptr, rust_vec_len, data_len),
-        35 => wire__crate__api__citadel__set_traffic_meter_impl(ptr, rust_vec_len, data_len),
-        36 => wire__crate__api__citadel__split_config_impl(ptr, rust_vec_len, data_len),
-        37 => wire__crate__api__diag__start_log_capture_impl(ptr, rust_vec_len, data_len),
-        38 => wire__crate__api__citadel__traffic_counters_impl(ptr, rust_vec_len, data_len),
-        39 => wire__crate__api__citadel__traffic_meter_enabled_impl(ptr, rust_vec_len, data_len),
-        41 => wire__crate__api__citadel__vault_biometric_blob_impl(ptr, rust_vec_len, data_len),
-        44 => wire__crate__api__citadel__vault_biometric_enrolled_impl(ptr, rust_vec_len, data_len),
-        48 => wire__crate__api__citadel__vault_exists_impl(ptr, rust_vec_len, data_len),
-        49 => wire__crate__api__citadel__vault_is_unlocked_impl(ptr, rust_vec_len, data_len),
-        50 => wire__crate__api__citadel__vault_list_impl(ptr, rust_vec_len, data_len),
-        51 => wire__crate__api__citadel__vault_location_impl(ptr, rust_vec_len, data_len),
-        52 => wire__crate__api__citadel__vault_lock_impl(ptr, rust_vec_len, data_len),
-        53 => wire__crate__api__citadel__vault_max_name_len_impl(ptr, rust_vec_len, data_len),
-        54 => wire__crate__api__citadel__vault_min_password_len_impl(ptr, rust_vec_len, data_len),
-        55 => wire__crate__api__citadel__vault_move_to_impl(ptr, rust_vec_len, data_len),
-        56 => wire__crate__api__citadel__vault_remove_impl(ptr, rust_vec_len, data_len),
-        57 => wire__crate__api__citadel__vault_rename_impl(ptr, rust_vec_len, data_len),
-        63 => wire__crate__api__citadel__vpn_disconnect_impl(ptr, rust_vec_len, data_len),
+        35 => wire__crate__api__citadel__set_strict_ipv6_impl(ptr, rust_vec_len, data_len),
+        36 => wire__crate__api__citadel__set_traffic_meter_impl(ptr, rust_vec_len, data_len),
+        37 => {
+            wire__crate__api__citadel__set_vault_autolock_minutes_impl(ptr, rust_vec_len, data_len)
+        }
+        38 => wire__crate__api__citadel__split_config_impl(ptr, rust_vec_len, data_len),
+        39 => wire__crate__api__diag__start_log_capture_impl(ptr, rust_vec_len, data_len),
+        40 => wire__crate__api__citadel__strict_ipv6_enabled_impl(ptr, rust_vec_len, data_len),
+        41 => wire__crate__api__citadel__traffic_counters_impl(ptr, rust_vec_len, data_len),
+        42 => wire__crate__api__citadel__traffic_meter_enabled_impl(ptr, rust_vec_len, data_len),
+        44 => wire__crate__api__citadel__vault_autolock_minutes_impl(ptr, rust_vec_len, data_len),
+        45 => wire__crate__api__citadel__vault_biometric_blob_impl(ptr, rust_vec_len, data_len),
+        48 => wire__crate__api__citadel__vault_biometric_enrolled_impl(ptr, rust_vec_len, data_len),
+        52 => wire__crate__api__citadel__vault_exists_impl(ptr, rust_vec_len, data_len),
+        53 => wire__crate__api__citadel__vault_is_unlocked_impl(ptr, rust_vec_len, data_len),
+        54 => wire__crate__api__citadel__vault_list_impl(ptr, rust_vec_len, data_len),
+        55 => wire__crate__api__citadel__vault_location_impl(ptr, rust_vec_len, data_len),
+        56 => wire__crate__api__citadel__vault_lock_impl(ptr, rust_vec_len, data_len),
+        57 => wire__crate__api__citadel__vault_max_name_len_impl(ptr, rust_vec_len, data_len),
+        58 => wire__crate__api__citadel__vault_min_password_len_impl(ptr, rust_vec_len, data_len),
+        59 => wire__crate__api__citadel__vault_move_to_impl(ptr, rust_vec_len, data_len),
+        60 => wire__crate__api__citadel__vault_remove_impl(ptr, rust_vec_len, data_len),
+        61 => wire__crate__api__citadel__vault_rename_impl(ptr, rust_vec_len, data_len),
+        67 => wire__crate__api__citadel__vpn_disconnect_impl(ptr, rust_vec_len, data_len),
         _ => unreachable!(),
     }
 }
@@ -2597,6 +2727,7 @@ impl flutter_rust_bridge::IntoDart for crate::api::citadel::AndroidStatusDto {
             self.transport.into_into_dart().into_dart(),
             self.cidr.into_into_dart().into_dart(),
             self.profile_id.into_into_dart().into_dart(),
+            self.ipv6_uncaptured.into_into_dart().into_dart(),
         ]
         .into_dart()
     }
@@ -2871,6 +3002,7 @@ impl SseEncode for crate::api::citadel::AndroidStatusDto {
         <String>::sse_encode(self.transport, serializer);
         <String>::sse_encode(self.cidr, serializer);
         <String>::sse_encode(self.profile_id, serializer);
+        <bool>::sse_encode(self.ipv6_uncaptured, serializer);
     }
 }
 

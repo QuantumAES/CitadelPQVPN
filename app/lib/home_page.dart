@@ -199,6 +199,7 @@ class _HomePageState extends State<HomePage> {
               _StatusCard(
                 state: s,
                 onDisconnect: s.disconnect,
+                onIpv6Warning: _showIpv6Warning,
                 rxRate: _traffic.rxRate,
                 txRate: _traffic.txRate,
               ),
@@ -491,6 +492,20 @@ class _HomePageState extends State<HomePage> {
                   _showAlwaysOnGuide();
                 },
               ),
+            // N-1: что делать, если устройство не даёт захватить IPv6 в туннель. Выключено —
+            // подниматься и честно предупреждать плашкой; включено — не подниматься вовсе.
+            // Только Android: на Linux/Windows захват IPv6 fail-closed и без настройки (A2/W1).
+            if (Platform.isAndroid)
+              SwitchListTile(
+                secondary: const Icon(Icons.filter_alt_outlined),
+                title: Text(t('strict_ipv6_title')),
+                subtitle: Text(t('strict_ipv6_sub')),
+                value: s.strictIpv6,
+                onChanged: (_) {
+                  s.toggleStrictIpv6();
+                  Navigator.pop(sheetCtx);
+                },
+              ),
             // C8.3 split-tunnel — Android (приложения+назначения); Linux/Windows (только назначения:
             // единый winnet::split_routes + bypass привилегированной части — helper/служба).
             if (Platform.isAndroid || Platform.isLinux || Platform.isWindows)
@@ -507,6 +522,19 @@ class _HomePageState extends State<HomePage> {
                   );
                 },
               ),
+            // N-2: автозамок хранилища. В хранилище лежит мастер-ссылка (admin-плоскость целиком),
+            // поэтому «открыто до выхода из приложения» — не тот дефолт, который можно оставлять.
+            ListTile(
+              leading: const Icon(Icons.lock_clock_outlined),
+              title: Text(t('autolock_title')),
+              subtitle: Text(s.autolockMinutes == 0
+                  ? t('autolock_sub_off')
+                  : t('autolock_sub_on', {'min': '${s.autolockMinutes}'})),
+              onTap: () {
+                Navigator.pop(sheetCtx);
+                _pickAutolock();
+              },
+            ),
             // Admin (C7.4): реестр абонентов живёт в меню admin-профиля («Абоненты»), не здесь —
             // операции идут по туннелю этого профиля, SSH-путь удалён.
             // Где лежит файл хранилища. Не мелочь: разбор жалобы «пароль не меняется» на Windows
@@ -592,6 +620,39 @@ class _HomePageState extends State<HomePage> {
     if (picked != null && picked != s.pacing) s.setPacing(picked);
   }
 
+  /// Выбор таймаута автозамка (N-2). Рядом с выбором — строка о том, что замок делает и чего НЕ
+  /// делает: он прячет профили и мастер-ссылку, но не рвёт активный туннель (иначе автозамок
+  /// первым делом выключали бы).
+  Future<void> _pickAutolock() async {
+    final picked = await showDialog<int>(
+      context: context,
+      builder: (dctx) => RadioGroup<int>(
+        groupValue: s.autolockMinutes,
+        onChanged: (v) => Navigator.pop(dctx, v),
+        child: SimpleDialog(
+          title: Text(Strings.of(dctx)('autolock_title')),
+          children: [
+            for (final minutes in kAutolockChoices)
+              RadioListTile<int>(
+                value: minutes,
+                title: Text(minutes == 0
+                    ? Strings.of(dctx)('autolock_off')
+                    : Strings.of(dctx)('autolock_minutes', {'min': '$minutes'})),
+              ),
+            Padding(
+              padding: const EdgeInsets.fromLTRB(24, 8, 24, 16),
+              child: Text(
+                Strings.of(dctx)('autolock_note'),
+                style: Theme.of(dctx).textTheme.bodySmall,
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+    if (picked != null && picked != s.autolockMinutes) s.setAutolockMinutes(picked);
+  }
+
   /// Выбор языка интерфейса. Языки перечислены на самих себе («Deutsch», «हिन्दी») — человек ищет
   /// в списке свой язык, а не перевод его названия на текущий. Выбор применяется сразу (весь
   /// MaterialApp перестраивается) и сохраняется ядром рядом с хранилищем.
@@ -671,6 +732,28 @@ class _HomePageState extends State<HomePage> {
         );
       },
     );
+  }
+
+  /// N-1: устройство не дало захватить IPv6 в туннель — объясняем, чем это грозит и что делать.
+  /// Оба выхода настоящие: системный always-on+lockdown режет весь не-VPN трафик (включая IPv6),
+  /// строгий режим — не поднимает туннель, который не может закрыть IPv6.
+  Future<void> _showIpv6Warning() async {
+    final ok = await showDialog<bool>(
+      context: context,
+      builder: (dctx) => AlertDialog(
+        icon: const Icon(Icons.warning_amber_outlined),
+        title: Text(t('ipv6_warn_title')),
+        content: Text(t('ipv6_warn_body')),
+        actions: [
+          TextButton(onPressed: () => Navigator.pop(dctx, false), child: Text(t('close'))),
+          FilledButton(
+            onPressed: () => Navigator.pop(dctx, true),
+            child: Text(t('open_settings')),
+          ),
+        ],
+      ),
+    );
+    if (ok == true) await AndroidVpn.openVpnSettings();
   }
 
   /// Android kill-switch = системный always-on+lockdown: объясняем и ведём в настройки VPN.
@@ -1090,11 +1173,15 @@ class _StatusCard extends StatelessWidget {
   const _StatusCard({
     required this.state,
     required this.onDisconnect,
+    required this.onIpv6Warning,
     this.rxRate = 0,
     this.txRate = 0,
   });
   final AppState state;
   final VoidCallback onDisconnect;
+
+  /// N-1: тап по плашке «IPv6 мимо туннеля» — разбор и путь в системные настройки VPN.
+  final VoidCallback onIpv6Warning;
 
   /// Текущая скорость приёма/передачи, байт/с (0, если индикация выключена или сессии нет).
   final double rxRate, txRate;
@@ -1213,6 +1300,39 @@ class _StatusCard extends StatelessWidget {
                     .textTheme
                     .bodyMedium
                     ?.copyWith(color: fg.withValues(alpha: 0.9)),
+              ),
+            ),
+          ],
+          // N-1: туннель поднят, но IPv6 в него не захвачен — «Защищено» без оговорки было бы
+          // неправдой на dual-stack (нативный IPv6 идёт мимо туннеля). Плашка внутри статуса, а
+          // не тост: состояние держится всю сессию, а тост исчезает через три секунды.
+          if (state.ipv6Uncaptured) ...[
+            const SizedBox(height: 12),
+            InkWell(
+              onTap: onIpv6Warning,
+              borderRadius: BorderRadius.circular(12),
+              child: Container(
+                width: double.infinity,
+                padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+                decoration: BoxDecoration(
+                  color: fg.withValues(alpha: 0.10),
+                  borderRadius: BorderRadius.circular(12),
+                  border: Border.all(color: fg.withValues(alpha: 0.35)),
+                ),
+                child: Row(
+                  children: [
+                    Icon(Icons.warning_amber_outlined, color: fg, size: 18),
+                    const SizedBox(width: 8),
+                    Expanded(
+                      child: Text(t('ipv6_warn'),
+                          style: Theme.of(context)
+                              .textTheme
+                              .bodySmall
+                              ?.copyWith(color: fg)),
+                    ),
+                    Icon(Icons.chevron_right, color: fg, size: 18),
+                  ],
+                ),
               ),
             ),
           ],

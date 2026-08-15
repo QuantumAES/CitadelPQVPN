@@ -38,6 +38,8 @@ const Map<String, String> langIt = {
   'err_no_vpn_permission_hint': 'consenti la connessione nella finestra di sistema',
   'err_activation_failed': 'Impossibile attivare il link',
   'err_activation_failed_hint': 'chiedi un nuovo link all’amministratore: il link iniziale si attiva una sola volta e per un tempo limitato',
+  'err_ipv6_required': 'Tunnel non stabilito: IPv6 non catturato',
+  'err_ipv6_required_hint': 'l’IPv6 rigoroso è attivo — disattivalo nelle impostazioni oppure attiva la VPN sempre attiva',
 
   'switch_title': 'Cambiare connessione?',
   'switch_body': 'Ora è connesso «{current}». Disconnetterlo e connettersi a «{name}»?',
@@ -103,9 +105,19 @@ const Map<String, String> langIt = {
   'killswitch_sub': 'Blocca il traffico fuori dal tunnel (fail-closed); dalla prossima sessione',
   'killswitch_android_title': 'Kill switch (sempre attivo)',
   'killswitch_android_sub': 'Da configurare nelle impostazioni VPN di sistema',
+  'strict_ipv6_title': 'IPv6 rigoroso',
+  'strict_ipv6_sub': 'Non connettersi se il dispositivo non instrada l’IPv6 nel tunnel',
   'split_title': 'Tunnel diviso',
   'split_sub_android': 'Per app e indirizzi: nel tunnel / fuori dal tunnel',
   'split_sub_desktop': 'Per indirizzi di destinazione: nel tunnel / fuori dal tunnel',
+  'autolock_title': 'Blocco automatico dell’archivio',
+  'autolock_sub_off': 'Disattivato: l’archivio resta aperto fino all’uscita dall’app',
+  'autolock_sub_on': 'Blocca dopo {min} min di inattività',
+  'autolock_off': 'Disattivato',
+  'autolock_minutes': '{min} min',
+  'autolock_note': 'Il blocco toglie i profili e il link principale dallo schermo e dalla '
+      'memoria. Non tocca il tunnel attivo; si rientra con l’impronta o la '
+      'password principale.',
   'vault_location_title': 'Archivio dei profili',
   'vault_path_copied': 'Percorso dell’archivio copiato',
   'language_title': 'Lingua dell’app',
@@ -129,6 +141,16 @@ const Map<String, String> langIt = {
       '• VPN sempre attiva (Always-on VPN)\n'
       '• Blocca le connessioni senza VPN',
   'open_settings': 'Apri le impostazioni',
+  'ipv6_warn': 'L’IPv6 passa fuori dal tunnel — dettagli',
+  'ipv6_warn_title': 'IPv6 non catturato',
+  'ipv6_warn_body': 'Questo dispositivo ha rifiutato di instradare l’IPv6 nel tunnel. Il tunnel funziona, ma '
+      'il traffico IPv6 (e il DNS IPv6) passa direttamente al di fuori: su una rete IPv6 '
+      'questo rivela il tuo indirizzo.\n\n'
+      'Cosa fare:\n'
+      '• attivare «VPN sempre attiva» e «Blocca connessioni senza VPN» per CitadelPQVPN: '
+      'il sistema blocca allora tutto il traffico fuori dal tunnel;\n'
+      '• oppure attivare «IPv6 rigoroso» nelle impostazioni: il tunnel non si alzerà finché '
+      'l’IPv6 non è catturato.',
 
   'new_profile': 'Nuovo profilo',
   'link_label': 'link citadel://',
@@ -218,6 +240,7 @@ const Map<String, String> langIt = {
   'issued_title_named': 'Accesso rilasciato: {label}',
   'copy_link': 'Copia il link',
   'link_copied': 'Link copiato',
+  'clipboard_autoclear': 'gli appunti si svuotano da soli',
   'verify_code_label': 'Codice di verifica dall\'amministratore',
   'verify_code_hint': '6 caratteri',
   'verify_code_help': 'L\'amministratore lo comunica separatamente dal link (a voce, di persona). Se coincide, il link non è stato manomesso durante la consegna.',

@@ -38,6 +38,8 @@ const Map<String, String> langEs = {
   'err_no_vpn_permission_hint': 'permite la conexión en el diálogo del sistema',
   'err_activation_failed': 'No se pudo activar el enlace',
   'err_activation_failed_hint': 'pida un enlace nuevo al administrador: el enlace inicial se activa una sola vez y por tiempo limitado',
+  'err_ipv6_required': 'Túnel no establecido: IPv6 no capturado',
+  'err_ipv6_required_hint': 'el IPv6 estricto está activado: desactívelo en los ajustes o active la VPN siempre activa',
 
   'switch_title': '¿Cambiar de conexión?',
   'switch_body': 'Ahora está conectado «{current}». ¿Desconectarlo y conectar a «{name}»?',
@@ -102,9 +104,19 @@ const Map<String, String> langEs = {
   'killswitch_sub': 'Bloquear el tráfico fuera del túnel (fail-closed); desde la próxima sesión',
   'killswitch_android_title': 'Kill switch (siempre activo)',
   'killswitch_android_sub': 'Se configura en los ajustes de VPN del sistema',
+  'strict_ipv6_title': 'IPv6 estricto',
+  'strict_ipv6_sub': 'No conectar si el dispositivo no permite llevar el IPv6 al túnel',
   'split_title': 'Túnel dividido',
   'split_sub_android': 'Por aplicaciones y direcciones: por el túnel / fuera del túnel',
   'split_sub_desktop': 'Por direcciones de destino: por el túnel / fuera del túnel',
+  'autolock_title': 'Bloqueo automático del almacén',
+  'autolock_sub_off': 'Desactivado: el almacén sigue abierto hasta salir de la aplicación',
+  'autolock_sub_on': 'Bloquear tras {min} min sin actividad',
+  'autolock_off': 'Desactivado',
+  'autolock_minutes': '{min} min',
+  'autolock_note': 'El bloqueo retira los perfiles y el enlace maestro de la pantalla y de la '
+      'memoria. No toca el túnel activo; vuelva con la huella o la contraseña '
+      'maestra.',
   'vault_location_title': 'Almacén de perfiles',
   'vault_path_copied': 'Ruta del almacén copiada',
   'language_title': 'Idioma de la aplicación',
@@ -128,6 +140,16 @@ const Map<String, String> langEs = {
       '• VPN siempre activa (Always-on VPN)\n'
       '• Bloquear conexiones sin VPN',
   'open_settings': 'Abrir los ajustes',
+  'ipv6_warn': 'El IPv6 va fuera del túnel: más información',
+  'ipv6_warn_title': 'IPv6 no capturado',
+  'ipv6_warn_body': 'Este dispositivo no aceptó llevar el IPv6 al túnel. El túnel funciona, pero el tráfico '
+      'IPv6 (y el DNS IPv6) va directo, por fuera: en una red con IPv6 eso revela su '
+      'dirección.\n\n'
+      'Qué hacer:\n'
+      '• activar «VPN siempre activa» y «Bloquear conexiones sin VPN» para CitadelPQVPN: '
+      'el sistema corta entonces todo el tráfico fuera del túnel;\n'
+      '• o activar «IPv6 estricto» en los ajustes: el túnel no se levantará mientras el '
+      'IPv6 no esté capturado.',
 
   'new_profile': 'Perfil nuevo',
   'link_label': 'enlace citadel://',
@@ -217,6 +239,7 @@ const Map<String, String> langEs = {
   'issued_title_named': 'Acceso emitido: {label}',
   'copy_link': 'Copiar el enlace',
   'link_copied': 'Enlace copiado',
+  'clipboard_autoclear': 'el portapapeles se borra solo',
   'verify_code_label': 'Código de verificación del administrador',
   'verify_code_hint': '6 caracteres',
   'verify_code_help': 'El administrador lo dicta por separado del enlace (de viva voz, en persona). Si coincide, el enlace no fue manipulado en el camino.',

@@ -49,6 +49,14 @@ class AndroidVpn {
         'down': down,
       });
 
+  /// N-3: положить в буфер обмена ЧУВСТВИТЕЛЬНОЕ — с пометкой `EXTRA_IS_SENSITIVE` (Android 13+:
+  /// системное превью показывает «•••» вместо содержимого) и автоочисткой через `ttlSeconds`.
+  /// `false` — платформа не справилась, вызывающий кладёт обычным путём.
+  static Future<bool> copySensitive(String text, int ttlSeconds) async =>
+      (await _ch.invokeMethod<bool>(
+          'copySensitive', {'text': text, 'ttlSeconds': ttlSeconds})) ??
+      false;
+
   /// C8.3: список запускаемых приложений для split-tunnel picker'а. Каждый элемент — `(package, label)`.
   static Future<List<({String package, String label})>> listInstalledApps() async {
     final raw = await _ch.invokeMethod<List<dynamic>>('listInstalledApps') ?? const [];

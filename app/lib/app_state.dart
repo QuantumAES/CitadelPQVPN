@@ -4,6 +4,7 @@ import 'dart:io';
 import 'package:flutter/foundation.dart';
 
 import 'package:app/android_vpn.dart';
+import 'package:app/autolock.dart';
 import 'package:app/biometric.dart';
 import 'package:app/l10n/strings.dart';
 import 'package:app/src/rust/api/citadel.dart';
@@ -18,6 +19,10 @@ enum VpnPhase { off, connecting, up, error }
 const kPacingOff = 'off';
 const kPacingLite = 'lite';
 const kPacingStrict = 'on';
+
+/// N-2: варианты таймаута автозамка хранилища в минутах (0 — выключен). Тот же набор enforce'ит
+/// ядро (`AUTOLOCK_CHOICES`): значение вне набора оно приводит к дефолту, а не к «выключено».
+const kAutolockChoices = [0, 1, 5, 15];
 
 /// Единый источник состояния приложения: vault (разблокировка/профили) + активная VPN-сессия.
 /// Тонкая обёртка над FFI `citadel-client`; UI слушает через [ChangeNotifier].
@@ -51,6 +56,24 @@ class AppState extends ChangeNotifier {
     setKillswitch(on_: killswitch);
     notifyListeners();
   }
+
+  /// N-1: строгий IPv6 (Android). Туннель IPv4-only, весь IPv6 захватывается в него blackhole'ом
+  /// (`::/0` + dummy-ULA); часть устройств такой адрес не принимает, и тогда клиент поднимает
+  /// туннель БЕЗ захвата — на dual-stack это нативный IPv6 мимо туннеля. Тумблер выбирает, что
+  /// делать в этом случае: **выключен** (по умолчанию) — подниматься и предупредить
+  /// ([ipv6Uncaptured]), **включён** — не подниматься вовсе.
+  bool strictIpv6 = strictIpv6Enabled();
+
+  void toggleStrictIpv6() {
+    strictIpv6 = !strictIpv6;
+    setStrictIpv6(on_: strictIpv6);
+    notifyListeners();
+  }
+
+  /// N-1: последний establish прошёл БЕЗ IPv6-blackhole — IPv6 идёт мимо туннеля. Приходит
+  /// событием ядра (`kind=ipv6`) на каждый (ре)коннект в обе стороны, поэтому предупреждение и
+  /// появляется, и снимается само.
+  bool ipv6Uncaptured = false;
 
   /// Язык интерфейса (код `ru`, `en`, …). Хранится ядром рядом с vault, а не внутри него: экран
   /// разблокировки уже говорит с человеком, а хранилище на тот момент закрыто. Дефолт — русский.
@@ -236,6 +259,7 @@ class AppState extends ChangeNotifier {
     exit = st.exit;
     transport = st.transport;
     cidr = st.cidr;
+    ipv6Uncaptured = st.ipv6Uncaptured; // N-1: предупреждение переживает перезапуск окна
     _onState(st.state);
     _sub?.cancel();
     _sub = androidAttachEvents().listen(_handleEvent, onError: _onStreamError);
@@ -247,6 +271,7 @@ class AppState extends ChangeNotifier {
   Future<void> unlock(String pw) async {
     await vaultUnlock(passphrase: pw);
     _unlocked = true;
+    autoLock.setUnlocked(true); // N-2: с этой секунды идёт отсчёт простоя
     // C9: система уничтожила ключ биометрии (добавили отпечаток, очистили данные приложения), а
     // слот в файле остался. Вычищаем его при первом же входе по паролю — иначе кнопка «Войти
     // отпечатком» продолжала бы обещать то, чего платформа уже не может.
@@ -260,6 +285,7 @@ class AppState extends ChangeNotifier {
   Future<void> createVault(String pw) async {
     await vaultCreate(passphrase: pw);
     _unlocked = true;
+    autoLock.setUnlocked(true);
     _reloadProfiles();
     notifyListeners();
   }
@@ -325,6 +351,7 @@ class AppState extends ChangeNotifier {
       // Отметить открытие НАДО до уборки: иначе любой отказ в `finally` оставляет ядро с открытым
       // хранилищем, а экран — запертым (ровно так выглядел упавший вход по отпечатку).
       _unlocked = true;
+      autoLock.setUnlocked(true);
     } finally {
       BiometricUnlock.zeroize(key); // ключ хранилища не должен пережить эту строку
     }
@@ -358,6 +385,25 @@ class AppState extends ChangeNotifier {
     notifyListeners();
   }
 
+  // ───────────────────── N-2: автозамок хранилища (таймаут простоя) ─────────────────────
+
+  /// Таймаут автозамка в минутах (0 — выключен). Хранится ядром рядом с vault; **дефолт 5 минут**
+  /// (см. `vault_autolock_minutes`): в хранилище лежит мастер-ссылка, то есть admin-плоскость.
+  int autolockMinutes = vaultAutolockMinutes();
+
+  /// Сам автозамок. Логика (простой + уход в фон) живёт отдельным классом без FFI и виджетов —
+  /// поэтому проверяется тестом, а не руками на телефоне. Здесь только проводка: замок зовёт
+  /// [lockVault], который туннель не трогает.
+  late final AutoLock autoLock = AutoLock(onLock: lockVault)
+    ..configure(Duration(minutes: autolockMinutes));
+
+  void setAutolockMinutes(int minutes) {
+    autolockMinutes = minutes;
+    setVaultAutolockMinutes(minutes: minutes);
+    autoLock.configure(Duration(minutes: minutes));
+    notifyListeners();
+  }
+
   /// Заблокировать хранилище. Живую сессию НЕ трогаем: замок — про секреты на диске, а не про
   /// туннель. Всё нужное для работы движок уже держит у себя (ссылка разобрана при старте сессии,
   /// свежий Layer-1 токен на каждый establish добывает собственный refresher); из хранилища живая
@@ -370,6 +416,7 @@ class AppState extends ChangeNotifier {
   void lockVault() {
     vaultLock();
     _unlocked = false;
+    autoLock.setUnlocked(false); // запирать больше нечего — таймер снимаем
     profiles = [];
     notifyListeners();
   }
@@ -468,6 +515,7 @@ class AppState extends ChangeNotifier {
     reconnecting = false;
     activeProfileId = profileId;
     exit = transport = cidr = '';
+    ipv6Uncaptured = false; // N-1: прошлое предупреждение не про эту попытку
     _clearError();
     since = null;
     notifyListeners();
@@ -496,6 +544,7 @@ class AppState extends ChangeNotifier {
     activeProfileId = profileId;
     if (profileId != null) lastProfileId = profileId; // переживёт отключение (нужно диагностике)
     exit = transport = cidr = '';
+    ipv6Uncaptured = false; // N-1: см. _androidConnect
     _clearError();
     since = null;
     _sessionLive = true; // цикл ядра пошёл — остановить его может только пользователь
@@ -517,6 +566,9 @@ class AppState extends ChangeNotifier {
         exit = ev.exit;
         transport = ev.transport;
         cidr = ev.cidr;
+      case 'ipv6':
+        // Не отказ, а качество защиты: туннель работает, но IPv6 может идти мимо него (N-1).
+        ipv6Uncaptured = ev.state == 'uncaptured';
       case 'error':
         final (title, hint) = _classify(ev.error);
         _setError(title, hint, ev.error);
@@ -544,6 +596,11 @@ class AppState extends ChangeNotifier {
   /// про выбранный язык, а экран (`_StatusCard`) переводит их при отрисовке — так смена языка
   /// перерисовывает и уже показанный отказ.
   static (String, String) _classify(String err) {
+    // N-1: строгий режим сам отказался поднимать туннель без захвата IPv6. Виновник локальный
+    // (устройство + настройка), и подсказка здесь говорит ровно то, что человек может сделать.
+    if (err.contains('IPv6')) {
+      return ('err_ipv6_required', 'err_ipv6_required_hint');
+    }
     if (err.contains('citadel-svc') || err.contains('CitadelPQVPN')) {
       if (err.contains('SERVICE_START') || err.contains('os error 5')) {
         return ('err_service_not_started', 'err_service_not_started_hint');
@@ -590,6 +647,7 @@ class AppState extends ChangeNotifier {
     reconnecting = false;
     activeProfileId = null;
     exit = transport = cidr = '';
+    ipv6Uncaptured = false;
     _clearError(); // отключились сами — прошлый отказ больше не про текущее состояние
     since = null;
     notifyListeners();
@@ -598,6 +656,7 @@ class AppState extends ChangeNotifier {
   @override
   void dispose() {
     _sub?.cancel();
+    autoLock.dispose();
     super.dispose();
   }
 }

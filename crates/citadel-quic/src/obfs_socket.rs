@@ -957,8 +957,34 @@ pub fn server_endpoint_obfs(
     psk: PskSource,
 ) -> Result<quinn::Endpoint> {
     // Сервер шейпит по своему `Citadel_PACING`: клиентский тумблер маскирует только ОТПРАВКУ
-    // абонента, ответное направление — забота оператора exit'а (M-8, §17.2).
-    build_endpoint(std::net::UdpSocket::bind(listen)?, Some(server_config), psk, pacing_from_env())
+    // абонента, ответное направление — забота оператора exit'а (M-8, §17.2). Но chaff здесь
+    // запрещён — см. [`check_server_chaff`].
+    let raw = std::env::var("Citadel_PACING").unwrap_or_default();
+    check_server_chaff(&raw)?;
+    build_endpoint(std::net::UdpSocket::bind(listen)?, Some(server_config), psk, parse_pacing(&raw))
+}
+
+/// N-4: chaff на СЕРВЕРНОЙ стороне запрещён кодом, а не договорённостью в документе.
+///
+/// Маркер пользовательского трафика (`dataplane::user_packets`) — один на процесс. У клиента это
+/// верно: туннель там один. На exit'е один процесс обслуживает всех абонентов сразу, поэтому
+/// chaff, взводимый «был ли трафик», взводился бы у одного абонента трафиком другого — то есть
+/// появился бы межклиентский тайминговый сайд-канал ровно там, где вся конструкция обещает
+/// обратное. Пока это держалось на том, что установщик не выставляет `Citadel_PACING`; одна
+/// строка в чужом systemd-юните отменяла бы обещание молча.
+///
+/// Запрещён именно **chaff**, а не пейсинг вообще: выпуск по слот-сетке без пустых слотов
+/// (`5:32:off`) счётчик не читает и остаётся законным инструментом оператора.
+fn check_server_chaff(raw: &str) -> Result<()> {
+    match parse_pacing(raw) {
+        Pacing::Slotted { chaff: Chaff::Adaptive { .. } | Chaff::Always, .. } => Err(anyhow!(
+            "Citadel_PACING={raw:?}: chaff на серверной стороне запрещён — маркер \
+             пользовательского трафика один на процесс, и chaff одного абонента взводился бы \
+             трафиком другого (межклиентский тайминговый канал). Уберите переменную либо задайте \
+             форму без chaff, например `5:32:off`; маскировку ОТПРАВКИ включает клиент у себя"
+        )),
+        _ => Ok(()),
+    }
 }
 
 /// КЛИЕНТ: ключ всегда один — тот, что он получил у издателя на текущую эпоху (или бутстрапный
@@ -1062,6 +1088,23 @@ mod tests {
         match pacing_profile(Some("on")) {
             Pacing::Slotted { burst, .. } => assert_eq!(burst, 32),
             Pacing::None => panic!("явный профиль `on` обязан включать шейпинг"),
+        }
+    }
+
+    /// N-4: серверный endpoint не должен подниматься с chaff'ом — маркер пользовательского
+    /// трафика процессный, и на exit'е chaff одного абонента взводился бы трафиком другого.
+    /// Раньше это держалось только на том, что установщик не пишет `Citadel_PACING`.
+    #[test]
+    fn server_refuses_chaff_but_allows_plain_slotting() {
+        for forbidden in ["on", "strict", "lite", "max", "always", "10:8:always", "5:32:adaptive"] {
+            let err = check_server_chaff(forbidden).expect_err("{forbidden} обязан быть отвергнут");
+            let msg = format!("{err}");
+            assert!(msg.contains("chaff"), "причина отказа обязана называть chaff: {msg}");
+            assert!(msg.contains(forbidden), "в отказе должно быть само значение: {msg}");
+        }
+        for allowed in ["", "off", "none", "0", "5:32:off", "3:16:off"] {
+            check_server_chaff(allowed)
+                .unwrap_or_else(|e| panic!("{allowed:?} обязан оставаться разрешённым: {e}"));
         }
     }
 

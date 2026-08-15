@@ -38,6 +38,8 @@ const Map<String, String> langCs = {
   'err_no_vpn_permission_hint': 'povolte připojení v systémovém dialogu',
   'err_activation_failed': 'Odkaz se nepodařilo aktivovat',
   'err_activation_failed_hint': 'požádejte správce o nový odkaz: první odkaz se aktivuje jednou a jen omezenou dobu',
+  'err_ipv6_required': 'Tunel nebyl navázán: IPv6 není zachyceno',
+  'err_ipv6_required_hint': 'přísné IPv6 je zapnuté — vypněte je v nastavení nebo zapněte trvalou síť VPN',
 
   'switch_title': 'Přepnout připojení?',
   'switch_body': 'Nyní je připojeno „{current}“. Odpojit je a připojit se k „{name}“?',
@@ -102,9 +104,18 @@ const Map<String, String> langCs = {
   'killswitch_sub': 'Blokovat provoz mimo tunel (fail-closed); od příští relace',
   'killswitch_android_title': 'Kill switch (always-on)',
   'killswitch_android_sub': 'Nastavuje se v systémovém nastavení VPN',
+  'strict_ipv6_title': 'Přísné IPv6',
+  'strict_ipv6_sub': 'Nepřipojovat se, pokud zařízení nepustí IPv6 do tunelu',
   'split_title': 'Dělený tunel',
   'split_sub_android': 'Podle aplikací a adres: tunelem / mimo tunel',
   'split_sub_desktop': 'Podle cílových adres: tunelem / mimo tunel',
+  'autolock_title': 'Automatické zamykání trezoru',
+  'autolock_sub_off': 'Vypnuto — trezor zůstává otevřený až do ukončení aplikace',
+  'autolock_sub_on': 'Zamknout po {min} min nečinnosti',
+  'autolock_off': 'Vypnuto',
+  'autolock_minutes': '{min} min',
+  'autolock_note': 'Zámek odebere profily a hlavní odkaz z obrazovky i z paměti. Aktivního '
+      'tunelu se nedotkne; zpět se dostanete otiskem nebo hlavním heslem.',
   'vault_location_title': 'Trezor profilů',
   'vault_path_copied': 'Cesta k trezoru zkopírována',
   'language_title': 'Jazyk aplikace',
@@ -127,6 +138,15 @@ const Map<String, String> langCs = {
       '• Trvalá VPN (Always-on VPN)\n'
       '• Blokovat připojení bez VPN',
   'open_settings': 'Otevřít nastavení',
+  'ipv6_warn': 'IPv6 jde mimo tunel — podrobnosti',
+  'ipv6_warn_title': 'IPv6 není zachyceno',
+  'ipv6_warn_body': 'Toto zařízení nepřijalo zachycení IPv6 do tunelu. Tunel funguje, ale provoz IPv6 '
+      '(a IPv6 DNS) jde přímo mimo něj — v síti s IPv6 to prozrazuje vaši adresu.\n\n'
+      'Co dělat:\n'
+      '• zapnout pro CitadelPQVPN „Trvalou síť VPN“ a „Blokovat připojení bez VPN“ — '
+      'systém pak odřízne veškerý provoz mimo tunel;\n'
+      '• nebo zapnout v nastavení „Přísné IPv6“ — tunel se nezvedne, dokud není IPv6 '
+      'zachyceno.',
 
   'new_profile': 'Nový profil',
   'link_label': 'odkaz citadel://',
@@ -216,6 +236,7 @@ const Map<String, String> langCs = {
   'issued_title_named': 'Přístup vydán: {label}',
   'copy_link': 'Zkopírovat odkaz',
   'link_copied': 'Odkaz zkopírován',
+  'clipboard_autoclear': 'schránka se sama vymaže',
   'verify_code_label': 'Ověřovací kód od správce',
   'verify_code_hint': '6 znaků',
   'verify_code_help': 'Správce jej nadiktuje zvlášť od odkazu (hlasem, osobně). Pokud souhlasí, odkaz nebyl cestou podvržen.',

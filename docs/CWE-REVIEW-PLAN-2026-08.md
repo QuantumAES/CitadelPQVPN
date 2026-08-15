@@ -252,6 +252,11 @@
 
 ### P-2. Реестр дефолтов, который нельзя молча поменять
 
+> **Первый экземпляр меры уже есть** (заход 12): настройка автозамка хранилища читает мусор в
+> файле как ДЕФОЛТ, а не как «выключено», и это зафиксировано тестом
+> (`autolock_garbage_never_disables_the_lock`). Ровно такой тест нужен каждой переменной из
+> реестра — образец для остальных.
+
 M-3 («rate-limit выключен в проде»), L-4, L-5, L-10 — один класс: **значение по умолчанию
 разошлось с намерением**. Мера: файл `docs/DEFAULTS.md` (или `defaults.toml`) со всеми
 переменными `Citadel_*` и флагами установщика: значение, что бывает при отсутствии, кто выставляет
@@ -319,6 +324,7 @@ DNS-имени внутри поднятого туннеля в харнесе.
 | Дата | Ревизия | Что прогонялось | Результат |
 |---|---|---|---|
 | 2026-08-14 | `9431cfe` | `cargo test --workspace --locked`; `cargo clippy --workspace --all-targets -- -D warnings`; `cargo deny --workspace check` | 332 теста / 0 провалов; clippy чист; advisories, bans, licenses, sources — ok |
+| 2026-08-15 | заход 12 (аудит-4 §21) | те же три гейта + `flutter analyze`/`flutter test`, `cargo ndk -t arm64-v8a check\|clippy`, `cargo check\|clippy -p citadel-winsvc --target x86_64-pc-windows-gnu`, `./gradlew :app:compileDebugKotlin`, `bash -n` установщика | 338 тестов / 0 провалов; clippy чист; deny ok; `flutter test` 52; Kotlin и Windows-цель собираются |
 
 ---
 
