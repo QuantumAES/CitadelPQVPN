@@ -152,6 +152,21 @@ pub fn same_dir(file: &std::path::Path, dir: &std::path::Path) -> bool {
 /// Сравниваем строковые SID владельцев (`S-1-5-21-…`). `None` — режим dev-console, где
 /// аутентификации клиента нет вовсе; смешанный случай означает рассогласование режима и трактуется
 /// как отказ (fail-closed).
+/// L-9 (аудит-4): признак переиспользования PID — процесс, который сейчас держит PID клиента,
+/// стартовал ПОЗЖЕ момента, когда клиент подключился к пайпу.
+///
+/// Настоящий клиент существовал до того, как позвал `CreateFile` на пайпе, поэтому его время старта
+/// не может быть больше времени accept'а. Если больше — прежний владелец PID уже умер, номер
+/// достался постороннему процессу, и все проверки (образ, подпись, SID владельца) относились бы к
+/// нему, а не к клиенту. Сорвать гонку умеет и непривилегированный пользователь: подключиться и
+/// сразу упасть. Оба времени — тики FILETIME (100 нс, UTC), сравнимы напрямую.
+///
+/// Чистая функция ради теста на любой ОС; сама выборка времён — WinAPI (`GetProcessTimes` +
+/// `GetSystemTimeAsFileTime`).
+pub fn is_pid_reuse(created_at: u64, accepted_at: u64) -> bool {
+    created_at > accepted_at
+}
+
 pub fn session_owner_may_preempt(cur: Option<&str>, new: Option<&str>) -> bool {
     match (cur, new) {
         (Some(a), Some(b)) => a.eq_ignore_ascii_case(b),
@@ -275,6 +290,17 @@ Network Destination        Netmask          Gateway       Interface  Metric
         assert!(!same_dir(Path::new(r"C:\Users\bob\AppData\Local\Temp\evil.exe"), dir), "чужой каталог");
         assert!(!same_dir(Path::new(r"C:\Program Files\CitadelPQVPN\sub\app.exe"), dir), "подкаталог ≠ каталог");
         assert!(!same_dir(Path::new("app.exe"), dir), "без родителя");
+    }
+
+    /// L-9: процесс, стартовавший позже accept'а на пайпе, клиентом быть не может — это чужой
+    /// процесс, получивший освободившийся PID. Равенство (тот же тик) — не отказ: настоящий клиент
+    /// стартует строго раньше, а отвергать по округлению времени нельзя.
+    #[test]
+    fn process_started_after_accept_is_pid_reuse() {
+        let accept = 133_000_000_000_000_000u64; // произвольный тик FILETIME
+        assert!(!is_pid_reuse(accept - 10_000_000, accept), "клиент стартовал раньше — норма");
+        assert!(!is_pid_reuse(accept, accept), "тот же тик — не отказ");
+        assert!(is_pid_reuse(accept + 1, accept), "стартовал после accept'а — PID переиспользован");
     }
 
     /// M-5: вытеснить активную сессию может только ЕЁ владелец. До правки любой интерактивный

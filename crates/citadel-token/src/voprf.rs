@@ -100,6 +100,8 @@ pub const TOKEN_LEN: usize = NONCE_LEN + SECRET_LEN;
 const DST_H2G: &str = "CitadelPQVPN/token/v2/hash-to-group";
 const DST_FINALIZE: &str = "CitadelPQVPN/token/v2/finalize";
 const DST_DLEQ: &str = "CitadelPQVPN/token/v2/dleq";
+/// B-1: вывод ключа эпохи для КОНКРЕТНОГО exit-узла (см. [`EpochKey::derive_for_exit`]).
+const DST_PER_EXIT: &str = "CitadelPQVPN/token/v2/epoch-key/per-exit";
 
 /// 64 байта псевдослучайного вывода BLAKE3 в режиме derive_key — вход для отображения в группу и
 /// для вывода скаляра (оба требуют равномерных 64 Б, чтобы смещение было пренебрежимо мало).
@@ -185,6 +187,34 @@ impl EpochKey {
     /// Сгенерировать ключ эпохи (микросекунды — ротация больше не стоит 10 секунд RSA-keygen).
     pub fn generate() -> Result<Self> {
         Self::from_scalar(random_scalar()?)
+    }
+
+    /// B-1 (аудит-4): ключ эпохи **конкретного exit-узла**: `k_exit = H2S(мастер ‖ эпоха ‖ pin)`.
+    ///
+    /// До этого все exit'ы одного издателя работали на ОДНОМ секрете эпохи, и это давало два
+    /// свойства, неприемлемых для мультиэкзитной установки:
+    ///
+    ///  * **кросс-exit реплей.** Множество потраченных токенов (`spent.bin`) локально для узла, а
+    ///    ключ был общий ⇒ один и тот же токен принимали все exit'ы по очереди. Квота A6 при этом
+    ///    соблюдена, снаружи всё выглядит штатно.
+    ///  * **компрометация одного узла = компрометация выдачи для всех.** Exit по построению держит
+    ///    секрет эпохи (иначе он не проверит предъявление), поэтому взятый под контроль exit чеканил
+    ///    токены, годные на ЛЮБОМ узле деплоя.
+    ///
+    /// Теперь `k` каждого узла свой и выводится односторонне: из `k_exit` мастер не восстановить
+    /// (BLAKE3), а значит и ключи соседей. Мастер остаётся только у издателя; при раздельном деплое
+    /// узел получает по keysync ровно СВОЙ `k_exit`, при совмещённом — выводит его сам из мастера на
+    /// общем томе (там издатель и exit и так одна машина).
+    ///
+    /// `exit_pin` — pin TLS-сертификата exit'а (`citadel_quic::cert_pin`, BLAKE3 DER). Он выбран
+    /// идентификатором узла потому, что его знают ВСЕ трое: exit (свой серт), абонент (из ссылки) и
+    /// издатель (абонент называет его при выдаче). Нулевой pin — «выдача без привязки к узлу»
+    /// (`EXIT_PIN_UNBOUND`): это тоже валидный ключ, но exit принимает его только по явной настройке.
+    pub fn derive_for_exit(master: &[u8; 32], epoch: u64, exit_pin: &[u8; 32]) -> Result<Self> {
+        Self::from_scalar(hash_to_scalar(
+            DST_PER_EXIT,
+            &[master, &epoch.to_be_bytes(), exit_pin],
+        ))
     }
 
     /// Восстановить ключ из 32 Б секрета (файл эпохи / keysync).
@@ -425,6 +455,34 @@ mod tests {
         assert_eq!(redeem.len(), REDEEM_LEN);
         let nonce = key.verify_redemption(&redeem, ctx).expect("валидное предъявление");
         assert_eq!(&nonce[..], &redeem[..NONCE_LEN], "nonce для spent-множества");
+    }
+
+    /// B-1: токен, выданный под ключ ОДНОГО exit'а, не проходит на другом — кросс-exit реплей
+    /// закрыт даже при пустом `spent.bin` соседа. И обратное: вывод детерминирован, поэтому узел и
+    /// издатель приходят к одному ключу независимо (иначе туннель не поднялся бы вовсе).
+    #[test]
+    fn per_exit_keys_do_not_accept_each_others_tokens() {
+        let master = [0x11u8; 32];
+        let (pin_a, pin_b) = ([0xAAu8; 32], [0xBBu8; 32]);
+        let a = EpochKey::derive_for_exit(&master, 42, &pin_a).unwrap();
+        let b = EpochKey::derive_for_exit(&master, 42, &pin_b).unwrap();
+        assert_ne!(a.secret_bytes(), b.secret_bytes(), "разные узлы — разные ключи");
+
+        let token = issue(&a);
+        let ctx = b"exporter".as_slice();
+        let redeem = token.redeem(ctx);
+        assert!(a.verify_redemption(&redeem, ctx).is_some(), "на своём узле токен годен");
+        assert!(b.verify_redemption(&redeem, ctx).is_none(), "на чужом узле — нет");
+
+        // Детерминизм: тот же мастер+эпоха+pin → тот же ключ; другая эпоха → другой.
+        let a2 = EpochKey::derive_for_exit(&master, 42, &pin_a).unwrap();
+        assert_eq!(a.secret_bytes(), a2.secret_bytes());
+        let a_next = EpochKey::derive_for_exit(&master, 43, &pin_a).unwrap();
+        assert_ne!(a.secret_bytes(), a_next.secret_bytes(), "смена эпохи меняет ключ");
+
+        // Односторонность: из ключа узла мастер не выводится — иначе взятый под контроль exit
+        // получал бы ключи соседей. Проверяем то, что можно проверить тестом: k_exit ≠ мастеру.
+        assert_ne!(a.secret_bytes(), master, "ключ узла не равен мастеру");
     }
 
     /// Главное новое свойство (остаток H-2): предъявление действительно только в СВОЕЙ сессии.

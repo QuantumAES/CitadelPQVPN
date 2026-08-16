@@ -143,6 +143,29 @@ pub fn check_wfp_plan(filters: &[WfpFilter]) -> anyhow::Result<()> {
                 .map_err(|e| anyhow::anyhow!("WFP-план не армирован: {e}"))?;
         }
     }
+    // L-12: на каждом слое (семейство × ступень) catch-all Block обязан сопровождаться permit'ами
+    // ЭТОГО ЖЕ слоя. Слой с одним лишь block-catch-all — это не kill-switch, а «интернета нет»:
+    // рубится и туннель, и loopback. Проверка нужна именно с появлением второй ступени: раньше
+    // потерять permit'ы можно было только переписав сам план целиком, теперь — забыв продублировать.
+    for family in [WfpFamily::V4, WfpFamily::V6] {
+        for stage in [WfpStage::Connect, WfpStage::Packet] {
+            let layer = filters.iter().filter(|f| f.family == family && f.stage == stage);
+            let (mut catch_all, mut permits) = (false, 0usize);
+            for f in layer {
+                match f.action {
+                    WfpAction::Block if f.match_ == WfpMatch::Any => catch_all = true,
+                    WfpAction::Permit => permits += 1,
+                    WfpAction::Block => {}
+                }
+            }
+            if catch_all && permits == 0 {
+                anyhow::bail!(
+                    "WFP-план не армирован: слой {family:?}/{stage:?} состоит из одного \
+                     block-catch-all без единого permit — это отключение сети, а не kill-switch"
+                );
+            }
+        }
+    }
     Ok(())
 }
 
@@ -330,15 +353,41 @@ pub enum WfpFamily {
     V6,
 }
 
+/// L-12 (аудит-4): **ступень** фильтрации — на каком слое WFP стоит фильтр.
+///
+/// `ALE_AUTH_CONNECT` гейтит только УСТАНОВЛЕНИЕ соединения: он спрашивается один раз, при
+/// `connect()` (и на первом исходящем UDP-датаграмме). Уже установленный поток через него больше
+/// не проходит — поэтому kill-switch, стоящий только на ALE, не рвёт скачивание, начатое ДО
+/// подъёма туннеля: оно продолжает идти физическим интерфейсом мимо туннеля, ровно то, чего
+/// kill-switch обязан не допускать (на Linux этого класса дыры нет — `iptables OUTPUT` смотрит
+/// КАЖДЫЙ пакет).
+///
+/// Лечится вторым набором тех же правил на **пакетном** слое `OUTBOUND_TRANSPORT`, который
+/// спрашивается на каждый исходящий пакет, включая пакеты давно живущих потоков. Выбран именно он,
+/// а не `ALE_FLOW_ESTABLISHED`: последний тоже срабатывает один раз (в момент установления потока)
+/// и для потоков, живших ДО армирования, не сработает вовсе — то есть не решает исходную задачу.
+///
+/// Обе ступени армируются вместе и содержат ОДИН И ТОТ ЖЕ набор permit/block: пакетный слой без
+/// permit'ов зарубил бы и сам туннель.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WfpStage {
+    /// `FWPM_LAYER_ALE_AUTH_CONNECT_{V4,V6}` — гейт установления исходящих соединений.
+    Connect,
+    /// `FWPM_LAYER_OUTBOUND_TRANSPORT_{V4,V6}` — пакетный слой: каждый исходящий пакет, включая
+    /// пакеты потоков, установленных до армирования (L-12).
+    Packet,
+}
+
 /// Один WFP-фильтр плана. `weight` — приоритет: чем выше, тем раньше матчится (permit'ы обязаны
 /// стоять ВЫШЕ финального Block, иначе трафик был бы заблокирован — как «DROP после всех RETURN»).
-/// `family` выбирает слой (V4 kill-switch vs V6-блок утечки) — веса сравниваются В ПРЕДЕЛАХ слоя.
+/// `family` + `stage` выбирают слой (V4/V6 × connect/packet) — веса сравниваются В ПРЕДЕЛАХ слоя.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WfpFilter {
     pub action: WfpAction,
     pub match_: WfpMatch,
     pub weight: u8,
     pub family: WfpFamily,
+    pub stage: WfpStage,
 }
 
 /// Вес финального Block (самый низкий): любой permit его перебивает.
@@ -356,7 +405,13 @@ pub const WFP_WEIGHT_PERMIT_HI: u8 = 12;
 /// работал» при включённом kill-switch. Здесь они получают отдельный `RemoteHost`-permit, fail-closed
 /// для всего прочего сохранён (Block — самый низкий вес, catch-all).
 pub fn wfp_killswitch_plan(exit_ips: &[String], bypass: &[String]) -> Vec<WfpFilter> {
-    let v4 = |action, match_, weight| WfpFilter { action, match_, weight, family: WfpFamily::V4 };
+    let v4 = |action, match_, weight| WfpFilter {
+        action,
+        match_,
+        weight,
+        family: WfpFamily::V4,
+        stage: WfpStage::Connect,
+    };
     let mut f = vec![
         v4(WfpAction::Permit, WfpMatch::Loopback, WFP_WEIGHT_PERMIT_HI),
         v4(WfpAction::Permit, WfpMatch::TunnelInterface, WFP_WEIGHT_PERMIT_HI),
@@ -371,7 +426,22 @@ pub fn wfp_killswitch_plan(exit_ips: &[String], bypass: &[String]) -> Vec<WfpFil
     f.push(v4(WfpAction::Permit, WfpMatch::Dhcp, WFP_WEIGHT_PERMIT));
     // fail-closed catch-all — самый низкий вес: любой permit выше него.
     f.push(v4(WfpAction::Block, WfpMatch::Any, WFP_WEIGHT_BLOCK));
-    f
+    mirror_to_packet_stage(f)
+}
+
+/// L-12: продублировать план на пакетную ступень (`OUTBOUND_TRANSPORT`).
+///
+/// Ровно ТЕ ЖЕ правила и веса — меняется только слой. Дублируется весь набор, а не один финальный
+/// Block: пакетный слой, на котором стоит только block-catch-all, зарубил бы и сам туннель (его
+/// UDP к exit'у), и loopback, то есть превратил бы kill-switch в «интернета нет вообще».
+fn mirror_to_packet_stage(connect: Vec<WfpFilter>) -> Vec<WfpFilter> {
+    let packet: Vec<WfpFilter> = connect
+        .iter()
+        .map(|f| WfpFilter { stage: WfpStage::Packet, ..f.clone() })
+        .collect();
+    let mut all = connect;
+    all.extend(packet);
+    all
 }
 
 /// W1 (аудит-3) / A2-паритет для Windows: fail-closed блок исходящего IPv6. Туннель IPv4-only ⇒
@@ -383,12 +453,18 @@ pub fn wfp_killswitch_plan(exit_ips: &[String], bypass: &[String]) -> Vec<WfpFil
 /// OUTPUT, где ND пришлось разрешать явно). Permit только loopback (::1). Триггерится при
 /// `killswitch || full-tunnel` (см. [`plan_session`]), как `block_ipv6` на Linux.
 pub fn wfp_ipv6_block_plan() -> Vec<WfpFilter> {
-    let v6 = |action, match_, weight| WfpFilter { action, match_, weight, family: WfpFamily::V6 };
-    vec![
+    let v6 = |action, match_, weight| WfpFilter {
+        action,
+        match_,
+        weight,
+        family: WfpFamily::V6,
+        stage: WfpStage::Connect,
+    };
+    mirror_to_packet_stage(vec![
         v6(WfpAction::Permit, WfpMatch::Loopback, WFP_WEIGHT_PERMIT_HI),
         // fail-closed: весь прочий исходящий IPv6 — Block (самый низкий вес, catch-all).
         v6(WfpAction::Block, WfpMatch::Any, WFP_WEIGHT_BLOCK),
-    ]
+    ])
 }
 
 #[cfg(test)]
@@ -515,40 +591,81 @@ mod tests {
         assert_eq!(&err[6..6 + elen], "нет прав на WinTUN".as_bytes());
     }
 
-    /// WFP-kill-switch: fail-closed форма + Q5. exit-ip и split-обход — permit; ровно один Block-Any;
-    /// Block имеет минимальный вес (любой permit его перебивает — «DROP после всех RETURN»).
+    /// WFP-kill-switch: fail-closed форма + Q5. exit-ip и split-обход — permit; на КАЖДОЙ ступени
+    /// ровно один Block-Any; Block имеет минимальный вес (любой permit его перебивает — «DROP после
+    /// всех RETURN»).
     #[test]
     fn wfp_killswitch_failclosed_and_q5_bypass() {
         let exit = vec!["203.0.113.9".to_string()];
         let bypass = vec!["192.168.1.0/24".to_string(), "203.0.113.7".to_string()];
-        let plan = wfp_killswitch_plan(&exit, &bypass);
+        let full = wfp_killswitch_plan(&exit, &bypass);
 
-        // ровно один финальный Block, условие Any
-        let blocks: Vec<_> = plan.iter().filter(|f| f.action == WfpAction::Block).collect();
-        assert_eq!(blocks.len(), 1);
-        assert_eq!(blocks[0].match_, WfpMatch::Any);
+        for stage in [WfpStage::Connect, WfpStage::Packet] {
+            let plan: Vec<&WfpFilter> = full.iter().filter(|f| f.stage == stage).collect();
 
-        // loopback и туннель разрешены
-        assert!(plan.iter().any(|f| f.action == WfpAction::Permit && f.match_ == WfpMatch::Loopback));
-        assert!(plan.iter().any(|f| f.action == WfpAction::Permit && f.match_ == WfpMatch::TunnelInterface));
+            // ровно один финальный Block на ступень, условие Any
+            let blocks: Vec<_> = plan.iter().filter(|f| f.action == WfpAction::Block).collect();
+            assert_eq!(blocks.len(), 1, "{stage:?}: один Block-catch-all");
+            assert_eq!(blocks[0].match_, WfpMatch::Any);
 
-        // Q5: КАЖДОЕ split-обход-назначение — permit по RemoteHost (иначе сплит не работает при KS)
-        for b in &bypass {
-            assert!(
-                plan.iter().any(|f| f.action == WfpAction::Permit
-                    && f.match_ == WfpMatch::RemoteHost(b.clone())),
-                "split-обход {b} должен быть Permit"
-            );
+            // loopback и туннель разрешены
+            assert!(plan.iter().any(|f| f.action == WfpAction::Permit && f.match_ == WfpMatch::Loopback));
+            assert!(plan.iter().any(|f| f.action == WfpAction::Permit && f.match_ == WfpMatch::TunnelInterface));
+
+            // Q5: КАЖДОЕ split-обход-назначение — permit по RemoteHost (иначе сплит не работает при KS)
+            for b in &bypass {
+                assert!(
+                    plan.iter().any(|f| f.action == WfpAction::Permit
+                        && f.match_ == WfpMatch::RemoteHost(b.clone())),
+                    "{stage:?}: split-обход {b} должен быть Permit"
+                );
+            }
+            // exit-ip тоже permit
+            assert!(plan.iter().any(|f| f.match_ == WfpMatch::RemoteHost("203.0.113.9".into())));
+
+            // fail-closed: Block — строго ниже любого permit по весу
+            let min_permit =
+                plan.iter().filter(|f| f.action == WfpAction::Permit).map(|f| f.weight).min().unwrap();
+            assert!(blocks[0].weight < min_permit, "{stage:?}: Block ниже всех permit (fail-closed)");
         }
-        // exit-ip тоже permit
-        assert!(plan.iter().any(|f| f.match_ == WfpMatch::RemoteHost("203.0.113.9".into())));
-
-        // fail-closed: Block — строго ниже любого permit по весу
-        let min_permit = plan.iter().filter(|f| f.action == WfpAction::Permit).map(|f| f.weight).min().unwrap();
-        assert!(blocks[0].weight < min_permit, "Block-вес должен быть ниже всех permit (fail-closed)");
 
         // W1: kill-switch — целиком IPv4-слой (V6-утечку закрывает отдельный wfp_ipv6_block_plan).
-        assert!(plan.iter().all(|f| f.family == WfpFamily::V4), "KS-фильтры — семейство V4");
+        assert!(full.iter().all(|f| f.family == WfpFamily::V4), "KS-фильтры — семейство V4");
+    }
+
+    /// L-12 (аудит-4): kill-switch обязан рвать УЖЕ УСТАНОВЛЕННЫЕ потоки. `ALE_AUTH_CONNECT`
+    /// спрашивается один раз при установлении соединения, поэтому скачивание, начатое до подъёма
+    /// туннеля, продолжало идти мимо. План обязан существовать на ОБЕИХ ступенях и быть на них
+    /// идентичным (пакетная ступень без permit'ов зарубила бы сам туннель).
+    #[test]
+    fn killswitch_covers_flows_established_before_arming() {
+        let plans = [
+            wfp_killswitch_plan(&["203.0.113.9".into()], &["192.168.1.0/24".into()]),
+            wfp_ipv6_block_plan(),
+        ];
+        for plan in plans {
+            let of = |stage: WfpStage| -> Vec<(WfpAction, WfpMatch, u8, WfpFamily)> {
+                plan.iter()
+                    .filter(|f| f.stage == stage)
+                    .map(|f| (f.action, f.match_.clone(), f.weight, f.family))
+                    .collect()
+            };
+            let connect = of(WfpStage::Connect);
+            assert!(!connect.is_empty(), "ступень connect обязана быть");
+            assert_eq!(connect, of(WfpStage::Packet), "ступени обязаны совпадать правило-в-правило");
+        }
+    }
+
+    /// Страховка от «слой из одного Block»: продублировать catch-all, забыв permit'ы, — это не
+    /// kill-switch, а отключение сети (рубится и туннель, и loopback). Такой план не армируется.
+    #[test]
+    fn plan_with_block_only_layer_is_refused() {
+        let mut plan = wfp_killswitch_plan(&["203.0.113.9".into()], &[]);
+        plan.retain(|f| f.stage == WfpStage::Connect || f.action == WfpAction::Block);
+        let err = check_wfp_plan(&plan).expect_err("слой из одного Block обязан быть отвергнут");
+        assert!(format!("{err}").contains("Packet"), "в отказе назван слой: {err}");
+        // …а полный план проходит.
+        check_wfp_plan(&wfp_killswitch_plan(&["203.0.113.9".into()], &[])).unwrap();
     }
 
     /// N-9: разбор CIDR для WFP — с ошибкой, а не с молчаливым `0.0.0.0`. Мусорная строка обязана
@@ -595,19 +712,22 @@ mod tests {
     /// V4-слой и не закрыли бы утечку нативного IPv6 мимо IPv4-only туннеля).
     #[test]
     fn wfp_ipv6_block_failclosed_v6_family() {
-        let plan = wfp_ipv6_block_plan();
-        assert!(plan.iter().all(|f| f.family == WfpFamily::V6), "IPv6-блок — семейство V6");
+        let full = wfp_ipv6_block_plan();
+        assert!(full.iter().all(|f| f.family == WfpFamily::V6), "IPv6-блок — семейство V6");
 
-        let blocks: Vec<_> = plan.iter().filter(|f| f.action == WfpAction::Block).collect();
-        assert_eq!(blocks.len(), 1, "ровно один финальный Block");
-        assert_eq!(blocks[0].match_, WfpMatch::Any, "Block — catch-all (весь IPv6)");
+        for stage in [WfpStage::Connect, WfpStage::Packet] {
+            let plan: Vec<&WfpFilter> = full.iter().filter(|f| f.stage == stage).collect();
+            let blocks: Vec<_> = plan.iter().filter(|f| f.action == WfpAction::Block).collect();
+            assert_eq!(blocks.len(), 1, "{stage:?}: ровно один финальный Block");
+            assert_eq!(blocks[0].match_, WfpMatch::Any, "Block — catch-all (весь IPv6)");
 
-        // loopback (::1) разрешён — не рвём локальные IPv6-сокеты
-        assert!(plan.iter().any(|f| f.action == WfpAction::Permit && f.match_ == WfpMatch::Loopback));
+            // loopback (::1) разрешён — не рвём локальные IPv6-сокеты
+            assert!(plan.iter().any(|f| f.action == WfpAction::Permit && f.match_ == WfpMatch::Loopback));
 
-        // fail-closed: Block строго ниже любого permit по весу (иначе IPv6 утёк бы)
-        let min_permit =
-            plan.iter().filter(|f| f.action == WfpAction::Permit).map(|f| f.weight).min().unwrap();
-        assert!(blocks[0].weight < min_permit, "Block ниже всех permit (fail-closed IPv6)");
+            // fail-closed: Block строго ниже любого permit по весу (иначе IPv6 утёк бы)
+            let min_permit =
+                plan.iter().filter(|f| f.action == WfpAction::Permit).map(|f| f.weight).min().unwrap();
+            assert!(blocks[0].weight < min_permit, "{stage:?}: Block ниже всех permit");
+        }
     }
 }

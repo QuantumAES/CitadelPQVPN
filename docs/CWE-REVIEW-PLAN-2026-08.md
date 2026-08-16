@@ -63,7 +63,7 @@
 
 | CWE | Поверхность у нас | Контроль | Статус | Чего не хватает |
 |---|---|---|---|---|
-| 787/125 запись/чтение за границей | Safe Rust почти везде; реальный риск — 47 `unsafe` в `citadel-winsvc` (WFP/Win32-структуры, union-поля), 68 в `app/rust` (JNI), `citadel-tun`/`citadel-vpnd` (ioctl, sendfd) | границы буферов проверяются до крипты (`vault.rs:257`, `obfs`), у каждого `unsafe` — комментарий `SAFETY` | 🟡 | **Ф2:** MIRI на тестах крейтов без FFI, ASAN-прогон `citadel-tun`/`citadel-vpnd`, `cargo geiger` в отчёт CI |
+| 787/125 запись/чтение за границей | Safe Rust почти везде; реальный риск — `unsafe` в `citadel-winsvc` (WFP/Win32-структуры, union-поля; заход 13 добавил `authenticode.rs` — WinTrust/CryptQueryObject, 3 блока, **не исполнялся ни разу: Windows-машины нет**), 68 в `app/rust` (JNI), `citadel-tun`/`citadel-vpnd` (ioctl, sendfd) | границы буферов проверяются до крипты (`vault.rs:257`, `obfs`), у каждого `unsafe` — комментарий `SAFETY` | 🟡 | **Ф2:** MIRI на тестах крейтов без FFI, ASAN-прогон `citadel-tun`/`citadel-vpnd`, `cargo geiger` в отчёт CI |
 | 416 use-after-free | `Arc`/`Weak` в pacer'е (`obfs_socket.rs:756` держит `Weak`, чтобы задача умирала вместе с сокетом), хэндлы WFP/Keystore | владение выражено типами; `Drop`-порядок задокументирован (`winsvc/main.rs:991`) | 🟡 | **Ф2:** те же прогоны + отдельный тест «задача pacer'а умирает вместе с endpoint'ом» (есть косвенный) |
 | 190/191 переполнение | длины из пакетов и заголовков: `pad_len_*`, `slots_len`, varint, MTU-арифметика | `saturating_*`/`checked_*` в разборе (`vault.rs:274`, `obfs_socket.rs:624`) | 🟡 | **Ф0:** `overflow-checks = true` в релизном профиле серверных бинарей (сейчас профиля нет вовсе ⇒ в release переполнение молча заворачивается) |
 | 476 разыменование null | только через FFI/Win32 | проверки `HANDLE`/указателей на месте | ✅ (компилятор + тесты) | — |
@@ -129,7 +129,7 @@
 | 1188 небезопасный дефолт | **77 различных переменных `Citadel_*`** (подсчёт по дереву на `9431cfe`) плюс флаги установщика | fail-closed при мусорном значении (M-1/M-2/M-7 закрыты именно так), rate-limit включён установщиком, insecure-эскейпы вне релиза | 🟡 | **P-2/P-3:** реестр дефолтов + тест «мусор в переменной = отказ, а не отключение защиты» для КАЖДОЙ переменной |
 | 732/276 права | ключи 0600, `spent.bin`, том издателя/exit'а, SDDL пайпа и службы | явные `chmod`/`set_file_perms_600`, разбор граблей с `cap_drop` и `CAP_CHOWN` (§14.3) | 🟡 | **Ф5:** тест-скрипт «после установки в `$DIR/keys` нет файла с правами шире 0600» |
 | 798 зашитые креды | демо-стенд | `Citadel_DEMO_STAND` + `guard_weak_seed` роняет старт вне стенда (L-10) | ✅ | **Ф0:** сканер секретов (gitleaks) в CI — сейчас его нет |
-| 494 загрузка без проверки | релизные бинари — minisign; **docker — `curl \| sh`** | `install-citadel-server.sh:456` против `:406` | 🟡 | **R2.3** (N-7) |
+| 494 загрузка без проверки | релизные бинари — minisign; docker — из репозитория дистрибутива | `install-citadel-server.sh` (скрипт `get.docker.com` — только по `CITADEL_ALLOW_DOCKER_SCRIPT=1`) | ✅ | закрыто заходом 12 (N-7); осталась **Ф5** — SBOM и воспроизводимость релиза |
 | 1104 неподдерживаемые компоненты | дерево зависимостей | `cargo-deny` в CI и локально; исключение только `RUSTSEC-2024-0436` (`paste` через `ratatui`, compile-time) | ✅ | **Ф5:** SBOM (CycloneDX) в артефактах релиза |
 
 ### 3.9. Инъекции (CWE-78/77/88, CWE-22)
@@ -325,6 +325,7 @@ DNS-имени внутри поднятого туннеля в харнесе.
 |---|---|---|---|
 | 2026-08-14 | `9431cfe` | `cargo test --workspace --locked`; `cargo clippy --workspace --all-targets -- -D warnings`; `cargo deny --workspace check` | 332 теста / 0 провалов; clippy чист; advisories, bans, licenses, sources — ok |
 | 2026-08-15 | заход 12 (аудит-4 §21) | те же три гейта + `flutter analyze`/`flutter test`, `cargo ndk -t arm64-v8a check\|clippy`, `cargo check\|clippy -p citadel-winsvc --target x86_64-pc-windows-gnu`, `./gradlew :app:compileDebugKotlin`, `bash -n` установщика | 338 тестов / 0 провалов; clippy чист; deny ok; `flutter test` 52; Kotlin и Windows-цель собираются |
+| 2026-08-15 | заход 13 (аудит-4 §22) | те же гейты + **сквозной docker-стенд** `docker/run-demo.sh` (слом провода: per-exit ключ эпохи, keysync, парольный конверт) | **347 тестов / 0 провалов** (+9); clippy чист; deny ok; `flutter analyze` чисто, `flutter test` 52; Windows-цель чиста; `bash -n` чист; **стенды: `run-demo.sh` 34/0** (новый ТЕСТ 26 — токен одного узла отвергнут другим) и **`run-cli-tests.sh --e2e-only` 48/0** (движок под отдельным uid, ссылка с pin'ом ⇒ привязанная выдача); оба погашены |
 
 ---
 

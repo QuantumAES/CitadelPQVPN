@@ -232,6 +232,29 @@ void vaultMoveTo({required String id, required int index}) =>
 /// а не «своим» (иначе человек набирает имя, которое молча обрежется).
 int vaultMaxNameLen() => RustLib.instance.api.crateApiCitadelVaultMaxNameLen();
 
+/// B-2/R4.2: похоже ли вставленное на **парольный конверт** мастер-ссылки, а не на саму ссылку.
+///
+/// Дёшево и синхронно (сравнение строк): UI спрашивает пароль ровно тогда, когда он нужен, а не
+/// показывает поле пароля всем подряд.
+bool linkIsWrapped({required String text}) =>
+    RustLib.instance.api.crateApiCitadelLinkIsWrapped(text: text);
+
+/// Развернуть парольный конверт мастер-ссылки. Возвращает саму `citadel://`-ссылку — дальше она
+/// идёт обычным путём (превью → добавление профиля).
+///
+/// НЕ `sync`: внутри Argon2id на 256 MiB — секунда-две работы, на UI-потоке это заморозка кадра.
+/// Ошибка одна на все случаи («неверный пароль или повреждённый блок»): различать их — значит
+/// подсказывать подбирающему, что пароль он уже угадал, а испортил что-то другое.
+Future<String> linkUnwrap({required String block, required String password}) =>
+    RustLib.instance.api.crateApiCitadelLinkUnwrap(
+      block: block,
+      password: password,
+    );
+
+/// Минимальная длина пароля конверта — из ядра, чтобы поле ввода не проверяло «своё» число.
+int linkWrapMinPassword() =>
+    RustLib.instance.api.crateApiCitadelLinkWrapMinPassword();
+
 /// Разобрать `citadel://`-ссылку → превью для UI (валидация при вставке).
 ///
 /// НЕ `sync` и намеренно небыстрая: см. [`guarded_parse_link`] — мгновенный вердикт «распознана /

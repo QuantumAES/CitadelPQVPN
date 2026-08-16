@@ -4,7 +4,7 @@
 //!
 //! ```text
 //! citadel-linkgen --servers "1.2.3.4:4433" --psk <hex64> --pin <hex64> \
-//!   [--activate-secs 86400] [--meta-out FILE] \
+//!   [--activate-secs 86400] [--meta-out FILE] [--wrap-password FILE|-] \
 //!   [--kx all] [--tcp-port 443] [--routes "1.1.1.1/32 1.0.0.1/32"] \
 //!   [--dns 1.1.1.1] [--server-name citadel.exit] [--qr link.svg] \
 //!   [--issuer host:7000] [--issuer-pin <hex64>] [--issuer-mldsa <hex64>] [--client-seed <hex64>] \
@@ -103,7 +103,30 @@ fn main() {
 
     let link = CredentialLink::from_bundle(&bundle);
     let uri = link.to_uri().expect("to_uri");
-    println!("{uri}");
+    // B-2/R4.2: `--wrap-password FILE|-` — печатать не саму ссылку, а парольный конверт вокруг неё.
+    // Смысл — доставка: голый текст ссылки остаётся предъявительским секретом везде, куда его
+    // скопировали (скролбэк SSH, лог терминала, «отправлю себе в мессенджер»), а конверт без
+    // пароля бесполезен. Пароль передаётся ДРУГИМ каналом; посланные вместе, они равны голой
+    // ссылке — об этом предупреждаем прямо здесь.
+    match get("--wrap-password") {
+        Some(src) => {
+            let password = read_password(&src);
+            match citadel_client::masterlink::wrap(&uri, password.trim_end_matches(['\n', '\r'])) {
+                Ok(block) => {
+                    println!("{block}");
+                    eprintln!(
+                        "[linkgen] ссылка в парольном конверте (Argon2id+AES-GCM). Пароль передай \
+                         ОТДЕЛЬНЫМ каналом: блок и пароль вместе = голая ссылка."
+                    );
+                }
+                Err(e) => {
+                    eprintln!("[linkgen] не завернуть ссылку: {e}");
+                    std::process::exit(1);
+                }
+            }
+        }
+        None => println!("{uri}"),
+    }
     if bundle.issuer.is_some() && bundle.issuer_pin.is_none() {
         eprintln!("[linkgen] ⚠ --issuer задан БЕЗ --issuer-pin — клиент не сможет безопасно фетчить токен (A1)");
     }
@@ -159,6 +182,26 @@ fn main() {
         std::fs::write(&qr, link.to_qr_svg().expect("qr")).expect("write qr");
         eprintln!("[linkgen] QR-SVG → {qr}");
     }
+}
+
+/// Пароль конверта: из файла или со stdin (`-`). Аргументом командной строки — намеренно НЕТ:
+/// он виден в `ps` любому пользователю машины и оседает в истории шелла.
+fn read_password(src: &str) -> String {
+    let raw = if src == "-" {
+        use std::io::Read as _;
+        let mut s = String::new();
+        if let Err(e) = std::io::stdin().read_to_string(&mut s) {
+            eprintln!("[linkgen] не прочитать пароль со stdin: {e}");
+            std::process::exit(1);
+        }
+        s
+    } else {
+        std::fs::read_to_string(src).unwrap_or_else(|e| {
+            eprintln!("[linkgen] не прочитать --wrap-password {src}: {e}");
+            std::process::exit(1);
+        })
+    };
+    raw
 }
 
 fn now_unix() -> u64 {

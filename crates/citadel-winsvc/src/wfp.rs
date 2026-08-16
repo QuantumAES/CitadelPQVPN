@@ -7,10 +7,15 @@
 //! не-туннельный трафик заблокирован (как helper держит iptables при EOF-без-'Q'). [`arm`]
 //! идемпотентен: сперва закрывает прошлый engine (чистит и осиротевший от аварии), затем ставит
 //! свежий набор — как `setup_killswitch` вызывает `teardown_killswitch`.
+//!
+//! Ступеней две (L-12): `ALE_AUTH_CONNECT_*` (установление соединений) и `OUTBOUND_TRANSPORT_*`
+//! (каждый исходящий пакет, включая потоки, живущие с момента ДО армирования). Обе — в одной
+//! динамической сессии, армятся и снимаются вместе; набор правил на них идентичен, см.
+//! [`citadel_winnet::WfpStage`].
 
 use std::sync::Mutex;
 
-use citadel_winnet::{WfpAction, WfpFamily, WfpFilter, WfpMatch};
+use citadel_winnet::{WfpAction, WfpFamily, WfpFilter, WfpMatch, WfpStage};
 use windows::core::{GUID, PWSTR};
 use windows::Win32::Foundation::{ERROR_SUCCESS, HANDLE};
 use windows::Win32::NetworkManagement::WindowsFilteringPlatform::*;
@@ -162,9 +167,17 @@ fn add_filter(engine: HANDLE, f: &WfpFilter, tun_luid: u64) -> anyhow::Result<()
     // W1: слой по семейству. V4 = kill-switch (весь стек); V6 = fail-closed блок утечки нативного
     // IPv6 (туннель IPv4-only). ALE_AUTH_CONNECT_V6 гейтит установление IPv6-соединений (TCP-connect/
     // первый UDP, включая IPv6-DNS); ICMPv6 ND идёт мимо этого слоя ⇒ локальный IPv6-стек не ломается.
-    filter.layerKey = match f.family {
-        WfpFamily::V4 => FWPM_LAYER_ALE_AUTH_CONNECT_V4,
-        WfpFamily::V6 => FWPM_LAYER_ALE_AUTH_CONNECT_V6,
+    //
+    // L-12: вторая ступень — OUTBOUND_TRANSPORT_{V4,V6}. ALE_AUTH_CONNECT спрашивается ОДИН РАЗ, при
+    // установлении соединения, поэтому поток, начатый до армирования (скачивание, открытый сокет
+    // мессенджера), продолжал идти мимо туннеля. Пакетный слой смотрит каждый исходящий пакет, в том
+    // числе таких потоков. Все используемые условия (FLAGS/IS_LOOPBACK, IP_LOCAL_INTERFACE,
+    // IP_REMOTE_ADDRESS, IP_REMOTE_PORT) на транспортном слое доступны — набор правил тот же.
+    filter.layerKey = match (f.family, f.stage) {
+        (WfpFamily::V4, WfpStage::Connect) => FWPM_LAYER_ALE_AUTH_CONNECT_V4,
+        (WfpFamily::V6, WfpStage::Connect) => FWPM_LAYER_ALE_AUTH_CONNECT_V6,
+        (WfpFamily::V4, WfpStage::Packet) => FWPM_LAYER_OUTBOUND_TRANSPORT_V4,
+        (WfpFamily::V6, WfpStage::Packet) => FWPM_LAYER_OUTBOUND_TRANSPORT_V6,
     };
     filter.subLayerKey = CITADEL_SUBLAYER;
     filter.weight.r#type = FWP_UINT8;

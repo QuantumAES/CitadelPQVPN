@@ -13,6 +13,7 @@ pub mod creds;
 pub mod vault;
 pub mod token_agent; // C5.3: добыча Layer-1 epoch-токенов у issuer (async-обёртка над citadel_token)
 pub mod enroll; // M-9: активация первичной ссылки (одноразовость + срок годности + заверение)
+pub mod masterlink; // B-2: парольный конверт мастер-ссылки (Argon2id + AES-GCM, печатаемый блок)
 pub mod admin; // C7.3: admin-плоскость по туннелю (управление реестром + минт клиентских ссылок), все платформы
 // gui_tun компилируется и на Android (unix SCM_RIGHTS/UnixSocket), но там НЕ используется —
 // мобильный путь идёт через VpnService (android_establish/run_data_plane). Нужно, чтобы

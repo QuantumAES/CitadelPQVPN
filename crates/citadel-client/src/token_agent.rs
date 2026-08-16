@@ -56,6 +56,9 @@ pub async fn fetch_tokens(
     issuer_pin: &[u8; 32],
     issuer_mldsa: &[u8; 32],
     client_seed: &[u8; 32],
+    // B-1: pin exit'а, под который берётся пачка (из ссылки). Ключ эпохи выводится per-exit,
+    // поэтому токен, взятый «вообще», ни на одном узле не пройдёт.
+    exit_pin: &[u8; 32],
     count: usize,
     retries: u32,
     obfs_psk: Option<[u8; 32]>,
@@ -65,8 +68,11 @@ pub async fn fetch_tokens(
     let pin = *issuer_pin;
     let mldsa = *issuer_mldsa;
     let seed = *client_seed;
+    let exit_pin = *exit_pin;
     tokio::task::spawn_blocking(move || {
-        citadel_token::fetch_tokens(&issuer, &pin, &mldsa, &seed, count, retries, obfs_psk, route)
+        citadel_token::fetch_tokens(
+            &issuer, &pin, &mldsa, &seed, &exit_pin, count, retries, obfs_psk, route,
+        )
     })
     .await
     .context("token-fetch задача паникнула")?
@@ -82,6 +88,8 @@ pub struct TokenPouch {
     pin: [u8; 32],
     mldsa: [u8; 32],
     seed: [u8; 32],
+    /// B-1: pin exit'а из ссылки — пачка берётся под КОНКРЕТНЫЙ узел (нули = без привязки).
+    exit_pin: [u8; 32],
     /// Бутстрапный obfs-PSK из ссылки — обёртка канала К ИЗДАТЕЛЮ (после H-3 только она).
     bootstrap_psk: Option<[u8; 32]>,
     batch: usize,
@@ -124,6 +132,7 @@ impl TokenPouch {
         pin: &[u8; 32],
         mldsa: &[u8; 32],
         seed: &[u8; 32],
+        exit_pin: &[u8; 32],
         bootstrap_psk: Option<[u8; 32]>,
     ) -> Self {
         Self {
@@ -131,6 +140,7 @@ impl TokenPouch {
             pin: *pin,
             mldsa: *mldsa,
             seed: *seed,
+            exit_pin: *exit_pin,
             bootstrap_psk,
             batch: batch_size(),
             st: Mutex::new(Purse::default()),
@@ -169,6 +179,7 @@ impl TokenPouch {
             &self.pin,
             &self.mldsa,
             &self.seed,
+            &self.exit_pin,
             self.batch,
             // Ретраи коннекта: фоновой дозаправке спешить некуда и повторить она может позже
             // сама, а вот путь перед establish обязан отработать сеть, которая только что
@@ -416,11 +427,36 @@ pub fn install_with_seed(
         return false;
     };
     // S2.1/A1-остаток: канал к издателю оборачиваем бутстрапным PSK из ссылки (probe-resistance).
-    let pouch = Arc::new(TokenPouch::new(issuer, &pin, &mldsa, &seed, link.obfs_psk));
+    // B-1: узел, под который берём токены, — тот, чей pin лежит в ссылке. Ссылка без pin'а
+    // (совсем старая) даёт непривязанную выдачу: exit примет её только в стендовом режиме, и это
+    // лучше, чем молча вернуться к общему на весь деплой ключу эпохи.
+    let exit_pin = link.cert_pin.unwrap_or(citadel_token::EXIT_PIN_UNBOUND);
+    let pouch =
+        Arc::new(TokenPouch::new(issuer, &pin, &mldsa, &seed, &exit_pin, link.obfs_psk));
     *pouch.events.lock().unwrap() = Some(controller.subscribe());
     pouch.ensure_topup(); // есть runtime — стартуем сразу, нет — стартует первый же establish
     controller.set_token_refresher(pouch.refresher());
     true
+}
+
+/// B-1: pin exit'а, под который клиент берёт токены, по уже собранному конфигу.
+///
+/// Берётся из того же источника, что и проверка сертификата (`ClientConfig::pin_for`), — иначе
+/// абонент назвал бы издателю один узел, а подключился к другому и получил бы отказ, который на
+/// его стороне выглядит как «сервер не принимает токен».
+///
+/// Пиннинг не настроен (`NoPin`) или pin ещё не известен (`Waiting`, TOFU) → нули: выдача без
+/// привязки. Такой токен exit принимает только в стендовом режиме — см. `Citadel_TOKEN_UNBOUND`.
+fn exit_pin_of(config: &ClientConfig) -> [u8; 32] {
+    let host = config
+        .servers
+        .first()
+        .map(|s| citadel_quic::client::host_of(s))
+        .unwrap_or(config.server_name.as_str());
+    match config.pin_for(host) {
+        citadel_quic::config::PinMode::Pinned(p) => p,
+        _ => citadel_token::EXIT_PIN_UNBOUND,
+    }
 }
 
 /// C5.4: разовая добыча токена для диагностики/одиночного establish (кошелька нет — он привязан к
@@ -450,8 +486,12 @@ pub async fn with_token(
         // что и туннель (probe-resistance; None → голый TLS для ссылок без obfs).
         let obfs_psk = config.obfs_psk;
         // Диагностика идёт при опущенном туннеле → маршрут прямой.
+        // B-1: под какой узел берём токен. Диагностический путь работает с уже собранным
+        // `ClientConfig`, поэтому pin берём оттуда же, откуда его возьмёт TLS-проверка.
+        let exit_pin = exit_pin_of(&config);
         let mut grant =
-            fetch_tokens(issuer, pin, mldsa, seed, 1, 20, obfs_psk, Route::Bypass).await?;
+            fetch_tokens(issuer, pin, mldsa, seed, &exit_pin, 1, 20, obfs_psk, Route::Bypass)
+                .await?;
         if let Some(t) = grant.tokens.pop() {
             config.token = t;
         }
@@ -468,7 +508,14 @@ mod tests {
     use super::*;
 
     fn pouch() -> Arc<TokenPouch> {
-        Arc::new(TokenPouch::new("127.0.0.1:9", &[0u8; 32], &[1u8; 32], &[7u8; 32], None))
+        Arc::new(TokenPouch::new(
+            "127.0.0.1:9",
+            &[0u8; 32],
+            &[1u8; 32],
+            &[7u8; 32],
+            &[0x5cu8; 32],
+            None,
+        ))
     }
 
     /// Недоступный issuer → Err (обёртка не паникует и не виснет); 1 попытка → быстро.
@@ -479,6 +526,7 @@ mod tests {
             &[0u8; 32],
             &[1u8; 32],
             &[7u8; 32],
+            &[0x5cu8; 32],
             1,
             1,
             None,
@@ -527,7 +575,9 @@ mod tests {
         let scfg = identity.server_config().unwrap();
         let pq = pqid::IssuerPqIdentity::load_or_generate(&dirs).unwrap();
         let issuer_mldsa = pq.commitment();
-        let epoch_key = EpochKey::generate().unwrap();
+        // B-1: издатель считает вслепую ключом ЗАЯВЛЕННОГО узла, выведенным из мастера эпохи.
+        let master = EpochKey::generate().unwrap().secret_bytes();
+        let exit_pin = [0x5cu8; 32];
 
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap().to_string();
@@ -545,6 +595,16 @@ mod tests {
                 pqid::verify_auth(&auth, pqid::DOMAIN_CLIENT, &challenge, &ekm).unwrap();
                 // M-9: гейт выдачи — обычный абонент (активация не требуется).
                 let _ = write_frame(&mut conn, &citadel_token::build_gate_frame(citadel_token::Gate::Allow));
+                // B-1: клиент называет узел → ключ эпохи выводится под него.
+                let Ok(bind) = read_frame(&mut conn) else { return };
+                let asked = citadel_token::parse_exit_binding(&bind).unwrap();
+                assert_eq!(asked, exit_pin, "клиент назвал exit из ссылки");
+                let epoch_key = EpochKey::derive_for_exit(
+                    &master,
+                    citadel_token::current_epoch(3600),
+                    &asked,
+                )
+                .unwrap();
                 let _ = write_frame(&mut conn, &epoch_key.public_bytes());
                 // Ротация L1 включена (0x01) + границы эпохи: ровно то, что клиент кладёт в кошелёк.
                 let _ = write_frame(&mut conn, &citadel_token::build_epoch_frame(Some([7u8; 32]), 3600));
@@ -557,7 +617,14 @@ mod tests {
             }
         });
 
-        let p = Arc::new(TokenPouch::new(&addr, &issuer_pin, &issuer_mldsa, &[0x33u8; 32], None));
+        let p = Arc::new(TokenPouch::new(
+            &addr,
+            &issuer_pin,
+            &issuer_mldsa,
+            &[0x33u8; 32],
+            &exit_pin,
+            None,
+        ));
         assert_eq!(p.batch, DEFAULT_BATCH, "по умолчанию берём пачку, а не один токен");
         let mut tokens = Vec::new();
         for i in 0..DEFAULT_BATCH {

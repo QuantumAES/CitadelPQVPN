@@ -50,6 +50,12 @@ services:
     sysctls: ["net.ipv4.ip_forward=1"]
     volumes: ["pinshare:/shared"]      # exit пишет pin (F1), читает issuer.key (M4/M5)
     networks: ["Citadelnet"]
+    # B-1 (СТЕНД, в деплое не включать): принимать и токены «без привязки к узлу». Харнес гоняет
+    # клиента сразу по двум разным exit'ам (shuffle+failover) и берёт одну пачку на оба, а с
+    # per-exit ключами такая пачка годна только своему узлу. Сам механизм привязки проверяется
+    # отдельно — ТЕСТ 26 берёт пачку под pin первого exit'а и предъявляет её второму.
+    environment:
+      Citadel_TOKEN_UNBOUND: "1"
 
   # Второй exit (M5 multi-server): идентичен exit, свой self-signed cert/pin → exit2.pin.
   exit2:
@@ -61,6 +67,7 @@ services:
     environment:
       Citadel_PIN_FILE: /shared/exit2.pin       # свой pin-файл (клиент пиннит per-host)
       Citadel_MLDSA_PUB_FILE: /shared/exit2.mldsa  # M7: свой ML-DSA-65 pub (per-host)
+      Citadel_TOKEN_UNBOUND: "1"                # B-1 (СТЕНД): см. комментарий у exit
     read_only: true                    # S1.5: неизменяемый rootfs
     tmpfs: ["/tmp", "/run"]
     # M-4: минимальный набор вместо дефолтного docker-набора. NET_ADMIN — TUN/iptables/ip route;

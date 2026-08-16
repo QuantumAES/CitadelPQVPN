@@ -25,6 +25,10 @@ export Citadel_OBFS_EPOCH_FILE=/shared/obfs.epoch
 EXIT_IP=$(getent hosts exit 2>/dev/null | awk '{print $1; exit}')
 EXIT_IP=${EXIT_IP:-exit}
 echo "[client] exit резолвится в $EXIT_IP"
+# IP второго exit'а — для ТЕСТА 26 (B-1: токен одного узла не проходит на другом), там DNS уже закрыт
+EXIT2_IP=$(getent hosts exit2 2>/dev/null | awk '{print $1; exit}')
+EXIT2_IP=${EXIT2_IP:-exit2}
+echo "[client] exit2 резолвится в $EXIT2_IP"
 # IP issuer — для ТЕСТ 20 (фетч токенов новым абонентом ПОСЛЕ DNS-lock: hostname уже не резолвится)
 ISSUER_IP=$(getent hosts issuer 2>/dev/null | awk '{print $1; exit}')
 ISSUER_IP=${ISSUER_IP:-issuer}
@@ -448,26 +452,29 @@ echo "===================================================================="
 # exit подтягивает его сам, по тому же obfs+PQ-TLS каналу с проверкой PQ-идентичности издателя.
 # M-6: ключ эпохи стал СЕКРЕТОМ, поэтому exit ещё и доказывает СВОЮ keysync-идентичность.
 # Здесь это гоняется «как на отдельной машине»: свой пустой каталог, только сетевой путь.
+# B-1: узел просит СВОЙ ключ эпохи (k_exit = KDF(мастер, эпоха, pin)), поэтому называет свой pin.
 KEYSYNC_SEED=$(printf 'ec%.0s' {1..32})   # тот же демо-seed, что знает issuer-entrypoint ('ec'×32 — обязан быть валидным hex)
 SYNCDIR=/tmp/keysync; rm -rf "$SYNCDIR"; mkdir -p "$SYNCDIR"
 Citadel_TOKEN_ROLE=keysync Citadel_TOKEN_DIR="$SYNCDIR" Citadel_TOKEN_ISSUER="$ISSUER_IP:7000" \
   Citadel_ISSUER_PIN=$ISSUER_PIN Citadel_ISSUER_MLDSA=$ISSUER_MLDSA Citadel_OBFS_PSK=$(cat /shared/obfs.psk) \
-  Citadel_KEYSYNC_SEED=$KEYSYNC_SEED \
+  Citadel_KEYSYNC_SEED=$KEYSYNC_SEED Citadel_EXIT_PIN_FILE=/shared/exit.pin \
   Citadel_EPOCH_SECS=3600 Citadel_KEYSYNC_INTERVAL=5 timeout 20 citadel-token >/tmp/keysync.log 2>&1 || true
-if [ -s "$SYNCDIR/issuer.key" ] && cmp -s "$SYNCDIR/issuer.key" /shared/issuer.key; then
-    echo "  OK ✔ ключ эпохи получен по сети и совпал с ключом издателя (exit может стоять отдельно)"
+# Ключ узла кладётся как exit-<эпоха>.key. Мастер эпохи (issuer.key) на exit-машину НЕ уезжает —
+# в этом весь смысл B-1, поэтому проверяем и то, и другое.
+if ls "$SYNCDIR"/exit-*.key >/dev/null 2>&1 && ! [ -f "$SYNCDIR/issuer.key" ]; then
+    echo "  OK ✔ ключ ЭТОГО узла получен по сети (мастер эпохи остался у издателя — B-1)"
 else
-    echo "  [!] keysync не принёс ключ эпохи ✗"; tail -3 /tmp/keysync.log
+    echo "  [!] keysync не принёс ключ узла (или принёс мастер) ✗"; tail -3 /tmp/keysync.log
 fi
 # Негатив 1: чужое обязательство PQ-идентичности издателя → синхронизация обязана отказать,
 # иначе подставной издатель навязал бы exit'у свой ключ и тот верил бы чужим токенам.
 rm -rf "$SYNCDIR"; mkdir -p "$SYNCDIR"
 Citadel_TOKEN_ROLE=keysync Citadel_TOKEN_DIR="$SYNCDIR" Citadel_TOKEN_ISSUER="$ISSUER_IP:7000" \
   Citadel_ISSUER_PIN=$ISSUER_PIN Citadel_ISSUER_MLDSA=$(printf 'ab%.0s' {1..32}) \
-  Citadel_KEYSYNC_SEED=$KEYSYNC_SEED \
+  Citadel_KEYSYNC_SEED=$KEYSYNC_SEED Citadel_EXIT_PIN_FILE=/shared/exit.pin \
   Citadel_OBFS_PSK=$(cat /shared/obfs.psk) Citadel_EPOCH_SECS=3600 Citadel_KEYSYNC_INTERVAL=5 \
   timeout 15 citadel-token >/tmp/keysync-mitm.log 2>&1 || true
-if [ -s "$SYNCDIR/issuer.key" ]; then
+if ls "$SYNCDIR"/exit-*.key >/dev/null 2>&1; then
     echo "  [!] ключ принят от «издателя» с чужой PQ-идентичностью ✗"
 else
     echo "  OK ✔ чужая PQ-идентичность издателя отклонена — ключ на диск не попал"
@@ -478,10 +485,10 @@ fi
 rm -rf "$SYNCDIR"; mkdir -p "$SYNCDIR"
 Citadel_TOKEN_ROLE=keysync Citadel_TOKEN_DIR="$SYNCDIR" Citadel_TOKEN_ISSUER="$ISSUER_IP:7000" \
   Citadel_ISSUER_PIN=$ISSUER_PIN Citadel_ISSUER_MLDSA=$ISSUER_MLDSA \
-  Citadel_KEYSYNC_SEED=$(printf 'c5%.0s' {1..32}) \
+  Citadel_KEYSYNC_SEED=$(printf 'c5%.0s' {1..32}) Citadel_EXIT_PIN_FILE=/shared/exit.pin \
   Citadel_OBFS_PSK=$(cat /shared/obfs.psk) Citadel_EPOCH_SECS=3600 Citadel_KEYSYNC_INTERVAL=5 \
   timeout 15 citadel-token >/tmp/keysync-foreign.log 2>&1 || true
-if [ -s "$SYNCDIR/issuer.key" ]; then
+if ls "$SYNCDIR"/exit-*.key >/dev/null 2>&1; then
     echo "  [!] секрет эпохи выдан по ЧУЖОЙ идентичности ✗ (любой абонент смог бы чеканить токены)"
 else
     echo "  OK ✔ чужая keysync-идентичность отклонена — секрет эпохи не выдан"
@@ -590,10 +597,54 @@ fi
 
 echo
 echo "===================================================================="
+echo "  ТЕСТ 26 (B-1) — ключ эпохи выводится ПОД УЗЕЛ: токен для exit не проходит на exit2"
+echo "===================================================================="
+# До B-1 все exit'ы одного издателя работали на общем секрете эпохи: один и тот же токен принимали
+# все узлы по очереди (spent-множество локально для узла), а взятый под контроль exit чеканил
+# токены, годные везде. Теперь абонент называет издателю pin узла, и ключ выводится под него.
+kill "$M1E" 2>/dev/null || true
+wait "$M1E" 2>/dev/null || true
+sleep 1
+rm -rf /tmp/t26; mkdir -p /tmp/t26
+# Пачка, привязанная к pin'у ПЕРВОГО exit'а (адрес издателя — числом: DNS уже fail-closed).
+Citadel_TOKEN_ROLE=client Citadel_TOKEN_ISSUER=$ISSUER_IP:7000 Citadel_ISSUER_PIN=$ISSUER_PIN \
+    Citadel_ISSUER_MLDSA=$ISSUER_MLDSA Citadel_TOKEN_DIR=/tmp/t26 Citadel_TOKEN_COUNT=2 \
+    Citadel_EXIT_PIN_FILE=/shared/exit.pin \
+    Citadel_CLIENT_SEED=$(printf 'c5%.0s' {1..32}) timeout 20 citadel-token >/tmp/t26/fetch 2>&1 || true
+if [ ! -s /tmp/t26/tokens ]; then
+    echo "  [!] не удалось получить привязанную пачку ✗"; tail -3 /tmp/t26/fetch
+else
+    # Позитив: на СВОЁМ узле привязанный токен принимается.
+    rm -f /tmp/Citadel-ready
+    Citadel_TOKENS=/tmp/t26/tokens Citadel_SERVERS="${EXIT_IP}:4433" Citadel_PIN="$(cat /shared/exit.pin)" \
+        citadel-m1 >/tmp/t26/own 2>&1 &
+    M1F=$!
+    for _ in $(seq 1 50); do [ -f /tmp/Citadel-ready ] && break; kill -0 "$M1F" 2>/dev/null || break; sleep 0.5; done
+    if [ -f /tmp/Citadel-ready ]; then
+        echo "  OK ✔ токен, взятый ПОД ЭТОТ узел, принят своим exit'ом"
+    else
+        echo "  [!] свой exit не принял привязанный к нему токен ✗"; tail -3 /tmp/t26/own
+    fi
+    kill "$M1F" 2>/dev/null || true; wait "$M1F" 2>/dev/null || true; sleep 1
+    # Негатив (суть B-1): тот же издатель, другой узел — токен не годится.
+    sed -i '1d' /tmp/t26/tokens 2>/dev/null || true   # второй токен пачки (первый уже потрачен)
+    rm -f /tmp/Citadel-ready
+    Citadel_TOKENS=/tmp/t26/tokens Citadel_SERVERS="${EXIT2_IP}:4433" Citadel_PIN="$(cat /shared/exit2.pin)" \
+        timeout 25 citadel-m1 >/tmp/t26/foreign 2>&1 || true
+    if [ -f /tmp/Citadel-ready ]; then
+        echo "  [!] чужой exit ПРИНЯЛ токен другого узла ✗ (кросс-exit реплей не закрыт)"
+    else
+        echo "  OK ✔ второй exit отверг токен, выданный под первый (кросс-exit реплей закрыт)"
+    fi
+fi
+
+echo
+echo "===================================================================="
 echo "  Готово. M1-M7 + STRIDE F1-F7: pinning, egress, obfs L1, drop-priv, DNS-leak, rate-limit,"
 echo "  миграция, TCP-fallback, split-issuance, multi-server, crypto-agility, PQ-auth, commitment-fetch,"
 echo "  admin-plane по туннелю (C7: add/revoke, домен-auth, порт снаружи закрыт),"
 echo "  синхронизация ключа эпохи по сети (P1: exit и издатель на разных машинах),"
-echo "  запрет инфраструктурных адресов из туннеля (G1/G2: хост и издатель закрыты, кроме token-порта)."
+echo "  запрет инфраструктурных адресов из туннеля (G1/G2: хост и издатель закрыты, кроме token-порта),
+  per-exit вывод ключа эпохи (B-1: токен одного узла не принимается другим)."
 echo "===================================================================="
 wait "$M1E" 2>/dev/null || true

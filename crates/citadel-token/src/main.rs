@@ -45,6 +45,33 @@ fn token_count() -> usize {
     std::env::var("Citadel_TOKEN_COUNT").ok().and_then(|s| s.parse().ok()).unwrap_or(8)
 }
 
+/// B-1: pin exit-узла для привязки выдачи — `Citadel_EXIT_PIN` (64 hex) или `Citadel_EXIT_PIN_FILE`
+/// (файл, куда сам exit пишет свой pin; там же его берёт keysync-сайдкар на той же машине).
+///
+/// Ничего не задано → [`citadel_token::EXIT_PIN_UNBOUND`]: выдача без привязки. Это осознанный
+/// режим для стенда/TOFU, а не тихий фолбэк: exit принимает такие токены только при
+/// `Citadel_TOKEN_UNBOUND=1`, поэтому «забыли настроить» проявится отказом доступа, а не молчаливым
+/// возвратом к общему на весь деплой ключу эпохи.
+///
+/// Мусор в переменной — ошибка, а не «как будто не задано»: опечатка в pin'е иначе выглядела бы
+/// как исправная конфигурация с непонятным отказом на exit'е.
+fn exit_pin_from_env() -> Result<[u8; 32]> {
+    let raw = match std::env::var("Citadel_EXIT_PIN") {
+        Ok(v) => Some(v),
+        Err(_) => match std::env::var("Citadel_EXIT_PIN_FILE") {
+            Ok(p) => Some(
+                std::fs::read_to_string(&p)
+                    .with_context(|| format!("Citadel_EXIT_PIN_FILE={p}: файл не читается"))?,
+            ),
+            Err(_) => None,
+        },
+    };
+    let Some(raw) = raw else {
+        return Ok(citadel_token::EXIT_PIN_UNBOUND);
+    };
+    parse_hex32(Some(&raw.trim().to_string()), "pin exit'а (Citadel_EXIT_PIN/_FILE)")
+}
+
 fn now_unix() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -1143,6 +1170,40 @@ fn publish_epoch_key(dir: &str, epoch: u64, key: &[u8]) -> Result<()> {
     Ok(())
 }
 
+/// B-1: положить ключ **этого exit-узла** (`exit-<epoch>.key`) — то, что keysync-сайдкар получил у
+/// издателя при раздельном деплое.
+///
+/// Отдельно от [`publish_epoch_key`] намеренно: там мастер эпохи (издатель), здесь — выведенный
+/// ключ одного узла. Один и тот же путь для обоих означал бы, что на exit-машине рано или поздно
+/// окажется файл с именем мастера, и следующий читатель решит, что мастер у него и есть.
+/// Права те же (0640 + группа exit'а): читать файл будет процесс со сброшенными привилегиями.
+fn publish_exit_key(dir: &str, epoch: u64, key: &[u8]) -> Result<()> {
+    let path = format!("{dir}/{}", citadel_token::exit_key_name(epoch));
+    let tmp = format!("{path}.tmp");
+    std::fs::write(&tmp, key).with_context(|| format!("публикация ключа узла, эпоха {epoch}"))?;
+    restrict_epoch_key(&tmp);
+    std::fs::rename(&tmp, &path).with_context(|| format!("публикация ключа узла, эпоха {epoch}"))?;
+    prune_exit_keys(dir, epoch);
+    Ok(())
+}
+
+/// Убрать ключи узла старше `epoch-1` — exit их уже не принимает (grace = current±prev), а лежащий
+/// на диске секрет без применения это только материал для того, кто до диска доберётся. Тот же
+/// принцип, что у бакетов `spent-<epoch>.bin`. Ошибки удаления игнорируем: не смогли — не беда.
+fn prune_exit_keys(dir: &str, epoch: u64) {
+    let Ok(entries) = std::fs::read_dir(dir) else { return };
+    for e in entries.flatten() {
+        let name = e.file_name();
+        let Some(name) = name.to_str() else { continue };
+        let Some(ep) = name.strip_prefix("exit-").and_then(|s| s.strip_suffix(".key")) else {
+            continue;
+        };
+        if ep.parse::<u64>().is_ok_and(|ep| ep + 1 < epoch) {
+            let _ = std::fs::remove_file(e.path());
+        }
+    }
+}
+
 /// Права на файл ключа эпохи: `0640`, группа = `Citadel_KEY_GID` (см. [`publish_epoch_key`]).
 ///
 /// Штатный путь — **издатель уже работает с нужной группой** (в compose это `user: "0:65534"`, та
@@ -1442,7 +1503,7 @@ fn serve_client(
     // Первый кадр клиента типизирован: абонент аутентифицируется, exit-узел просит ключ эпохи.
     let frame = read_frame(&mut conn)?;
     let auth = match citadel_token::pqid::parse_client_frame(&frame)? {
-        citadel_token::pqid::ClientFrame::KeySync(auth) => {
+        citadel_token::pqid::ClientFrame::KeySync { auth, exit_pin } => {
             // Раздельный деплой (P1): exit на другой машине подтягивает ключ эпохи — общего тома
             // /shared у него нет. M-6: ключ СЕКРЕТЕН, поэтому здесь полноценная аутентификация, а
             // не «раз дошёл — держи»: доказательство владения keysync-seed'ом в своём домене плюс
@@ -1450,10 +1511,17 @@ fn serve_client(
             let Some(expect) = keysync_id else {
                 anyhow::bail!("keysync запрошен, но Citadel_KEYSYNC_ID не настроен — отказ");
             };
+            // B-1: узел называет СВОЙ pin, и этот pin накрыт его же подписью (челлендж связан с
+            // ним) — иначе владелец keysync-seed'а мог бы попросить ключ соседнего узла.
+            let exit_pin: [u8; 32] = exit_pin
+                .as_slice()
+                .try_into()
+                .map_err(|_| anyhow::anyhow!("keysync: pin exit'а не 32 Б"))?;
+            let bound = citadel_token::pqid::keysync_bound_challenge(&challenge, &exit_pin);
             let id = citadel_token::pqid::verify_hybrid(
                 auth,
                 citadel_token::pqid::DOMAIN_KEYSYNC,
-                &challenge,
+                &bound,
                 &ekm,
             )
             .context("keysync: аутентификация exit-узла")?;
@@ -1462,9 +1530,19 @@ fn serve_client(
             }
             ctl.authenticated();
             drop(pass);
-            let cur = state.lock().unwrap().1.clone();
-            write_frame(&mut conn, &cur.secret_bytes())?;
-            citadel_token::dlog!("[issuer] отдан ключ эпохи (keysync exit-узла)");
+            // B-1: наружу уходит ТОЛЬКО выведенный ключ этого узла. Мастер эпохи остаётся на
+            // машине издателя: узел, получивший `k_exit`, не может ни восстановить мастер, ни
+            // вывести ключи соседей — до этой правки по keysync ехал общий секрет эпохи.
+            let (epoch, master) = {
+                let s = state.lock().unwrap();
+                (s.0, s.1.secret_bytes())
+            };
+            let k_exit = citadel_token::EpochKey::derive_for_exit(&master, epoch, &exit_pin)?;
+            write_frame(&mut conn, &k_exit.secret_bytes())?;
+            citadel_token::dlog!(
+                "[issuer] отдан ключ эпохи {epoch} для exit'а {}… (keysync, per-exit)",
+                &hex::encode(exit_pin)[..12]
+            );
             return Ok(());
         }
         citadel_token::pqid::ClientFrame::Auth(a) => a,
@@ -1523,9 +1601,17 @@ fn serve_client(
             }
         }
     }
+    // B-1: абонент называет узел, на котором предъявит пачку. Кадр читается ДО публичного элемента:
+    // элемент относится уже к ключу этого узла (`k_exit`), и под ним же проверяется DLEQ.
+    let exit_pin = citadel_token::parse_exit_binding(
+        &read_frame(&mut conn).context("абонент не прислал кадр привязки к exit'у")?,
+    )?;
     // C5.3: отдаём клиенту публичный элемент K ТЕКУЩЕЙ эпохи — под ним он проверит DLEQ каждой
     // выдачи (и заметит, если издатель применит не тот ключ).
-    let cur = state.lock().unwrap().1.clone();
+    let cur = {
+        let s = state.lock().unwrap();
+        citadel_token::EpochKey::derive_for_exit(&s.1.secret_bytes(), s.0, &exit_pin)?
+    };
     write_frame(&mut conn, &cur.public_bytes())?;
     // H-3: следом — ключ L1-обфускации текущей эпохи. Он выводится из мастер-секрета, которого нет
     // ни в одной ссылке, поэтому получить его может ТОЛЬКО прошедший Layer-1 абонент — и ровно на
@@ -1544,9 +1630,11 @@ fn serve_client(
         // режут повтор ОДНОГО токена, но не число разных). Счётчик per-(client_id, эпоха),
         // сбрасывается со сменой эпохи. In-RAM (как spent-set exit'а): рестарт обнуляет, но
         // квота epoch-bounded. Достигнут потолок → прекращаем выдачу этому клиенту в эту эпоху.
+        // B-1: ключ выводим на каждой итерации — эпоха могла смениться (фоновая ротация мастера),
+        // и токен обязан быть под ключом ТОЙ эпохи, в которой он выдан.
         let (cur_epoch, key) = {
             let s = state.lock().unwrap();
-            (s.0, s.1.clone())
+            (s.0, citadel_token::EpochKey::derive_for_exit(&s.1.secret_bytes(), s.0, &exit_pin)?)
         };
         if !issuance.lock().unwrap().take_quota(client_id, cur_epoch, max_per_epoch) {
             citadel_token::dlog!(
@@ -1633,6 +1721,11 @@ fn run_client_fetch() -> Result<()> {
         .context("Citadel_ISSUER_MLDSA (32 байта hex) обязателен: PQ-обязательство издателя")?;
     let count = token_count();
     let dir = token_dir();
+    // B-1: под какой exit берём пачку. В GUI это pin из ссылки; здесь — явная переменная
+    // (`Citadel_EXIT_PIN` hex или `Citadel_EXIT_PIN_FILE`, куда exit пишет свой pin). Не задано —
+    // выдача «без привязки к узлу»: она работает, но такие токены exit примет только при
+    // `Citadel_TOKEN_UNBOUND=1`, поэтому молча деградировать до общего ключа деплой не может.
+    let exit_pin = exit_pin_from_env()?;
     // S2.1/A1-остаток: obfs-обёртка канала (probe-resistance) — PSK из env, обязан совпасть с issuer.
     let obfs_psk = obfs_psk_from_env();
     eprintln!("[client] Layer-1 issuance у издателя {issuer} ({count} токенов, PQ-TLS+pin{}, VOPRF epoch-scoped)…",
@@ -1644,6 +1737,7 @@ fn run_client_fetch() -> Result<()> {
         &issuer_pin,
         &issuer_mldsa,
         &seed,
+        &exit_pin,
         count,
         20,
         obfs_psk,
@@ -1748,6 +1842,25 @@ fn run_keysync() -> Result<()> {
     let mut last: Option<u64> = None;
     loop {
         let epoch = citadel_token::current_epoch(epoch_secs);
+        // B-1: pin своего exit'а перечитываем на каждой итерации — сайдкар обычно стартует раньше,
+        // чем exit успел записать pin-файл (первый запуск, пересоздание идентичности). Нет файла —
+        // ждём следующий круг, а не падаем в рестарт-петлю контейнера.
+        let exit_pin = match exit_pin_from_env() {
+            Ok(p) if p == citadel_token::EXIT_PIN_UNBOUND => {
+                anyhow::bail!(
+                    "keysync: не задан pin exit'а (Citadel_EXIT_PIN / Citadel_EXIT_PIN_FILE). \
+                     С per-exit ключами эпохи (B-1) узел обязан назвать себя: без этого издатель \
+                     вывел бы ключ «без привязки», а exit проверял бы токены своим — и туннель не \
+                     поднимался бы вовсе"
+                );
+            }
+            Ok(p) => p,
+            Err(e) => {
+                eprintln!("[keysync] жду pin exit'а: {e:#}");
+                std::thread::sleep(std::time::Duration::from_secs(interval.max(5)));
+                continue;
+            }
+        };
         // Уже есть ключ ЭТОЙ эпохи — не дёргаем издателя лишний раз (сеть + его accept-петля).
         if last != Some(epoch) {
             match citadel_token::fetch_epoch_key(
@@ -1755,11 +1868,12 @@ fn run_keysync() -> Result<()> {
                 &issuer_pin,
                 &issuer_mldsa,
                 &keysync_seed,
+                &exit_pin,
                 3,
                 obfs_psk,
             ) {
                 Ok(key) => {
-                    if let Err(e) = publish_epoch_key(&dir, epoch, &key) {
+                    if let Err(e) = publish_exit_key(&dir, epoch, &key) {
                         eprintln!("[keysync] ключ эпохи {epoch} получен, но не записан: {e:#}");
                     } else {
                         // no-logs и гигиена секрета: длину ключа не печатаем, сам ключ — тем более.

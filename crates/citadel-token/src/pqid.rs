@@ -236,19 +236,44 @@ pub enum ClientFrame {
     Auth(HybridAuth),
     /// «Дай ключ текущей эпохи» — запрос exit-узла (см. `citadel-token keysync`), с доказательством
     /// владения keysync-идентичностью.
-    KeySync(HybridAuth),
+    ///
+    /// **B-1:** запрос называет ещё и `exit_pin` — узел просит СВОЙ ключ (`k_exit`), а не мастер
+    /// эпохи. Pin входит в подписываемое сообщение (см. [`keysync_bound_challenge`]), поэтому
+    /// подменить его на pin соседа нельзя даже владельцу keysync-seed'а: подпись перестанет
+    /// сходиться. Без этого узел, доказавший свою идентичность, мог бы попросить ключ чужого.
+    KeySync {
+        auth: HybridAuth,
+        #[serde(with = "serde_bytes")]
+        exit_pin: Vec<u8>,
+    },
 }
 
-/// Собрать кадр-запрос ключа эпохи (exit-узел доказывает свою keysync-идентичность).
+/// B-1: челлендж keysync, привязанный к pin запрашивающего узла: `H(challenge ‖ exit_pin)`.
+///
+/// Обе стороны считают его одинаково и подписывают/проверяют именно его. Так `exit_pin`, который
+/// едет отдельным полем кадра, оказывается под подписью, не меняя формат [`HybridAuth`].
+pub fn keysync_bound_challenge(challenge: &[u8], exit_pin: &[u8; 32]) -> [u8; 32] {
+    let mut h = blake3::Hasher::new_derive_key("CitadelPQVPN/keysync/v2/exit-bind");
+    h.update(challenge);
+    h.update(exit_pin);
+    *h.finalize().as_bytes()
+}
+
+/// Собрать кадр-запрос ключа эпохи (exit-узел доказывает свою keysync-идентичность и называет
+/// свой pin — B-1: издатель выведет ключ ровно для этого узла).
 pub fn build_keysync_request(
     seed: &[u8; SEED_LEN],
     challenge: &[u8],
     ekm: &[u8],
+    exit_pin: &[u8; 32],
 ) -> Result<Vec<u8>> {
-    let raw = build_auth(seed, DOMAIN_KEYSYNC, challenge, ekm)?;
+    let bound = keysync_bound_challenge(challenge, exit_pin);
+    let raw = build_auth(seed, DOMAIN_KEYSYNC, &bound, ekm)?;
     match parse_client_frame(&raw)? {
-        ClientFrame::Auth(a) => to_cbor(&ClientFrame::KeySync(a)),
-        ClientFrame::KeySync(_) => unreachable!("build_auth возвращает Auth"),
+        ClientFrame::Auth(a) => {
+            to_cbor(&ClientFrame::KeySync { auth: a, exit_pin: exit_pin.to_vec() })
+        }
+        ClientFrame::KeySync { .. } => unreachable!("build_auth возвращает Auth"),
     }
 }
 
@@ -343,7 +368,7 @@ pub fn build_auth(
 pub fn verify_auth(raw: &[u8], domain: &[u8], challenge: &[u8], ekm: &[u8]) -> Result<[u8; 32]> {
     match parse_client_frame(raw)? {
         ClientFrame::Auth(auth) => verify_hybrid(auth, domain, challenge, ekm),
-        ClientFrame::KeySync(_) => bail!("на этом канале доступна только аутентификация"),
+        ClientFrame::KeySync { .. } => bail!("на этом канале доступна только аутентификация"),
     }
 }
 
@@ -506,23 +531,32 @@ mod tests {
     fn keysync_request_is_domain_separated() {
         let seed = [0x5eu8; SEED_LEN];
         let challenge = [0u8; 32];
-        let raw = build_keysync_request(&seed, &challenge, EKM).unwrap();
-        assert!(verify_auth(&raw, DOMAIN_CLIENT, &challenge, EKM).is_err());
-        assert!(verify_auth(&raw, DOMAIN_ADMIN, &challenge, EKM).is_err());
-        let ClientFrame::KeySync(auth) = parse_client_frame(&raw).unwrap() else {
+        let pin = [0x77u8; 32];
+        let bound = keysync_bound_challenge(&challenge, &pin);
+        let raw = build_keysync_request(&seed, &challenge, EKM, &pin).unwrap();
+        assert!(verify_auth(&raw, DOMAIN_CLIENT, &bound, EKM).is_err());
+        assert!(verify_auth(&raw, DOMAIN_ADMIN, &bound, EKM).is_err());
+        let ClientFrame::KeySync { auth, exit_pin } = parse_client_frame(&raw).unwrap() else {
             panic!("ожидался keysync-кадр");
         };
+        assert_eq!(exit_pin, pin.to_vec(), "узел называет свой pin (B-1)");
         assert_eq!(
-            verify_hybrid(auth.clone(), DOMAIN_KEYSYNC, &challenge, EKM).unwrap(),
+            verify_hybrid(auth.clone(), DOMAIN_KEYSYNC, &bound, EKM).unwrap(),
             id_from_seed(&seed).unwrap(),
             "издатель опознаёт exit по keysync-id"
         );
         // тот же кадр под чужим доменом не проходит
-        assert!(verify_hybrid(auth, DOMAIN_CLIENT, &challenge, EKM).is_err());
+        assert!(verify_hybrid(auth.clone(), DOMAIN_CLIENT, &bound, EKM).is_err());
+        // B-1: подпись накрывает pin — подставить чужой (чтобы получить ключ соседа) нельзя
+        let other = keysync_bound_challenge(&challenge, &[0x88u8; 32]);
+        assert!(
+            verify_hybrid(auth, DOMAIN_KEYSYNC, &other, EKM).is_err(),
+            "подмена pin обязана ломать подпись"
+        );
         // и наоборот: абонентский auth-кадр не сойдёт за keysync
-        let as_client = build_auth(&seed, DOMAIN_CLIENT, &challenge, EKM).unwrap();
+        let as_client = build_auth(&seed, DOMAIN_CLIENT, &bound, EKM).unwrap();
         let ClientFrame::Auth(a) = parse_client_frame(&as_client).unwrap() else { unreachable!() };
-        assert!(verify_hybrid(a, DOMAIN_KEYSYNC, &challenge, EKM).is_err());
+        assert!(verify_hybrid(a, DOMAIN_KEYSYNC, &bound, EKM).is_err());
     }
 
     /// Мусор на входе не роняет верификаторы (кадры приходят из сети до всякой аутентификации).

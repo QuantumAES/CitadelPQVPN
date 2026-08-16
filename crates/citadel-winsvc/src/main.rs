@@ -7,13 +7,20 @@
 //!
 //! Реализовано целиком: named-pipe сервер + config-handshake (`TunSetup` → READY), чистая
 //! оркестрация [`plan`], WinTUN-адаптер и packet-pump (`windows_svc::Session`/`bring_up`),
-//! WFP-фильтры (`crate::wfp`) — IPv4-kill-switch и fail-closed блок IPv6-утечки (W1). Открытый остаток —
-//! не заглушки, а известные ограничения: L-9 (опознание клиента пайпа по PID→путь образа, без
-//! проверки подписи) и L-12 (фильтры стоят на `ALE_AUTH_CONNECT`, поэтому армирование не рвёт уже
-//! установленные потоки); оба — в `docs/SECURITY-AUDIT-4-2026-08.md §20.3`.
+//! WFP-фильтры (`crate::wfp`) — IPv4-kill-switch и fail-closed блок IPv6-утечки (W1), на двух
+//! ступенях: `ALE_AUTH_CONNECT` (установление соединений) и `OUTBOUND_TRANSPORT` (каждый пакет,
+//! включая потоки, начатые до армирования — L-12). Опознание клиента пайпа — по одному хэндлу
+//! процесса, с проверкой времени старта (анти-PID-reuse) и подписи образа (L-9,
+//! [`crate::authenticode`]).
+//!
+//! **Не проверено на живой машине** (нет Windows-стенда): фактический разрыв установленного потока
+//! при армировании и поведение проверки подписи на подписанной сборке. Сценарии — в
+//! `docs/SECURITY-AUDIT-4-2026-08.md §22`.
 
 #[cfg_attr(not(windows), allow(dead_code))]
 mod plan;
+#[cfg(windows)]
+mod authenticode;
 #[cfg(windows)]
 mod log;
 #[cfg(windows)]
@@ -626,6 +633,11 @@ mod windows_svc {
     /// флаг остановки — общий [`SHUTDOWN`], его же ставит рабочий поток на `TAG_QUIT`.
     fn serve(enforce_client_auth: bool) -> anyhow::Result<()> {
         eprintln!("[svc] слушаю {PIPE_NAME} (client-auth W3: {})", if enforce_client_auth { "вкл" } else { "выкл (dev-console)" });
+        if enforce_client_auth {
+            // Режим проверки подписи вычисляется по образу самой службы — печатаем его один раз при
+            // старте, чтобы «подпись не проверяется» никогда не было молчаливым состоянием.
+            eprintln!("[svc] {}", crate::authenticode::policy_banner());
+        }
         // Overlapped-контекст акцептора: только ConnectNamedPipe. Каждый рабочий поток заводит свой Ov.
         let ov = Ov::new()?;
         let mut workers: Vec<std::thread::JoinHandle<()>> = Vec::new();
@@ -633,6 +645,10 @@ mod windows_svc {
             let h = create_pipe_instance()?;
             LISTENING_PIPE.store(h as isize, Ordering::Release);
             let connected = overlapped_connect(h, &ov);
+            // L-9: момент accept'а фиксируем СРАЗУ — по нему отсекается процесс, стартовавший позже
+            // (переиспользованный PID). Взять его позже нельзя: тогда «позже accept'а» перестанет
+            // отличаться от «позже проверки».
+            let accepted_at = now_filetime();
             LISTENING_PIPE.store(0, Ordering::Release);
             if SHUTDOWN.load(Ordering::Acquire) {
                 unsafe { CloseHandle(h) };
@@ -649,10 +665,10 @@ mod windows_svc {
             // должен стоить рабочего потока.
             // W3 — образ клиента из install-dir; M-5 — SID его пользователя (владелец сессии).
             let owner = if enforce_client_auth {
-                match authenticate_client(h) {
+                match authenticate_client(h, accepted_at) {
                     Ok(sid) => Some(sid),
                     Err(e) => {
-                        eprintln!("[svc] отклонён клиент пайпа (W3/M-5): {e:#}");
+                        eprintln!("[svc] отклонён клиент пайпа (W3/L-9/M-5): {e:#}");
                         unsafe {
                             DisconnectNamedPipe(h);
                             CloseHandle(h);
@@ -692,78 +708,173 @@ mod windows_svc {
         Ok(())
     }
 
+    /// Клиент пайпа как ОДИН открытый хэндл процесса.
+    ///
+    /// L-9 (аудит-4), первая половина: **PID-reuse**. Раньше каждая проверка (образ, затем SID)
+    /// заново звала `OpenProcess(pid)`. Между `GetNamedPipeClientProcessId` и этими вызовами
+    /// клиент мог завершиться, а его PID — достаться ЧУЖОМУ процессу: проверки уходили в другой
+    /// объект, и служба могла аутентифицировать по образу приложения, а владельца сессии взять у
+    /// постороннего (или наоборот). Windows переиспользует PID охотно, а инициировать окно гонки
+    /// умеет и непривилегированный пользователь — достаточно подключиться к пайпу и сразу упасть.
+    ///
+    /// Лечение из двух частей: (1) хэндл открывается ОДИН раз и все проверки идут по нему — пока
+    /// хэндл жив, он указывает на тот же объект процесса, даже если PID уже переиспользован;
+    /// (2) сверяется время старта: настоящий клиент существовал ДО того, как подключился к пайпу,
+    /// поэтому процесс, стартовавший позже момента accept'а, — это уже другой процесс (см.
+    /// [`ClientProcess::verify_not_pid_reuse`]).
+    struct ClientProcess {
+        pid: u32,
+        handle: HANDLE,
+    }
+
+    impl Drop for ClientProcess {
+        fn drop(&mut self) {
+            // SAFETY: хэндл получен OpenProcess и больше нигде не закрывается.
+            unsafe { CloseHandle(self.handle) };
+        }
+    }
+
+    impl ClientProcess {
+        /// Открыть процесс, подключившийся к `pipe`. SYSTEM открывает любой процесс правом
+        /// PROCESS_QUERY_LIMITED_INFORMATION (кросс-integrity вниз всегда разрешён).
+        fn open(pipe: HANDLE) -> anyhow::Result<Self> {
+            use windows_sys::Win32::System::Threading::{
+                OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
+            };
+            let mut pid: u32 = 0;
+            // SAFETY: pipe — валидный серверный хэндл подключённого клиента; pid — out-указатель.
+            if unsafe { GetNamedPipeClientProcessId(pipe, &mut pid) } == 0 {
+                anyhow::bail!("GetNamedPipeClientProcessId err={}", unsafe { GetLastError() });
+            }
+            // SAFETY: OpenProcess лимитированным правом; хэндл живёт до Drop.
+            let handle = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
+            if handle.is_null() {
+                anyhow::bail!("OpenProcess(pid={pid}) err={}", unsafe { GetLastError() });
+            }
+            Ok(Self { pid, handle })
+        }
+
+        /// L-9: процесс, стартовавший ПОСЛЕ момента подключения к пайпу, клиентом быть не может —
+        /// значит, PID переиспользован и открытый нами объект принадлежит постороннему.
+        /// `accepted_at` — системное время (FILETIME, 100-нс тики) сразу после успешного accept'а.
+        fn verify_not_pid_reuse(&self, accepted_at: u64) -> anyhow::Result<()> {
+            use windows_sys::Win32::Foundation::FILETIME;
+            use windows_sys::Win32::System::Threading::GetProcessTimes;
+            // SAFETY: handle валиден; все четыре out-структуры — на стеке.
+            let (ok, created) = unsafe {
+                let mut created: FILETIME = std::mem::zeroed();
+                let mut exit: FILETIME = std::mem::zeroed();
+                let mut kernel: FILETIME = std::mem::zeroed();
+                let mut user: FILETIME = std::mem::zeroed();
+                let ok = GetProcessTimes(
+                    self.handle,
+                    &mut created,
+                    &mut exit,
+                    &mut kernel,
+                    &mut user,
+                );
+                (ok, filetime_u64(created))
+            };
+            if ok == 0 {
+                anyhow::bail!("GetProcessTimes(pid={}) err={}", self.pid, unsafe { GetLastError() });
+            }
+            if crate::plan::is_pid_reuse(created, accepted_at) {
+                anyhow::bail!(
+                    "L-9: процесс pid={} стартовал ПОСЛЕ подключения к пайпу ({created} > \
+                     {accepted_at}) — PID переиспользован, это не наш клиент",
+                    self.pid
+                );
+            }
+            Ok(())
+        }
+
+        /// Полный путь образа (QueryFullProcessImageNameW) — по уже открытому хэндлу.
+        fn image_path(&self) -> anyhow::Result<std::path::PathBuf> {
+            use windows_sys::Win32::System::Threading::QueryFullProcessImageNameW;
+            // SAFETY: handle валиден; буфер фикс. под MAX_PATH, len — in/out (ёмкость буфера →
+            // фактическая длина, символы UTF-16).
+            unsafe {
+                let mut buf = [0u16; 260]; // MAX_PATH
+                let mut len = buf.len() as u32;
+                if QueryFullProcessImageNameW(self.handle, 0, buf.as_mut_ptr(), &mut len) == 0 {
+                    anyhow::bail!(
+                        "QueryFullProcessImageNameW(pid={}) err={}",
+                        self.pid,
+                        GetLastError()
+                    );
+                }
+                Ok(std::path::PathBuf::from(String::from_utf16_lossy(&buf[..len as usize])))
+            }
+        }
+
+        /// M-5 (аудит-4): строковый SID пользователя процесса (`S-1-5-21-…`). По нему служба решает,
+        /// кому принадлежит активная сессия туннеля и кто вправе её вытеснить.
+        fn user_sid(&self) -> anyhow::Result<String> {
+            client_user_sid(self.handle, self.pid)
+        }
+    }
+
+    /// FILETIME → u64 (100-нс тики с 1601 г.), в этом виде времена сравнимы напрямую.
+    fn filetime_u64(t: windows_sys::Win32::Foundation::FILETIME) -> u64 {
+        ((t.dwHighDateTime as u64) << 32) | t.dwLowDateTime as u64
+    }
+
+    /// Текущее системное время в тиках FILETIME (момент accept'а соединения — см.
+    /// [`ClientProcess::verify_not_pid_reuse`]).
+    fn now_filetime() -> u64 {
+        use windows_sys::Win32::Foundation::FILETIME;
+        use windows_sys::Win32::System::SystemInformation::GetSystemTimeAsFileTime;
+        // SAFETY: out-структура на стеке.
+        unsafe {
+            let mut t: FILETIME = std::mem::zeroed();
+            GetSystemTimeAsFileTime(&mut t);
+            filetime_u64(t)
+        }
+    }
+
     /// W3 (аудит-3): аутентификация клиента пайпа. ACL даёт доступ любому интерактивному юзеру (IU),
     /// но служба (LocalSystem) выполняет привилегированную реконфигурацию сети — доверять ЛЮБОМУ
     /// процессу нельзя. Проверяем, что подключившийся процесс — установленное приложение Citadel: его
     /// образ в ТОМ ЖЕ каталоге, что и служба (Inno ставит app.exe и citadel-svc.exe в один
     /// `%ProgramFiles%\CitadelPQVPN`; Program Files пишет только админ ⇒ медиум-малварь туда бинарь
-    /// не положит). SYSTEM открывает клиента (≤ integrity) — OpenProcess надёжен. Дополняет
-    /// mandatory-label в SDDL (блок low-integrity). Err → клиент не из install-dir (отклонить).
-    fn verify_client_is_installed_app(pipe: HANDLE) -> anyhow::Result<()> {
+    /// не положит). Дополняет mandatory-label в SDDL (блок low-integrity).
+    ///
+    /// L-9 (аудит-4) добавил к «правильному каталогу» проверку подписи образа
+    /// ([`crate::authenticode`]): каталог отвечает за «кто мог туда положить», подпись — за «чей это
+    /// бинарь». Err → клиент отклонён.
+    fn verify_client_is_installed_app(proc: &ClientProcess) -> anyhow::Result<()> {
         let install_dir = std::env::current_exe()
             .ok()
             .and_then(|p| p.parent().map(|d| d.to_path_buf()))
             .ok_or_else(|| anyhow::anyhow!("не определить install-dir службы (current_exe)"))?;
-        let mut pid: u32 = 0;
-        // SAFETY: pipe — валидный серверный хэндл подключённого клиента; pid — out-указатель.
-        if unsafe { GetNamedPipeClientProcessId(pipe, &mut pid) } == 0 {
-            anyhow::bail!("GetNamedPipeClientProcessId err={}", unsafe { GetLastError() });
-        }
-        let image = client_image_path(pid)?;
+        let image = proc.image_path()?;
         if !crate::plan::same_dir(&image, &install_dir) {
             anyhow::bail!(
                 "образ клиента {image:?} не в install-dir службы {install_dir:?} — не приложение Citadel"
             );
         }
-        eprintln!("[svc] W3: клиент пайпа аутентифицирован (образ из install-dir, pid={pid})");
+        crate::authenticode::check_client_image(&image)?;
+        eprintln!(
+            "[svc] W3/L-9: клиент пайпа аутентифицирован (образ из install-dir, pid={})",
+            proc.pid
+        );
         Ok(())
     }
 
-    /// Полный путь образа процесса `pid` (QueryFullProcessImageNameW). SYSTEM открывает любой процесс
-    /// правом PROCESS_QUERY_LIMITED_INFORMATION (кросс-integrity вниз всегда разрешён).
-    fn client_image_path(pid: u32) -> anyhow::Result<std::path::PathBuf> {
-        use windows_sys::Win32::System::Threading::{
-            OpenProcess, QueryFullProcessImageNameW, PROCESS_QUERY_LIMITED_INFORMATION,
-        };
-        // SAFETY: OpenProcess лимитированным правом; хэндл закрываем; буфер фикс. под MAX_PATH,
-        // len — in/out (ёмкость буфера → фактическая длина, символы UTF-16).
-        unsafe {
-            let h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
-            if h.is_null() {
-                anyhow::bail!("OpenProcess(pid={pid}) err={}", GetLastError());
-            }
-            let mut buf = [0u16; 260]; // MAX_PATH
-            let mut len = buf.len() as u32;
-            let ok = QueryFullProcessImageNameW(h, 0, buf.as_mut_ptr(), &mut len);
-            CloseHandle(h);
-            if ok == 0 {
-                anyhow::bail!("QueryFullProcessImageNameW(pid={pid}) err={}", GetLastError());
-            }
-            Ok(std::path::PathBuf::from(String::from_utf16_lossy(&buf[..len as usize])))
-        }
-    }
-
-    /// M-5 (аудит-4): строковый SID пользователя, под которым работает процесс `pid` (`S-1-5-21-…`).
-    /// По нему служба решает, кому принадлежит активная сессия туннеля и кто вправе её вытеснить.
-    fn client_user_sid(pid: u32) -> anyhow::Result<String> {
+    /// Строковый SID пользователя процесса по УЖЕ открытому хэндлу (см. [`ClientProcess`]).
+    fn client_user_sid(proc: HANDLE, pid: u32) -> anyhow::Result<String> {
         use windows_sys::Win32::Foundation::LocalFree;
         use windows_sys::Win32::Security::Authorization::ConvertSidToStringSidW;
         use windows_sys::Win32::Security::{GetTokenInformation, TokenUser, TOKEN_QUERY, TOKEN_USER};
-        use windows_sys::Win32::System::Threading::{
-            OpenProcess, OpenProcessToken, PROCESS_QUERY_LIMITED_INFORMATION,
-        };
+        use windows_sys::Win32::System::Threading::OpenProcessToken;
 
-        // SAFETY: стандартный путь «процесс → токен → TokenUser → строковый SID». Каждый успешно
-        // полученный хэндл закрывается; буфер выделяется по размеру, который вернул сам
-        // GetTokenInformation; строку SID освобождает LocalFree (её выделил ConvertSidToStringSidW).
+        // SAFETY: стандартный путь «процесс → токен → TokenUser → строковый SID». Хэндл процесса
+        // принадлежит вызывающему (ClientProcess) и здесь НЕ закрывается; токен закрывается;
+        // буфер выделяется по размеру, который вернул сам GetTokenInformation; строку SID
+        // освобождает LocalFree (её выделил ConvertSidToStringSidW).
         unsafe {
-            let proc = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
-            if proc.is_null() {
-                anyhow::bail!("OpenProcess(pid={pid}) err={}", GetLastError());
-            }
             let mut token: HANDLE = std::ptr::null_mut();
             let ok = OpenProcessToken(proc, TOKEN_QUERY, &mut token);
-            CloseHandle(proc);
             if ok == 0 {
                 anyhow::bail!("OpenProcessToken(pid={pid}) err={}", GetLastError());
             }
@@ -796,20 +907,22 @@ mod windows_svc {
     }
 
     /// Аутентифицировать подключившегося клиента и вернуть **владельца** соединения (строковый SID).
-    /// W3 — образ из install-dir; M-5 — пользователь, которому будет принадлежать сессия.
+    /// W3 — образ из install-dir; L-9 — подпись образа и защита от PID-reuse; M-5 — пользователь,
+    /// которому будет принадлежать сессия.
+    ///
+    /// Все проверки идут по ОДНОМУ хэндлу процесса ([`ClientProcess`]) — иначе они относились бы к
+    /// разным моментам времени и (при переиспользовании PID) к разным процессам.
     ///
     /// Не смогли определить владельца — отказ (fail-closed): иначе противник, умеющий сорвать эту
     /// проверку, получал бы `None`, который «совпадает» с dev-режимом и вытеснял бы любую сессию.
-    fn authenticate_client(pipe: HANDLE) -> anyhow::Result<String> {
-        verify_client_is_installed_app(pipe)?;
-        let mut pid: u32 = 0;
-        // SAFETY: pipe — валидный серверный хэндл подключённого клиента; pid — out-указатель.
-        if unsafe { GetNamedPipeClientProcessId(pipe, &mut pid) } == 0 {
-            anyhow::bail!("GetNamedPipeClientProcessId err={}", unsafe { GetLastError() });
-        }
-        let sid = client_user_sid(pid)
+    fn authenticate_client(pipe: HANDLE, accepted_at: u64) -> anyhow::Result<String> {
+        let proc = ClientProcess::open(pipe)?;
+        proc.verify_not_pid_reuse(accepted_at)?;
+        verify_client_is_installed_app(&proc)?;
+        let sid = proc
+            .user_sid()
             .map_err(|e| anyhow::anyhow!("M-5: не определить владельца сессии: {e:#}"))?;
-        eprintln!("[svc] M-5: владелец соединения — {sid} (pid={pid})");
+        eprintln!("[svc] M-5: владелец соединения — {sid} (pid={})", proc.pid);
         Ok(sid)
     }
 

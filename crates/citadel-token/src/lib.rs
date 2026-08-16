@@ -88,6 +88,55 @@ pub fn epoch_key_name(epoch: u64) -> String {
     format!("issuer-{epoch}.key")
 }
 
+/// B-1: имя файла ключа эпохи **этого exit-узла** (`exit-<epoch>.key`, 0600).
+///
+/// Отдельное имя, а не то же `issuer-<epoch>.key`, потому что содержимое разное по смыслу: в
+/// `issuer-*` лежит МАСТЕР эпохи (из него выводятся ключи всех узлов), в `exit-*` — ключ ровно
+/// одного узла. Один и тот же путь для двух разных секретов рано или поздно означал бы, что мастер
+/// уехал на exit-машину при раздельном деплое — то есть ровно та компрометация, которую B-1 и
+/// закрывает.
+pub fn exit_key_name(epoch: u64) -> String {
+    format!("exit-{epoch}.key")
+}
+
+/// B-1: «выдача не привязана к узлу» — pin из одних нулей.
+///
+/// Нужен там, где абонент не знает pin exit'а заранее (TOFU-режим CLI, dev без пиннинга). Ключ под
+/// ним выводится как обычно, но exit принимает такие токены ТОЛЬКО при `Citadel_TOKEN_UNBOUND=1`:
+/// иначе непривязанная выдача тихо вернула бы общий ключ на весь деплой и обнулила бы B-1.
+pub const EXIT_PIN_UNBOUND: [u8; 32] = [0u8; 32];
+
+/// Метка кадра привязки выдачи к exit'у (см. [`build_exit_binding`]).
+const EXIT_BIND_TAG: &[u8] = b"EXIT1";
+
+/// B-1: кадр «токены нужны вот для этого узла»: `"EXIT1" ‖ pin(32)`.
+///
+/// Метка обязательна: без неё кадр неотличим от первого ослеплённого элемента (тоже 32 Б), и
+/// клиент старой версии молча получал бы ключ, выведенный из его же `B` как из pin'а — с отказом
+/// уже на exit'е и без единой внятной строки. Кадр идёт ВНУТРИ PQ-TLS после Layer-1, поэтому
+/// отдельной подписи не требует: подделать его может только сам аутентифицированный абонент, а
+/// назвать чужой exit ему не выгодно — он получит токены, годные не у себя.
+pub fn build_exit_binding(exit_pin: &[u8; 32]) -> Vec<u8> {
+    let mut f = Vec::with_capacity(EXIT_BIND_TAG.len() + 32);
+    f.extend_from_slice(EXIT_BIND_TAG);
+    f.extend_from_slice(exit_pin);
+    f
+}
+
+/// Разобрать кадр привязки. Ошибка называет причину прямо: чаще всего это старый клиент.
+pub fn parse_exit_binding(raw: &[u8]) -> Result<[u8; 32]> {
+    if raw.len() != EXIT_BIND_TAG.len() + 32 || !raw.starts_with(EXIT_BIND_TAG) {
+        bail!(
+            "кадр привязки к exit'у не разобран ({} Б): клиент старой версии (до per-exit ключей \
+             эпохи, B-1) — обновите приложение",
+            raw.len()
+        );
+    }
+    let mut pin = [0u8; 32];
+    pin.copy_from_slice(&raw[EXIT_BIND_TAG.len()..]);
+    Ok(pin)
+}
+
 /// Домен контекста предъявления (входит в MAC — см. [`voprf::Token::redeem`]).
 const REDEEM_DOMAIN: &[u8] = b"CitadelPQVPN/token/v2/redeem";
 
@@ -231,6 +280,10 @@ pub fn fetch_epoch_key(
     issuer_pin: &[u8; 32],
     issuer_mldsa: &[u8; 32],
     keysync_seed: &[u8; 32],
+    // B-1: pin ЭТОГО exit'а — издатель выведет ключ именно для него (`k_exit`), мастер не покидает
+    // машину издателя. Pin входит в подписываемое сообщение (см. `pqid::build_keysync_request`),
+    // поэтому подменить его на чужой по дороге нельзя.
+    exit_pin: &[u8; 32],
     retries: u32,
     obfs_psk: Option<[u8; 32]>,
 ) -> Result<Vec<u8>> {
@@ -243,7 +296,10 @@ pub fn fetch_epoch_key(
         obfs_psk,
         citadel_protect::Route::Bypass,
     )?;
-    write_frame(&mut conn, &pqid::build_keysync_request(keysync_seed, &challenge, &ekm)?)?;
+    write_frame(
+        &mut conn,
+        &pqid::build_keysync_request(keysync_seed, &challenge, &ekm, exit_pin)?,
+    )?;
     let key = read_frame(&mut conn)
         .context("издатель не отдал ключ эпохи (keysync-идентичность не принята?)")?;
     // Разбираем сразу: мусор/чужой формат должен упасть здесь, а не при первой проверке токена.
@@ -271,6 +327,9 @@ pub fn fetch_tokens(
     issuer_pin: &[u8; 32],
     issuer_mldsa: &[u8; 32],
     seed: &[u8; 32],
+    // B-1: pin exit'а, на котором пачка будет предъявлена (из ссылки). [`EXIT_PIN_UNBOUND`] —
+    // «узел заранее неизвестен»: такие токены exit примет только по явной настройке.
+    exit_pin: &[u8; 32],
     count: usize,
     retries: u32,
     obfs_psk: Option<[u8; 32]>,
@@ -292,6 +351,10 @@ pub fn fetch_tokens(
         Gate::Enroll { until } => return Err(EnrollmentRequired { until }.into()),
         Gate::Refuse(code) => bail!("{}", refusal_text(code)),
     }
+
+    // B-1: назвать узел, на котором пачка будет предъявлена, — ДО того, как издатель отдаст `K`:
+    // публичный элемент относится уже к ключу этого узла (`k_exit`), и проверка DLEQ идёт под ним.
+    write_frame(&mut conn, &build_exit_binding(exit_pin))?;
 
     // Публичный элемент K текущей эпохи — под ним проверяется DLEQ каждой выдачи.
     let issuer_public =
@@ -780,8 +843,9 @@ mod tests {
         use std::net::TcpListener;
         let seed = [0x33u8; 32];
         let client_id = pqid::id_from_seed(&seed).unwrap();
-        let epoch_key = EpochKey::generate().unwrap();
-        let epoch_public = epoch_key.public_bytes();
+        // B-1: издатель держит мастер эпохи, а вслепую считает ключом ЗАЯВЛЕННОГО узла.
+        let master = EpochKey::generate().unwrap().secret_bytes();
+        let exit_pin = [0x5cu8; 32];
 
         // S2.1/A1: издатель поднимает постоянный TLS-серт; клиент пиннит его pin.
         let dir = std::env::temp_dir().join(format!("citadel-fetch-{}", std::process::id()));
@@ -807,7 +871,11 @@ mod tests {
             assert_eq!(got, client_id, "зарегистрированный абонент");
             // M-9: гейт выдачи — «обычный абонент, активация не нужна».
             write_frame(&mut conn, &build_gate_frame(Gate::Allow)).unwrap();
-            write_frame(&mut conn, &epoch_public).unwrap(); // публичный элемент текущей эпохи
+            // B-1: абонент называет узел, под который берёт пачку → ключ выводится для него.
+            let asked = parse_exit_binding(&read_frame(&mut conn).unwrap()).unwrap();
+            assert_eq!(asked, exit_pin, "клиент назвал свой exit");
+            let epoch_key = EpochKey::derive_for_exit(&master, current_epoch(3600), &asked).unwrap();
+            write_frame(&mut conn, &epoch_key.public_bytes()).unwrap(); // публичный элемент эпохи
             // H-3 + §7.1: следом кадр эпохи; здесь ротация L1 выключена, но границы эпохи есть.
             write_frame(&mut conn, &build_epoch_frame(None, 3600)).unwrap();
             while let Ok(blinded) = read_frame(&mut conn) {
@@ -816,9 +884,18 @@ mod tests {
             }
             epoch_key
         });
-        let grant =
-            fetch_tokens(&addr, &issuer_pin, &issuer_mldsa, &seed, 3, 3, None, Route::Bypass)
-                .unwrap();
+        let grant = fetch_tokens(
+            &addr,
+            &issuer_pin,
+            &issuer_mldsa,
+            &seed,
+            &exit_pin,
+            3,
+            3,
+            None,
+            Route::Bypass,
+        )
+        .unwrap();
         assert_eq!(grant.tokens.len(), 3);
         assert!(grant.data_psk.is_none(), "издатель сказал «ротации нет» — клиент это и увидел");
         assert_eq!(grant.epoch_secs, 3600, "длина эпохи приехала клиенту (§7.1: срок годности пачки)");
@@ -963,8 +1040,10 @@ mod tests {
         let issuer_mldsa = pq.commitment();
         let keysync_seed = [0x5eu8; 32];
         let keysync_id = pqid::id_from_seed(&keysync_seed).unwrap();
-        let epoch_key = EpochKey::generate().unwrap();
-        let secret = epoch_key.secret_bytes();
+        // B-1: издатель держит МАСТЕР эпохи и отдаёт узлу выведенный из него `k_exit`.
+        let master = EpochKey::generate().unwrap().secret_bytes();
+        let exit_pin = [0x9au8; 32];
+        let secret = EpochKey::derive_for_exit(&master, 7, &exit_pin).unwrap().secret_bytes();
 
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap().to_string();
@@ -975,17 +1054,28 @@ mod tests {
             let challenge = [0x31u8; 32];
             write_frame(&mut conn, &pq.hello(&challenge, &issuer_pin, &ekm).unwrap()).unwrap();
             let frame = read_frame(&mut conn).unwrap();
-            let pqid::ClientFrame::KeySync(auth) = pqid::parse_client_frame(&frame).unwrap() else {
+            let pqid::ClientFrame::KeySync { auth, exit_pin: asked } =
+                pqid::parse_client_frame(&frame).unwrap()
+            else {
                 panic!("ожидался keysync-кадр");
             };
-            let got =
-                pqid::verify_hybrid(auth, pqid::DOMAIN_KEYSYNC, &challenge, &ekm).unwrap();
+            assert_eq!(asked, exit_pin.to_vec(), "узел просит ключ ДЛЯ СЕБЯ (B-1)");
+            let bound = pqid::keysync_bound_challenge(&challenge, &exit_pin);
+            let got = pqid::verify_hybrid(auth, pqid::DOMAIN_KEYSYNC, &bound, &ekm).unwrap();
             assert_eq!(got, keysync_id, "издатель узнаёт СВОЙ exit-узел");
             write_frame(&mut conn, &secret).unwrap();
         });
 
-        let got =
-            fetch_epoch_key(&addr, &issuer_pin, &issuer_mldsa, &keysync_seed, 3, None).unwrap();
+        let got = fetch_epoch_key(
+            &addr,
+            &issuer_pin,
+            &issuer_mldsa,
+            &keysync_seed,
+            &exit_pin,
+            3,
+            None,
+        )
+        .unwrap();
         srv.join().unwrap();
         // и этим ключом exit действительно проверяет токены эпохи
         let restored = EpochKey::from_secret(&got).unwrap();
@@ -1026,7 +1116,16 @@ mod tests {
             }
         });
         let foreign = pqid::issuer_commitment(&pqid::mldsa_pub_from_seed(&[0x99u8; 32]).unwrap());
-        let err = fetch_epoch_key(&addr, &issuer_pin, &foreign, &[0x5eu8; 32], 1, None).unwrap_err();
+        let err = fetch_epoch_key(
+            &addr,
+            &issuer_pin,
+            &foreign,
+            &[0x5eu8; 32],
+            &EXIT_PIN_UNBOUND,
+            1,
+            None,
+        )
+        .unwrap_err();
         assert!(format!("{err:#}").contains("PQ-аутентификация издателя"), "err: {err:#}");
         srv.join().unwrap();
         assert!(!saw_frame.load(Ordering::SeqCst), "keysync-идентичность не должна уйти самозванцу");
@@ -1065,8 +1164,18 @@ mod tests {
 
         // «Другой» издатель в ссылке (обязательство не совпадает с предъявленным ML-DSA pub)
         let foreign = pqid::issuer_commitment(&pqid::mldsa_pub_from_seed(&[0xABu8; 32]).unwrap());
-        let err = fetch_tokens(&addr, &issuer_pin, &foreign, &[0x44u8; 32], 1, 1, None, Route::Bypass)
-            .unwrap_err();
+        let err = fetch_tokens(
+            &addr,
+            &issuer_pin,
+            &foreign,
+            &[0x44u8; 32],
+            &EXIT_PIN_UNBOUND,
+            1,
+            1,
+            None,
+            Route::Bypass,
+        )
+        .unwrap_err();
         assert!(format!("{err:#}").contains("PQ-аутентификация издателя"), "err: {err:#}");
         srv.join().unwrap();
         assert!(

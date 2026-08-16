@@ -282,7 +282,20 @@ fn cmd_add(args: &[String]) -> Result<()> {
     let uri = if from_stdin {
         askpass::read_secret_line()?
     } else {
-        askpass::read_password("Вставьте citadel://-ссылку (ввод скрыт): ")?
+        askpass::read_password("Вставьте citadel://-ссылку или парольный блок (ввод скрыт): ")?
+    };
+    // B-2: мастер-ссылка может приехать в парольном конверте (`-----BEGIN CITADEL MASTER LINK-----`,
+    // см. `citadel_client::masterlink`). Спрашиваем пароль ровно тогда, когда конверт распознан:
+    // всем подряд поле пароля показывать незачем.
+    let uri = if citadel_client::masterlink::looks_wrapped(&uri) {
+        let pass = askpass::read_password("Пароль конверта мастер-ссылки (ввод скрыт): ")?;
+        // Развёрнутая ссылка — такой же секрет, как введённый блок: держим её в Zeroizing.
+        askpass::Secret::new(
+            citadel_client::masterlink::unwrap(&uri, &pass)
+                .context("развернуть парольный блок мастер-ссылки")?,
+        )
+    } else {
+        uri
     };
     if !uri.starts_with("citadel://") {
         bail!("это не citadel://-ссылка");

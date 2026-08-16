@@ -1545,6 +1545,40 @@ class _AddProfileSheetState extends State<AddProfileSheet> {
   String _checking = '';
   bool _busy = false;
 
+  /// B-2: вставили не ссылку, а ПАРОЛЬНЫЙ КОНВЕРТ мастер-ссылки — спрашиваем пароль. Проверять
+  /// такой текст как ссылку бессмысленно (он ею не является), а молча отвечать «не распознана» —
+  /// худший вариант: человек видит отказ там, где на самом деле нужен один вопрос.
+  final _wrapPassword = TextEditingController();
+  bool _wrapped = false;
+  bool _unwrapping = false;
+  String? _wrapError;
+
+  Future<void> _unwrapBlock() async {
+    final block = _link.text.trim();
+    final pass = _wrapPassword.text;
+    setState(() {
+      _unwrapping = true;
+      _wrapError = null;
+    });
+    try {
+      final uri = await linkUnwrap(block: block, password: pass);
+      if (!mounted) return;
+      _wrapPassword.clear();
+      _link.text = uri;
+      setState(() {
+        _wrapped = false;
+        _unwrapping = false;
+      });
+      _onLinkChanged(uri);
+    } catch (e) {
+      if (!mounted) return;
+      setState(() {
+        _unwrapping = false;
+        _wrapError = Strings.of(context)('wrapped_bad_password');
+      });
+    }
+  }
+
   void _onLinkChanged(String v) {
     _pending?.cancel();
     final t = v.trim();
@@ -1552,8 +1586,22 @@ class _AddProfileSheetState extends State<AddProfileSheet> {
       setState(() {
         _summary = null;
         _busy = false;
+        _wrapped = false;
+        _wrapError = null;
       });
       return;
+    }
+    if (linkIsWrapped(text: t)) {
+      setState(() {
+        _summary = null;
+        _busy = false;
+        _wrapped = true;
+        _wrapError = null;
+      });
+      return;
+    }
+    if (_wrapped) {
+      setState(() => _wrapped = false);
     }
     // Пока не проверили — ни «валидна», ни «не распознана»: показываем ожидание.
     setState(() {
@@ -1619,6 +1667,7 @@ class _AddProfileSheetState extends State<AddProfileSheet> {
     _link.dispose();
     _name.dispose();
     _code.dispose();
+    _wrapPassword.dispose();
     super.dispose();
   }
 
@@ -1671,7 +1720,34 @@ class _AddProfileSheetState extends State<AddProfileSheet> {
               label: Text(t('scan_qr_camera')),
             ),
           ],
-          if (_busy) ...[
+          // B-2: парольный конверт мастер-ссылки — спрашиваем пароль и разворачиваем на месте.
+          if (_wrapped) ...[
+            const SizedBox(height: 12),
+            Text(t('wrapped_link_hint'),
+                style: Theme.of(context).textTheme.bodyMedium),
+            const SizedBox(height: 8),
+            TextField(
+              controller: _wrapPassword,
+              obscureText: true,
+              autofocus: true,
+              onChanged: (_) => setState(() => _wrapError = null),
+              onSubmitted: (_) => _unwrapping ? null : _unwrapBlock(),
+              decoration: InputDecoration(
+                labelText: t('wrapped_password'),
+                border: const OutlineInputBorder(),
+                errorText: _wrapError,
+              ),
+            ),
+            const SizedBox(height: 12),
+            FilledButton.icon(
+              onPressed: _unwrapping || _wrapPassword.text.isEmpty ? null : _unwrapBlock,
+              icon: _unwrapping
+                  ? const SizedBox(
+                      height: 16, width: 16, child: CircularProgressIndicator(strokeWidth: 2))
+                  : const Icon(Icons.lock_open),
+              label: Text(t(_unwrapping ? 'wrapped_unwrapping' : 'wrapped_unwrap')),
+            ),
+          ] else if (_busy) ...[
             const SizedBox(height: 12),
             Row(
               children: [

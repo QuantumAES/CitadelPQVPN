@@ -439,12 +439,23 @@ fn read_pin_for(host: &str) -> PinMode {
 /// бы «токены выключены» — то есть exit, пускающий кого угодно, при внешне исправном конфиге.
 enum IssuerAuth {
     Disabled,
+    /// Единый ключ вне схемы эпох (офлайн-пачка `citadel-token batch`). **Привязки к узлу здесь нет**
+    /// (B-1): режим существует для стенда и одиночного token-less деплоя, где exit ровно один;
+    /// в мультиэкзитной установке пользоваться им нельзя — общий ключ вернёт кросс-exit реплей.
     Legacy(Vec<u8>),
-    Epoch { dir: String, epoch_secs: u64 },
+    Epoch {
+        dir: String,
+        epoch_secs: u64,
+        /// B-1: pin ЭТОГО узла — по нему выводится его ключ эпохи (`k_exit`).
+        exit_pin: [u8; 32],
+        /// B-1: принимать ли токены «без привязки к узлу» (`Citadel_TOKEN_UNBOUND=1`).
+        unbound: bool,
+    },
 }
 
 impl IssuerAuth {
-    fn from_env() -> Result<Self> {
+    /// `exit_pin` — pin собственного сертификата узла (B-1: ключ эпохи выводится per-exit).
+    fn from_env(exit_pin: [u8; 32]) -> Result<Self> {
         let key_path = match std::env::var("Citadel_ISSUER_KEY") {
             Ok(p) => p,
             Err(_) => {
@@ -464,7 +475,18 @@ impl IssuerAuth {
                     .parent()
                     .map(|p| p.to_string_lossy().into_owned())
                     .unwrap_or_else(|| ".".into());
-                IssuerAuth::Epoch { dir, epoch_secs }
+                // B-1: стендовый режим — принимать и токены, выданные «без привязки к узлу»
+                // (клиент без пиннинга не может назвать издателю exit). В деплое НЕ включается:
+                // непривязанный ключ общий для всех узлов, то есть ровно та дыра, которую B-1
+                // закрывает (кросс-exit реплей + компрометация одного узла бьёт по всем).
+                let unbound = matches!(std::env::var("Citadel_TOKEN_UNBOUND").as_deref(), Ok("1"));
+                if unbound {
+                    eprintln!(
+                        "[Citadel-m1:server] ⚠ Citadel_TOKEN_UNBOUND=1: принимаются токены без \
+                         привязки к узлу (стендовый режим, в деплое не включать — B-1)"
+                    );
+                }
+                IssuerAuth::Epoch { dir, epoch_secs, exit_pin, unbound }
             }
             None => match std::fs::read(&key_path) {
                 Ok(k) => IssuerAuth::Legacy(k),
@@ -526,20 +548,60 @@ impl IssuerAuth {
                 .ok()?
                 .verify_redemption(redeem, ctx)
                 .map(|n| (n, 0)),
-            IssuerAuth::Epoch { dir, epoch_secs } => {
+            IssuerAuth::Epoch { dir, epoch_secs, exit_pin, unbound } => {
                 let e = citadel_token::current_epoch(*epoch_secs);
                 // current + prev (grace на границе эпохи / скью часов); старее — не принимаем.
                 let keys: Vec<citadel_token::EpochKey> = [e, e.wrapping_sub(1)]
                     .iter()
-                    .filter_map(|ep| {
-                        std::fs::read(format!("{dir}/{}", citadel_token::epoch_key_name(*ep))).ok()
-                    })
-                    .filter_map(|raw| citadel_token::EpochKey::from_secret(&raw).ok())
+                    .flat_map(|ep| epoch_keys_for(dir, *ep, exit_pin, *unbound))
                     .collect();
                 citadel_token::verify_redemption_multi(&keys, redeem, ctx).map(|n| (n, e))
             }
         }
     }
+}
+
+/// B-1: ключи эпохи `ep`, которыми ЭТОТ узел вправе проверять предъявления.
+///
+/// Два источника, оба законны и живут рядом:
+///
+///  * `exit-<ep>.key` — **раздельный деплой**: keysync-сайдкар получил у издателя ключ, выведенный
+///    для pin'а этого узла. Мастера эпохи на машине нет вовсе — в этом и смысл.
+///  * `issuer-<ep>.key` — **совмещённый деплой**: на общем томе лежит МАСТЕР, и узел выводит свой
+///    ключ сам (издатель и exit тут одна машина, скрывать мастер не от кого).
+///
+/// `unbound` (стенд) добавляет ключ «без привязки к узлу» — им проверяются токены клиента, который
+/// не знал pin exit'а заранее (TOFU/без пиннинга). Вывести его можно только из мастера, поэтому в
+/// раздельном деплое этот режим не работает — и правильно: там он и не нужен.
+fn epoch_keys_for(
+    dir: &str,
+    ep: u64,
+    exit_pin: &[u8; 32],
+    unbound: bool,
+) -> Vec<citadel_token::EpochKey> {
+    let mut keys = Vec::new();
+    if let Ok(raw) = std::fs::read(format!("{dir}/{}", citadel_token::exit_key_name(ep))) {
+        if let Ok(k) = citadel_token::EpochKey::from_secret(&raw) {
+            keys.push(k);
+        }
+    }
+    if let Ok(raw) = std::fs::read(format!("{dir}/{}", citadel_token::epoch_key_name(ep))) {
+        if let Ok(master) = <[u8; 32]>::try_from(raw.as_slice()) {
+            if let Ok(k) = citadel_token::EpochKey::derive_for_exit(&master, ep, exit_pin) {
+                keys.push(k);
+            }
+            if unbound {
+                if let Ok(k) = citadel_token::EpochKey::derive_for_exit(
+                    &master,
+                    ep,
+                    &citadel_token::EXIT_PIN_UNBOUND,
+                ) {
+                    keys.push(k);
+                }
+            }
+        }
+    }
+    keys
 }
 
 /// C5/аудит-3 + L-3/аудит-4: множество потраченных токенов по epoch-бакетам.
@@ -888,9 +950,13 @@ async fn run_server(tun: Arc<Tun>) -> Result<()> {
     };
     eprintln!("[Citadel-m1:server] слушаю {listen} (KX=X25519MLKEM768)");
 
-    let issuer_auth = Arc::new(IssuerAuth::from_env()?);
+    // B-1: свой pin — идентификатор узла при выводе ключа эпохи (тот же, что абонент видит в ссылке).
+    let issuer_auth = Arc::new(IssuerAuth::from_env(pin)?);
     if issuer_auth.enabled() {
-        eprintln!("[Citadel-m1:server] per-user epoch-токены включены (C5.1, VOPRF v2)");
+        eprintln!(
+            "[Citadel-m1:server] per-user epoch-токены включены (C5.1, VOPRF v2; ключ эпохи \
+             выводится per-exit — B-1)"
+        );
     }
     // C5: spent-токены по epoch-бакетам (prune старых эпох → без утечки памяти на долгом exit).
     // L-3: множество переживает рестарт — журнал поднимается ЗДЕСЬ, до `drop_privileges`, потому

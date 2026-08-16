@@ -102,6 +102,12 @@ CitadelPQVPN — установщик exit-сервера (запускать н
                     ОБЯЗАТЕЛЕН при --role issuer (там порт публикуется наружу);
                     'any' — открыть всем осознанно                [CITADEL_ADMIN_PEER]
 
+Мастер-ссылка (B-2 — как её доставлять админу):
+  --master-password F  файл с паролем: мастер-ссылка печатается не голым текстом, а
+                    ПАРОЛЬНЫМ КОНВЕРТОМ (Argon2id+AES-GCM). Блок можно переслать чем
+                    угодно — без пароля он бесполезен; пароль передавай ДРУГИМ каналом.
+                    Приложение спросит его при импорте.       [CITADEL_MASTER_PASSWORD_FILE]
+
 Ограничение полосы на абонента (F7/D3 — чтобы один клиент не съел аплинк exit'а):
   --rate-limit  N   (10485760) байт/с на клиента вверх; 0 = без лимита [CITADEL_RATE_LIMIT]
   --rate-burst  N   (20971520) допустимый всплеск, байт          [CITADEL_RATE_BURST]
@@ -122,8 +128,11 @@ CitadelPQVPN — установщик exit-сервера (запускать н
                     `-` — прочитать со stdin (вставить копипастом, без файла на диске)
   --keysync-seed H  идентичность exit-узла для получения ключа эпохи (обычно из --issuer-bundle)
 
-Одна кража диска не должна давать обе идентичности сразу, поэтому на серьёзной установке
-издателя выносят на отдельную машину. Порядок: сначала `--role issuer` (он напечатает bundle),
+`--role all` удобен для личной установки, но у него есть цена, которую не закрывает никакая
+криптография: издатель видит `client_id`+IP+время (Layer-1), exit видит трафик, и на одной машине
+эти два наблюдения сводит воедино её root. Для сервиса «для других» роли обязаны жить под РАЗНЫМИ
+администрациями. Одна кража диска не должна давать обе идентичности сразу, поэтому на серьёзной
+установке издателя выносят на отдельную машину. Порядок: сначала `--role issuer` (он напечатает bundle),
 затем на другой машине `--role exit --issuer-bundle …`. Публичный ключ эпохи exit подтягивает
 сам (контейнер `citadel-keysync`), общий том между машинами не нужен.
 
@@ -150,6 +159,7 @@ while (($#)); do
     --obfs-psk)       CITADEL_OBFS_PSK="${2:-}";      shift 2 ;;
     --client-seed)    CITADEL_CLIENT_SEED="${2:-}";   shift 2 ;;
     --admin-seed)     CITADEL_ADMIN_SEED="${2:-}";    shift 2 ;;
+    --master-password) CITADEL_MASTER_PASSWORD_FILE="${2:-}"; shift 2 ;;
     --udp-port)     CITADEL_UDP_PORT="${2:-}";     shift 2 ;;
     --tcp-port)     CITADEL_TCP_PORT="${2:-}";     shift 2 ;;
     --issuer-port)  CITADEL_ISSUER_PORT="${2:-}";  shift 2 ;;
@@ -212,6 +222,19 @@ case "$ROLE" in
   all|issuer|exit) ;;
   *) die "--role: '$ROLE' — допустимо all | issuer | exit" ;;
 esac
+# A-1 (§7.1) / R5.1: совмещённая установка — это НЕ «просто дешевле». Издатель по построению видит
+# Layer-1 (client_id + IP + время, раз в эпоху), exit видит трафик; анонимность абонента держится на
+# том, что эти два наблюдения принадлежат РАЗНЫМ администрациям. На одной машине их сводит воедино
+# кто угодно с root'ом на ней — и владелец, и тот, кто её изымет. Криптографией это не лечится
+# (см. §7.1: разнесение ролей — продуктовое решение), поэтому здесь — громкое предупреждение, а не
+# тихий дефолт: для личной/семейной установки совмещение нормально, для сервиса «для других» — нет.
+if [[ "$ROLE" == all ]]; then
+  warn "--role all: издатель и exit на ОДНОЙ машине. Root этой машины (или тот, кто её изымет)
+        видит и связку client_id↔IP↔время (Layer-1 издателя), и сам трафик exit'а — то есть может
+        сопоставить абонента с его сессией. Разделение ролей — единственная защита: сначала
+        \`--role issuer\` на одной машине, затем \`--role exit --issuer-bundle …\` на другой,
+        желательно у другого провайдера и под другой администрацией. Подробности — docs/SECURITY-AUDIT-4-2026-08.md §7.1."
+fi
 # Файл-bundle от установки издателя: те же имена, что и env-переменные (KEY=VALUE, без экспорта).
 if [[ -n "${CITADEL_ISSUER_BUNDLE:-}" ]]; then
   # `-` = читать со stdin: bundle несёт seed'ы и мастер L1, и класть его файлом на exit-машину
@@ -253,6 +276,13 @@ PSK_IN="${CITADEL_OBFS_PSK:-}"             # общий obfs-PSK (генерит
 KEYSYNC_SEED_IN="${CITADEL_KEYSYNC_SEED:-}"
 CLIENT_SEED_IN="${CITADEL_CLIENT_SEED:-}"  # seed абонента (ссылку минтит exit-машина)
 ADMIN_SEED_IN="${CITADEL_ADMIN_SEED:-}"    # seed админа (мастер-ссылка)
+# B-2/R4.2: файл с паролем для конверта мастер-ссылки. Пароль берётся ИЗ ФАЙЛА, а не аргументом:
+# аргумент виден в `ps` любому пользователю машины и остаётся в истории шелла.
+MASTER_PASSWORD_FILE="${CITADEL_MASTER_PASSWORD_FILE:-}"
+if [[ -n "$MASTER_PASSWORD_FILE" ]]; then
+  [[ -r "$MASTER_PASSWORD_FILE" ]] || die "--master-password: файл не читается: $MASTER_PASSWORD_FILE"
+  [[ -s "$MASTER_PASSWORD_FILE" ]] || die "--master-password: файл пуст — конверт без пароля не имеет смысла"
+fi
 if [[ "$ROLE" == exit && "$ISSUER_ON" == 1 ]]; then
   hex64() { [[ "$1" =~ ^[0-9a-fA-F]{64}$ ]]; }
   [[ -n "$ISSUER_ADDR" ]] || die "--role exit: нужен --issuer-addr host:port (или --issuer-bundle)"
@@ -523,6 +553,7 @@ if [[ -f "$DIR/keys/obfs.psk" && "${CITADEL_KEEP_KEYS:-0}" != 1 ]]; then
         "$DIR/keys/"exit-mldsa.seed "$DIR/keys/"exit.mldsa "$DIR/keys/"exit2.pin "$DIR/keys/"exit2.mldsa \
         "$DIR/keys/"issuer-tls.crt "$DIR/keys/"issuer-tls.key "$DIR/keys/"issuer-tls.pin \
         "$DIR/keys/"issuer.key "$DIR"/keys/issuer-*.key "$DIR/keys/"keysync.seed \
+        "$DIR"/keys/exit-*.key \
         "$DIR/keys/"issuer.pub "$DIR"/keys/issuer-*.pub 2>/dev/null || true
 fi
 
@@ -608,6 +639,12 @@ elif [[ "$ISSUER_ON" == 1 ]]; then
   ADMIN_SEED="$(cat "$ADMIN_SEED_FILE")"
   ADMIN_PUB="$(Citadel_CLIENT_SEED="$ADMIN_SEED" "$DIR/bin/citadel-token" pubkey)" \
     || die "не удалось вывести admin_id (citadel-token pubkey)"
+  # B-2/R4.2 (восстановление доступа): ПРЕЖНЮЮ Layer-1 запись админа запоминаем ДО перезаписи —
+  # ниже она гасится в реестре. Иначе устройство с потерянной/скомпрометированной мастер-ссылкой
+  # хоть и лишалось admin-прав (admin_id сменился), но продолжало ходить в туннель как обычный
+  # абонент. Перевыпуск мастер-доступа обязан отбирать доступ целиком, иначе это не перевыпуск.
+  OLD_ADMIN_CID=""
+  [[ -s "$DIR/keys/admin.client_id" ]] && OLD_ADMIN_CID="$(cat "$DIR/keys/admin.client_id")"
   # admin_id — pub, по которому issuer пускает в admin-канал. admin.client_id — Layer-1 client_id
   # самого админа: issuer запрещает его отзыв (анти-self-lockout, R6). Оба файла читает issuer из /shared.
   printf '%s' "$ADMIN_PUB"  > "$DIR/keys/admin_id"
@@ -820,6 +857,9 @@ export Citadel_ISSUER_PIN=$ISSUER_PIN_IN
 export Citadel_ISSUER_MLDSA=$ISSUER_MLDSA_IN
 export Citadel_KEYSYNC_SEED=$KEYSYNC_SEED_IN
 export Citadel_EPOCH_SECS=$EPOCH_SECS
+# B-1: ключ эпохи выводится ПОД КОНКРЕТНЫЙ узел, поэтому сайдкар обязан назвать издателю pin своего
+# exit'а. Файл пишет сам exit при старте (Citadel_PIN_FILE); пока его нет, сайдкар просто ждёт.
+export Citadel_EXIT_PIN_FILE=/shared/exit.pin
 export Citadel_OBFS_PSK=\$(cat /shared/obfs.psk)
 echo "[citadel-keysync] слежу за ключом эпохи у издателя $ISSUER_ADDR (эпоха ${EPOCH_SECS}с)…"
 exec citadel-token
@@ -1004,9 +1044,13 @@ if [[ "$ISSUER_ON" == 1 && "$ROLE" == exit ]]; then
   ISSUER_TLS_PIN="$ISSUER_PIN_IN"
   ISSUER_MLDSA="$ISSUER_MLDSA_IN"
   log "жду ML-DSA pub exit'а и первую синхронизацию ключа эпохи с издателем $ISSUER_ADDR…"
-  for _ in $(seq 1 90); do [[ -s "$DIR/keys/exit.mldsa" && -s "$DIR/keys/issuer.key" ]] && break; sleep 1; done
+  # B-1: сайдкар кладёт СВОЙ ключ узла (`exit-<эпоха>.key`), а не мастер эпохи — мастер остаётся у
+  # издателя. Поэтому ждём именно этот файл; наличие `issuer.key` на exit-машине после B-1 означало
+  # бы, что на неё уехал мастер (то есть ровно то, чего быть не должно).
+  have_exit_key() { compgen -G "$DIR/keys/exit-*.key" >/dev/null 2>&1; }
+  for _ in $(seq 1 90); do [[ -s "$DIR/keys/exit.mldsa" ]] && have_exit_key && break; sleep 1; done
   [[ -s "$DIR/keys/exit.mldsa" ]] || die "exit не опубликовал ML-DSA pub (exit.mldsa) за 90с"
-  [[ -s "$DIR/keys/issuer.key" ]] || {
+  have_exit_key || {
     docker compose -f "$DIR/etc/compose.yml" logs --tail 30 keysync || true
     die "не удалось получить ключ эпохи у издателя $ISSUER_ADDR за 90с — проверь: порт $ISSUER_TOKEN_PORT открыт с этой машины, obfs-PSK/pin/обязательство из bundle те самые (лог выше)"
   }
@@ -1205,6 +1249,10 @@ if [[ "$ISSUER_ON" == 1 ]]; then
   LINKARGS+=(--admin-seed "$ADMIN_SEED" --admin-port "$ADMIN_PORT"
              --activate-secs "$ACTIVATE_SECS" --meta-out "$work/link.meta")
 fi
+# B-2/R4.2: с паролем печатаем не саму ссылку, а парольный конверт вокруг неё. Голый текст
+# мастер-ссылки — предъявительский секрет: он остаётся в скролбэке SSH, в логе терминала и в том
+# мессенджере, куда его «отправили себе, чтобы открыть на телефоне». Конверт это окно закрывает.
+[[ -n "$MASTER_PASSWORD_FILE" ]] && LINKARGS+=(--wrap-password "$MASTER_PASSWORD_FILE")
 # $LINKGEN — во временном каталоге (на бокс не кладётся, Q4).
 LINK="$("$LINKGEN" "${LINKARGS[@]}" 2>/dev/null)" \
   || die "citadel-linkgen не сгенерировал мастер-ссылку"
@@ -1225,6 +1273,17 @@ if [[ "$ISSUER_ON" == 1 ]]; then
   Citadel_TOKEN_DIR="$DIR/keys" "$DIR/bin/citadel-token" registry add \
       "$CLIENT_PUB" "+3650d" --enroll "$ACTIVATE_UNTIL" --linkh "$LINK_HASH" >/dev/null 2>&1 \
     || die "не удалось заверить мастер-ссылку в реестре (citadel-token registry add --enroll)"
+  # B-2: гасим Layer-1 запись ПРЕЖНЕГО админа (перевыпуск мастер-доступа). Срок «1» = unix 1970,
+  # то есть запись просрочена: издатель откажет в выдаче токенов, и старое устройство теряет и
+  # управление, и туннель. При полной ротации ключей реестр и так стёрт — тогда это no-op.
+  if [[ -n "${OLD_ADMIN_CID:-}" && "$OLD_ADMIN_CID" != "$CLIENT_PUB" ]]; then
+    if Citadel_TOKEN_DIR="$DIR/keys" "$DIR/bin/citadel-token" registry add \
+        "$OLD_ADMIN_CID" 1 >/dev/null 2>&1; then
+      log "прежний admin-доступ отозван: старая мастер-ссылка больше не даёт ни управления, ни туннеля"
+    else
+      warn "не удалось погасить прежнюю Layer-1 запись админа ($OLD_ADMIN_CID) — проверь реестр вручную"
+    fi
+  fi
 fi
 
 # Задача 3: ссылки НЕ сохраняем на диск сервера — печатаем ОДИН РАЗ здесь. Секретные креды
@@ -1267,6 +1326,20 @@ fi)
 МАСТЕР-ссылка (СЕКРЕТ, ТОЛЬКО АДМИНУ — даёт управление реестром абонентов по туннелю):
 
 $LINK
+$(if [[ -n "$MASTER_PASSWORD_FILE" ]]; then cat <<WRAPPED
+
+  Это ПАРОЛЬНЫЙ КОНВЕРТ (B-2): блок выше без пароля бесполезен, поэтому его можно переслать
+  обычным каналом. Пароль назови АДМИНУ ОТДЕЛЬНО (голосом) — блок и пароль вместе равны голой
+  ссылке. Приложение спросит пароль при импорте. Файл пароля на этой машине удали:
+  shred -u $MASTER_PASSWORD_FILE
+WRAPPED
+else cat <<PLAIN
+
+  Ссылка напечатана ГОЛЫМ ТЕКСТОМ и останется в скролбэке этой сессии, в логе терминала и всюду,
+  куда её скопируют. Хочешь безопаснее — перезапусти с --master-password ФАЙЛ: тогда вместо
+  ссылки печатается парольный конверт (B-2), который бесполезен без пароля.
+PLAIN
+fi)
 $(if [[ "$ISSUER_ON" == 1 ]]; then cat <<ONETIME
 
 ⚠ ССЫЛКА ОДНОРАЗОВАЯ. Она активируется на ПЕРВОМ устройстве, которое по ней подключится, и
@@ -1282,6 +1355,16 @@ ONETIME
 fi)
 
 НЕ раздавать абонентам. Управление: docker compose -f $DIR/etc/compose.yml {ps,logs,down}
+
+ПОТЕРЯНО УСТРОЙСТВО АДМИНА (или мастер-ссылка утекла) — B-2. Переустанавливать сервер НЕ нужно и
+абонентов это не касается. Перевыпуск мастер-доступа:
+
+    CITADEL_KEEP_KEYS=1 ./install-citadel-server.sh $VERSION [--master-password ФАЙЛ]
+
+Транспортная идентичность (obfs-PSK, cert-pin, ML-DSA) и реестр абонентов сохраняются — уже
+розданные абонентские ссылки продолжают работать. Admin-доступ выпускается заново: печатается
+НОВАЯ мастер-ссылка, а прежняя перестаёт и управлять, и пускать в туннель (её Layer-1 запись
+гасится этим же запуском). Утерянное устройство после этого не может ничего.
 
 ЕСЛИ СЕРВЕР СКОМПРОМЕТИРОВАН (или есть подозрение). Узел спроектирован расходным: восстановление
 — это переустановка, а не «чистка». Запусти этот же скрипт заново — он сменит ВСЮ идентичность
@@ -1309,8 +1392,11 @@ cat <<EOF
     либо \`citadel-token admin <list|add|revoke>\` с машины, где эта ссылка есть.
     На сервере после установки нет ни linkgen, ни seed'ов, ни admin-ключа → «нарисовать»
     рабочую ссылку и отозвать абонента на боксе нечем (Q4). Потеря мастер-ссылки, ротация
-    admin-доступа, self-lockout (R6) → РЕИНСТАЛЛ: свежая идентичность, ВСЕ прежние ссылки
-    (клиентские и мастер) становятся нерабочими.
+    admin-доступа, self-lockout (R6) → ПЕРЕВЫПУСК: \`CITADEL_KEEP_KEYS=1\` + этот скрипт
+    (B-2, см. блок «ПОТЕРЯНО УСТРОЙСТВО АДМИНА» выше) — абонентская база и уже розданные
+    ссылки при этом ЖИВЫ; мёртвой становится только прежняя мастер-ссылка. Полный реинсталл
+    (без KEEP_KEYS) остаётся ответом на компрометацию самого сервера: он меняет ВСЮ
+    идентичность, и тогда нерабочими становятся все ссылки без исключения.
     ⚠ Это снимает ИНСТРУМЕНТ, а не полномочия: root на этой машине правит файл реестра
     напрямую и видит его содержимое. Мера рассчитана на то, что у сервера не остаётся
     штатного пути управления — компрометация сервера не даёт готовой кнопки.
