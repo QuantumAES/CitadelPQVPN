@@ -1,0 +1,26 @@
+# CitadelPQVPN — конфигурация clippy.
+#
+# P-1 (docs/CWE-REVIEW-PLAN-2026-08.md §6): инвариант «исходящий сокет движка идёт МИМО
+# собственного туннеля» ломался дважды (obfs-TCP 2026-08-06, QUIC/UDP 2026-08-12) и оба раза
+# выглядел не как ошибка, а как «плохая сеть»: хендшейк проходит, данные встают ровно в момент
+# подъёма TUN, разбор уезжает в MTU/оператора. Причина одна и та же — пара «создали сокет» и
+# «не забыли protect()» держалась на внимательности, а не на типе.
+#
+# Ниже — вторая половина меры: создавать исходящие сокеты напрямую нельзя. Единственная фабрика —
+# `citadel_protect::{bind_udp_route, bind_udp_ephemeral, connect_tcp_route, connect_tcp_str_route}`;
+# у неё маршрут (`Route::Bypass` / `Route::Tunnel`) стоит в сигнатуре, то есть решение принимается
+# осознанно и один раз. Серверный слушающий сокет — `bind_udp_listen` (маршрут неприменим).
+#
+# Исключения делаются точечно, `#[allow(clippy::disallowed_methods)]` с причиной рядом. Их два
+# рода и оба законны: сама фабрика (ей и положено) и тестовые модули (петля 127.0.0.1 к туннелю
+# отношения не имеет). Всё остальное обязано идти через фабрику — иначе `-D warnings` не пустит.
+#
+# TcpListener::bind в списке НЕТ намеренно: слушающий сокет ничего не инициирует, защищать его
+# не от чего, а запрет ради симметрии превратил бы линт в шум, который начнут глушить оптом.
+disallowed-methods = [
+    { path = "std::net::UdpSocket::bind", reason = "исходящий сокет движка создаётся через citadel_protect::bind_udp_route/bind_udp_ephemeral (маршрут — параметр); серверный listen — bind_udp_listen" },
+    { path = "tokio::net::UdpSocket::bind", reason = "то же: маршрут выбирается до bind — citadel_protect::bind_udp_route, затем UdpSocket::from_std" },
+    { path = "std::net::TcpStream::connect", reason = "TCP движка соединяется через citadel_protect::connect_tcp_timeout/connect_tcp_route (protect ДО connect + таймаут)" },
+    { path = "std::net::TcpStream::connect_timeout", reason = "то же: citadel_protect::connect_tcp_route — маршрут относительно собственного туннеля обязан быть явным" },
+    { path = "tokio::net::TcpStream::connect", reason = "то же для async-пути: citadel_quic::protect::connect_tcp (TcpSocket + protect + connect)" },
+]

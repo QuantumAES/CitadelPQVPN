@@ -34,7 +34,7 @@ ANDROID_PLATFORM="${ANDROID_PLATFORM:-android-36}"   # Flutter 3.44 требуе
 ANDROID_BUILD_TOOLS="${ANDROID_BUILD_TOOLS:-36.0.0}"
 CMDLINE_TOOLS_BUILD="${CMDLINE_TOOLS_BUILD:-11076708}"  # commandlinetools-linux-<build>_latest.zip
 FLUTTER_CHANNEL="${FLUTTER_CHANNEL:-stable}"
-RUST_NIGHTLY="${RUST_NIGHTLY:-nightly}"            # для cargo-fuzz (M6 future)
+RUST_NIGHTLY="${RUST_NIGHTLY:-nightly}"            # для cargo-fuzz (Ф1) и miri (Ф2)
 
 # ---- пути установки ----------------------------------------------------------
 ANDROID_HOME="${ANDROID_HOME:-$HOME/Android/Sdk}"
@@ -102,7 +102,7 @@ install_rust() {
   bashrc_add 'export PATH="$HOME/.cargo/bin:$PATH"'
 
   rustup component add clippy rustfmt rust-src 2>/dev/null || true
-  log "ставлю nightly (для cargo-fuzz, M6 future)"
+  log "ставлю nightly (cargo-fuzz — Ф1, miri — Ф2 программы по CWE)"
   rustup toolchain install "$RUST_NIGHTLY" --profile minimal --component rust-src 2>/dev/null || warn "nightly не поставился — fuzzing отложится"
   ok "rust: $(rustc --version)"
 }

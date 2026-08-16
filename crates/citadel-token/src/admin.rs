@@ -17,7 +17,7 @@
 //! деплоем (C7.2: DNAT с `-i Citadel0`, порт наружу не публикуется) — этот модуль даёт
 //! криптографический слой, который держит и без неё (defense in depth).
 
-use std::net::{TcpStream, ToSocketAddrs};
+use std::net::ToSocketAddrs;
 use std::time::Duration;
 
 use anyhow::{anyhow, bail, Context, Result};
@@ -569,14 +569,22 @@ impl AdminClient {
         // и транспорта к exit). Он идёт к ADMIN_VIP — адресу ВНУТРИ туннеля, ядро exit'а DNAT'ит
         // его на издателя (C7.2). Пометка «мимо туннеля» увела бы соединение в обычную сеть, где
         // такого адреса нет, и «Абоненты» перестали бы открываться.
+        //
+        // P-1: раньше это знание жило только в комментарии, а в коде стоял голый
+        // `TcpStream::connect_timeout` — то есть «не защищаем» было НЕОТЛИЧИМО от «забыли
+        // защитить». Теперь решение записано типом: `Route::Tunnel` — сознательный отказ.
         // Диагностика пути «Абоненты». Единственный инструмент разбора жалобы «список не
         // грузится» — журнал ядра на самом устройстве: экран показывает лишь итог, а этапов у
         // операции четыре (TCP по туннелю → obfs → PQ-TLS с пином → PQ-аутентификация издателя),
         // и молчали они все. Адрес — VIP внутри туннеля, ничего приватного в строке нет.
         let t0 = std::time::Instant::now();
         eprintln!("[admin] подключаюсь к {addr} по туннелю…");
-        let tcp = TcpStream::connect_timeout(&sa, Self::CONNECT_TIMEOUT)
-            .with_context(|| format!("admin-канал {addr} недоступен (туннель поднят?)"))?;
+        let tcp = citadel_protect::connect_tcp_route(
+            sa,
+            Self::CONNECT_TIMEOUT,
+            citadel_protect::Route::Tunnel,
+        )
+        .with_context(|| format!("admin-канал {addr} недоступен (туннель поднят?)"))?;
         tcp.set_read_timeout(Some(Self::IO_TIMEOUT)).context("set_read_timeout")?;
         tcp.set_write_timeout(Some(Self::IO_TIMEOUT)).context("set_write_timeout")?;
         eprintln!("[admin] TCP до {addr} за {} мс — поднимаю PQ-TLS", t0.elapsed().as_millis());
@@ -658,9 +666,12 @@ impl AdminClient {
 
 #[cfg(test)]
 mod tests {
+    // P-1: тестовая петля 127.0.0.1 к собственному туннелю отношения не имеет — маршрутного
+    // решения здесь нет, и фабрика `citadel_protect` не нужна (см. clippy.toml).
+    #![allow(clippy::disallowed_methods)]
     use super::*;
     use crate::pqtls;
-    use std::net::TcpListener;
+    use std::net::{TcpListener, TcpStream};
 
     // ── чистая логика реестра (перенесено из main.rs вместе с кодом, C5.5) ──
 

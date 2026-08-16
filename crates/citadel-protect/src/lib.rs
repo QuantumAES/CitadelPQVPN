@@ -23,7 +23,7 @@
 //! пути; (в) при поднятии туннеля система рвёт незащищённые сокеты процесса.
 
 use std::io;
-use std::net::{SocketAddr, TcpStream, ToSocketAddrs};
+use std::net::{SocketAddr, TcpStream, ToSocketAddrs, UdpSocket};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -104,6 +104,78 @@ pub enum Route {
     Tunnel,
 }
 
+/// Применить решение о маршруте к свежесозданному сокету — и **сказать об этом в журнал**.
+///
+/// Одна точка на все транспорты движка (UDP/QUIC, obfs-TCP, канал издателя), потому что
+/// диагностика здесь важнее самой строки `protect`: на Android «защищён» и «не защищён» дают
+/// ОДИНАКОВО успешный хендшейк (туннеля в этот момент ещё нет) и расходятся только позже, когда
+/// поднимается TUN. Пока сообщения не было, гонка «VpnService ещё не зарегистрировался» выглядела
+/// в журнале как исправная работа, и разбор дважды уезжал в MTU/оператора.
+///
+/// `what` — короткое имя пути для журнала («QUIC/UDP», «obfs-TCP», «издатель»).
+pub fn apply_route(sock: SocketHandle, route: Route, what: &str) {
+    if route == Route::Tunnel {
+        return; // сознательный отказ от защиты (admin-плоскость, дозаправка при поднятом туннеле)
+    }
+    let ok = protect_socket(sock);
+    // Сообщение имеет смысл только там, где протектор вообще бывает: на desktop/сервере `false` —
+    // норма (анти-петлю держит bypass-маршрут), и предупреждение было бы ложью.
+    if cfg!(target_os = "android") {
+        if ok {
+            eprintln!("[protect] {what}: сокет исключён из туннеля ✔");
+        } else {
+            eprintln!(
+                "[protect] ⚠ {what}: сокет НЕ защищён (VpnService не зарегистрирован либо protect() \
+                 отказал) — как только поднимется TUN, транспорт замкнётся сам на себя"
+            );
+        }
+    }
+}
+
+/// **P-1 (единственная фабрика).** Исходящий UDP-сокет движка: маршрут относительно собственного
+/// туннеля выбирается ЗДЕСЬ — параметром, до первой отправки, — а не наследуется по умолчанию.
+///
+/// Зачем отдельная функция там, где раньше стоял `UdpSocket::bind` + строчка `protect_socket`
+/// рядом: инвариант «сокет движка идёт мимо своего туннеля» ломался **дважды** (obfs-TCP
+/// 2026-08-06, QUIC/UDP 2026-08-12 — строку потеряли при переносе `pacing` в параметр), и оба раза
+/// поломка выглядела как «плохая сеть»: хендшейк проходит, данные встают при подъёме TUN. Пара
+/// «bind + не забыть protect» — это дисциплина; функция, у которой маршрут в сигнатуре, —
+/// конструкция. Прямые `UdpSocket::bind`/`TcpStream::connect` в движковых крейтах запрещены
+/// линтом (`clippy.toml`, `disallowed-methods`), поэтому забыть маршрут больше нельзя: код с
+/// голым `bind` не собирается под `-D warnings`.
+///
+/// Возврат — `std::net::UdpSocket` (не tokio): quinn принимает именно его, а `set_nonblocking`
+/// и оборачивание в tokio делает вызывающий, когда ему нужно.
+pub fn bind_udp_route(local: SocketAddr, route: Route) -> io::Result<UdpSocket> {
+    // Та самая единственная точка bind в движке — ей исключение и полагается.
+    #[allow(clippy::disallowed_methods)]
+    let sock = UdpSocket::bind(local)?;
+    // Локальный адрес в метке не косметика: по нему строка сходится с журналом миграции пути
+    // («rebind сокета X → Y»), иначе при реконнекте непонятно, о каком из сокетов речь.
+    // format! на каждый bind ничтожен — сокеты создаются считаные разы за сессию.
+    let what = match sock.local_addr() {
+        Ok(a) => format!("QUIC/UDP {a}"),
+        Err(_) => "QUIC/UDP".to_string(),
+    };
+    apply_route(handle_of(&sock), route, &what);
+    Ok(sock)
+}
+
+/// То же на эфемерном порту (`0.0.0.0:0`) — обычный случай клиентского транспорта и реконнекта.
+pub fn bind_udp_ephemeral(route: Route) -> io::Result<UdpSocket> {
+    bind_udp_route(SocketAddr::from(([0, 0, 0, 0], 0)), route)
+}
+
+/// Слушающий UDP-сокет сервера (exit). [`Route`] неприменим **по построению**, и это не поблажка:
+/// сокет ничего не инициирует, а на серверной стороне VpnService-протектора нет вовсе. Отдельное
+/// имя нужно, чтобы «серверный listen» не выглядел в коде как «исходящий сокет, которому забыли
+/// маршрут» — и чтобы линт не приходилось глушить в чужом файле.
+pub fn bind_udp_listen(local: SocketAddr) -> io::Result<UdpSocket> {
+    #[allow(clippy::disallowed_methods)]
+    let sock = UdpSocket::bind(local)?;
+    Ok(sock)
+}
+
 /// Синхронный TCP-connect с защитой сокета ДО соединения и таймаутом.
 ///
 /// Таймаут здесь не косметика: раньше на этом месте стоял голый `TcpStream::connect`, и
@@ -119,9 +191,7 @@ pub fn connect_tcp_route(addr: SocketAddr, timeout: Duration, route: Route) -> i
         socket2::Type::STREAM,
         Some(socket2::Protocol::TCP),
     )?;
-    if route == Route::Bypass {
-        let _ = protect_socket(handle_of(&sock));
-    }
+    apply_route(handle_of(&sock), route, "TCP (издатель/транспорт)");
     sock.connect_timeout(&addr.into(), timeout)?;
     Ok(sock.into())
 }
@@ -267,6 +337,33 @@ mod tests {
         let mut buf = [0u8; 2];
         s.read_exact(&mut buf).expect("read обязан заблокироваться и дождаться, а не вернуть WouldBlock");
         assert_eq!(&buf, b"hi");
+    }
+
+    /// P-1: у UDP-фабрики маршрут — параметр, и оба его значения обязаны наблюдаться на
+    /// протекторе. Проверяется в одном тесте, потому что доказательство здесь парное: «Bypass
+    /// защитил» без «Tunnel не защитил» одинаково проходило бы и с безусловным `protect_socket`.
+    #[test]
+    fn udp_factory_routes_are_observable_on_protector() {
+        let _g = serial();
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        set_socket_protector(Arc::new(Peeker(seen.clone())));
+
+        let bypass = bind_udp_ephemeral(Route::Bypass).unwrap();
+        assert_eq!(seen.lock().unwrap().len(), 1, "Bypass обязан пройти через протектор");
+        assert_eq!(seen.lock().unwrap()[0], handle_of(&bypass), "защищали ИМЕННО этот сокет");
+
+        let tunnel = bind_udp_ephemeral(Route::Tunnel).unwrap();
+        assert_eq!(seen.lock().unwrap().len(), 1, "Route::Tunnel не должен звать протектор");
+
+        // Серверный listen — тоже мимо протектора, и это не «забыли», а отдельное имя в API.
+        let srv = bind_udp_listen(SocketAddr::from(([127, 0, 0, 1], 0))).unwrap();
+        assert_eq!(seen.lock().unwrap().len(), 1, "listen не проходит через протектор");
+
+        clear_socket_protector();
+        // Сокеты живые и разные: фабрика не подсунула один и тот же и не отдала полудохлый.
+        for s in [&bypass, &tunnel, &srv] {
+            assert!(s.local_addr().is_ok(), "сокет фабрики обязан быть привязан");
+        }
     }
 
     #[test]

@@ -409,6 +409,9 @@ impl ServerCertVerifier for AcceptAnyServerCert {
 
 #[cfg(test)]
 mod tests {
+    // P-1: тестовая петля 127.0.0.1 к собственному туннелю отношения не имеет — маршрутного
+    // решения здесь нет, и фабрика `citadel_protect` не нужна (см. clippy.toml).
+    #![allow(clippy::disallowed_methods)]
     use super::*;
 
     /// Crypto-agility (M6): именованный выбор KX-suite и человекочитаемые имена.

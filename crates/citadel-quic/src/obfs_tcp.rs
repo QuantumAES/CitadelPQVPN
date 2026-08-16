@@ -202,6 +202,9 @@ pub async fn server_endpoint_obfs_tcp(
 
 #[cfg(test)]
 mod tests {
+    // P-1: тестовая петля 127.0.0.1 к собственному туннелю отношения не имеет — маршрутного
+    // решения здесь нет, и фабрика `citadel_protect` не нужна (см. clippy.toml).
+    #![allow(clippy::disallowed_methods)]
     use super::*;
 
     /// Ключевая валидация S0.3: настоящий PQ-QUIC хендшейк (TLS 1.3 + X25519MLKEM768) + обмен

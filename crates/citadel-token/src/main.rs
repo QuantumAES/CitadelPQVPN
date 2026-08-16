@@ -1914,6 +1914,9 @@ fn run_batch() -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+    // P-1: тестовая петля 127.0.0.1 к собственному туннелю отношения не имеет — маршрутного
+    // решения здесь нет, и фабрика `citadel_protect` не нужна (см. clippy.toml).
+    #![allow(clippy::disallowed_methods)]
     use super::{merge_registry, parse_bootstrap_pub, BootstrapPub};
 
     /// Многоразовая bootstrap-запись (как было до M-9).

@@ -40,3 +40,10 @@ jni = "0.21"
 
 [lints.rust]
 unexpected_cfgs = { level = "warn", check-cfg = ['cfg(frb_expand)'] }
+
+# Ф0.2 (docs/CWE-REVIEW-PLAN-2026-08.md §5, CWE-190/191) — то же, что в корневом Cargo.toml, и
+# ЗДЕСЬ отдельно: app/rust — свой воркспейс, профили движка сюда не достают. Именно эта сборка
+# уезжает в APK/десктопное приложение, то есть в руки людей; профиль релиза у неё задаёт cargokit,
+# а `overflow-checks` он не выставляет.
+[profile.release]
+overflow-checks = true

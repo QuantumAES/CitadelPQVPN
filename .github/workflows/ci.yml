@@ -157,6 +157,47 @@ jobs:
         working-directory: app/rust
         run: cargo deny --config ../../deny.toml check
 
+  # ── Ф1 (docs/CWE-REVIEW-PLAN-2026-08.md §5): фаззинг разборщиков недоверенного ввода.
+  #
+  # Гейт намеренно короткий (60 с на цель): он ловит не «глубокие» находки, а регрессию — правку,
+  # после которой разборщик начинает падать на входе из репозиторного корпуса. Настоящая кампания
+  # (по 10+ минут на цель, §5 Ф6) гоняется локально и ежемесячно, а найденное переезжает
+  # в обычные тесты крейтов, чтобы ловиться и без nightly.
+  fuzz-smoke:
+    name: фаззинг — smoke по корпусу (nightly)
+    runs-on: [self-hosted, linux, x64]
+    needs: rust
+    if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: PATH раннера
+        run: echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+
+      - name: проверка инструментов
+        run: |
+          set -u
+          rc=0
+          rustup toolchain list | grep -q '^nightly' || {
+            echo "::error::на раннере нет nightly (rustup toolchain install nightly; tools/setup-dev-env.sh)"; rc=1; }
+          command -v cargo-fuzz >/dev/null 2>&1 || {
+            echo "::error::на раннере нет cargo-fuzz (cargo install --locked cargo-fuzz)"; rc=1; }
+          exit $rc
+
+      # Падение цели = красный job. Вход, на котором она упала, лежит в fuzz/artifacts/<цель>/ и
+      # обязан переехать в fuzz/corpus/<цель>/ вместе с обычным тестом крейта.
+      - name: smoke по всем целям
+        run: bash tools/fuzz.sh 60
+
+      - name: артефакты падений
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-artifacts
+          path: fuzz/artifacts/
+          if-no-files-found: ignore
+
   # ── Тяжёлые e2e в контейнерах: настоящий туннель, настоящие iptables/TUN.
   # Не на каждый PR — на push и по кнопке.
   e2e:

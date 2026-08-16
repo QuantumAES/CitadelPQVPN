@@ -92,6 +92,35 @@ pub fn wrap(link: &str, password: &str) -> Result<String> {
 /// Развернуть блок. Неверный пароль и поломанный/подменённый блок неотличимы намеренно: оба —
 /// «не разворачивается», и гадать по сообщению, «тот ли пароль», противнику не с чего.
 pub fn unwrap(block: &str, password: &str) -> Result<String> {
+    let (salt, nonce, mut buf) = parse_envelope(block)?;
+    let header = header_bytes(&salt, &nonce);
+    // Заголовок целиком идёт в AAD: подмена соли/nonce (в том числе перестановка их между двумя
+    // блоками) ломает тег, а не тихо меняет то, что развернётся.
+    let key = derive(password, &salt)?;
+    let plain = key
+        .open_in_place(Nonce::assume_unique_for_key(nonce), Aad::from(&header), &mut buf)
+        .map_err(|_| anyhow!("неверный пароль или повреждённый блок мастер-ссылки"))?;
+    let link = String::from_utf8(plain.to_vec())
+        .context("развёрнутое содержимое не текст — блок не от этой версии?")?;
+    buf.zeroize();
+    if !link.starts_with("citadel://") {
+        bail!("развернулось не ссылкой Citadel — блок собран не установкой сервера");
+    }
+    Ok(link)
+}
+
+/// **Ф1** (`docs/CWE-REVIEW-PLAN-2026-08.md`, Приложение A): разбор недоверенного блока **до**
+/// KDF — рамка, base64, длина, магия. Отдельная дверь для фаззера нужна потому, что за ней стоит
+/// Argon2id на 256 МиБ: гонять его на случайных байтах бессмысленно (проверять там нечего, кроме
+/// тега AEAD) и невозможно по времени. Противник — тот, кто прислал человеку «мастер-ссылку»:
+/// скомпрометированный канал доставки, подменённое письмо, чужой QR.
+pub fn probe_block(block: &str) -> Result<()> {
+    parse_envelope(block).map(|_| ())
+}
+
+/// Общая часть [`unwrap`] и [`probe_block`]: печатаемый блок → `(соль, nonce, шифртекст)`.
+/// Всё, что здесь проверяется, обязано проверяться ДО единого байта криптографии.
+fn parse_envelope(block: &str) -> Result<([u8; SALT_LEN], [u8; NONCE_LEN], Vec<u8>)> {
     let raw = dearmor(block)?;
     if raw.len() < MAGIC.len() + SALT_LEN + NONCE_LEN {
         bail!("блок мастер-ссылки повреждён (слишком короткий)");
@@ -104,21 +133,8 @@ pub fn unwrap(block: &str, password: &str) -> Result<String> {
     let s = MAGIC.len();
     salt.copy_from_slice(&raw[s..s + SALT_LEN]);
     nonce.copy_from_slice(&raw[s + SALT_LEN..s + SALT_LEN + NONCE_LEN]);
-    let header = header_bytes(&salt, &nonce);
-    // Заголовок целиком идёт в AAD: подмена соли/nonce (в том числе перестановка их между двумя
-    // блоками) ломает тег, а не тихо меняет то, что развернётся.
-    let key = derive(password, &salt)?;
-    let mut buf = raw[header.len()..].to_vec();
-    let plain = key
-        .open_in_place(Nonce::assume_unique_for_key(nonce), Aad::from(&header), &mut buf)
-        .map_err(|_| anyhow!("неверный пароль или повреждённый блок мастер-ссылки"))?;
-    let link = String::from_utf8(plain.to_vec())
-        .context("развёрнутое содержимое не текст — блок не от этой версии?")?;
-    buf.zeroize();
-    if !link.starts_with("citadel://") {
-        bail!("развернулось не ссылкой Citadel — блок собран не установкой сервера");
-    }
-    Ok(link)
+    let ct = raw[MAGIC.len() + SALT_LEN + NONCE_LEN..].to_vec();
+    Ok((salt, nonce, ct))
 }
 
 /// Открытая часть конверта (она же AAD): `magic ‖ salt ‖ nonce`. Argon2-параметры сюда НЕ

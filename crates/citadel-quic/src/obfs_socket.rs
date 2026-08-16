@@ -497,9 +497,10 @@ impl ObfsUdpSocket {
     /// видит пакеты с нового пути, валидирует его (PATH_CHALLENGE) и продолжает. obfs-keystream
     /// скоупится на сессию (sid/psk), не на путь — миграция совместима с обфускацией.
     fn rebind(&self) -> io::Result<()> {
-        let std_sock = std::net::UdpSocket::bind("0.0.0.0:0")?;
-        // после миграции новый сокет тоже исключаем из туннеля (Android); desktop — no-op
-        let _ = crate::protect::protect_socket(crate::protect::handle_of(&std_sock));
+        // P-1: маршрут — параметр фабрики. Новый сокет после миграции обязан идти мимо туннеля
+        // ровно так же, как исходный: иначе реконнект в сети с поднятым TUN замкнёт транспорт
+        // сам на себя, и симптом будет тот же «данные встали, потерь нет».
+        let std_sock = crate::protect::bind_udp_ephemeral(crate::protect::Route::Bypass)?;
         std_sock.set_nonblocking(true)?;
         let new = tokio::net::UdpSocket::from_std(std_sock)?;
         let old = self.inner.load().local_addr().ok();
@@ -891,32 +892,14 @@ fn build_endpoint(
     psk: PskSource,
     pacing: Pacing,
 ) -> Result<quinn::Endpoint> {
-    // Android: исключить исходящий сокет движка из собственного туннеля (анти-петля).
-    // На desktop/сервере протектор не установлен → no-op. Должно быть ДО connect.
-    //
-    // Без этой строки хендшейк проходит (он идёт ДО `VpnService.Builder.establish`, туннеля ещё
-    // нет), а в момент подъёма TUN с маршрутом по умолчанию наши же UDP-пакеты к exit'у уходят
-    // В СОБСТВЕННЫЙ туннель: данные встают намертво, ACK'и не возвращаются, cwnd не открывается —
-    // «на провод ушло 2 из 113, потерь 0». Ровно это и наблюдалось на Android (см. регрессию из
-    // захода 7, где строку потеряли при переносе `pacing` в параметр). Тест
-    // `transport_sockets_go_through_protector` держит инвариант.
-    let protected = crate::protect::protect_socket(crate::protect::handle_of(&std_sock));
-    // На Android результат обязан быть в журнале: «не защищён» и «защищён» дают ОДИНАКОВО успешный
-    // хендшейк (туннеля в этот момент ещё нет) и расходятся только потом — когда поднимается TUN.
-    // Пока строка молчала, гонка «сервис не успел зарегистрироваться» была неотличима от нормы, и
-    // разбор дважды уезжал в сеть/MTU. `server_config.is_none()` — только клиент: на exit'е
-    // протектора нет по построению, и предупреждение там было бы ложью.
-    if cfg!(target_os = "android") && server_config.is_none() {
-        let local = std_sock.local_addr().map(|a| a.to_string()).unwrap_or_default();
-        if protected {
-            eprintln!("[protect] QUIC/UDP сокет {local} исключён из туннеля ✔");
-        } else {
-            eprintln!(
-                "[protect] ⚠ QUIC/UDP сокет {local} НЕ защищён (VpnService не зарегистрирован либо \
-                 protect() отказал) — как только поднимется TUN, транспорт замкнётся сам на себя"
-            );
-        }
-    }
+    // P-1: сокет сюда приходит УЖЕ с принятым решением о маршруте — из фабрики
+    // `citadel_protect::{bind_udp_ephemeral, bind_udp_listen}`. Раньше `protect` звался здесь, и
+    // это ровно то место, где его однажды потеряли при переносе `pacing` в параметр (заход 7):
+    // на Android хендшейк после такой потери проходит (он идёт ДО `VpnService.Builder.establish`,
+    // туннеля ещё нет), а в момент подъёма TUN наши же UDP-пакеты к exit'у уходят В СОБСТВЕННЫЙ
+    // туннель — данные встают намертво, ACK'и не возвращаются, «на провод ушло 2 из 113, потерь 0».
+    // Теперь потерять нечего: без фабрики сокет не создать (линт), а маршрут у неё в сигнатуре.
+    // Инвариант держит тест `transport_sockets_go_through_protector`.
     let sock = Arc::new(ObfsUdpSocket::new(std_sock, psk, pacing)?);
     // Pacer спавним только при включённом пейсинге; держит Weak → не мешает дропу сокета.
     if matches!(pacing, Pacing::Slotted { .. }) {
@@ -961,7 +944,15 @@ pub fn server_endpoint_obfs(
     // запрещён — см. [`check_server_chaff`].
     let raw = std::env::var("Citadel_PACING").unwrap_or_default();
     check_server_chaff(&raw)?;
-    build_endpoint(std::net::UdpSocket::bind(listen)?, Some(server_config), psk, parse_pacing(&raw))
+    // P-1: слушающий сокет exit'а — отдельное имя фабрики. Маршрут относительно «собственного
+    // туннеля» здесь неприменим по построению: сокет ничего не инициирует, а VpnService-протектора
+    // на серверной стороне нет вовсе.
+    build_endpoint(
+        crate::protect::bind_udp_listen(listen)?,
+        Some(server_config),
+        psk,
+        parse_pacing(&raw),
+    )
 }
 
 /// N-4: chaff на СЕРВЕРНОЙ стороне запрещён кодом, а не договорённостью в документе.
@@ -990,7 +981,12 @@ fn check_server_chaff(raw: &str) -> Result<()> {
 /// КЛИЕНТ: ключ всегда один — тот, что он получил у издателя на текущую эпоху (или бутстрапный
 /// в token-less деплое). Перебирать эпохи клиенту незачем: он знает, чем говорит.
 pub fn client_endpoint_obfs(psk: [u8; 32], pacing: Pacing) -> Result<quinn::Endpoint> {
-    build_endpoint(std::net::UdpSocket::bind("0.0.0.0:0")?, None, PskSource::Fixed(psk), pacing)
+    build_endpoint(
+        crate::protect::bind_udp_ephemeral(crate::protect::Route::Bypass)?,
+        None,
+        PskSource::Fixed(psk),
+        pacing,
+    )
 }
 
 /// КЛИЕНТ без obfs (token-less деплой/проба, где транспортного PSK нет): обычный QUIC-endpoint,
@@ -1000,14 +996,16 @@ pub fn client_endpoint_obfs(psk: [u8; 32], pacing: Pacing) -> Result<quinn::Endp
 /// и вклиниться между `bind` и `connect` с `protect()` там негде — на Android такой endpoint
 /// работал бы только до подъёма TUN (та же беда, что описана в [`build_endpoint`]).
 pub fn client_endpoint_plain() -> Result<quinn::Endpoint> {
-    let sock = std::net::UdpSocket::bind("0.0.0.0:0")?;
-    let _ = crate::protect::protect_socket(crate::protect::handle_of(&sock));
+    let sock = crate::protect::bind_udp_ephemeral(crate::protect::Route::Bypass)?;
     let runtime = quinn::default_runtime().ok_or_else(|| anyhow!("нет async runtime (tokio)"))?;
     Ok(quinn::Endpoint::new(quinn::EndpointConfig::default(), None, sock, runtime)?)
 }
 
 #[cfg(test)]
 mod tests {
+    // P-1: тестовая петля 127.0.0.1 к собственному туннелю отношения не имеет — маршрутного
+    // решения здесь нет, и фабрика `citadel_protect` не нужна (см. clippy.toml).
+    #![allow(clippy::disallowed_methods)]
     use super::*;
 
     /// П1 опирается на ПРОЦЕССНЫЙ счётчик пользовательских датаграмм, поэтому тесты, которые его

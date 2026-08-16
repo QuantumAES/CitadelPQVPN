@@ -5,6 +5,19 @@ members = ["crates/citadel-obfs", "crates/citadel-masque", "crates/citadel-prote
 # (тянет flutter_rust_bridge; собирается cargokit'ом; citadel-client подключён path-зависимостью).
 exclude = ["app/rust"]
 
+# Ф0.2 (docs/CWE-REVIEW-PLAN-2026-08.md §5, CWE-190/191). В debug переполнение целого — паника,
+# в release по умолчанию — молчаливое заворачивание по модулю. Ровно то, что в этом дереве считает
+# арифметику, живёт на недоверенном вводе: длины из пакетов (`pad_len_*`, varint, `slots_len`),
+# MTU-арифметика, счётчики окна анти-реплея, квоты и потолки гейта. Тесты гоняются в debug и
+# переполнение поймают, но ПРОД собирается в release — то есть единственная сборка, где ошибка
+# такого рода имеет последствия, была единственной, где она молчала.
+#
+# Цена измерена (см. docs/BENCHMARKS.md §«overflow-checks»): hot-path obfs seal/open и разбор
+# data-plane — в пределах шума, критерий выхода Ф0.2 («не хуже 3 %») выполнен. Перепроверять
+# после любой правки hot-path: `cargo bench -p citadel-obfs --bench obfs -- --baseline before`.
+[profile.release]
+overflow-checks = true
+
 [workspace.package]
 # Крейты внутренние: на crates.io не публикуются никогда (нет стабильного API, есть path-зависимости).
 # Флаг здесь — и страховка от `cargo publish` по ошибке, и то, что позволяет cargo-deny считать

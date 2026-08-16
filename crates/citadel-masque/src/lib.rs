@@ -168,7 +168,22 @@ pub mod capsule {
         }
         let mut addr = [0u8; 4];
         addr.copy_from_slice(&rest[1..5]);
-        Some(AssignedV4 { request_id: rid, addr, prefix: rest[5] })
+        let prefix = rest[5];
+        // Ф1 (цель `capsule_address`, найдено фаззером 2026-08-16): длина IPv4-префикса больше 32
+        // не существует ни при каком корректном пире — это не «странное значение», а невозможное
+        // состояние, и разбор не имеет права выпускать его наружу. Политику («какой префикс
+        // разумно принять от exit'а») по-прежнему решает вызывающий: клиент требует /12../30
+        // (`client::validate_assignment`, H-4), демон границы привилегий — 1..=32
+        // (`vpnd::valid`). Здесь — только физическая невозможность.
+        //
+        // `prefix == 0` остаётся законным: клиент шлёт им ADDRESS_REQUEST («префикс не указан»).
+        //
+        // Живой уязвимости на момент находки не было — оба потребителя проверяют диапазон сами;
+        // это снятие класса, а не заплатка на дыру.
+        if prefix > 32 {
+            return None;
+        }
+        Some(AssignedV4 { request_id: rid, addr, prefix })
     }
 
     pub fn encode_address_assign_v4(a: &AssignedV4) -> Vec<u8> {
@@ -232,6 +247,32 @@ pub mod capsule {
             assert_eq!(t, ADDRESS_ASSIGN);
             assert_eq!(used, cap.len());
             assert_eq!(decode_assigned_v4(val).unwrap(), a);
+        }
+
+        /// Ф1 (регрессия по находке фаззера, цель `capsule_address`, 2026-08-16): тело капсулы с
+        /// префиксом больше 32 не разбирается вовсе.
+        ///
+        /// Вход `33 04 00 00 00 00 4b 24` — ровно тот, что нашёл libFuzzer: `varint(0x33)`, версия
+        /// 4, адрес `0.0.0.0`, префикс `0x4b` = 75. Раньше он выходил из разбора «валидной»
+        /// структурой, и правильность держалась на том, что оба потребителя проверяют диапазон
+        /// сами. Держится и сейчас — но невозможное состояние больше не создаётся.
+        ///
+        /// `prefix == 0` обязан остаться разбираемым: им клиент шлёт ADDRESS_REQUEST.
+        #[test]
+        fn prefix_above_32_is_not_a_capsule() {
+            let bad = [0x33u8, 0x04, 0, 0, 0, 0, 0x4b, 0x24];
+            assert!(decode_assigned_v4(&bad).is_none(), "префикс /75 не существует");
+            let _ = decode_idle_hint(&bad); // соседний разбор того же тела не паникует
+
+            let req = AssignedV4 { request_id: 1, addr: [0, 0, 0, 0], prefix: 0 };
+            let cap = encode_address_request_v4(&req);
+            let (_, val, _) = decode(&cap).unwrap();
+            assert_eq!(decode_assigned_v4(val).unwrap(), req, "/0 в запросе законен");
+
+            let edge = AssignedV4 { request_id: 1, addr: [10, 0, 0, 1], prefix: 32 };
+            let cap = encode_address_assign_v4(&edge);
+            let (_, val, _) = decode(&cap).unwrap();
+            assert_eq!(decode_assigned_v4(val).unwrap(), edge, "/32 — граница, она внутри");
         }
 
         /// П5: хвост-подсказка читается новым пиром и НЕ мешает старому — тот разбирает те же

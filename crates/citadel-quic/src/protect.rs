@@ -6,9 +6,9 @@
 //! асинхронный TCP-connect для транспортных путей движка.
 
 pub use citadel_protect::{
-    clear_socket_protector, connect_tcp_route, connect_tcp_str, connect_tcp_str_route,
-    connect_tcp_timeout, handle_of, protect_socket, protector_active, set_socket_protector, Route,
-    SocketHandle, SocketProtector,
+    apply_route, bind_udp_ephemeral, bind_udp_listen, bind_udp_route, clear_socket_protector,
+    connect_tcp_route, connect_tcp_str, connect_tcp_str_route, connect_tcp_timeout, handle_of,
+    protect_socket, protector_active, set_socket_protector, Route, SocketHandle, SocketProtector,
 };
 
 /// Асинхронный TCP-connect с защитой сокета ДО соединения (Android) — obfs-TCP транспорт и
@@ -24,7 +24,7 @@ pub async fn connect_tcp(addr: std::net::SocketAddr) -> std::io::Result<tokio::n
     } else {
         tokio::net::TcpSocket::new_v6()?
     };
-    protect_socket(handle_of(&sock));
+    apply_route(handle_of(&sock), Route::Bypass, "obfs-TCP");
     sock.connect(addr).await
 }
 

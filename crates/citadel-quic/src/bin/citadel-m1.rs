@@ -1280,7 +1280,11 @@ async fn run_probe() -> Result<()> {
         .await?
         .next()
         .ok_or_else(|| anyhow!("не разрешился {connect}"))?;
-    let sock = tokio::net::UdpSocket::bind("0.0.0.0:0").await?;
+    // P-1: диагностический сокет — тоже сокет движка, и маршрут у него явный (мимо туннеля:
+    // probe проверяет реакцию exit'а из обычной сети, а не изнутри собственного туннеля).
+    let std_sock = citadel_quic::protect::bind_udp_ephemeral(citadel_quic::protect::Route::Bypass)?;
+    std_sock.set_nonblocking(true)?;
+    let sock = tokio::net::UdpSocket::from_std(std_sock)?;
     sock.connect(addr).await?;
     eprintln!("[probe] шлю не-PSK датаграммы на {connect} ({addr})…");
     let mut junk = vec![0xc0u8, 0, 0, 0, 1]; // похоже на начало QUIC long header v1

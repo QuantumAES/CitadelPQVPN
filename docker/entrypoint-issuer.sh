@@ -12,6 +12,10 @@ rm -f /shared/registry
 # Общий obfs-PSK для exit↔client генерируем здесь (а не хардкодим в репозитории).
 # Для прода PSK доставляется в конфиге по аутентифицированному каналу (см. docs/PHASE0-OBFS §8).
 [ -f /shared/obfs.psk ] || { head -c 32 /dev/urandom | od -An -tx1 | tr -d ' \n' > /shared/obfs.psk; }
+# Ф0.4: секрет, созданный редиректом shell'а, рождается с правами по umask — то есть 0644, и
+# читается кем угодно на машине. Соседний obfs.master эту строку имел, а этот файл — нет.
+# Группа = та, в которую садится exit после сброса привилегий (см. комментарий у compose).
+chmod 640 /shared/obfs.psk
 echo "[issuer] общий obfs-PSK → /shared/obfs.psk"
 # S2.1/A1-остаток: issuer оборачивает token- и admin-каналы в obfs тем же PSK (probe-resistance:
 # issuer-порт молчит на не-obfs пробу и на проводе неотличим от туннеля). Клиент берёт PSK из ссылки.

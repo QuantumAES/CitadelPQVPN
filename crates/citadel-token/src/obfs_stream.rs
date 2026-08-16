@@ -209,6 +209,9 @@ impl Write for ObfsMaybe {
 
 #[cfg(test)]
 mod tests {
+    // P-1: тестовая петля 127.0.0.1 к собственному туннелю отношения не имеет — маршрутного
+    // решения здесь нет, и фабрика `citadel_protect` не нужна (см. clippy.toml).
+    #![allow(clippy::disallowed_methods)]
     use super::*;
 
     const PSK: [u8; 32] = [0x42; 32];
