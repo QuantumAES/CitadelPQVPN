@@ -5,6 +5,22 @@
 # IDEs (https://dart.dev/tools#ides-and-editors). The analyzer can also be
 # invoked from the command line by running `flutter analyze`.
 
+# Анализатору отдаём только НАШ Dart: `lib/` и `test/`. Всё остальное под app/ — либо чужой
+# вендоренный код, либо генерат сборки, и замечания оттуда мы всё равно не правим, зато они топят
+# собственные: `rust_builder/cargokit` (вендоренный сборщик Rust-моста, тянет пакеты, которых нет
+# в нашем pubspec) в одиночку даёт все 72 замечания `flutter analyze`, то есть до этого исключения
+# «чисто/грязно» по выводу команды не читалось вовсе — а `flutter analyze` стоит гейтом в CI.
+analyzer:
+  exclude:
+    - build/**
+    - rust_builder/**
+    - android/**
+    - ios/**
+    - web/**
+    - windows/**
+    - macos/**
+    - linux/**
+
 # The following line activates a set of recommended lints for Flutter apps,
 # packages, and plugins designed to encourage good coding practices.
 include: package:flutter_lints/flutter.yaml
