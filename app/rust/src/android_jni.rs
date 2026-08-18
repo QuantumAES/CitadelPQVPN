@@ -180,10 +180,15 @@ pub fn set_status(state: &str) {
 // Итог захвата IPv6 в туннель — те же значения, что константы `IPV6_*` в `CitadelVpnService`.
 /// blackhole поставлен: весь IPv6 уходит в туннель (и там дропается exit'ом).
 pub const IPV6_CAPTURED: i32 = 0;
-/// Устройство отвергло v6-адрес/маршрут — туннель поднят БЕЗ blackhole (нативный IPv6 мимо него).
+/// blackhole не встал И у приложений под VPN есть путь наружу по IPv6 — это УТЕЧКА (N-1).
 pub const IPV6_FALLBACK: i32 = 1;
 /// Захват неприменим: не full-tunnel (split-include) — IPv6 идёт напрямую по выбору человека.
 pub const IPV6_SPLIT: i32 = 2;
+/// blackhole не встал, но пути наружу по IPv6 нет вовсе (Android кладёт `unreachable ::/0` в
+/// таблицу VPN-сети, когда в конфиге VpnService нет ни v6-адреса, ни v6-маршрута). Цель S2.2/A2
+/// достигнута — предупреждать не о чем. Штатный исход на Android: TUN ужат под бюджет
+/// QUIC-датаграммы (1161 б), а IPv6 на интерфейсе с MTU < 1280 ядро не поднимает вовсе.
+pub const IPV6_BLOCKED: i32 = 3;
 
 /// Итог последней попытки захватить IPv6 (`CitadelVpnService.ipv6State()`, S2.2/A2). Спрашивается
 /// сразу после [`establish_tun`]: молчаливый фолбэк без blackhole означает нативный IPv6 мимо

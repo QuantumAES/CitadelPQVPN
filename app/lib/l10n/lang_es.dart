@@ -38,7 +38,7 @@ const Map<String, String> langEs = {
   'err_no_vpn_permission_hint': 'permite la conexión en el diálogo del sistema',
   'err_activation_failed': 'No se pudo activar el enlace',
   'err_activation_failed_hint': 'pida un enlace nuevo al administrador: el enlace inicial se activa una sola vez y por tiempo limitado',
-  'err_ipv6_required': 'Túnel no establecido: IPv6 no capturado',
+  'err_ipv6_required': 'Túnel no establecido: el IPv6 va fuera del túnel',
   'err_ipv6_required_hint': 'el IPv6 estricto está activado: desactívelo en los ajustes o active la VPN siempre activa',
 
   'switch_title': '¿Cambiar de conexión?',
@@ -105,7 +105,7 @@ const Map<String, String> langEs = {
   'killswitch_android_title': 'Kill switch (siempre activo)',
   'killswitch_android_sub': 'Se configura en los ajustes de VPN del sistema',
   'strict_ipv6_title': 'IPv6 estricto',
-  'strict_ipv6_sub': 'No conectar si el dispositivo no permite llevar el IPv6 al túnel',
+  'strict_ipv6_sub': 'No conectar si el IPv6 va fuera del túnel',
   'split_title': 'Túnel dividido',
   'split_sub_android': 'Por aplicaciones y direcciones: por el túnel / fuera del túnel',
   'split_sub_desktop': 'Por direcciones de destino: por el túnel / fuera del túnel',
@@ -142,9 +142,8 @@ const Map<String, String> langEs = {
   'open_settings': 'Abrir los ajustes',
   'ipv6_warn': 'El IPv6 va fuera del túnel: más información',
   'ipv6_warn_title': 'IPv6 no capturado',
-  'ipv6_warn_body': 'Este dispositivo no aceptó llevar el IPv6 al túnel. El túnel funciona, pero el tráfico '
-      'IPv6 (y el DNS IPv6) va directo, por fuera: en una red con IPv6 eso revela su '
-      'dirección.\n\n'
+  'ipv6_warn_body': 'El túnel funciona, pero el tráfico IPv6 (y el DNS IPv6) sale del dispositivo '
+      'directamente, por fuera del túnel: en una red con IPv6 eso revela su dirección.\n\n'
       'Qué hacer:\n'
       '• activar «VPN siempre activa» y «Bloquear conexiones sin VPN» para CitadelPQVPN: '
       'el sistema corta entonces todo el tráfico fuera del túnel;\n'

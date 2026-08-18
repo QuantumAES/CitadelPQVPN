@@ -55,12 +55,22 @@ class CitadelVpnService : VpnService() {
         const val NOTIF_ID = 1
 
         // S2.2/A2: чем кончилась попытка захватить IPv6 в туннель (см. establishTun). Ядро
-        // спрашивает это ПОСЛЕ каждого establish (`ipv6State`) и, если захвата нет, говорит об
-        // этом человеку: молчаливый фолбэк оставлял нативный IPv6 мимо туннеля, а на экране
-        // по-прежнему горело «Защищено» (находка N-1 сверки 2026-08-14).
+        // спрашивает это ПОСЛЕ каждого establish (`ipv6State`) и, если v6 уходит мимо туннеля,
+        // говорит об этом человеку: молчаливый фолбэк оставлял нативный IPv6 мимо туннеля, а на
+        // экране по-прежнему горело «Защищено» (находка N-1 сверки 2026-08-14).
         const val IPV6_CAPTURED = 0 // blackhole поставлен: весь v6 уходит в туннель
-        const val IPV6_FALLBACK = 1 // устройство отвергло v6-адрес/маршрут → туннель БЕЗ blackhole
+        const val IPV6_FALLBACK = 1 // blackhole не встал И v6 реально уходит мимо туннеля — УТЕЧКА
         const val IPV6_SPLIT = 2 // не full-tunnel (split-include): v6 идёт напрямую ПО ВЫБОРУ человека
+        // blackhole не встал, но у приложений под VPN нет НИ ОДНОГО пути наружу по IPv6 (проверено
+        // пробой ниже). Цель S2.2/A2 — «нативный IPv6 не уходит с устройства мимо туннеля» — при
+        // этом достигнута, поэтому предупреждать не о чем и строгий режим обязан пропускать такой
+        // туннель. Ровно этот исход даёт сам Android: увидев конфиг VpnService без единого
+        // IPv6-адреса и маршрута, он кладёт в таблицу VPN-сети `unreachable ::/0`.
+        const val IPV6_BLOCKED = 3
+
+        /** Минимальный MTU IPv6 (RFC 8200 §5). Ниже него ядро не поднимает IPv6 на интерфейсе
+         *  вовсе (`ipv6_add_dev()` → EINVAL), поэтому blackhole на таком TUN недостижим. */
+        const val IPV6_MIN_MTU = 1280
 
         // Тексты постоянной нотификации по состоянию сессии. Она — единственное, что видно о VPN
         // при закрытом окне, поэтому «туннель активен» в ней должно означать ровно то, что сказано:
@@ -193,8 +203,10 @@ class CitadelVpnService : VpnService() {
      *  Rust через JNI (`AndroidTunProvider::configure` в нативном connect-loop) на КАЖДЫЙ (ре)коннект,
      *  НЕ из Dart. routes/dns приходят строкой через пробел (Rust шлёт TunParams как есть, без массивов).
      *
-     *  `requireV6` — строгий режим (настройка «Не подключаться без захвата IPv6»): туннель без
-     *  IPv6-blackhole не поднимается вовсе, вместо тихого фолбэка ядро получает исключение. */
+     *  `requireV6` — строгий режим (настройка «Не подключаться без захвата IPv6»): туннель не
+     *  поднимается, если v6 РЕАЛЬНО уходит мимо него. Туннель без blackhole, но и без единого
+     *  v6-пути наружу (IPV6_BLOCKED) строгий режим пропускает: цель настройки — отсутствие утечки,
+     *  а не наличие адреса на интерфейсе. */
     fun establishTun(
         addr: String, prefix: Int, routes: String, dns: String, mtu: Int,
         appMode: String, apps: String, destMode: String, destRoutes: String,
@@ -309,18 +321,28 @@ class CitadelVpnService : VpnService() {
             return b.establish()
         }
 
-        // Пробуем с IPv6-blackhole (только full-tunnel). НЕ все устройства/версии принимают v6-адрес
-        // или ::/0 на VpnService — тогда establish() бросает («Cannot set address») ЛИБО возвращает
-        // null; в этом случае пересобираем БЕЗ blackhole (fallback → системный always-on lockdown,
-        // который тоже режет не-VPN трафик). Так establish не ломается там, где v6 не поддержан.
+        // Пробуем с IPv6-blackhole — но только там, где он в принципе достижим.
         //
-        // N-1: сам фолбэк нужен (без него на таких устройствах туннель не поднимется вовсе), но
-        // МОЛЧАТЬ о нём нельзя — на dual-stack он означает нативный IPv6 мимо туннеля. Поэтому
-        // итог фиксируется в [ipv6State] (ядро покажет предупреждение), а в строгом режиме
-        // (`requireV6`) отказ захвата вообще не даёт поднять туннель.
+        // MTU < 1280 делает blackhole НЕВОЗМОЖНЫМ: ядро Linux не создаёт inet6_dev на интерфейсе с
+        // MTU ниже IPv6-минимума (`ipv6_add_dev()` → EINVAL), поэтому VpnService отвечает на
+        // addAddress("fd00:…") ровно «Cannot set address». А наш TUN ужимается под бюджет
+        // QUIC-датаграммы (citadel_quic::INNER_MTU = 1161 б, см. `clamp_tun_mtu`) — то есть на живом
+        // транспорте это НЕ «особенность устройства», а гарантированный исход на любом Android.
+        // Пробовать его значит каждый раз ловить исключение и валить вину на устройство.
+        //
+        // Поставить один только маршрут `::/0` без адреса — не выход, а ухудшение: ядру для
+        // device-route тоже нужен inet6_dev (`fib6_nh_init` → `in6_dev_get` → ENODEV), маршрут не
+        // встанет, но Android, увидев в конфиге IPv6, УЖЕ НЕ добавит свой `unreachable ::/0` — и
+        // v6 уйдёт мимо туннеля по-настоящему.
+        //
+        // N-1: важен не сам blackhole, а его цель — чтобы нативный IPv6 не уходил с устройства мимо
+        // туннеля. Поэтому после фолбэка проверяем цель НАПРЯМУЮ (`ipv6EscapesTunnel`), а не по
+        // косвенному признаку «получилось ли поставить адрес».
+        val v6Reachable = fullTunnel && mtu >= IPV6_MIN_MTU
         ipv6State = if (fullTunnel) IPV6_FALLBACK else IPV6_SPLIT
-        if (fullTunnel) {
-            var why = "establish с IPv6-blackhole вернул null"
+        var why = "MTU туннеля $mtu < $IPV6_MIN_MTU — ядро не поднимает IPv6 на таком интерфейсе"
+        if (v6Reachable) {
+            why = "establish с IPv6-blackhole вернул null"
             try {
                 val fd = build(true)
                 if (fd != null) {
@@ -330,15 +352,90 @@ class CitadelVpnService : VpnService() {
             } catch (e: Exception) {
                 why = "IPv6-blackhole отвергнут устройством (${e.message})"
             }
-            android.util.Log.w("CitadelVpn", "S2.2/A2: $why")
-            if (requireV6) {
+        }
+        if (fullTunnel) android.util.Log.w("CitadelVpn", "S2.2/A2: blackhole не поставлен — $why")
+
+        val fd = build(false) ?: throw IllegalStateException("VpnService.establish() == null (нет разрешения VPN?)")
+        if (fullTunnel) {
+            val escapes = ipv6EscapesTunnel()
+            ipv6State = if (escapes) IPV6_FALLBACK else IPV6_BLOCKED
+            android.util.Log.i(
+                "CitadelVpn",
+                if (escapes) "S2.2/A2: IPv6 УХОДИТ мимо туннеля (у приложения под VPN есть v6-маршрут наружу)"
+                else "S2.2/A2: IPv6 в туннель не захвачен, но и наружу не уходит — путей по v6 нет (unreachable ::/0)"
+            )
+            if (requireV6 && escapes) {
                 // Строгий режим: лучше отсутствие туннеля, чем туннель с утечкой v6 мимо него.
+                // fd ещё НАШ (detachFd не звали) — закрываем, иначе TUN остался бы висеть без
+                // владельца, а система показывала бы ключ VPN над несуществующей сессией.
                 // Текст уезжает в ядро как причина отказа и доходит до экрана — см. `_classify`.
-                throw IllegalStateException("IPv6 не захвачен в туннель, строгий режим: $why")
+                //
+                // Цена честной проверки: ответ на «уходит ли v6 мимо туннеля» существует только
+                // ПОСЛЕ establish (до него таблица маршрутов ещё доVPN'ная), поэтому строгий режим
+                // теперь поднимает туннель и рвёт его через ~секунду. Окно узкое и не хуже
+                // нестрогого режима: v4 в эту секунду уже в туннеле, наружу может уйти только v6 —
+                // ровно то, из-за чего мы и отказываемся.
+                fd.close()
+                throw IllegalStateException("IPv6 уходит мимо туннеля, строгий режим: $why")
             }
         }
-        val fd = build(false) ?: throw IllegalStateException("VpnService.establish() == null (нет разрешения VPN?)")
         return fd.detachFd() // владение переходит в Rust
+    }
+
+    /**
+     * Есть ли у приложения ПОД VPN хоть какой-то путь наружу по IPv6.
+     *
+     * Проверка по существу, а не по конфигу: [ipv6RouteExists] зовёт `connect()` на UDP-сокете —
+     * пакетов это НЕ шлёт, это только выбор маршрута ядром в той самой таблице, которой пользуются
+     * приложения под VPN. Наш процесс всегда внутри туннеля (`applyAppFilter`: себя не исключаем),
+     * и сокет намеренно не протектится — нас интересует ровно то, что видят обычные приложения.
+     *
+     * «Пути нет» — ответ окончательный и мгновенный: это штатный исход на Android, где Android сам
+     * кладёт `unreachable ::/0` в таблицу VPN-сети для конфига без единого v6-адреса и маршрута.
+     * Ждать имеет смысл только в обратном случае: правила VPN-сети ConnectivityService ставит уже
+     * ПОСЛЕ возврата из establish(), поэтому «путь есть» может означать, что мы ещё смотрим в
+     * доVPN'ную таблицу. Так задержку платит только «плохая» ветка, а не каждый реконнект.
+     */
+    private fun ipv6EscapesTunnel(): Boolean {
+        val cm = getSystemService(ConnectivityManager::class.java)
+        var waited = 0
+        while (ipv6RouteExists()) {
+            val caps = cm?.activeNetwork?.let { cm.getNetworkCapabilities(it) }
+            // VPN-сеть уже активна для нас, а путь по v6 всё равно есть — это настоящая утечка.
+            if (caps?.hasTransport(NetworkCapabilities.TRANSPORT_VPN) == true) return true
+            if (waited >= 1000) {
+                android.util.Log.w("CitadelVpn", "VPN-сеть не стала активной за ${waited}мс — считаю худшее (v6 мимо туннеля)")
+                return true
+            }
+            try {
+                Thread.sleep(100)
+            } catch (e: InterruptedException) {
+                Thread.currentThread().interrupt()
+                android.util.Log.w("CitadelVpn", "проба IPv6 прервана: ${e.message}")
+                return true // прервали — не выдаём «утечки нет» на непроверенном
+            }
+            waited += 100
+        }
+        return false
+    }
+
+    /** Находит ли ядро маршрут наружу по IPv6 для сокета этого процесса (см. [ipv6EscapesTunnel]). */
+    private fun ipv6RouteExists(): Boolean {
+        // Литералы, а не имена: getByName на литерале в DNS не ходит. Два разных префикса — чтобы
+        // единичная blackhole-запись у провайдера не выглядела как «v6 никуда не уходит».
+        for (probe in arrayOf("2001:4860:4860::8888", "2606:4700:4700::1111")) {
+            try {
+                java.nio.channels.DatagramChannel.open(java.net.StandardProtocolFamily.INET6).use { ch ->
+                    ch.connect(java.net.InetSocketAddress(java.net.InetAddress.getByName(probe), 53))
+                    return true // маршрут нашёлся → путь наружу по v6 есть
+                }
+            } catch (e: Exception) {
+                // ENETUNREACH/EHOSTUNREACH — маршрута нет, это и есть «заблокировано». Любая другая
+                // ошибка тоже означает, что v6-путь отсюда не открылся; следующий префикс проверим.
+                android.util.Log.d("CitadelVpn", "v6-проба $probe: пути нет (${e.message})")
+            }
+        }
+        return false
     }
 
     /** C3.3: исключить сокет движка из туннеля (анти-петля). Зовётся из Rust через JNI. */

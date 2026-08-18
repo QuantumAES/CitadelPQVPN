@@ -38,7 +38,7 @@ const Map<String, String> langDe = {
   'err_no_vpn_permission_hint': 'Erlauben Sie die Verbindung im Systemdialog',
   'err_activation_failed': 'Der Link konnte nicht aktiviert werden',
   'err_activation_failed_hint': 'bitten Sie den Administrator um einen neuen Link: ein Erstlink wird einmal und nur begrenzte Zeit aktiviert',
-  'err_ipv6_required': 'Tunnel nicht aufgebaut: IPv6 nicht erfasst',
+  'err_ipv6_required': 'Tunnel nicht aufgebaut: IPv6 läuft am Tunnel vorbei',
   'err_ipv6_required_hint': 'striktes IPv6 ist aktiv — schalten Sie es in den Einstellungen ab oder aktivieren Sie ein immer aktives VPN',
 
   'switch_title': 'Verbindung wechseln?',
@@ -107,7 +107,7 @@ const Map<String, String> langDe = {
   'killswitch_android_title': 'Kill-Switch (Always-on)',
   'killswitch_android_sub': 'In den System-VPN-Einstellungen konfigurieren',
   'strict_ipv6_title': 'Striktes IPv6',
-  'strict_ipv6_sub': 'Nicht verbinden, wenn das Gerät IPv6 nicht in den Tunnel leiten lässt',
+  'strict_ipv6_sub': 'Nicht verbinden, wenn IPv6 am Tunnel vorbeiläuft',
   'split_title': 'Split-Tunnel',
   'split_sub_android': 'Nach Apps und Adressen: durch den Tunnel / daran vorbei',
   'split_sub_desktop': 'Nach Zieladressen: durch den Tunnel / daran vorbei',
@@ -144,9 +144,8 @@ const Map<String, String> langDe = {
   'open_settings': 'Einstellungen öffnen',
   'ipv6_warn': 'IPv6 läuft am Tunnel vorbei — Details',
   'ipv6_warn_title': 'IPv6 nicht erfasst',
-  'ipv6_warn_body': 'Dieses Gerät hat die Erfassung von IPv6 im Tunnel abgelehnt. Der Tunnel arbeitet, aber '
-      'IPv6-Verkehr (und IPv6-DNS) läuft direkt daran vorbei — in einem IPv6-Netz gibt das '
-      'Ihre Adresse preis.\n\n'
+  'ipv6_warn_body': 'Der Tunnel arbeitet, aber IPv6-Verkehr (und IPv6-DNS) verlässt das Gerät direkt '
+      'am Tunnel vorbei — in einem IPv6-Netz gibt das Ihre Adresse preis.\n\n'
       'Was tun:\n'
       '• für CitadelPQVPN „Immer aktives VPN“ und „Verbindungen ohne VPN blockieren“ '
       'einschalten — dann sperrt das System jeden Verkehr außerhalb des Tunnels;\n'

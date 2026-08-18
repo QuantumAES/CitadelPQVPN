@@ -38,7 +38,7 @@ const Map<String, String> langHi = {
   'err_no_vpn_permission_hint': 'सिस्टम डायलॉग में कनेक्शन की अनुमति दें',
   'err_activation_failed': 'लिंक सक्रिय नहीं हो सका',
   'err_activation_failed_hint': 'व्यवस्थापक से नया लिंक माँगें: पहला लिंक एक ही बार और सीमित समय के लिए सक्रिय होता है',
-  'err_ipv6_required': 'टनल नहीं बना: IPv6 कैप्चर नहीं हुआ',
+  'err_ipv6_required': 'टनल नहीं बना: IPv6 टनल के बाहर जा रहा है',
   'err_ipv6_required_hint': 'सख़्त IPv6 चालू है — इसे सेटिंग्स में बंद करें या हमेशा चालू VPN सक्षम करें',
 
   'switch_title': 'कनेक्शन बदलें?',
@@ -105,7 +105,7 @@ const Map<String, String> langHi = {
   'killswitch_android_title': 'किल-स्विच (always-on)',
   'killswitch_android_sub': 'सिस्टम की VPN सेटिंग्स में कॉन्फ़िगर करें',
   'strict_ipv6_title': 'सख़्त IPv6',
-  'strict_ipv6_sub': 'यदि डिवाइस IPv6 को टनल में नहीं भेजने देता, तो कनेक्ट न करें',
+  'strict_ipv6_sub': 'यदि IPv6 टनल के बाहर जाता है, तो कनेक्ट न करें',
   'split_title': 'स्प्लिट टनल',
   'split_sub_android': 'ऐप और पतों के अनुसार: टनल से / टनल के बाहर',
   'split_sub_desktop': 'गंतव्य पतों के अनुसार: टनल से / टनल के बाहर',
@@ -140,8 +140,8 @@ const Map<String, String> langHi = {
   'open_settings': 'सेटिंग्स खोलें',
   'ipv6_warn': 'IPv6 टनल के बाहर जा रहा है — विवरण',
   'ipv6_warn_title': 'IPv6 कैप्चर नहीं हुआ',
-  'ipv6_warn_body': 'इस डिवाइस ने IPv6 को टनल में लेने से मना कर दिया। टनल काम कर रहा है, पर IPv6 ट्रैफ़िक '
-      '(और IPv6 DNS) सीधे, उसके बाहर से जाता है — IPv6 वाले नेटवर्क में इससे आपका पता खुल जाता है।\n\n'
+  'ipv6_warn_body': 'टनल काम कर रहा है, पर IPv6 ट्रैफ़िक (और IPv6 DNS) डिवाइस से सीधे, टनल के बाहर से '
+      'जाता है — IPv6 वाले नेटवर्क में इससे आपका पता खुल जाता है।\n\n'
       'क्या करें:\n'
       '• CitadelPQVPN के लिए «हमेशा चालू VPN» और «VPN के बिना कनेक्शन रोकें» चालू करें — '
       'तब सिस्टम स्वयं टनल के बाहर का सारा ट्रैफ़िक रोक देता है;\n'

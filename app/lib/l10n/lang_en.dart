@@ -38,7 +38,7 @@ const Map<String, String> langEn = {
   'err_no_vpn_permission_hint': 'allow the connection in the system dialog',
   'err_activation_failed': 'The link could not be activated',
   'err_activation_failed_hint': 'ask the administrator for a new link: a first-use link activates once and only for a limited time',
-  'err_ipv6_required': 'Tunnel not established: IPv6 not captured',
+  'err_ipv6_required': 'Tunnel not established: IPv6 goes outside the tunnel',
   'err_ipv6_required_hint': 'strict IPv6 is on — turn it off in the settings or enable always-on VPN',
 
   'switch_title': 'Switch connection?',
@@ -105,7 +105,7 @@ const Map<String, String> langEn = {
   'killswitch_android_title': 'Kill switch (always-on)',
   'killswitch_android_sub': 'Configure in the system VPN settings',
   'strict_ipv6_title': 'Strict IPv6',
-  'strict_ipv6_sub': 'Do not connect if the device will not route IPv6 into the tunnel',
+  'strict_ipv6_sub': 'Do not connect if IPv6 goes outside the tunnel',
   'split_title': 'Split tunnel',
   'split_sub_android': 'By apps and addresses: through the tunnel / bypass',
   'split_sub_desktop': 'By destination addresses: through the tunnel / bypass',
@@ -142,9 +142,8 @@ const Map<String, String> langEn = {
   'open_settings': 'Open settings',
   'ipv6_warn': 'IPv6 goes outside the tunnel — details',
   'ipv6_warn_title': 'IPv6 not captured',
-  'ipv6_warn_body': 'This device refused to route IPv6 into the tunnel. The tunnel works, but IPv6 traffic '
-      '(and IPv6 DNS) goes directly, bypassing it — on an IPv6 network that reveals your '
-      'address.\n\n'
+  'ipv6_warn_body': 'The tunnel works, but IPv6 traffic (and IPv6 DNS) leaves the device directly, '
+      'bypassing the tunnel — on an IPv6 network that reveals your address.\n\n'
       'What to do:\n'
       '• enable “Always-on VPN” and “Block connections without VPN” for CitadelPQVPN — '
       'the system then blocks all traffic outside the tunnel;\n'

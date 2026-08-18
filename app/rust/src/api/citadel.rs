@@ -1476,16 +1476,24 @@ impl TunProvider for AndroidTunProvider {
 /// бы её игнорировать.
 #[cfg(target_os = "android")]
 fn report_ipv6_state(state: i32) {
-    use crate::android_jni::{IPV6_CAPTURED, IPV6_FALLBACK};
+    use crate::android_jni::{IPV6_BLOCKED, IPV6_CAPTURED, IPV6_FALLBACK};
+    // Предупреждаем ровно об утечке. `IPV6_BLOCKED` (blackhole не встал, но и путей наружу по v6
+    // нет) — штатный и безопасный исход на Android, где TUN ужат под бюджет QUIC-датаграммы и
+    // IPv6 на нём не поднимается в принципе; плашка о нём была бы ложной тревогой в каждом сеансе.
     let uncaptured = state == IPV6_FALLBACK;
     if uncaptured {
         eprintln!(
-            "[vpn] S2.2/A2: туннель поднят БЕЗ IPv6-blackhole — нативный IPv6 идёт мимо туннеля. \
+            "[vpn] S2.2/A2: IPv6 идёт МИМО туннеля (у приложений под VPN есть v6-маршрут наружу). \
              Включите системный always-on + «Блокировать соединения без VPN» либо настройку \
              «Не подключаться без захвата IPv6»"
         );
     } else if state == IPV6_CAPTURED {
         eprintln!("[vpn] S2.2/A2: IPv6 захвачен в туннель");
+    } else if state == IPV6_BLOCKED {
+        eprintln!(
+            "[vpn] S2.2/A2: IPv6 в туннель не захвачен (MTU туннеля < 1280), но и наружу не уходит \
+             — путей по IPv6 у приложений под VPN нет"
+        );
     }
     ANDROID_STATUS.lock().unwrap().ipv6_uncaptured = uncaptured;
     let guard = ANDROID_SINK.lock().unwrap();

@@ -38,7 +38,7 @@ const Map<String, String> langFr = {
   'err_no_vpn_permission_hint': 'autorisez la connexion dans la boîte de dialogue du système',
   'err_activation_failed': 'Impossible d’activer le lien',
   'err_activation_failed_hint': 'demandez un nouveau lien à l’administrateur : un lien initial s’active une seule fois et pendant une durée limitée',
-  'err_ipv6_required': 'Tunnel non établi : IPv6 non capturé',
+  'err_ipv6_required': 'Tunnel non établi : l’IPv6 passe hors du tunnel',
   'err_ipv6_required_hint': 'l’IPv6 strict est activé — désactivez-le dans les réglages ou activez le VPN permanent',
 
   'switch_title': 'Changer de connexion ?',
@@ -105,7 +105,7 @@ const Map<String, String> langFr = {
   'killswitch_android_title': 'Kill switch (always-on)',
   'killswitch_android_sub': 'À configurer dans les paramètres VPN du système',
   'strict_ipv6_title': 'IPv6 strict',
-  'strict_ipv6_sub': 'Ne pas se connecter si l’appareil refuse de router l’IPv6 dans le tunnel',
+  'strict_ipv6_sub': 'Ne pas se connecter si l’IPv6 passe hors du tunnel',
   'split_title': 'Tunnel scindé',
   'split_sub_android': 'Par applications et adresses : via le tunnel / hors tunnel',
   'split_sub_desktop': 'Par adresses de destination : via le tunnel / hors tunnel',
@@ -142,9 +142,8 @@ const Map<String, String> langFr = {
   'open_settings': 'Ouvrir les paramètres',
   'ipv6_warn': 'L’IPv6 passe hors du tunnel — détails',
   'ipv6_warn_title': 'IPv6 non capturé',
-  'ipv6_warn_body': 'Cet appareil a refusé de router l’IPv6 dans le tunnel. Le tunnel fonctionne, mais le '
-      'trafic IPv6 (et le DNS IPv6) passe directement à côté — sur un réseau IPv6 cela '
-      'révèle votre adresse.\n\n'
+  'ipv6_warn_body': 'Le tunnel fonctionne, mais le trafic IPv6 (et le DNS IPv6) quitte l’appareil '
+      'directement, hors du tunnel — sur un réseau IPv6 cela révèle votre adresse.\n\n'
       'Que faire :\n'
       '• activer « VPN permanent » et « Bloquer les connexions sans VPN » pour '
       'CitadelPQVPN — le système coupe alors tout trafic hors du tunnel ;\n'

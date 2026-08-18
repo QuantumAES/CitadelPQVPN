@@ -38,7 +38,7 @@ const Map<String, String> langIt = {
   'err_no_vpn_permission_hint': 'consenti la connessione nella finestra di sistema',
   'err_activation_failed': 'Impossibile attivare il link',
   'err_activation_failed_hint': 'chiedi un nuovo link all’amministratore: il link iniziale si attiva una sola volta e per un tempo limitato',
-  'err_ipv6_required': 'Tunnel non stabilito: IPv6 non catturato',
+  'err_ipv6_required': 'Tunnel non stabilito: l’IPv6 passa fuori dal tunnel',
   'err_ipv6_required_hint': 'l’IPv6 rigoroso è attivo — disattivalo nelle impostazioni oppure attiva la VPN sempre attiva',
 
   'switch_title': 'Cambiare connessione?',
@@ -106,7 +106,7 @@ const Map<String, String> langIt = {
   'killswitch_android_title': 'Kill switch (sempre attivo)',
   'killswitch_android_sub': 'Da configurare nelle impostazioni VPN di sistema',
   'strict_ipv6_title': 'IPv6 rigoroso',
-  'strict_ipv6_sub': 'Non connettersi se il dispositivo non instrada l’IPv6 nel tunnel',
+  'strict_ipv6_sub': 'Non connettersi se l’IPv6 passa fuori dal tunnel',
   'split_title': 'Tunnel diviso',
   'split_sub_android': 'Per app e indirizzi: nel tunnel / fuori dal tunnel',
   'split_sub_desktop': 'Per indirizzi di destinazione: nel tunnel / fuori dal tunnel',
@@ -143,9 +143,8 @@ const Map<String, String> langIt = {
   'open_settings': 'Apri le impostazioni',
   'ipv6_warn': 'L’IPv6 passa fuori dal tunnel — dettagli',
   'ipv6_warn_title': 'IPv6 non catturato',
-  'ipv6_warn_body': 'Questo dispositivo ha rifiutato di instradare l’IPv6 nel tunnel. Il tunnel funziona, ma '
-      'il traffico IPv6 (e il DNS IPv6) passa direttamente al di fuori: su una rete IPv6 '
-      'questo rivela il tuo indirizzo.\n\n'
+  'ipv6_warn_body': 'Il tunnel funziona, ma il traffico IPv6 (e il DNS IPv6) esce dal dispositivo '
+      'direttamente, fuori dal tunnel: su una rete IPv6 questo rivela il tuo indirizzo.\n\n'
       'Cosa fare:\n'
       '• attivare «VPN sempre attiva» e «Blocca connessioni senza VPN» per CitadelPQVPN: '
       'il sistema blocca allora tutto il traffico fuori dal tunnel;\n'

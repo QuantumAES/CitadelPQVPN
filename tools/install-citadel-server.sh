@@ -294,6 +294,20 @@ if [[ "$ROLE" == exit && "$ISSUER_ON" == 1 ]]; then
     [[ -n "${!var}" ]] || die "--role exit: нужен $flag (или --issuer-bundle с ним)"
     hex64 "${!var}" || die "$flag: ожидается 64 hex-символа"
   done
+  # H-3: мастер L1 приходит ТОЛЬКО bundle'ом — отдельного флага у него нет намеренно (серверный
+  # секрет: аргумент виден в `ps` любому пользователю машины и остаётся в истории шелла).
+  #
+  # Проверять его здесь обязательно, потому что молчание тут стоит дороже всего: без мастера exit
+  # сгенерировал бы себе СВОЙ случайный (см. ниже $MASTER_FILE), издатель раздавал бы абонентам
+  # ключ СВОЕЙ эпохи, exit ждал бы ключ чужой — и оба транспорта выглядели бы у абонента как
+  # «порт закрыт». Установка при этом проходит успешно во всём остальном: и pin'ы сходятся, и
+  # keysync приносит ключ эпохи (он идёт под бутстрапным PSK, а не под мастером).
+  #
+  # Ловится ровно тот случай, который и случается на практике: bundle, собранный руками из
+  # /opt/citadel/keys, — в нём мастера нет, потому что на диске он лежит отдельным файлом и в
+  # список «pin'ы + seed'ы» не попадает.
+  [[ -n "${CITADEL_OBFS_MASTER:-}" ]] || die "--role exit: в bundle нет CITADEL_OBFS_MASTER — L1 у издателя и exit'а разойдётся, и туннель не поднимется ни по QUIC, ни по obfs-TCP (H-3). Мастер передаётся ТОЛЬКО через --issuer-bundle: возьми bundle целиком из вывода установки издателя"
+  hex64 "${CITADEL_OBFS_MASTER}" || die "CITADEL_OBFS_MASTER: ожидается 64 hex-символа"
 fi
 
 # ─── 0a-ter. L-14: кто имеет право стучаться в admin-канал издателя ───
@@ -578,14 +592,20 @@ PSK="$(cat "$PSK_FILE")"
 # Бутстрапный $PSK остаётся тем, чем и был, — обёрткой канала К ИЗДАТЕЛЮ (его адрес и так в ссылке).
 # Мастер нужен ОБЕИМ серверным ролям: издатель раздаёт ключи эпох, exit ими принимает.
 MASTER_FILE="$DIR/keys/obfs.master"
-if [[ "$ROLE" == exit && -n "${CITADEL_OBFS_MASTER:-}" ]]; then
-  printf '%s' "$CITADEL_OBFS_MASTER" > "$MASTER_FILE"
-  chmod 600 "$MASTER_FILE"
+if [[ "$ROLE" == exit ]]; then
+  # На exit-машине мастер НИКОГДА не рождается локально: свой случайный мастер — это не «дефолт»,
+  # а тихий рассинхрон L1 с издателем (гейт выше). Либо он приехал bundle'ом, либо его нет вовсе
+  # (token-less деплой, ISSUER_ON=0) — и тогда exit остаётся на бутстрапном PSK.
+  if [[ -n "${CITADEL_OBFS_MASTER:-}" ]]; then
+    printf '%s' "$CITADEL_OBFS_MASTER" > "$MASTER_FILE"
+    chmod 600 "$MASTER_FILE"
+  fi
 elif [[ ! -f "$MASTER_FILE" ]]; then
   head -c 32 /dev/urandom | od -An -tx1 | tr -d ' \n' > "$MASTER_FILE"
   chmod 600 "$MASTER_FILE"
 fi
-MASTER="$(cat "$MASTER_FILE")"
+MASTER=""
+[[ -f "$MASTER_FILE" ]] && MASTER="$(cat "$MASTER_FILE")"
 # Ротация L1 живёт на канале издателя: без него ключ эпохи некому раздать, и exit обязан
 # остаться на бутстрапном PSK (иначе token-less деплой просто перестал бы принимать клиентов).
 [[ "$ISSUER_ON" == 1 ]] || MASTER=""
@@ -879,24 +899,24 @@ export Citadel_TOKEN_LISTEN=0.0.0.0:7000
 export Citadel_ADMIN_LISTEN=0.0.0.0:$ADMIN_PORT
 export Citadel_EPOCH_SECS=$EPOCH_SECS
 export Citadel_TOKEN_LEASE_SECS=$LEASE_SECS   # задача 4/B: single-session (0=выкл; см. CITADEL_LEASE_SECS)
-# client_id админа (issuer НЕ получает seed). M-9: суффикс `:<unix>` делает запись ОДНОРАЗОВОЙ —
+# client_id админа (issuer НЕ получает seed). M-9: суффикс \`:<unix>\` делает запись ОДНОРАЗОВОЙ —
 # мастер-ссылка активируется на первом устройстве админа и до этого момента, дальше мертва.
-# Отпечаток ссылки (`linkh`) здесь ещё неизвестен — TLS-идентичность издателя рождается при первом
+# Отпечаток ссылки (\`linkh\`) здесь ещё неизвестен — TLS-идентичность издателя рождается при первом
 # старте контейнера, то есть ПОСЛЕ генерации этого файла; его дописывает установщик сразу после
-# того, как соберёт ссылку (см. ниже `registry add --linkh`). Если реестр когда-нибудь потеряется,
+# того, как соберёт ссылку (см. ниже \`registry add --linkh\`). Если реестр когда-нибудь потеряется,
 # этот bootstrap пересоздаст запись одноразовой и просроченной — то есть fail-closed, а не
 # «внезапно снова многоразовая».
 export Citadel_REGISTER_PUBS="$REGISTER_PUBS"
 # M-6/P1: кому отдавать секретный ключ эпохи по сети (роль keysync у exit-машины). При установке
 # «всё на одном сервере» ключ читается с общего тома и раздача по сети не нужна — но id всё равно
-# задан, чтобы `--role issuer` и `--role all` вели себя одинаково.
+# задан, чтобы \`--role issuer\` и \`--role all\` вели себя одинаково.
 export Citadel_KEYSYNC_ID=$KEYSYNC_ID
 # L-14: при раздельном деплое admin-порт публикуется наружу — процесс сам закрывает всех, кроме
 # exit-машины (до TLS, до слота гейта). Пусто = совмещённая установка, порт наружу не смотрит.
 export Citadel_ADMIN_PEER="$ADMIN_PEER"
 # H-3: мастер L1 — из него абоненту выдаётся ключ текущей эпохи (после Layer-1, ровно на эпоху).
 # \$ ОБЯЗАТЕЛЕН: этот heredoc — не в кавычках, и без экранирования переменную раскрывал бы САМ
-# установщик (у него её нет — мастер лежит в \$MASTER), зашивая в скрипт `=""`. Тогда издатель
+# установщик (у него её нет — мастер лежит в \$MASTER), зашивая в скрипт \`=""\`. Тогда издатель
 # молча уходил в legacy «ротации нет», exit при этом принимал ТОЛЬКО ключи эпох, и туннель не
 # поднимался ни по QUIC, ни по obfs-TCP — оба транспорта выглядели как «порт закрыт».
 export Citadel_OBFS_MASTER="\${Citadel_OBFS_MASTER:-}"
@@ -1057,13 +1077,31 @@ if [[ "$ISSUER_ON" == 1 && "$ROLE" == exit ]]; then
   MLDSA_ARGS=(--mldsa-pub "$DIR/keys/exit.mldsa")
   log "ключ эпохи получен от издателя ✓ (дальше сайдкар citadel-keysync держит его свежим)"
 elif [[ "$ISSUER_ON" == 1 ]]; then
-  log "жду издателя (issuer.key, issuer-tls.pin, issuer-mldsa.pin) и ML-DSA pub exit'а…"
-  for _ in $(seq 1 90); do [[ -s "$DIR/keys/issuer.key" && -s "$DIR/keys/issuer-tls.pin" && -s "$DIR/keys/issuer-mldsa.pin" && -s "$DIR/keys/exit.mldsa" ]] && break; sleep 1; done
+  # `exit.mldsa` пишет КОНТЕЙНЕР EXIT'а на общий том. При `--role issuer` такого контейнера на этой
+  # машине нет по построению (см. compose: сервис `exit` только при ROLE != issuer), значит файл тут
+  # не появится НИКОГДА — exit ставится отдельной командой на другой машине и своего ML-DSA pub
+  # издателю не отдаёт (он ему и не нужен: ссылки собирает exit-машина). Ждать его здесь означало
+  # гарантированное падение на 90-й секунде — ровно перед печатью bundle'а, то есть установка
+  # издателя «не удавалась», хотя издатель уже поднят и здоров, а оператор оставался без bundle'а и
+  # добывал pin'ы/seed'ы вручную из $DIR/keys. Поэтому exit.mldsa ждём только там, где его пишут.
+  EXIT_LOCAL=0; [[ "$ROLE" != issuer ]] && EXIT_LOCAL=1   # exit-контейнер здесь только при `--role all`
+  have_all() {
+    [[ -s "$DIR/keys/issuer.key" && -s "$DIR/keys/issuer-tls.pin" && -s "$DIR/keys/issuer-mldsa.pin" ]] \
+      && { [[ "$EXIT_LOCAL" == 0 ]] || [[ -s "$DIR/keys/exit.mldsa" ]]; }
+  }
+  if [[ "$EXIT_LOCAL" == 1 ]]; then
+    log "жду издателя (issuer.key, issuer-tls.pin, issuer-mldsa.pin) и ML-DSA pub exit'а…"
+  else
+    log "жду издателя (issuer.key, issuer-tls.pin, issuer-mldsa.pin)…"
+  fi
+  for _ in $(seq 1 90); do have_all && break; sleep 1; done
   [[ -s "$DIR/keys/issuer.key" ]] || { docker compose -f "$DIR/etc/compose.yml" logs --tail 40 issuer || true; die "издатель не положил ключ эпохи (issuer.key) за 90с"; }
   [[ -s "$DIR/keys/issuer-tls.pin" ]] || die "издатель не опубликовал issuer-tls.pin (PQ-TLS канал, A1) за 90с"
   [[ -s "$DIR/keys/issuer-mldsa.pin" ]] || die "издатель не опубликовал issuer-mldsa.pin (PQ-аутентификация издателя) за 90с"
-  [[ -s "$DIR/keys/exit.mldsa" ]] || die "exit не опубликовал ML-DSA pub (exit.mldsa) за 90с"
-  MLDSA_ARGS=(--mldsa-pub "$DIR/keys/exit.mldsa")
+  if [[ "$EXIT_LOCAL" == 1 ]]; then
+    [[ -s "$DIR/keys/exit.mldsa" ]] || { docker compose -f "$DIR/etc/compose.yml" logs --tail 40 exit || true; die "exit не опубликовал ML-DSA pub (exit.mldsa) за 90с"; }
+    MLDSA_ARGS=(--mldsa-pub "$DIR/keys/exit.mldsa")
+  fi
   ISSUER_TLS_PIN="$(cat "$DIR/keys/issuer-tls.pin")"   # S2.1/A1: pin PQ-TLS канала издателя → в ссылку
   # PQ: обязательство к ML-DSA-идентичности издателя. Без него клиент откажется и фетчить токены,
   # и открывать admin-канал: pin серта — классическая привязка, против CRQC она не держит.

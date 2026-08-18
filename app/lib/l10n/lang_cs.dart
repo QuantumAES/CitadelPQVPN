@@ -38,7 +38,7 @@ const Map<String, String> langCs = {
   'err_no_vpn_permission_hint': 'povolte připojení v systémovém dialogu',
   'err_activation_failed': 'Odkaz se nepodařilo aktivovat',
   'err_activation_failed_hint': 'požádejte správce o nový odkaz: první odkaz se aktivuje jednou a jen omezenou dobu',
-  'err_ipv6_required': 'Tunel nebyl navázán: IPv6 není zachyceno',
+  'err_ipv6_required': 'Tunel nebyl navázán: IPv6 jde mimo tunel',
   'err_ipv6_required_hint': 'přísné IPv6 je zapnuté — vypněte je v nastavení nebo zapněte trvalou síť VPN',
 
   'switch_title': 'Přepnout připojení?',
@@ -105,7 +105,7 @@ const Map<String, String> langCs = {
   'killswitch_android_title': 'Kill switch (always-on)',
   'killswitch_android_sub': 'Nastavuje se v systémovém nastavení VPN',
   'strict_ipv6_title': 'Přísné IPv6',
-  'strict_ipv6_sub': 'Nepřipojovat se, pokud zařízení nepustí IPv6 do tunelu',
+  'strict_ipv6_sub': 'Nepřipojovat se, pokud IPv6 jde mimo tunel',
   'split_title': 'Dělený tunel',
   'split_sub_android': 'Podle aplikací a adres: tunelem / mimo tunel',
   'split_sub_desktop': 'Podle cílových adres: tunelem / mimo tunel',
@@ -140,8 +140,8 @@ const Map<String, String> langCs = {
   'open_settings': 'Otevřít nastavení',
   'ipv6_warn': 'IPv6 jde mimo tunel — podrobnosti',
   'ipv6_warn_title': 'IPv6 není zachyceno',
-  'ipv6_warn_body': 'Toto zařízení nepřijalo zachycení IPv6 do tunelu. Tunel funguje, ale provoz IPv6 '
-      '(a IPv6 DNS) jde přímo mimo něj — v síti s IPv6 to prozrazuje vaši adresu.\n\n'
+  'ipv6_warn_body': 'Tunel funguje, ale provoz IPv6 (a IPv6 DNS) odchází ze zařízení přímo, mimo '
+      'tunel — v síti s IPv6 to prozrazuje vaši adresu.\n\n'
       'Co dělat:\n'
       '• zapnout pro CitadelPQVPN „Trvalou síť VPN“ a „Blokovat připojení bez VPN“ — '
       'systém pak odřízne veškerý provoz mimo tunel;\n'
