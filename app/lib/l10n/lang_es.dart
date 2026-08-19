@@ -38,6 +38,8 @@ const Map<String, String> langEs = {
   'err_no_vpn_permission_hint': 'permite la conexión en el diálogo del sistema',
   'err_activation_failed': 'No se pudo activar el enlace',
   'err_activation_failed_hint': 'pida un enlace nuevo al administrador: el enlace inicial se activa una sola vez y por tiempo limitado',
+  'err_activation_offline': 'Sin conexión con el emisor',
+  'err_activation_offline_hint': 'el enlace está intacto: conéctese a la red y vuelva a intentarlo, la activación se reintenta sola',
   'err_ipv6_required': 'Túnel no establecido: el IPv6 va fuera del túnel',
   'err_ipv6_required_hint': 'el IPv6 estricto está activado: desactívelo en los ajustes o active la VPN siempre activa',
 

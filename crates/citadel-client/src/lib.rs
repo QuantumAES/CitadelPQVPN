@@ -59,7 +59,9 @@ pub use vault::{
     IssuedRecord, PlatformSlot, Profile, Vault, VaultOpenError, MAX_PROFILE_NAME_LEN,
     MIN_PASSPHRASE_LEN,
 };
-pub use enroll::{activate_profile, activate_profile_blocking, effective_seed, Activation};
+pub use enroll::{
+    activate_profile, activate_profile_blocking, effective_seed, Activation, OFFLINE_MARK,
+};
 #[cfg(any(target_os = "linux", target_os = "android"))]
 pub use gui_tun::GuiTunProvider;
 #[cfg(windows)]

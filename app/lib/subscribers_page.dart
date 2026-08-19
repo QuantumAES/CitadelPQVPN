@@ -38,7 +38,11 @@ class _SubscribersPageState extends State<SubscribersPage> {
   /// каждый реконнект запускал её заново — получался бесконечный круг «загрузка → отказ →
   /// переподключение → загрузка», ровно тот, на который жалуются. Дальше — только «Обновить».
   int _autoTried = 0;
-  static const _autoLimit = 2;
+  static const _autoLimit = 4;
+
+  /// Отложенная следующая авто-попытка (см. [_scheduleAuto]). Отменяется руками и в [dispose] —
+  /// иначе `setState` придёт в снятый со стены экран.
+  Timer? _autoTimer;
 
   /// Сколько раз потолок авто-загрузок был возвращён из-за оборвавшейся под попыткой сессии
   /// (см. [_autoRefresh]). Ограничен, чтобы мигающий туннель не давал бесконечный круг попыток.
@@ -63,6 +67,7 @@ class _SubscribersPageState extends State<SubscribersPage> {
 
   @override
   void dispose() {
+    _autoTimer?.cancel();
     s.removeListener(_onStateChanged);
     super.dispose();
   }
@@ -83,15 +88,39 @@ class _SubscribersPageState extends State<SubscribersPage> {
   /// засчитывал себе неудачу и после второй такой же сдавался на «Обновить». Возвраты ограничены
   /// ([_refundLimit]), иначе мигающий туннель крутил бы загрузку бесконечно.
   void _autoRefresh() {
+    _autoTimer?.cancel();
     if (!_sessionUp || _busy || _entries != null || _autoTried >= _autoLimit) return;
     _autoTried++;
-    _refresh().then((_) {
-      if (!mounted || _entries != null || _sessionUp || _refunds >= _refundLimit) return;
-      _refunds++;
-      _autoTried--;
-      // Отказ был про оборвавшуюся сессию, а не про реестр: баннер с ним только пугает, пока
-      // движок переподключается. Новая попытка пойдёт сама на событии «сессия поднялась».
-      setState(() => _error = null);
+    // Одна попытка на круг: спаивание попыток внутри `_run` (`retries`) и ожидание снаружи
+    // складывались в минуты немого экрана. Паузу между кругами держим здесь — она видна и
+    // растёт.
+    _refresh(retries: 0).then((_) {
+      if (!mounted || _entries != null) return;
+      if (!_sessionUp) {
+        if (_refunds >= _refundLimit) return;
+        _refunds++;
+        _autoTried--;
+        // Отказ был про оборвавшуюся сессию, а не про реестр: баннер с ним только пугает, пока
+        // движок переподключается. Новая попытка пойдёт сама на событии «сессия поднялась».
+        setState(() => _error = null);
+        return;
+      }
+      // Сессия жива, а список не приехал. Раньше на этом всё и заканчивалось: следующая попытка
+      // могла случиться только от события контроллера, и если туннель после подъёма стоял ровно,
+      // событий больше не было — экран навсегда оставался с отказом, пока человек не нажимал
+      // «Обновить». Это и есть жалоба «после обновления по кнопке абоненты загружаются».
+      // Путь к ADMIN_VIP через свежий туннель готов не мгновенно (маршрут, conntrack на exit'е,
+      // первые датаграммы data-plane), поэтому продолжаем сами — с растущей паузой.
+      _scheduleAuto();
+    });
+  }
+
+  /// Следующая авто-попытка через паузу, растущую по номеру круга (2с → 4с → 8с).
+  void _scheduleAuto() {
+    if (_autoTried >= _autoLimit) return;
+    _autoTimer?.cancel();
+    _autoTimer = Timer(Duration(seconds: 2 << (_autoTried - 1).clamp(0, 2)), () {
+      if (mounted) _autoRefresh();
     });
   }
 
@@ -144,20 +173,19 @@ class _SubscribersPageState extends State<SubscribersPage> {
 
   /// Ручное «Обновить»: потолок авто-попыток сброшен (человек ждёт результата сейчас).
   Future<void> _manualRefresh() async {
+    _autoTimer?.cancel();
     _autoTried = 0;
     _refunds = 0;
     await _refresh();
   }
 
-  Future<void> _refresh() async {
-    // #0.1: авто-загрузка после подъёма туннеля — повтор, пока admin-путь стабилизируется
-    // (DNAT/маршрут к VIP могут быть готовы на секунду позже самого туннеля). Повторов ДВА, а не
-    // четыре: каждая неудачная попытка стоит до `_opTimeout`, и четыре подряд превращались в две
-    // минуты немого ожидания — за это время туннель успевал переподключиться, и круг начинался
-    // сначала.
+  /// `retries` — повторы ВНУТРИ одной попытки: ручному «Обновить» они нужны (человек ждёт ответа
+  /// прямо сейчас), авто-загрузке — нет, у неё свой внешний круг с растущей паузой
+  /// ([_scheduleAuto]). Раньше было и то и другое сразу, и экран молчал минутами.
+  Future<void> _refresh({int retries = 1}) async {
     final list = await _run(
       () => adminSubscribers(profileId: widget.profile.id),
-      retries: 1,
+      retries: retries,
     );
     if (list != null && mounted) {
       // активные сверху, внутри групп — по убыванию срока (свежевыданные видны сразу)

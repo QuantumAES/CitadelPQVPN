@@ -38,6 +38,8 @@ const Map<String, String> langDe = {
   'err_no_vpn_permission_hint': 'Erlauben Sie die Verbindung im Systemdialog',
   'err_activation_failed': 'Der Link konnte nicht aktiviert werden',
   'err_activation_failed_hint': 'bitten Sie den Administrator um einen neuen Link: ein Erstlink wird einmal und nur begrenzte Zeit aktiviert',
+  'err_activation_offline': 'Keine Verbindung zum Aussteller',
+  'err_activation_offline_hint': 'der Link ist unversehrt — gehen Sie online und verbinden Sie erneut: die Aktivierung wiederholt sich von selbst',
   'err_ipv6_required': 'Tunnel nicht aufgebaut: IPv6 läuft am Tunnel vorbei',
   'err_ipv6_required_hint': 'striktes IPv6 ist aktiv — schalten Sie es in den Einstellungen ab oder aktivieren Sie ein immer aktives VPN',
 

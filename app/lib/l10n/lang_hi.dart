@@ -38,6 +38,8 @@ const Map<String, String> langHi = {
   'err_no_vpn_permission_hint': 'सिस्टम डायलॉग में कनेक्शन की अनुमति दें',
   'err_activation_failed': 'लिंक सक्रिय नहीं हो सका',
   'err_activation_failed_hint': 'व्यवस्थापक से नया लिंक माँगें: पहला लिंक एक ही बार और सीमित समय के लिए सक्रिय होता है',
+  'err_activation_offline': 'जारीकर्ता से संपर्क नहीं',
+  'err_activation_offline_hint': 'लिंक सुरक्षित है — नेटवर्क चालू करें और फिर से जुड़ें: सक्रियण अपने आप दोहराया जाएगा',
   'err_ipv6_required': 'टनल नहीं बना: IPv6 टनल के बाहर जा रहा है',
   'err_ipv6_required_hint': 'सख़्त IPv6 चालू है — इसे सेटिंग्स में बंद करें या हमेशा चालू VPN सक्षम करें',
 

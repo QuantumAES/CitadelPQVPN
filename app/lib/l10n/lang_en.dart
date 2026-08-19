@@ -38,6 +38,8 @@ const Map<String, String> langEn = {
   'err_no_vpn_permission_hint': 'allow the connection in the system dialog',
   'err_activation_failed': 'The link could not be activated',
   'err_activation_failed_hint': 'ask the administrator for a new link: a first-use link activates once and only for a limited time',
+  'err_activation_offline': 'No connection to the issuer',
+  'err_activation_offline_hint': 'the link is untouched — get online and connect again: activation retries by itself',
   'err_ipv6_required': 'Tunnel not established: IPv6 goes outside the tunnel',
   'err_ipv6_required_hint': 'strict IPv6 is on — turn it off in the settings or enable always-on VPN',
 

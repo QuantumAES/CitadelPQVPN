@@ -28,7 +28,7 @@ use anyhow::{Context, Result};
 use citadel_quic::protect::Route; // маршрут сокета к издателю: мимо туннеля / сквозь него
 use citadel_quic::config::ClientConfig;
 use citadel_quic::vpn::{SessionGrant, TokenRefresher, VpnController, VpnEvent, VpnState};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -99,6 +99,11 @@ pub struct TokenPouch {
     /// Подписка на события контроллера — из неё фоновая задача узнаёт, поднят ли туннель.
     /// `Mutex<Option<..>>`, потому что задача забирает её ровно один раз при старте.
     events: Mutex<Option<tokio::sync::broadcast::Receiver<VpnEvent>>>,
+    /// Поколение привязки к контроллеру. Кошелёк переживает пересоздание контроллера
+    /// ([`rebind`]), а вместе с ним — и фоновую задачу: старая обязана уйти, когда пришла новая.
+    /// Она и так уходит по закрытому broadcast'у, но между `disconnect()` прошлой сессии и дропом
+    /// прошлого контроллера есть окно, в котором живы обе; номер поколения его закрывает.
+    generation: AtomicU64,
 }
 
 /// Содержимое кошелька. Пусто ⇒ следующий establish идёт к издателю синхронно.
@@ -110,6 +115,11 @@ struct Purse {
     deadline: Option<Instant>,
     /// Длина эпохи издателя (сек) — из неё считается и дедлайн, и разброс фоновой дозаправки.
     epoch_secs: u64,
+    /// До какого момента ходить к издателю бессмысленно: квота эпохи (A6) уже выбрана, и он не
+    /// отдаст ни одного токена до её конца ([`citadel_token::QuotaExhausted`]). Без этой отметки
+    /// цикл реконнекта поднимал PQ-TLS-сессию к издателю каждые несколько секунд до конца эпохи —
+    /// сотня бесполезных хендшейков вместо одного честного «ждём столько-то».
+    quota_block: Option<Instant>,
 }
 
 impl Purse {
@@ -123,6 +133,12 @@ impl Purse {
         self.tokens.clear();
         self.data_psk = None;
         self.deadline = None;
+    }
+
+    /// Сколько ещё ждать до снятия блокировки по квоте (`None` — идти можно).
+    fn quota_wait(&self) -> Option<Duration> {
+        let until = self.quota_block?;
+        until.checked_duration_since(Instant::now())
     }
 }
 
@@ -146,7 +162,21 @@ impl TokenPouch {
             st: Mutex::new(Purse::default()),
             topup: AtomicBool::new(false),
             events: Mutex::new(None),
+            generation: AtomicU64::new(0),
         }
+    }
+
+    /// Привязать переживший прошлую сессию кошелёк к НОВОМУ контроллеру.
+    ///
+    /// Кошелёк живёт дольше контроллера (см. [`install_with_seed`]), а фоновая дозаправка — нет:
+    /// она слушает события конкретного контроллера. Поэтому при каждой новой сессии подписка
+    /// меняется, номер поколения растёт (старая задача видит это и уходит), и право на старт
+    /// задачи освобождается заново.
+    fn rebind(self: &Arc<Self>, controller: &Arc<VpnController>) {
+        self.generation.fetch_add(1, Ordering::SeqCst);
+        *self.events.lock().unwrap() = Some(controller.subscribe());
+        self.topup.store(false, Ordering::SeqCst);
+        self.ensure_topup();
     }
 
     /// Взять токен из кошелька, не обращаясь к издателю. `None` — пусто или пачка просрочена
@@ -174,6 +204,29 @@ impl TokenPouch {
 
     /// Сходить к издателю за пачкой. Возвращает число добытых токенов.
     async fn refill(&self, route: Route) -> Result<usize> {
+        match self.refill_inner(route).await {
+            Ok(n) => {
+                self.st.lock().unwrap().quota_block = None; // выдача пошла — блокировка не нужна
+                Ok(n)
+            }
+            Err(e) => {
+                // A6: квота эпохи выбрана. Издатель не отдаст ничего до её конца, и повторные
+                // заходы отличаются от первого только потраченным временем — отмечаем срок и
+                // молчим до него (см. `Purse::quota_block`).
+                if let Some(q) = e.downcast_ref::<citadel_token::QuotaExhausted>() {
+                    let wait = q.retry_after();
+                    self.st.lock().unwrap().quota_block = Some(Instant::now() + wait);
+                    eprintln!(
+                        "[token] {q} — к издателю не хожу ещё {} мин",
+                        wait.as_secs().div_ceil(60)
+                    );
+                }
+                Err(e)
+            }
+        }
+    }
+
+    async fn refill_inner(&self, route: Route) -> Result<usize> {
         let grant = fetch_tokens(
             &self.issuer,
             &self.pin,
@@ -216,6 +269,17 @@ impl TokenPouch {
         self.ensure_topup();
         if let Some(g) = self.take_cached() {
             return Some(g);
+        }
+        // A6: квота эпохи выбрана — идти к издателю незачем до её конца. Говорим об этом один раз
+        // за попытку и коротко: цикл реконнекта всё равно повторит, но уже не притащит за собой
+        // TLS-хендшейк к издателю.
+        if let Some(left) = self.st.lock().unwrap().quota_wait() {
+            eprintln!(
+                "[token] квота выдачи на текущую эпоху выбрана — новые токены будут через ~{} мин \
+                 (доступ не отозван; чаще всего это слишком частые переподключения)",
+                left.as_secs().div_ceil(60)
+            );
+            return None;
         }
         match self.refill(Route::Bypass).await {
             Ok(n) => {
@@ -263,12 +327,24 @@ impl TokenPouch {
     /// СКВОЗЬ туннель (§7.1(в)). Задача умирает вместе с контроллером (его broadcast закрывается).
     async fn topup_loop(self: Arc<Self>, mut rx: tokio::sync::broadcast::Receiver<VpnEvent>) {
         let mut up = false;
+        let mine = self.generation.load(Ordering::SeqCst);
         loop {
+            // Кошелёк переехал на новый контроллер ([`rebind`]) — эта задача слушает уже мёртвую
+            // подписку, и вторая такая же в это время делает ту же работу.
+            if self.generation.load(Ordering::SeqCst) != mine {
+                return;
+            }
+            // Лок берём ОДИН раз и до ветвления: `Mutex` здесь не реентрантный, а ветки ниже
+            // тоже смотрят в кошелёк (`left()`), и временная блокировка из условия дожила бы до
+            // конца всей цепочки `if/else`.
+            let quota_left = self.st.lock().unwrap().quota_wait();
             // Пока туннель не поднят — просто ждём событий: дозаправка мимо туннеля тут не нужна
             // (она раскрыла бы адрес абонента ровно так же, как старый путь), а пустой кошелёк
             // доберёт `take_or_fetch` перед следующим establish.
             let wait = if !up {
                 None // до ближайшего события
+            } else if let Some(left) = quota_left {
+                Some(left) // квота эпохи выбрана — просыпаться раньше её конца незачем
             } else if self.left() > LOW_WATER {
                 Some(Duration::from_secs(30)) // кошелёк полон — просто периодически перепроверяем
             } else {
@@ -277,13 +353,17 @@ impl TokenPouch {
                 // эпохи: ждать дольше её остатка бессмысленно, пачка всё равно протухнет.
                 Some(topup_delay(self.st.lock().unwrap().epoch_secs))
             };
-            let need_topup = up && self.left() <= LOW_WATER;
+            // Квота эпохи выбрана — дозаправлять нечем; ждём событий и срока, а не издателя.
+            let need_topup = up && self.left() <= LOW_WATER && quota_left.is_none();
             match self.wait_events(&mut rx, wait, &mut up).await {
                 Wake::Gone => return, // контроллер ушёл — уходим и мы
                 Wake::Event => continue, // состояние поменялось: пересчитаем, что делать
                 Wake::Elapsed => {}
             }
-            if !need_topup || !up {
+            // Проверяем поколение ещё раз ПЕРЕД походом к издателю, а не только в начале круга:
+            // задача прошлой сессии могла проснуться с устаревшим `up == true` и потратить пачку
+            // из квоты эпохи (A6) на туннель, которого уже нет.
+            if !need_topup || !up || self.generation.load(Ordering::SeqCst) != mine {
                 continue;
             }
             match self.refill(Route::Tunnel).await {
@@ -431,12 +511,72 @@ pub fn install_with_seed(
     // (совсем старая) даёт непривязанную выдачу: exit примет её только в стендовом режиме, и это
     // лучше, чем молча вернуться к общему на весь деплой ключу эпохи.
     let exit_pin = link.cert_pin.unwrap_or(citadel_token::EXIT_PIN_UNBOUND);
-    let pouch =
-        Arc::new(TokenPouch::new(issuer, &pin, &mldsa, &seed, &exit_pin, link.obfs_psk));
-    *pouch.events.lock().unwrap() = Some(controller.subscribe());
-    pouch.ensure_topup(); // есть runtime — стартуем сразу, нет — стартует первый же establish
+    let key = PouchKey {
+        issuer: issuer.to_string(),
+        pin,
+        mldsa,
+        seed,
+        exit_pin,
+        obfs_psk: link.obfs_psk,
+    };
+    let pouch = pouch_for(key);
+    pouch.rebind(controller);
     controller.set_token_refresher(pouch.refresher());
     true
+}
+
+/// Что делает кошелёк ТЕМ ЖЕ кошельком: тот же издатель, та же Layer-1 идентичность, тот же узел
+/// и тот же канал к издателю. Расхождение по любому полю — другая пачка токенов (под другой ключ
+/// эпохи или другую подписку), и переиспользовать её нельзя.
+#[derive(PartialEq, Eq)]
+struct PouchKey {
+    issuer: String,
+    pin: [u8; 32],
+    mldsa: [u8; 32],
+    seed: [u8; 32],
+    exit_pin: [u8; 32],
+    obfs_psk: Option<[u8; 32]>,
+}
+
+/// Кошелёк ПЕРЕЖИВАЕТ пересоздание контроллера — один слот на процесс.
+///
+/// **Зачем.** Контроллер создаётся заново на КАЖДОЕ подключение (GUI: `spawn_controller`), а
+/// кошелёк жил внутри него. Значит «Отключить → Подключить» выбрасывало непотраченную пачку
+/// (7 токенов из 8) и шло к издателю за новой. При квоте A6 в 64 токена на эпоху это ровно
+/// **восемь** переподключений в час, после чего издатель переставал чеканить, и клиент до конца
+/// эпохи видел «издатель прекратил выдачу, не выдав ни одного токена» — то есть выглядел как
+/// сломанный сервер. Теперь тот же кошелёк подхватывается новой сессией: заходов к издателю
+/// становится один на эпоху, как и задумано §7.1 (и, кстати, лучше для unlinkability — реже
+/// «выдача ⇒ сессия»).
+///
+/// **Границы жизни не изменились:** только память процесса, на диск ничего не ложится, рестарт
+/// приложения по-прежнему обнуляет кошелёк. Слот ОДИН: сессия в клиенте тоже одна, а держать
+/// токены профиля, к которому не подключены, незачем — смена профиля вытесняет прошлый кошелёк.
+static POUCH: Mutex<Option<(PouchKey, Arc<TokenPouch>)>> = Mutex::new(None);
+
+fn pouch_for(key: PouchKey) -> Arc<TokenPouch> {
+    let mut slot = POUCH.lock().unwrap();
+    if let Some((k, p)) = slot.as_ref() {
+        if *k == key {
+            return p.clone();
+        }
+    }
+    let p = Arc::new(TokenPouch::new(
+        &key.issuer,
+        &key.pin,
+        &key.mldsa,
+        &key.seed,
+        &key.exit_pin,
+        key.obfs_psk,
+    ));
+    *slot = Some((key, p.clone()));
+    p
+}
+
+/// Забыть кошелёк процесса — точка сброса для тестов (в клиенте её звать неоткуда и не нужно:
+/// слот вытесняется сменой профиля, а рестарт процесса и так границей жизни токенов).
+pub fn forget_pouch() {
+    *POUCH.lock().unwrap() = None;
 }
 
 /// B-1: pin exit'а, под который клиент берёт токены, по уже собранному конфигу.
@@ -534,6 +674,56 @@ mod tests {
         )
         .await
         .is_err());
+    }
+
+    fn key(seed: [u8; 32], exit_pin: [u8; 32]) -> PouchKey {
+        PouchKey {
+            issuer: "127.0.0.1:9".into(),
+            pin: [0u8; 32],
+            mldsa: [1u8; 32],
+            seed,
+            exit_pin,
+            obfs_psk: None,
+        }
+    }
+
+    /// **Регрессия на «после нескольких переподключений клиент перестаёт подключаться».**
+    ///
+    /// Контроллер в GUI создаётся заново на каждое «Подключить», а кошелёк жил внутри него — и
+    /// «Отключить → Подключить» выбрасывало непотраченную пачку (7 токенов из 8) и шло к издателю
+    /// за новой. Квота A6 (64 токена на эпоху) выбиралась за восемь таких кругов, после чего
+    /// издатель до конца эпохи не выдавал ничего. Инвариант: тот же профиль — тот же кошелёк, и
+    /// уже добытые токены переживают пересоздание контроллера.
+    #[test]
+    fn wallet_survives_reconnect_and_is_per_profile() {
+        forget_pouch();
+        let first = pouch_for(key([7u8; 32], [0x5cu8; 32]));
+        first.st.lock().unwrap().tokens = vec![vec![1], vec![2]];
+
+        let again = pouch_for(key([7u8; 32], [0x5cu8; 32]));
+        assert!(Arc::ptr_eq(&first, &again), "тот же профиль обязан получить ТОТ ЖЕ кошелёк");
+        assert_eq!(again.st.lock().unwrap().tokens.len(), 2, "пачка пережила новый контроллер");
+
+        // Другая Layer-1 идентичность — другая подписка и другая пачка: делить их нельзя.
+        let other = pouch_for(key([8u8; 32], [0x5cu8; 32]));
+        assert!(!Arc::ptr_eq(&first, &other), "чужой профиль обязан получить свой кошелёк");
+        assert!(other.st.lock().unwrap().tokens.is_empty());
+        // ...и тот же профиль, но другой exit: ключ эпохи выводится per-exit (B-1), пачка чужая.
+        let other_exit = pouch_for(key([7u8; 32], [0x5du8; 32]));
+        assert!(!Arc::ptr_eq(&first, &other_exit), "другой узел — другая пачка");
+        forget_pouch();
+    }
+
+    /// Выбранная квота эпохи (A6) — не повод долбить издателя до её конца: пока отметка жива,
+    /// `take_or_fetch` обязан отвечать сразу и БЕЗ сети. Проверяем по времени: заход к мёртвому
+    /// издателю стоил бы секунд, отметка — микросекунды.
+    #[tokio::test]
+    async fn quota_block_stops_pointless_issuer_visits() {
+        let p = pouch();
+        p.st.lock().unwrap().quota_block = Some(Instant::now() + Duration::from_secs(600));
+        let t0 = Instant::now();
+        assert!(p.take_or_fetch().await.is_none(), "токенов нет и взять негде");
+        assert!(t0.elapsed() < Duration::from_millis(200), "к издателю ходить не должны");
     }
 
     /// §7.1: пока пачка не просрочена, токены отдаются ИЗ ПАМЯТИ — к издателю (заведомо мёртвому)

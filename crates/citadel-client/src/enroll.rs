@@ -32,6 +32,26 @@ use anyhow::{anyhow, Context, Result};
 use crate::creds::CredentialLink;
 use crate::vault::Profile;
 
+/// Стабильная примета «активация не состоялась из-за СЕТИ, а не из-за ссылки».
+///
+/// Это два разных ответа человеку, и путать их дорого: отказ издателя значит «просите новую
+/// ссылку у администратора», недоступность издателя — «включите сеть и повторите». К интерфейсу
+/// через FFI едет только текст ошибки, поэтому различие обязано жить в нём и быть стабильным:
+/// клиент ищет ровно эту подстроку ([`crate::enroll::OFFLINE_MARK`]). Пока её не было, попытка
+/// активироваться без сети показывалась как «ссылку не удалось активировать: запросите новую» —
+/// то есть целая ссылка выглядела сожжённой, а человек шёл к администратору вместо Wi-Fi.
+pub const OFFLINE_MARK: &str = "нет связи с издателем";
+
+/// Отказ активации → ошибка, в которой различима недоступность издателя (см. [`OFFLINE_MARK`]).
+/// Ссылку при этом НИЧТО не тронуло: до издателя мы не дошли, а ключ устройства уже сохранён и
+/// повтор доведёт активацию тем же ключом.
+fn classify(e: anyhow::Error) -> anyhow::Error {
+    if e.downcast_ref::<citadel_token::IssuerUnreachable>().is_some() {
+        return e.context(format!("{OFFLINE_MARK}: активация не начиналась, ссылка цела"));
+    }
+    e
+}
+
 /// Что сделала [`activate_profile`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Activation {
@@ -152,7 +172,8 @@ where
     // Протокол издателя блокирующий — как и весь этот канал, гоняем его в blocking-пуле.
     let done = tokio::task::spawn_blocking(move || p.enroll(&seed))
         .await
-        .context("задача активации паникнула")??;
+        .context("задача активации паникнула")?
+        .map_err(classify)?;
     confirm(done, mark_enrolled)
 }
 
@@ -169,7 +190,7 @@ where
 {
     let Some(plan) = plan(profile)? else { return Ok(Activation::NotRequired) };
     let seed = ensure_seed(&plan, save_seed)?;
-    confirm(plan.enroll(&seed)?, mark_enrolled)
+    confirm(plan.enroll(&seed).map_err(classify)?, mark_enrolled)
 }
 
 /// Шаг 1: ключ устройства. Берём уже сохранённый (оборванная попытка обязана продолжиться ТЕМ ЖЕ

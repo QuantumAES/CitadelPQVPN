@@ -38,6 +38,8 @@ const Map<String, String> langFr = {
   'err_no_vpn_permission_hint': 'autorisez la connexion dans la boîte de dialogue du système',
   'err_activation_failed': 'Impossible d’activer le lien',
   'err_activation_failed_hint': 'demandez un nouveau lien à l’administrateur : un lien initial s’active une seule fois et pendant une durée limitée',
+  'err_activation_offline': 'Pas de connexion à l’émetteur',
+  'err_activation_offline_hint': 'le lien est intact — connectez-vous au réseau et réessayez : l’activation se relance d’elle-même',
   'err_ipv6_required': 'Tunnel non établi : l’IPv6 passe hors du tunnel',
   'err_ipv6_required_hint': 'l’IPv6 strict est activé — désactivez-le dans les réglages ou activez le VPN permanent',
 

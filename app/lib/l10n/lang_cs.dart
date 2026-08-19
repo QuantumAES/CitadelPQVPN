@@ -38,6 +38,8 @@ const Map<String, String> langCs = {
   'err_no_vpn_permission_hint': 'povolte připojení v systémovém dialogu',
   'err_activation_failed': 'Odkaz se nepodařilo aktivovat',
   'err_activation_failed_hint': 'požádejte správce o nový odkaz: první odkaz se aktivuje jednou a jen omezenou dobu',
+  'err_activation_offline': 'Není spojení s vydavatelem',
+  'err_activation_offline_hint': 'odkaz je nedotčený — připojte se k síti a zkuste to znovu: aktivace se zopakuje sama',
   'err_ipv6_required': 'Tunel nebyl navázán: IPv6 jde mimo tunel',
   'err_ipv6_required_hint': 'přísné IPv6 je zapnuté — vypněte je v nastavení nebo zapněte trvalou síť VPN',
 
