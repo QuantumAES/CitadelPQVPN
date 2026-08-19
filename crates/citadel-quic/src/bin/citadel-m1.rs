@@ -216,10 +216,23 @@ fn open_spent_log(path: &std::path::Path) -> Result<std::fs::File> {
 
 // ----------------------- сетевая обвязка (ip/iptables) -----------------------
 fn run(cmd: &str, args: &[&str]) {
+    let _ = run_ok(cmd, args);
+}
+
+/// То же, но с ответом «получилось ли». Нужно там, где у правила есть запасной вариант: матч
+/// `-m conntrack` требует модуля ядра, которого на чужом хосте может не оказаться, и разницу
+/// между «правило стоит» и «iptables ругнулся в stderr» надо видеть в коде, а не глазами.
+fn run_ok(cmd: &str, args: &[&str]) -> bool {
     match Command::new(cmd).args(args).status() {
-        Ok(s) if s.success() => {}
-        Ok(s) => eprintln!("[net] {cmd} {} → {s}", args.join(" ")),
-        Err(e) => eprintln!("[net] {cmd}: {e}"),
+        Ok(s) if s.success() => true,
+        Ok(s) => {
+            eprintln!("[net] {cmd} {} → {s}", args.join(" "));
+            false
+        }
+        Err(e) => {
+            eprintln!("[net] {cmd}: {e}");
+            false
+        }
     }
 }
 
@@ -382,9 +395,39 @@ fn server_setup_net(ifname: &str, policy: &citadel_quic::dataplane::EgressPolicy
     {
         let vip_s = format!("{}.{}.{}.{}", vip[0], vip[1], vip[2], vip[3]);
         let port_s = port.to_string();
+        let target = target.trim().to_string();
         run("iptables", &["-t", "nat", "-A", "PREROUTING", "-i", ifname, "-p", "tcp",
-            "-d", &vip_s, "--dport", &port_s, "-j", "DNAT", "--to-destination", target.trim()]);
-        eprintln!("[net] C7.2 admin-plane: DNAT {vip_s}:{port_s} → {} (только -i {ifname})", target.trim());
+            "-d", &vip_s, "--dport", &port_s, "-j", "DNAT", "--to-destination", &target]);
+        eprintln!("[net] C7.2 admin-plane: DNAT {vip_s}:{port_s} → {target} (только -i {ifname})");
+        // G2 × C7.2 (раздельный деплой): FORWARD видит УЖЕ DNAT'нутый пакет, то есть dst =
+        // адрес ИЗДАТЕЛЯ — а он при `--role exit` лежит в deny_dsts (G1/G2), и DROP выше съедал
+        // ровно тот поток, ради которого DNAT и стоит. Снаружи это выглядело как «admin-канал
+        // 10.7.0.1:7001 недоступен» при исправном туннеле: SYN уходил в туннель, проходил
+        // userspace-фильтр (там dst ещё VIP) и умирал в ядре.
+        //
+        // Возвращаем ровно этот поток и ровно его: `--ctorigdst VIP --ctorigdstport port` матчит
+        // только соединения, ПРИШЕДШИЕ на admin-VIP. Прямой путь абонента к `ISSUER:порт` (G2)
+        // остаётся закрытым обоими рубежами — userspace-фильтром (dst издателя в deny) и этим же
+        // DROP'ом (у такого соединения ctorigdst = адрес издателя, а не VIP).
+        let denied_target = target
+            .rsplit_once(':')
+            .and_then(|(a, p)| Some((a.parse::<std::net::Ipv4Addr>().ok()?, a, p)))
+            .filter(|(ip, _, _)| policy.deny_dsts.contains(&ip.octets()));
+        if let Some((_, tip, tport)) = denied_target {
+            let conntrack = run_ok("iptables", &["-I", "FORWARD", "1", "-i", ifname, "-p", "tcp",
+                "-d", tip, "--dport", tport, "-m", "conntrack",
+                "--ctorigdst", &vip_s, "--ctorigdstport", &port_s, "-j", "ACCEPT"]);
+            if conntrack {
+                eprintln!("[net] C7.2: admin-поток VIP→{target} пропущен мимо запрета G1 (только DNAT'нутые соединения)");
+            } else {
+                // xt_conntrack на хосте нет: ставим более широкое исключение (TCP из туннеля на
+                // admin-порт издателя). G2 при этом держится userspace-фильтром — он режет прямой
+                // путь ДО ядра, — но ядрового дубля у этого запрета уже нет: это видно в логе.
+                run("iptables", &["-I", "FORWARD", "1", "-i", ifname, "-p", "tcp",
+                    "-d", tip, "--dport", tport, "-j", "ACCEPT"]);
+                eprintln!("[net] ⚠ C7.2: conntrack-матч недоступен — исключение для {target} шире (ядровый дубль G2 на этом порту снят, userspace-фильтр держит)");
+            }
+        }
     }
 }
 

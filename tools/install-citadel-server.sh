@@ -50,7 +50,13 @@ LOCAL_BIN="${CITADEL_LOCAL_BIN:-}"           # dir с УЖЕ СОБРАННЫМ�
 ISSUER_ON="${CITADEL_ISSUER:-1}"             # 1 = двухслойная идентичность (issuer+токены+ML-DSA); 0 = token-less
 ISSUER_PORT="${CITADEL_ISSUER_PORT:-}"       # публичный порт издателя (клиент фетчит токены сюда);
                                              # пусто → случайный при первой установке (M-8)
-ADMIN_PORT="${CITADEL_ADMIN_PORT:-7001}"     # C7.2: порт admin-канала — НЕ публикуется наружу (только из туннеля)
+ADMIN_PORT="${CITADEL_ADMIN_PORT:-7001}"     # C7.2: порт admin-канала. При --role all наружу НЕ публикуется
+                                             # (только из туннеля); при --role issuer публикуется — его
+                                             # дёргает exit-машина, см. ADMIN_BIND/ADMIN_PEER ниже
+ADMIN_BIND="${CITADEL_ADMIN_BIND:-}"         # L-14: на КАКОМ адресе издателя публиковать admin-порт.
+                                             # Пусто = 0.0.0.0 (все интерфейсы). Есть приватная сеть
+                                             # с exit-машиной (VPC/WireGuard) — задай её адрес, и порт
+                                             # физически не появится на публичном интерфейсе
 ADMIN_VIP="${CITADEL_ADMIN_VIP:-10.7.0.1}"   # C7.2: admin-VIP = шлюз туннеля (= Citadel_TUN_ADDR exit'а)
 EPOCH_SECS="${CITADEL_EPOCH_SECS:-3600}"     # длина эпохи токенов (exit и issuer ДОЛЖНЫ совпадать)
 # M-9: окно активации МАСТЕР-ссылки, которую печатает установщик. Ссылка одноразовая: первое
@@ -94,13 +100,18 @@ CitadelPQVPN — установщик exit-сервера (запускать н
   --udp-port    N   (случайный) QUIC/UDP туннеля       [CITADEL_UDP_PORT]
   --tcp-port    N   (443)   obfs-over-TCP fallback      [CITADEL_TCP_PORT]
   --issuer-port N   (случайный) издатель токенов (публичный) [CITADEL_ISSUER_PORT]
-  --admin-port  N   (7001)  admin-канал, НАРУЖУ НЕ ОТКРЫТ — только из туннеля [CITADEL_ADMIN_PORT]
+  --admin-port  N   (7001)  admin-канал. --role all: наружу НЕ публикуется (только из
+                    туннеля). --role issuer: публикуется — его дёргает exit-машина [CITADEL_ADMIN_PORT]
+  --admin-bind  IP  (0.0.0.0) адрес, на котором издатель публикует admin-порт. Есть приватная
+                    сеть с exit-машиной — задай её IP: порт не появится на WAN [CITADEL_ADMIN_BIND]
   --ufw / --no-ufw  синхронизировать правила ufw без вопроса / не трогать их вовсе.
                     По умолчанию: если ufw активен и порты разошлись — спросить [CITADEL_UFW=yes|no]
   --activate-secs N (86400) окно активации мастер-ссылки, сек [CITADEL_ACTIVATE_SECS]
   --admin-peer  IP  адрес exit-машины, которому разрешён admin-канал (L-14).
                     ОБЯЗАТЕЛЕН при --role issuer (там порт публикуется наружу);
                     'any' — открыть всем осознанно                [CITADEL_ADMIN_PEER]
+                    Кроме проверки в самом издателе установщик ставит ядровое правило
+                    (цепочка CITADEL-ADMIN в DOCKER-USER): ufw порты docker'а НЕ фильтрует.
 
 Мастер-ссылка (B-2 — как её доставлять админу):
   --master-password F  файл с паролем: мастер-ссылка печатается не голым текстом, а
@@ -165,6 +176,7 @@ while (($#)); do
     --issuer-port)  CITADEL_ISSUER_PORT="${2:-}";  shift 2 ;;
     --admin-port)   CITADEL_ADMIN_PORT="${2:-}";   shift 2 ;;
     --admin-peer)   CITADEL_ADMIN_PEER="${2:-}";   shift 2 ;;
+    --admin-bind)   CITADEL_ADMIN_BIND="${2:-}";   shift 2 ;;
     --activate-secs) CITADEL_ACTIVATE_SECS="${2:-}"; shift 2 ;;
     --ufw)          CITADEL_UFW=yes;               shift ;;
     --no-ufw)       CITADEL_UFW=no;                shift ;;
@@ -189,6 +201,7 @@ UDP_PORT="${CITADEL_UDP_PORT:-$UDP_PORT}"
 TCP_PORT="${CITADEL_TCP_PORT:-$TCP_PORT}"
 ISSUER_PORT="${CITADEL_ISSUER_PORT:-$ISSUER_PORT}"
 ADMIN_PORT="${CITADEL_ADMIN_PORT:-$ADMIN_PORT}"
+ADMIN_BIND="${CITADEL_ADMIN_BIND:-$ADMIN_BIND}"
 ROUTES="${CITADEL_ROUTES:-$ROUTES}"
 DNS="${CITADEL_DNS:-$DNS}"
 DIR="${CITADEL_DIR:-$DIR}"
@@ -325,6 +338,14 @@ if [[ "$ROLE" == issuer ]]; then
     for a in ${ADMIN_PEER//,/ }; do
       [[ "$a" =~ ^[0-9a-fA-F:.]+$ ]] || die "--admin-peer: '$a' не похоже на IP-адрес"
     done
+  fi
+  # --admin-bind: адрес, на котором docker опубликует порт. Чужой/несуществующий адрес докер
+  # обнаружит только на `up` («cannot assign requested address») — уже после сборки образа и
+  # генерации ключей, то есть на середине установки. Проверяем здесь.
+  if [[ -n "$ADMIN_BIND" ]]; then
+    [[ "$ADMIN_BIND" =~ ^[0-9a-fA-F:.]+$ ]] || die "--admin-bind: '$ADMIN_BIND' не похоже на IP-адрес"
+    ip -o addr show 2>/dev/null | awk '{print $4}' | cut -d/ -f1 | grep -qxF "$ADMIN_BIND" \
+      || die "--admin-bind: адреса $ADMIN_BIND нет ни на одном интерфейсе этой машины (docker не сможет опубликовать порт)"
   fi
 fi
 
@@ -974,7 +995,9 @@ cat <<EOF
     user: "0:65534"
     ports:
       - "$ISSUER_PORT:7000/tcp"        # клиент фетчит epoch-токены сюда (Layer-1)$(
-      if [[ "$ROLE" == issuer ]]; then printf '\n      - "%s:%s/tcp"   # admin-канал: нужен только exit-машине (%s). L-14: посторонние адреса режет сам издатель (Citadel_ADMIN_PEER), firewall — второй рубеж' "$ADMIN_PORT" "$ADMIN_PORT" "$ADMIN_PEER"; fi)
+      if [[ "$ROLE" == issuer ]]; then printf '\n      - "%s%s:%s/tcp"   # admin-канал: нужен только exit-машине (%s). Рубежи: %s + CITADEL-ADMIN в DOCKER-USER (ufw порты docker'"'"'а не фильтрует) + Citadel_ADMIN_PEER в самом издателе (L-14)' \
+        "${ADMIN_BIND:+$ADMIN_BIND:}" "$ADMIN_PORT" "$ADMIN_PORT" "$ADMIN_PEER" \
+        "$(if [[ -n "$ADMIN_BIND" ]]; then echo "слушает только на $ADMIN_BIND"; else echo "0.0.0.0 (--admin-bind сузит до одного интерфейса)"; fi)"; fi)
     volumes:
       - "$DIR/keys:/shared"
     healthcheck:                       # готов, когда ключ эпохи сгенерирован и issuer.key лежит на томе
@@ -1122,6 +1145,206 @@ if [[ "$ISSUER_ON" == 1 && "$ROLE" != exit && -n "$MASTER" ]]; then
   esac
 fi
 
+# ─── 6.5. firewall: ядровый рубеж admin-порта + синхронизация ufw ───
+#
+# Секция стоит ДО печати ссылок и bundle'а намеренно: `--role issuer` заканчивает работу прямо на
+# bundle'е (`exit 0`), и пока firewall-секция была ниже, на машине ИЗДАТЕЛЯ она не выполнялась
+# вовсе — ufw оставался с портами прошлой установки, а опубликованный admin-порт не получал ни
+# одного ядрового правила. Живьём это выглядело так: `ufw allow` руками ничего не меняет, а порт
+# снаружи всё равно открыт.
+#
+# ГЛАВНОЕ ПРО DOCKER И UFW. `ports:` докера — это DNAT в nat/PREROUTING: пакет из WAN уходит в
+# FORWARD (DOCKER-USER → DOCKER), а НЕ в INPUT, где живут правила ufw. Поэтому на опубликованных
+# докером портах `ufw allow from …` ничего не открывает, `ufw deny` и `default deny incoming`
+# ничего не закрывают, а сканер снаружи видит порт открытым (`7001/tcp open tcpwrapped` — ядро
+# доводит TCP-хендшейк, соединение закрывает уже сам издатель по L-14). Единственная точка, где
+# фильтр применяется к таким пакетам и которую docker не перетирает, — цепочка DOCKER-USER.
+# Туда и ставим настоящий рубеж; ufw остаётся для портов, которые слушает хост, и для гигиены.
+
+# L-14, рубеж 2 (ядро хоста издателя): CITADEL-ADMIN — адреса exit-машин RETURN, всё прочее на
+# admin-порт DROP. Рубеж 1 — сам издатель (Citadel_ADMIN_PEER, закрывает соединение до TLS),
+# рубеж 0 — `--admin-bind`, если admin-порт вообще не должен появляться на публичном интерфейсе.
+admin_fw() {
+  [[ "$ROLE" == issuer ]] || return 0          # в совмещённой установке порт наружу не публикуется
+  if [[ "$ADMIN_PEER" == any ]]; then
+    warn "admin-порт $ADMIN_PORT/tcp опубликован ДЛЯ ВСЕХ (--admin-peer any) — ядровое правило не ставлю"
+    return 0
+  fi
+  if ! command -v iptables >/dev/null 2>&1; then
+    warn "нет iptables — ядровый рубеж admin-порта не поставлен (остаётся только L-14 в самом издателе)"
+    return 0
+  fi
+  cat > "$DIR/etc/admin-fw.sh" <<EOF
+#!/usr/bin/env bash
+# Сгенерировано install-citadel-server.sh. Ограничивает admin-канал издателя ($ADMIN_PORT/tcp)
+# адресами exit-машин: $ADMIN_PEER.
+#
+# Почему не ufw: docker публикует порт через DNAT в nat/PREROUTING, и пакет идёт в FORWARD
+# (DOCKER-USER → DOCKER) мимо INPUT — то есть мимо всех правил ufw. Фильтровать такой трафик
+# можно только в DOCKER-USER: её создаёт сам docker и при рестарте демона НЕ чистит.
+#
+# Идемпотентен (цепочка пересоздаётся целиком). Правила iptables не переживают ребут — их
+# возвращает citadel-admin-fw.service; вручную: $DIR/etc/admin-fw.sh
+set -u
+PORT=$ADMIN_PORT
+PEERS="${ADMIN_PEER//,/ }"
+apply() {
+  ipt="\$1"; fam="\$2"
+  command -v "\$ipt" >/dev/null 2>&1 || return 0
+  "\$ipt" -L -n >/dev/null 2>&1 || return 0      # семейства нет на хосте (типично для ip6tables)
+  "\$ipt" -N CITADEL-ADMIN 2>/dev/null || true
+  "\$ipt" -F CITADEL-ADMIN || return 0
+  for p in \$PEERS; do
+    case "\$p" in *:*) [ "\$fam" = 6 ] || continue ;; *) [ "\$fam" = 4 ] || continue ;; esac
+    "\$ipt" -A CITADEL-ADMIN -s "\$p" -j RETURN
+  done
+  # У семейства без разрешённых адресов цепочка остаётся «всё DROP» — так и надо: exit-машина
+  # ходит ровно с одного адреса, остальным на этом порту делать нечего (fail-closed).
+  "\$ipt" -A CITADEL-ADMIN -j DROP
+  chain=DOCKER-USER
+  "\$ipt" -S DOCKER-USER >/dev/null 2>&1 || chain=FORWARD   # docker без своей цепочки → в начало FORWARD
+  # Снимаем ВСЕ прежние переходы в нашу цепочку (после переустановки с другим --admin-port остался
+  # бы висеть переход на старый порт), затем ставим актуальный — скрипт идемпотентен в любом случае.
+  "\$ipt" -S "\$chain" 2>/dev/null | grep -e '-j CITADEL-ADMIN' | sed 's/^-A/-D/' | while read -r rule; do
+    "\$ipt" \$rule 2>/dev/null || true
+  done
+  "\$ipt" -I "\$chain" 1 -p tcp --dport "\$PORT" -j CITADEL-ADMIN
+}
+apply iptables 4
+apply ip6tables 6
+EOF
+  chmod +x "$DIR/etc/admin-fw.sh"
+  if "$DIR/etc/admin-fw.sh"; then
+    log "admin-порт $ADMIN_PORT/tcp: ядровое правило поставлено (цепочка CITADEL-ADMIN, разрешено: $ADMIN_PEER)"
+  else
+    warn "не удалось поставить правило для admin-порта — проверь вручную: $DIR/etc/admin-fw.sh"
+    return 0
+  fi
+  # Ребут (и `iptables -F`) правила стирает. systemd возвращает их до/после docker'а; PartOf
+  # добавляет повтор при рестарте самого docker'а — он пересоздаёт свои цепочки.
+  if command -v systemctl >/dev/null 2>&1 && [[ -d /etc/systemd/system ]]; then
+    cat > /etc/systemd/system/citadel-admin-fw.service <<EOF
+[Unit]
+Description=CitadelPQVPN: admin-канал издателя только с адресов exit-машин (DOCKER-USER)
+After=docker.service
+Wants=docker.service
+PartOf=docker.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=$DIR/etc/admin-fw.sh
+
+[Install]
+WantedBy=multi-user.target
+EOF
+    systemctl daemon-reload >/dev/null 2>&1 || true
+    if systemctl enable --now citadel-admin-fw.service >/dev/null 2>&1; then
+      log "citadel-admin-fw.service включён — правило переживёт ребут и рестарт docker'а"
+    else
+      warn "citadel-admin-fw.service не включился — после ребута выполни $DIR/etc/admin-fw.sh вручную"
+    fi
+  else
+    warn "нет systemd — после ребута правило для admin-порта восстанови сам: $DIR/etc/admin-fw.sh"
+  fi
+}
+admin_fw
+
+# ─── ufw: привести правила к портам ЭТОЙ установки (обнаружение прежней) ───
+#
+# Самая частая живая поломка после переустановки: порты выбраны заново (M-8), в ufw открыты
+# ПРЕЖНИЕ — сервер исправен, а у всех абонентов «сервер недоступен». Раньше установщик про это
+# только писал текстом. Теперь: если ufw активен, предлагаем добавить нужные правила и снять
+# правила прежних портов. Спрашиваем всегда (кроме `--ufw`/`--no-ufw`), потому что правила
+# firewall — это изменение конфигурации машины, а не нашего каталога.
+#
+# NB: порты, опубликованные docker'ом, ufw не фильтрует (см. преамбулу секции) — для admin-порта
+# реальный рубеж ставит admin_fw выше. Приводить ufw в порядок всё равно нужно: (а) на серверах с
+# ufw-docker и на iptables-политике DROP правила ufw уже работают; (б) висящие разрешения на
+# портах, которые никто не слушает, — лишняя поверхность и лишняя примета деплоя.
+ufw_sync() {
+  command -v ufw >/dev/null 2>&1 || return 0
+  ufw status 2>/dev/null | head -1 | grep -qi 'active' || return 0   # неактивный ufw не трогаем
+
+  # Что должно быть открыто в этой роли. Admin-порт открывается ТОЛЬКО у роли issuer и ТОЛЬКО
+  # для адресов exit-машин (в совмещённой установке он наружу не публикуется вовсе).
+  local -a want=()
+  local -a want_src=()      # правила с ограничением источника: "порт/proto|адрес"
+  local a
+  case "$ROLE" in
+    issuer) want+=("$ISSUER_PORT/tcp")
+            if [[ "$ADMIN_PEER" == any ]]; then
+              want+=("$ADMIN_PORT/tcp")
+            else
+              for a in ${ADMIN_PEER//,/ }; do want_src+=("$ADMIN_PORT/tcp|$a"); done
+            fi ;;
+    exit)   want+=("$UDP_PORT/udp" "$TCP_PORT/tcp") ;;
+    *)      want+=("$UDP_PORT/udp" "$TCP_PORT/tcp"); [[ "$ISSUER_ON" == 1 ]] && want+=("$ISSUER_PORT/tcp") ;;
+  esac
+  # Что осталось от прежней установки и больше не нужно.
+  local -a stale=()
+  [[ -n "$PREV_UDP_PORT"    && "$PREV_UDP_PORT"    != "$UDP_PORT"    ]] && stale+=("$PREV_UDP_PORT/udp")
+  [[ -n "$PREV_ISSUER_PORT" && "$PREV_ISSUER_PORT" != "$ISSUER_PORT" ]] && stale+=("$PREV_ISSUER_PORT/tcp")
+
+  # Уже открытые правила (ufw печатает `12345/udp   ALLOW  Anywhere`).
+  local rules; rules="$(ufw status 2>/dev/null || true)"
+  local -a add=()
+  local p
+  for p in "${want[@]}"; do
+    grep -qE "^${p//\//\\/}[[:space:]]+ALLOW" <<<"$rules" || add+=("$p")
+  done
+  local -a add_src=()
+  local spec src
+  for spec in "${want_src[@]}"; do
+    p="${spec%|*}"; src="${spec#*|}"
+    # `ufw status` печатает источник в третьей колонке: `7001/tcp  ALLOW  1.2.3.4`.
+    grep -qE "^${p//\//\\/}[[:space:]]+ALLOW[[:space:]]+${src//./\\.}([[:space:]]|$)" <<<"$rules" \
+      || add_src+=("$spec")
+  done
+  local -a del=()
+  for p in "${stale[@]}"; do
+    grep -qE "^${p//\//\\/}[[:space:]]+ALLOW" <<<"$rules" && del+=("$p")
+  done
+  ((${#add[@]} + ${#add_src[@]} + ${#del[@]})) || { log "ufw активен, порты уже в порядке"; return 0; }
+
+  echo
+  echo "Обнаружен активный ufw. Предлагаю привести правила в соответствие с этой установкой:"
+  ((${#add[@]}))     && printf '  открыть:  %s\n' "${add[*]}"
+  ((${#add_src[@]})) && for spec in "${add_src[@]}"; do printf '  открыть:  %s только с %s\n' "${spec%|*}" "${spec#*|}"; done
+  ((${#del[@]}))     && printf '  закрыть:  %s   (порты прежней установки)\n' "${del[*]}"
+  case "$UFW_MODE" in
+    yes) : ;;
+    no)  log "ufw не трогаю (--no-ufw). Открой порты сам, иначе абоненты получат «сервер недоступен»."; return 0 ;;
+    *)
+      # Без tty (curl | bash в чужом скрипте) ничего молча не меняем — только подсказываем.
+      if [[ ! -t 0 ]]; then
+        warn "нет терминала для вопроса — правила ufw НЕ меняю. Повтори с --ufw либо сделай вручную:"
+        for p in "${add[@]}"; do echo "    ufw allow ${p%/*}/${p#*/}"; done
+        for spec in "${add_src[@]}"; do p="${spec%|*}"; echo "    ufw allow from ${spec#*|} to any port ${p%/*} proto ${p#*/}"; done
+        for p in "${del[@]}"; do echo "    ufw delete allow ${p%/*}/${p#*/}"; done
+        return 0
+      fi
+      local ans=""
+      read -r -p "Применить? [y/N] " ans || true
+      [[ "$ans" =~ ^[YyДд]$ ]] || { log "ufw оставлен как есть (порты открой сам)"; return 0; }
+      ;;
+  esac
+  for p in "${add[@]}"; do
+    ufw allow "$p" >/dev/null 2>&1 && log "ufw: открыт $p" || warn "ufw: не удалось открыть $p"
+  done
+  for spec in "${add_src[@]}"; do
+    p="${spec%|*}"; src="${spec#*|}"
+    ufw allow from "$src" to any port "${p%/*}" proto "${p#*/}" >/dev/null 2>&1 \
+      && log "ufw: открыт $p только с $src" || warn "ufw: не удалось открыть $p с $src"
+  done
+  for p in "${del[@]}"; do
+    ufw delete allow "$p" >/dev/null 2>&1 && log "ufw: закрыт прежний $p" || warn "ufw: не удалось закрыть $p"
+  done
+  [[ "$ROLE" == issuer ]] && log "напоминание: правила ufw не действуют на порты, опубликованные docker'ом — их режет $DIR/etc/admin-fw.sh"
+  return 0
+}
+ufw_sync
+
 # ─── 7. citadel:// (секрет) ─── (публичный адрес уже определён до генерации entrypoint'ов, §5)
 
 # ── роль issuer: ссылок здесь нет (у машины нет exit-идентичности) — печатаем bundle для exit'а ──
@@ -1154,10 +1377,28 @@ EOF
 
 Порты этой машины:
   • $ISSUER_PORT/tcp  — выдача токенов          → ОТКРЫТЬ для клиентов
-  • $ADMIN_PORT/tcp  — admin-канал            → разрешён только адресу: $ADMIN_PEER (L-14, режет сам издатель)
-    Второй рубеж — firewall хоста, например:
-      ufw allow from $ADMIN_PEER to any port $ADMIN_PORT proto tcp
-    (канал и сам защищён PQ-TLS+pin и подписью админа, но лишней публичности ему не нужно)
+  • $ADMIN_PORT/tcp  — admin-канал             → ТОЛЬКО с адресов: $ADMIN_PEER
+    Порт опубликован docker'ом $(if [[ -n "$ADMIN_BIND" ]]; then echo "на адресе $ADMIN_BIND"; else echo "на 0.0.0.0 (все интерфейсы)"; fi) — это нужно, потому что в него
+    стучится exit-машина (DNAT из туннеля). Рубежи по порядку:
+      1) ядро хоста — цепочка CITADEL-ADMIN в DOCKER-USER (поставлена этой установкой,
+         переживает ребут через citadel-admin-fw.service). Снаружи порт молчит: filtered.
+      2) сам издатель — Citadel_ADMIN_PEER: чужой адрес закрывается ДО TLS (L-14).
+      3) сам канал — PQ-TLS с пином + подпись админа.
+    ⚠ ufw на этот порт НЕ действует: docker публикует порты через DNAT в PREROUTING, и пакет
+      идёт в FORWARD мимо INPUT, где живут правила ufw. \`ufw allow\`/\`deny\` тут не значат
+      ничего — правило ставится в DOCKER-USER (файл $DIR/etc/admin-fw.sh).
+    Проверить: iptables -nvL CITADEL-ADMIN   и снаружи: nmap -Pn -p $ADMIN_PORT $SERVER_HOST
+      (ожидание: filtered. Было \`open\`/\`tcpwrapped\` — значит правило не встало.)
+    Совсем убрать порт с публичного интерфейса: переустановить с --admin-bind <приватный IP>
+      (нужна приватная сеть с exit-машиной: VPC, WireGuard и т.п.).
+
+⚠ ОБСЛУЖИВАТЬ ЭТУ МАШИНУ ИЗ-ПОД СВОЕГО ЖЕ ТУННЕЛЯ НЕЛЬЗЯ. Адрес издателя закрыт для трафика из
+  туннеля целиком, кроме token-порта $ISSUER_PORT (G1/G2: иначе абонент дотягивался бы из туннеля
+  до sshd этой машины и до admin-порта в обход VIP — SNAT exit'а выдавал бы его за разрешённый
+  адрес). Поэтому при поднятом туннеле ssh на $SERVER_HOST виснет, а открытая сессия рвётся.
+  Как обслуживать: (а) с машины, где туннель не поднят, либо (б) в приложении «Раздельный
+  туннель» → «По адресам назначения» → «В обход» добавить $SERVER_HOST/32 и адрес exit-машины —
+  ssh пойдёт напрямую мимо туннеля, остальной трафик останется в нём.
 
 ────────────────── СЕКРЕТ: bundle для установки exit-узла ──────────────────
 Скопируй в файл на exit-машине (например issuer.env) и поставь exit так:
@@ -1192,75 +1433,6 @@ EOF
   exit 0
 fi
 
-# ─── 7.5. firewall: синхронизировать порты в ufw (обнаружение прежней установки) ───
-#
-# Самая частая живая поломка после переустановки: порты выбраны заново (M-8), в ufw открыты
-# ПРЕЖНИЕ — сервер исправен, а у всех абонентов «сервер недоступен». Раньше установщик про это
-# только писал текстом. Теперь: если ufw активен, предлагаем добавить нужные правила и снять
-# правила прежних портов. Спрашиваем всегда (кроме `--ufw`/`--no-ufw`), потому что правила
-# firewall — это изменение конфигурации машины, а не нашего каталога.
-#
-# NB: docker публикует порты через свою цепочку в nat/FORWARD и ufw их, как правило, НЕ режет.
-# Это не повод не приводить правила в порядок: (а) на серверах с ufw-docker и на iptables-политике
-# DROP это уже не так; (б) висящие разрешения на портах, которые никто не слушает, — лишняя
-# поверхность и лишняя примета деплоя.
-ufw_sync() {
-  command -v ufw >/dev/null 2>&1 || return 0
-  ufw status 2>/dev/null | head -1 | grep -qi 'active' || return 0   # неактивный ufw не трогаем
-
-  # Что должно быть открыто в этой роли (admin-порт — НИКОГДА: он только из туннеля).
-  local -a want=()
-  case "$ROLE" in
-    issuer) want+=("$ISSUER_PORT/tcp") ;;
-    exit)   want+=("$UDP_PORT/udp" "$TCP_PORT/tcp") ;;
-    *)      want+=("$UDP_PORT/udp" "$TCP_PORT/tcp"); [[ "$ISSUER_ON" == 1 ]] && want+=("$ISSUER_PORT/tcp") ;;
-  esac
-  # Что осталось от прежней установки и больше не нужно.
-  local -a stale=()
-  [[ -n "$PREV_UDP_PORT"    && "$PREV_UDP_PORT"    != "$UDP_PORT"    ]] && stale+=("$PREV_UDP_PORT/udp")
-  [[ -n "$PREV_ISSUER_PORT" && "$PREV_ISSUER_PORT" != "$ISSUER_PORT" ]] && stale+=("$PREV_ISSUER_PORT/tcp")
-
-  # Уже открытые правила (ufw печатает `12345/udp   ALLOW  Anywhere`).
-  local rules; rules="$(ufw status 2>/dev/null || true)"
-  local -a add=()
-  local p
-  for p in "${want[@]}"; do
-    grep -qE "^${p//\//\\/}[[:space:]]+ALLOW" <<<"$rules" || add+=("$p")
-  done
-  local -a del=()
-  for p in "${stale[@]}"; do
-    grep -qE "^${p//\//\\/}[[:space:]]+ALLOW" <<<"$rules" && del+=("$p")
-  done
-  ((${#add[@]} + ${#del[@]})) || { log "ufw активен, порты уже в порядке"; return 0; }
-
-  echo
-  echo "Обнаружен активный ufw. Предлагаю привести правила в соответствие с этой установкой:"
-  ((${#add[@]})) && printf '  открыть:  %s\n' "${add[*]}"
-  ((${#del[@]})) && printf '  закрыть:  %s   (порты прежней установки)\n' "${del[*]}"
-  case "$UFW_MODE" in
-    yes) : ;;
-    no)  log "ufw не трогаю (--no-ufw). Открой порты сам, иначе абоненты получат «сервер недоступен»."; return 0 ;;
-    *)
-      # Без tty (curl | bash в чужом скрипте) ничего молча не меняем — только подсказываем.
-      if [[ ! -t 0 ]]; then
-        warn "нет терминала для вопроса — правила ufw НЕ меняю. Повтори с --ufw либо сделай вручную:"
-        for p in "${add[@]}"; do echo "    ufw allow ${p%/*}/${p#*/}"; done
-        for p in "${del[@]}"; do echo "    ufw delete allow ${p%/*}/${p#*/}"; done
-        return 0
-      fi
-      local ans=""
-      read -r -p "Применить? [y/N] " ans || true
-      [[ "$ans" =~ ^[YyДд]$ ]] || { log "ufw оставлен как есть (порты открой сам)"; return 0; }
-      ;;
-  esac
-  for p in "${add[@]}"; do
-    ufw allow "$p" >/dev/null 2>&1 && log "ufw: открыт $p" || warn "ufw: не удалось открыть $p"
-  done
-  for p in "${del[@]}"; do
-    ufw delete allow "$p" >/dev/null 2>&1 && log "ufw: закрыт прежний $p" || warn "ufw: не удалось закрыть $p"
-  done
-}
-ufw_sync
 
 LINKARGS=(--servers "$SERVER_HOST:$UDP_PORT" --psk "$PSK" --pin "$PIN"
           --kx pq --tcp-port "$TCP_PORT" --routes "$ROUTES" --dns "$DNS" "${MLDSA_ARGS[@]}")
@@ -1344,10 +1516,19 @@ $(if [[ "$ROLE" == exit ]]; then cat <<PORTS
 PORTS
 else cat <<PORTS
   • $ISSUER_PORT/tcp  — издатель токенов                    → ОТКРЫТЬ (при выключенном издателе не нужен)
-  • $ADMIN_PORT/tcp  — admin-канал                        → НЕ открывать: доступен только из туннеля
+  • $ADMIN_PORT/tcp  — admin-канал                        → НЕ открывать: docker его не публикует
+    (совмещённая установка: издатель слушает его внутри docker-сети, снаружи порта нет вовсе —
+     проверить: ss -ltnp | grep :$ADMIN_PORT  → пусто. Доступ только из туннеля через $ADMIN_VIP.)
 PORTS
 fi)
   Свои значения: ./install-citadel-server.sh --udp-port N --tcp-port N --issuer-port N (см. --help).
+
+⚠ ОБСЛУЖИВАТЬ СЕРВЕР ИЗ-ПОД СВОЕГО ЖЕ ТУННЕЛЯ НЕЛЬЗЯ. Адреса самой машины$(if [[ "$ROLE" == exit ]]; then printf ' и издателя'; fi) закрыты для
+  трафика из туннеля целиком, кроме token-порта издателя (G1/G2: иначе абонент дотягивался бы из
+  туннеля до sshd, до docker-API и до published-портов соседних контейнеров — мимо облачной
+  security-group). Поэтому при поднятом туннеле ssh на $SERVER_HOST виснет, а открытая сессия
+  рвётся. Обслуживать: с машины без туннеля, либо добавить адреса серверов «в обход» в разделе
+  приложения «Раздельный туннель» → «По адресам назначения».
 $(if [[ "$PORTS_PICKED" == 1 ]]; then cat <<PORTSWARN
 
 ⚠ ПОРТЫ ВЫБРАНЫ ЗАНОВО этой установкой (M-8: фиксированные 4433/7000 опознают деплой сканером).
@@ -1421,7 +1602,8 @@ cat <<EOF
     ОТКРОЙ этот порт в firewall/облачной security-group, иначе клиент не получит токен.
   • Управление абонентами — ИЗ ПРИЛОЖЕНИЯ по мастер-ссылке (C7): подключись мастер-ссылкой,
     меню «Абоненты» → добавить/отозвать. Канал идёт по туннелю → PQ-TLS(pin) → admin-подпись;
-    порт :$ADMIN_PORT НАРУЖУ НЕ ОТКРЫТ (в firewall его открывать НЕ нужно — доступ только из туннеля).
+    порт :$ADMIN_PORT $(if [[ "$ROLE" == exit ]]; then printf 'слушает МАШИНА ИЗДАТЕЛЯ и открыт там только для этой exit-машины
+    (L-14 + цепочка CITADEL-ADMIN в её DOCKER-USER); здесь открывать нечего'; else printf 'НАРУЖУ НЕ ОТКРЫТ вовсе (в firewall его открывать НЕ нужно — только из туннеля)'; fi).
   • На сервере НЕТ управляющих операций — ни выдачи, ни отзыва, ни списка абонентов.
     \`registry revoke\` и \`registry list\` убраны из серверного CLI (тот же принцип, что и
     отсутствие linkgen: боксу не выдаётся инструмент управления). Отзыв действует ≤ длины
