@@ -728,6 +728,32 @@ impl ObfsUdpSocket {
             },
         }
     }
+
+    /// **П2-бис (батарея):** не «спать ли вообще», а «до какого момента точно нечего делать».
+    /// `None` — работа возможна уже в ближайшем слоте; `Some(t)` — раньше `t` тик заведомо пуст.
+    ///
+    /// **Зачем (полевой лог, август 2026).** [`Self::pace_parked`] отвечает только «да/нет», и при
+    /// `Chaff::Adaptive` он говорит «нет» ВСЁ окно `window` (2 с) после каждого пользовательского
+    /// пакета. Сетка при этом 5 мс, то есть 200 пробуждений в секунду, а хвост chaff затухает
+    /// геометрически до [`CHAFF_STEP_MAX`] = 320 мс — то есть пакет уходит в лучшем случае каждое
+    /// 64-е пробуждение, остальные лишь щёлкают счётчиком. В ночном логе телефона это 150 пробуждений
+    /// в секунду при 1–2 chaff-пакетах: CPU не уходит в глубокий сон, и «утром постоянные попытки
+    /// подключиться» начинались с разряженной батареи и придушенного системой процесса.
+    ///
+    /// Тайминги на проводе не меняются: момент выпуска по-прежнему берётся с сетки (`next_slot`
+    /// в [`pace_loop`]), просто до него мы теперь спим, а не крутимся. Дедлайн — момент, когда
+    /// СЛЕДУЮЩИЙ chaff станет разрешён (`tail.next`); пропуск по бюджету его тоже сдвигает
+    /// (см. [`Self::pace_tick`]), поэтому исчерпанный бюджет больше не крутит сетку впустую.
+    fn pace_idle_until(&self) -> Option<Instant> {
+        if !self.queue.lock().unwrap().is_empty() {
+            return None; // есть что выпускать — решает сетка, а не хвост
+        }
+        let Pacing::Slotted { chaff: Chaff::Adaptive { .. }, .. } = self.pacing else {
+            return None; // `Always`/`Off`/`None` — прежнее поведение (парковка через pace_parked)
+        };
+        let next = self.tail.lock().unwrap().next;
+        (next > Instant::now()).then_some(next)
+    }
 }
 
 /// П2: ближайшая граница слот-сетки не раньше `now`. Сетка привязана к якорю запуска pacer'а,
@@ -773,6 +799,13 @@ async fn pace_loop(weak: Weak<ObfsUdpSocket>) {
         if parked {
             // Держать `Arc` тут нельзя: он не дал бы сокету умереть, а задача — проснуться.
             let _ = tokio::time::timeout(PACE_PARK_GUARD, notify.notified()).await;
+        } else if let Some(until) = weak.upgrade().and_then(|s| s.pace_idle_until()) {
+            // П2-бис: очередь пуста и до следующего chaff ещё далеко — досыпаем до него вместо
+            // того, чтобы будиться на каждом 5-мс слоте и уходить ни с чем. Ждём НЕ голым sleep:
+            // `enqueue` обязан прервать сон, иначе реальный пакет пролежал бы в очереди до
+            // `tail.next` (сотни миллисекунд задержки на ровном месте).
+            let until = tokio::time::Instant::from_std(until);
+            let _ = tokio::time::timeout_at(until, notify.notified()).await;
         }
         next = tokio::time::Instant::from_std(next_slot(
             next.into_std(),
@@ -1302,6 +1335,50 @@ mod tests {
         let (real, chaff) = drain(&rx, psk, Duration::from_millis(400)).await;
         assert_eq!(real, 1);
         assert!(chaff > 0, "после пользовательского трафика chaff обязан пойти");
+    }
+
+    /// **П2-бис (батарея): между chaff'ами pacer спит, а не крутит сетку.**
+    ///
+    /// Полевой лог телефона за ночь: ~150 пробуждений в секунду при 1–2 chaff-пакетах — сетка 5 мс
+    /// крутилась всё окно `Chaff::Adaptive` (2 с) после каждого пользовательского пакета, хотя
+    /// хвост затухает до [`CHAFF_STEP_MAX`] = 320 мс и пакет уходит в лучшем случае с каждого
+    /// 64-го пробуждения. CPU в таком режиме не уходит в глубокий сон.
+    ///
+    /// Инвариант: очередь пуста и следующий chaff ещё не наступил ⇒ есть дедлайн, до которого
+    /// делать нечего. Есть что отправлять ⇒ дедлайна нет (реальный пакет не ждёт хвоста).
+    #[tokio::test]
+    async fn pacer_sleeps_until_next_chaff_instead_of_spinning() {
+        let _serial = USER_TRAFFIC_TESTS.lock().await;
+        let pacing = Pacing::Slotted {
+            slot: Duration::from_millis(5),
+            burst: 8,
+            chaff: Chaff::Adaptive { window: CHAFF_WINDOW },
+            budget: None,
+        };
+        let sock = Arc::new(
+            ObfsUdpSocket::new(
+                std::net::UdpSocket::bind("127.0.0.1:0").unwrap(),
+                PskSource::Fixed([9u8; 32]),
+                pacing,
+            )
+            .unwrap(),
+        );
+        let dst: SocketAddr = "127.0.0.1:9".parse().unwrap();
+
+        // Хвост назначен на 300 мс вперёд — до него тик заведомо пуст.
+        let far = Instant::now() + Duration::from_millis(300);
+        sock.tail.lock().unwrap().next = far;
+        let until = sock.pace_idle_until().expect("до следующего chaff спим, а не крутимся");
+        assert!(until > Instant::now() + Duration::from_millis(200), "дедлайн — момент chaff'а");
+
+        // Появился реальный пакет — сон обязан отмениться: он уходит по сетке, а не по хвосту.
+        sock.enqueue(b"user-data", dst);
+        assert!(sock.pace_idle_until().is_none(), "непустая очередь не ждёт хвоста");
+
+        // Момент chaff'а наступил — снова тикаем по сетке.
+        while sock.queue.lock().unwrap().pop_front().is_some() {}
+        sock.tail.lock().unwrap().next = Instant::now();
+        assert!(sock.pace_idle_until().is_none(), "chaff назрел — спать нечего");
     }
 
     /// **П3:** исчерпанный бюджет останавливает chaff, а не «замедляет» его задним числом.

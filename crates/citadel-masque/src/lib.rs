@@ -372,6 +372,18 @@ pub mod ip {
         Some(u16::from_be_bytes([v.payload[2], v.payload[3]]))
     }
 
+    /// Порт назначения TCP **или UDP** внутри IPv4-пакета (`None` для прочих протоколов и
+    /// усечённого заголовка). В отличие от [`tcp_dport`], который отвечает на вопрос exit'а «пустить
+    /// ли этот TCP мимо egress-фильтра», здесь нужен порт как таковой: клиентский детектор петли
+    /// сверяет его с портом СВОЕГО транспорта, а тот бывает и UDP (PQ-QUIC), и TCP (obfs-fallback).
+    pub fn l4_dport(v: &Ipv4View<'_>) -> Option<u16> {
+        // 6 = TCP, 17 = UDP; у обоих порт назначения лежит в байтах 2..4 заголовка L4.
+        if !matches!(v.proto, 6 | 17) || v.payload.len() < 4 {
+            return None;
+        }
+        Some(u16::from_be_bytes([v.payload[2], v.payload[3]]))
+    }
+
     /// Назначение, которое exit НЕ должен форвардить (анти-пивот во внутреннюю сеть):
     /// приватные/loopback/link-local(incl. 169.254.169.254 metadata)/CGNAT/multicast/reserved
     /// плюс IANA special-purpose (RFC 6890) и облачные metadata-адреса вне link-local.
@@ -671,6 +683,30 @@ pub mod ip {
     #[cfg(test)]
     mod tests {
         use super::*;
+
+        /// `l4_dport` читает порт назначения и у TCP, и у UDP — и молчит на всём остальном.
+        /// Клиентский детектор петли сверяет по нему порт СВОЕГО транспорта, поэтому «не тот
+        /// протокол» и «усечённый заголовок» обязаны давать `None`, а не случайное число:
+        /// ложное совпадение здесь — это ложное обвинение `VpnService.protect`.
+        #[test]
+        fn l4_dport_reads_tcp_and_udp_only() {
+            let l4 = |dport: u16| {
+                let mut p = vec![0x30, 0x39]; // sport 12345
+                p.extend_from_slice(&dport.to_be_bytes());
+                p.extend_from_slice(&[0u8; 4]);
+                p
+            };
+            let tcp = build_ipv4(6, [10, 7, 0, 2], [1, 2, 3, 4], &l4(443));
+            assert_eq!(l4_dport(&parse_ipv4(&tcp).unwrap()), Some(443));
+            let udp = build_ipv4(17, [10, 7, 0, 2], [1, 2, 3, 4], &l4(15388));
+            assert_eq!(l4_dport(&parse_ipv4(&udp).unwrap()), Some(15388));
+            // ICMP порта не имеет
+            let icmp = build_ipv4(1, [10, 7, 0, 2], [1, 2, 3, 4], &l4(443));
+            assert_eq!(l4_dport(&parse_ipv4(&icmp).unwrap()), None);
+            // усечённый L4-заголовок (фрагмент/битый пакет) — не гадаем
+            let short = build_ipv4(6, [10, 7, 0, 2], [1, 2, 3, 4], &[0, 0, 1]);
+            assert_eq!(l4_dport(&parse_ipv4(&short).unwrap()), None);
+        }
 
         #[test]
         fn icmp_echo_roundtrip_and_checksums() {

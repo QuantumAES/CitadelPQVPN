@@ -62,6 +62,35 @@ impl EstablishError {
     fn spent(source: anyhow::Error) -> Self {
         Self { source, token_presented: true }
     }
+
+    /// Отказ ПОСЛЕ предъявления токена, когда причину назвал сам exit кодом `CONNECTION_CLOSE`.
+    ///
+    /// Смысл — вернуть себе токен в единственном случае, когда exit прямо сказал, что не принял и
+    /// не потратил его ([`crate::refusal::TOKEN_REJECTED`]). Практически это «у exit'а нет ключа
+    /// текущей эпохи» — систематическое состояние узла, а не свойство попытки: без этой развилки
+    /// цикл реконнекта сжигал по токену на попытку (по два — с эскалацией на obfs-TCP), за минуты
+    /// выгребал квоту эпохи (A6) и запирал абонента до её конца, показывая «Сервер недоступен».
+    /// Любой другой код (в т.ч. `1` старого exit'а и обрыв без кода) — консервативно «потрачен».
+    fn refused(conn: &quinn::Connection, source: anyhow::Error) -> Self {
+        let code = match conn.close_reason() {
+            Some(quinn::ConnectionError::ApplicationClosed(f)) => u64::from(f.error_code) as u32,
+            _ => return Self::spent(source),
+        };
+        if !crate::refusal::token_survived(code) {
+            return Self::spent(source);
+        }
+        Self {
+            // Отказ exit'а — не «сервер недоступен», и подменять его сетевой формулировкой нельзя:
+            // именно эта подмена уводила разбор к портам и firewall'у при исправной сети.
+            source: source.context(
+                "exit отверг анонимный токен (не проверился его ключом эпохи). Токен НЕ потрачен — \
+                 сохраняю. Обычная причина: на exit'е нет ключа текущей эпохи (раздельный деплой — \
+                 упал сайдкар citadel-keysync; проверьте `docker logs citadel-keysync` на \
+                 exit-машине), реже — отозванная подписка",
+            ),
+            token_presented: false,
+        }
+    }
 }
 
 /// Установленная клиентская сессия: поднятый транспорт + назначенный сервером адрес.
@@ -380,8 +409,18 @@ pub async fn run_data_plane(session: Session, tun: Arc<dyn TunIo>) -> Result<Pum
     // ClientPath — чистая диагностика (pump ничего не фильтрует): назначенный адрес, чтобы назвать
     // пакеты с чужим src (exit дропнет их молча), и адрес exit'а, чтобы отдельно назвать петлю
     // собственного транспорта в собственный туннель.
-    let exit = match session.peer_addr().ip() {
-        std::net::IpAddr::V4(v4) => Some(v4.octets()),
+    // Адрес И порт И протокол транспорта: детектор петли обязан отличать наш собственный сокет от
+    // санкционированного трафика на тот же хост (дозаправка кошелька у издателя, который на
+    // совмещённом деплое живёт по тому же адресу) — см. `dataplane::ExitTransport`.
+    // `peer_addr()` = `conn.remote_address()`, а её для obfs-TCP задаёт `ep.connect_with(.., taddr, ..)`
+    // с НАСТОЯЩИМ адресом TCP-сессии, поэтому порт здесь верен для обоих транспортов.
+    let peer = session.peer_addr();
+    let exit = match peer.ip() {
+        std::net::IpAddr::V4(v4) => Some(crate::dataplane::ExitTransport {
+            addr: v4.octets(),
+            port: peer.port(),
+            over_tcp: session.over_tcp(),
+        }),
         std::net::IpAddr::V6(_) => None,
     };
     let path = ClientPath { assigned: session.addr, exit };
@@ -606,8 +645,12 @@ async fn client_request_address(
     out.extend_from_slice(&redeem);
     out.extend_from_slice(&capsule::encode_address_request_v4(&req));
     // С этой строки токен считается предъявленным: даже если ответ не дойдёт, exit мог его
-    // заспендить, и повтор дал бы double-spend вместо подключения.
-    let buf = tunnel.control_client(&out).await.map_err(EstablishError::spent)?;
+    // заспендить, и повтор дал бы double-spend вместо подключения. Единственное исключение —
+    // когда exit САМ сказал кодом закрытия, что токен не принят и не потрачен (`refused`).
+    let buf = match tunnel.control_client(&out).await {
+        Ok(b) => b,
+        Err(e) => return Err(EstablishError::refused(tunnel.conn(), e)),
+    };
 
     let assign = |e: anyhow::Error| EstablishError::spent(e);
     let (t, val, _) =

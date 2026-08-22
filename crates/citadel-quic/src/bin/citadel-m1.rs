@@ -577,6 +577,38 @@ impl IssuerAuth {
         }
     }
 
+    /// **Диагностика рассинхрона ключа эпохи.** Если ключей текущей эпохи у exit'а НЕТ вовсе, он
+    /// отвергает вообще все токены — то есть исправный сервер с открытыми портами и проходящей
+    /// PQ-аутентификацией не пускает ни одного абонента. Отличить это от «клиент предъявил мусор»
+    /// снаружи было нельзя: отказ пишется под `dlog!` (no-logs), а клиент видит лишь оборванный
+    /// control-стрим и показывает «Сервер недоступен». В поле это стоило суток простоя на
+    /// раздельном деплое, где ключ приносит сайдкар `citadel-keysync`: он молчал, exit молчал.
+    ///
+    /// Это состояние — не о клиенте, а о САМОМ УЗЛЕ (никаких адресов и идентификаторов в строке
+    /// нет), поэтому печатается всегда, а не только под `Citadel_DEBUG_LOG`. Не чаще раза в минуту:
+    /// в этом состоянии каждая попытка каждого абонента шла бы строкой в лог.
+    fn warn_if_keyless(&self) {
+        let IssuerAuth::Epoch { dir, epoch_secs, exit_pin, unbound } = self else { return };
+        let e = citadel_token::current_epoch(*epoch_secs);
+        if !epoch_keys_for(dir, e, exit_pin, *unbound).is_empty() {
+            return; // ключ есть — отказ относится к предъявленному токену, а не к узлу
+        }
+        static LAST: Mutex<Option<Instant>> = Mutex::new(None);
+        let mut last = LAST.lock().unwrap();
+        if last.is_some_and(|t| t.elapsed() < Duration::from_secs(60)) {
+            return;
+        }
+        *last = Some(Instant::now());
+        eprintln!(
+            "[citadel-m1:server] ⚠ КЛЮЧА ЭПОХИ {e} НЕТ ({dir}/{} и {}) — отвергаются ВСЕ токены, \
+             ни один абонент не подключится. Раздельный деплой: проверьте сайдкар \
+             `docker logs citadel-keysync` (издатель недоступен? admin/token-порт закрыт? \
+             разъехались часы?). Совмещённый: жив ли контейнер издателя и виден ли ему том keys/",
+            citadel_token::exit_key_name(e),
+            citadel_token::epoch_key_name(e),
+        );
+    }
+
     /// Проверить предъявление токена → `(nonce для double-spend, epoch-бакет для prune)` или None
     /// (невалид/чужая эпоха/чужая сессия). Legacy → бакет `0` (не истекает, не чистится); Epoch →
     /// текущая эпоха (C5: бакеты старше current-1 можно чистить — токен той эпохи всё равно не
@@ -776,6 +808,44 @@ fn spend_token(spent: &Mutex<SpentStore>, nonce: [u8; 32], epoch: u64) -> bool {
     true
 }
 
+/// Отказ в доступе, несущий КОД для `CONNECTION_CLOSE` (см. [`citadel_quic::refusal`]).
+///
+/// Раньше любой отказ закрывал сессию кодом `1` с фразой `auth-failed`, и клиент не мог отличить
+/// «токен не принят» от «токен потрачен» — а от этого зависит, сохранять ли токен для следующей
+/// попытки. Возвращается как `anyhow::Error`, чтобы обработчики control-шагов не меняли сигнатуру;
+/// код достаётся обратно через [`Refusal::code_of`].
+#[derive(Debug)]
+struct Refusal {
+    code: u32,
+    msg: String,
+}
+
+impl std::fmt::Display for Refusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.msg)
+    }
+}
+impl std::error::Error for Refusal {}
+
+impl Refusal {
+    fn err(code: u32, msg: impl Into<String>) -> anyhow::Error {
+        anyhow!(Refusal { code, msg: msg.into() })
+    }
+    /// Токен не проверился — и потому НЕ потрачен: клиент вправе предъявить его снова.
+    fn rejected(msg: impl Into<String>) -> anyhow::Error {
+        Self::err(citadel_quic::refusal::TOKEN_REJECTED, msg)
+    }
+    /// Токен потрачен (double-spend): повтор им бессмыслен.
+    fn spent(msg: impl Into<String>) -> anyhow::Error {
+        Self::err(citadel_quic::refusal::TOKEN_SPENT, msg)
+    }
+    /// Код для закрытия сессии. Незнакомая ошибка → `1` (прежнее поведение: клиент трактует её
+    /// консервативно, как «токен потрачен»).
+    fn code_of(e: &anyhow::Error) -> u32 {
+        e.downcast_ref::<Refusal>().map_or(1, |r| r.code)
+    }
+}
+
 /// Control-обмен серверной стороны — **два шага** (H-2/аудит-4).
 ///
 /// Раньше это был один round-trip: клиент присылал `nonce‖токен‖ADDRESS_REQUEST`, а сервер лишь
@@ -852,24 +922,35 @@ async fn server_assign_address(
                 match issuer.verify(token, &ctx) {
                     Some((tn, epoch)) => {
                         if !spend_token(spent, tn, epoch) {
-                            return Err(anyhow!("токен уже использован (double-spend)"));
+                            return Err(Refusal::spent("токен уже использован (double-spend)"));
                         }
                         // no-logs: nonce токена — псевдоним сессии; в лог только при Citadel_DEBUG_LOG
                         citadel_quic::dlog!("[citadel-m1:server] токен принят (nonce {}…)", hex::encode(&tn[..6]));
                     }
-                    None => return Err(anyhow!("невалидный токен — отказ в доступе")),
+                    // Отказ помечается «токен НЕ потрачен» (`spend_token` сюда не дошёл): клиент
+                    // сохранит его и не будет жечь квоту выдачи (A6) по токену на попытку.
+                    None => {
+                        issuer.warn_if_keyless();
+                        return Err(Refusal::rejected("невалидный токен — отказ в доступе"));
+                    }
                 }
             }
 
-            let (t, _v, _) = capsule::decode(rest).ok_or_else(|| anyhow!("битая капсула запроса"))?;
+            let (t, _v, _) = capsule::decode(rest)
+                .ok_or_else(|| Refusal::err(citadel_quic::refusal::BAD_REQUEST, "битая капсула запроса"))?;
             if t != capsule::ADDRESS_REQUEST {
-                return Err(anyhow!("ожидался ADDRESS_REQUEST, type={t}"));
+                return Err(Refusal::err(
+                    citadel_quic::refusal::BAD_REQUEST,
+                    format!("ожидался ADDRESS_REQUEST, type={t}"),
+                ));
             }
 
             // C6: адрес выделяем ТОЛЬКО ПОСЛЕ верификации токена — неавториз. флуд не жжёт пул.
             let (addr, prefix) = {
                 let mut p = pool.lock().unwrap();
-                let a = p.alloc().ok_or_else(|| anyhow!("пул адресов exit исчерпан — отказ"))?;
+                let a = p.alloc().ok_or_else(|| {
+                    Refusal::err(citadel_quic::refusal::NO_ADDRESS, "пул адресов exit исчерпан — отказ")
+                })?;
                 (a, p.prefix)
             };
             // П5 (батарея): к назначению прикладываем СВОЙ `max_idle_timeout`. Только по нему
@@ -1257,7 +1338,11 @@ async fn handle_client(
         Ok(a) => a,
         Err(e) => {
             citadel_quic::dlog!("[citadel-m1:server] отказ в доступе: {e}");
-            tunnel.close(1, b"auth-failed");
+            // Код называет ПРИЧИНУ (citadel_quic::refusal): по нему клиент решает, остался ли у
+            // него неистраченный токен. Reason-фразу оставляем прежней — её всё равно не видно
+            // (quinn печатает `ReadError::ConnectionLost` как «connection lost»), а место в
+            // CONNECTION_CLOSE она занимает.
+            tunnel.close(Refusal::code_of(&e), b"auth-failed");
             return;
         }
     };
