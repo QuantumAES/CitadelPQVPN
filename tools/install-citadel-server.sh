@@ -50,9 +50,15 @@ LOCAL_BIN="${CITADEL_LOCAL_BIN:-}"           # dir с УЖЕ СОБРАННЫМ�
 ISSUER_ON="${CITADEL_ISSUER:-1}"             # 1 = двухслойная идентичность (issuer+токены+ML-DSA); 0 = token-less
 ISSUER_PORT="${CITADEL_ISSUER_PORT:-}"       # публичный порт издателя (клиент фетчит токены сюда);
                                              # пусто → случайный при первой установке (M-8)
-ADMIN_PORT="${CITADEL_ADMIN_PORT:-7001}"     # C7.2: порт admin-канала. При --role all наружу НЕ публикуется
+ADMIN_PORT="${CITADEL_ADMIN_PORT:-}"         # C7.2: порт admin-канала. При --role all наружу НЕ публикуется
                                              # (только из туннеля); при --role issuer публикуется — его
-                                             # дёргает exit-машина, см. ADMIN_BIND/ADMIN_PEER ниже
+                                             # дёргает exit-машина, см. ADMIN_BIND/ADMIN_PEER ниже.
+                                             # M-8: пусто → случайный при первой установке (прежний
+                                             # фиксированный 7001 был такой же приметой деплоя, как
+                                             # 4433/7000, и при --role issuer он смотрит наружу).
+                                             # Выбирает его МАШИНА ИЗДАТЕЛЯ; exit получает готовый
+                                             # номер в bundle (свой выдумать нельзя — DNAT ведёт
+                                             # именно на порт издателя)
 ADMIN_BIND="${CITADEL_ADMIN_BIND:-}"         # L-14: на КАКОМ адресе издателя публиковать admin-порт.
                                              # Пусто = 0.0.0.0 (все интерфейсы). Есть приватная сеть
                                              # с exit-машиной (VPC/WireGuard) — задай её адрес, и порт
@@ -100,7 +106,7 @@ CitadelPQVPN — установщик exit-сервера (запускать н
   --udp-port    N   (случайный) QUIC/UDP туннеля       [CITADEL_UDP_PORT]
   --tcp-port    N   (443)   obfs-over-TCP fallback      [CITADEL_TCP_PORT]
   --issuer-port N   (случайный) издатель токенов (публичный) [CITADEL_ISSUER_PORT]
-  --admin-port  N   (7001)  admin-канал. --role all: наружу НЕ публикуется (только из
+  --admin-port  N   (случайный) admin-канал. --role all: наружу НЕ публикуется (только из
                     туннеля). --role issuer: публикуется — его дёргает exit-машина [CITADEL_ADMIN_PORT]
   --admin-bind  IP  (0.0.0.0) адрес, на котором издатель публикует admin-порт. Есть приватная
                     сеть с exit-машиной — задай её IP: порт не появится на WAN [CITADEL_ADMIN_BIND]
@@ -332,7 +338,7 @@ fi
 ADMIN_PEER="${CITADEL_ADMIN_PEER:-}"
 if [[ "$ROLE" == issuer ]]; then
   [[ -n "$ADMIN_PEER" ]] || die \
-    "--role issuer: нужен --admin-peer <IP exit-машины> — admin-порт $ADMIN_PORT публикуется наружу,
+    "--role issuer: нужен --admin-peer <IP exit-машины> — admin-порт публикуется наружу,
    и без списка разрешённых адресов он открыт всему интернету. Осознанно открыть: --admin-peer any"
   if [[ "$ADMIN_PEER" != "any" ]]; then
     for a in ${ADMIN_PEER//,/ }; do
@@ -366,21 +372,27 @@ ROTATING=0
 # Порты ПРЕЖНЕЙ установки — нужны, даже когда мы их не наследуем: по ним в firewall стоят
 # разрешающие правила, и при смене портов их надо снять (иначе на сервере годами висят открытые
 # порты, которых уже никто не слушает — лишняя примета деплоя и лишняя поверхность).
-PREV_UDP_PORT=""; PREV_ISSUER_PORT=""
+PREV_UDP_PORT=""; PREV_ISSUER_PORT=""; PREV_ADMIN_PORT=""
 if [[ -r "$PORTS_FILE" ]]; then
   while IFS='=' read -r k v; do
     case "$k" in
       UDP_PORT)    PREV_UDP_PORT="$v" ;;
       ISSUER_PORT) PREV_ISSUER_PORT="$v" ;;
+      ADMIN_PORT)  PREV_ADMIN_PORT="$v" ;;
     esac
   done < "$PORTS_FILE"
 elif [[ -f "$DIR/etc/compose.yml" ]]; then
   # Установка до M-8 (ports.env ещё не было) — исторические значения.
   PREV_UDP_PORT=4433; PREV_ISSUER_PORT=7000
 fi
+# ports.env прежней версии знал только два порта: admin-порт тогда был фиксированным 7001, и
+# обновление обязано оставить его на месте — на нём стоит правило firewall и он записан в уже
+# розданной МАСТЕР-ссылке (её admin-порт не перевыпустишь вместе с обновлением).
+[[ -n "$PREV_ADMIN_PORT" || ! -f "$DIR/etc/compose.yml" ]] || PREV_ADMIN_PORT=7001
 if [[ -r "$PORTS_FILE" && "$ROTATING" != 1 ]]; then
   [[ -n "$UDP_PORT"    ]] || UDP_PORT="$PREV_UDP_PORT"
   [[ -n "$ISSUER_PORT" ]] || ISSUER_PORT="$PREV_ISSUER_PORT"
+  [[ -n "$ADMIN_PORT"  ]] || ADMIN_PORT="$PREV_ADMIN_PORT"
 fi
 # Обновление УЖЕ СТОЯЩЕЙ установки, сделанной до M-8 (ports.env ещё нет): порты обязаны остаться
 # прежними — исторические 4433/7000, — но ТОЛЬКО когда идентичность сохраняется. Иначе
@@ -390,6 +402,7 @@ fi
 if [[ ! -r "$PORTS_FILE" && -f "$DIR/etc/compose.yml" && "$ROTATING" != 1 ]]; then
   [[ -n "$UDP_PORT"    ]] || { UDP_PORT=4433; LEGACY_PORTS=1; }
   [[ -n "$ISSUER_PORT" ]] || { ISSUER_PORT=7000; LEGACY_PORTS=1; }
+  [[ -n "$ADMIN_PORT"  ]] || { ADMIN_PORT=7001; LEGACY_PORTS=1; }
   if [[ "${LEGACY_PORTS:-0}" == 1 ]]; then
     warn "обновление прежней установки: порты оставлены историческими ($UDP_PORT/udp, $ISSUER_PORT/tcp),"
     warn "чтобы выданные ссылки продолжали работать. Сменить их (M-8) — --udp-port/--issuer-port + новые ссылки."
@@ -401,9 +414,29 @@ rand_port() { echo $(( 10000 + $(od -An -N2 -tu2 /dev/urandom | tr -d ' ') % 220
 PORTS_PICKED=0
 [[ -n "$UDP_PORT"    ]] || { UDP_PORT="$(rand_port)";    PORTS_PICKED=1; }
 [[ -n "$ISSUER_PORT" ]] || { ISSUER_PORT="$(rand_port)"; PORTS_PICKED=1; }
+# Admin-порт назначает МАШИНА ИЗДАТЕЛЯ и только она: exit'у он приезжает в bundle и служит целью
+# DNAT'а (`$ADMIN_VIP:порт` → `issuer:тот же порт`), поэтому выдумать свой exit не вправе — канал
+# просто не сойдётся. Пустое значение на exit-машине означает bundle от издателя прежней версии,
+# где порт был фиксированным.
+ADMIN_RANDOM=0
+if [[ -z "$ADMIN_PORT" ]]; then
+  if [[ "$ROLE" == exit ]]; then
+    ADMIN_PORT=7001
+    warn "bundle без CITADEL_ADMIN_PORT (издатель прежней версии) — admin-канал считаю на 7001"
+  else
+    ADMIN_PORT="$(rand_port)"; PORTS_PICKED=1; ADMIN_RANDOM=1
+  fi
+fi
 # Совпали два случайных — переберём (проверка ниже всё равно отвалила бы установку).
 while [[ "$ISSUER_PORT" == "$UDP_PORT" || "$ISSUER_PORT" == "$TCP_PORT" || "$ISSUER_PORT" == "$ADMIN_PORT" ]]; do
   ISSUER_PORT="$(rand_port)"; PORTS_PICKED=1
+done
+while [[ "$ADMIN_PORT" == "$UDP_PORT" || "$ADMIN_PORT" == "$TCP_PORT" || "$ADMIN_PORT" == "$ISSUER_PORT" ]]; do
+  # Перебираем ТОЛЬКО что выбранный СЕЙЧАС случайный. Заданный флагом, приехавший в bundle или
+  # унаследованный от прошлой установки порт трогать нельзя: на конфликт ниже честно ругается
+  # валидация, а молча подменённый admin-порт увёл бы DNAT в никуда и оборвал мастер-ссылку.
+  [[ "$ADMIN_RANDOM" == 1 ]] || break
+  ADMIN_PORT="$(rand_port)"
 done
 
 # ─── 0a. валидация портов ───
@@ -514,15 +547,15 @@ mkdir -p "$DIR/bin" "$DIR/keys" "$DIR/etc"
 chmod 711 "$DIR/keys"
 # M-8: запомнить выбранные порты — следующая установка/обновление возьмёт их отсюда, и уже
 # розданные ссылки не «переедут» на новый случайный порт.
-printf 'UDP_PORT=%s\nISSUER_PORT=%s\n' "$UDP_PORT" "$ISSUER_PORT" > "$PORTS_FILE"
+printf 'UDP_PORT=%s\nISSUER_PORT=%s\nADMIN_PORT=%s\n' "$UDP_PORT" "$ISSUER_PORT" "$ADMIN_PORT" > "$PORTS_FILE"
 chmod 644 "$PORTS_FILE"
 if [[ "$PORTS_PICKED" == 1 ]]; then
   # Роль решает, какой из портов этой машине вообще нужен: exit не поднимает издателя, издатель —
   # туннель. Печатать оба значило бы отправить оператора открывать в firewall лишнее.
   case "$ROLE" in
     exit)   log "порт туннеля выбран случайно (M-8: не «подпись Citadel»): QUIC/UDP $UDP_PORT" ;;
-    issuer) log "порт издателя выбран случайно (M-8: не «подпись Citadel»): TCP $ISSUER_PORT" ;;
-    *)      log "порты выбраны случайно (M-8: не «подпись Citadel»): QUIC/UDP $UDP_PORT, издатель TCP $ISSUER_PORT" ;;
+    issuer) log "порты выбраны случайно (M-8: не «подпись Citadel»): издатель TCP $ISSUER_PORT, admin TCP $ADMIN_PORT" ;;
+    *)      log "порты выбраны случайно (M-8: не «подпись Citadel»): QUIC/UDP $UDP_PORT, издатель TCP $ISSUER_PORT, admin TCP $ADMIN_PORT (наружу не публикуется)" ;;
   esac
   log "запомнены в $PORTS_FILE и попадут в ссылки; открой их в firewall/security-group; свои — --udp-port/--issuer-port"
   # Переустановка с ротацией: прежние порты у оператора уже открыты, новые — ещё нет, и это самая

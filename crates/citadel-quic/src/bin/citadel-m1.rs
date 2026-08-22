@@ -590,22 +590,43 @@ impl IssuerAuth {
     fn warn_if_keyless(&self) {
         let IssuerAuth::Epoch { dir, epoch_secs, exit_pin, unbound } = self else { return };
         let e = citadel_token::current_epoch(*epoch_secs);
-        if !epoch_keys_for(dir, e, exit_pin, *unbound).is_empty() {
-            return; // ключ есть — отказ относится к предъявленному токену, а не к узлу
-        }
+        // Тот же набор эпох, что и в `verify` (current ± 1): иначе на отставших часах узел
+        // кричал бы «ключа нет», проверяя токены ключом, который прекрасно лежит на диске.
+        let keyless = [e, e.wrapping_sub(1), e.wrapping_add(1)]
+            .iter()
+            .all(|ep| epoch_keys_for(dir, *ep, exit_pin, *unbound).is_empty());
         static LAST: Mutex<Option<Instant>> = Mutex::new(None);
         let mut last = LAST.lock().unwrap();
         if last.is_some_and(|t| t.elapsed() < Duration::from_secs(60)) {
             return;
         }
         *last = Some(Instant::now());
+        if keyless {
+            eprintln!(
+                "[citadel-m1:server] ⚠ КЛЮЧА ЭПОХИ {e} НЕТ ({dir}/{} и {}) — отвергаются ВСЕ \
+                 токены, ни один абонент не подключится. Раздельный деплой: проверьте сайдкар \
+                 `docker logs citadel-keysync` (издатель недоступен? admin/token-порт закрыт? \
+                 разъехались часы?). Совмещённый: жив ли контейнер издателя и виден ли ему том keys/",
+                citadel_token::exit_key_name(e),
+                citadel_token::epoch_key_name(e),
+            );
+            return;
+        }
+        // Ключ ЕСТЬ, а токен под ним не сошёлся. Одиночное такое — дело клиента (мусор, чужой
+        // деплой, протухшая пачка), и молчать про него правильно. Но ровно так же выглядит
+        // РАССИНХРОН: файл на месте, keysync пишет «ключ эпохи обновлён», exit «исправен» — а
+        // внутри файла ключ другой эпохи (издатель ещё не ротировал в момент опроса) или другого
+        // узла (в кошельке токены под pin соседнего exit'а). Снаружи это неотличимо от «сервер
+        // недоступен» и стоило суток разбора по портам и firewall'у. Строка о САМОМ УЗЛЕ —
+        // идентификаторов абонента в ней нет, — раз в минуту, как и соседняя.
         eprintln!(
-            "[citadel-m1:server] ⚠ КЛЮЧА ЭПОХИ {e} НЕТ ({dir}/{} и {}) — отвергаются ВСЕ токены, \
-             ни один абонент не подключится. Раздельный деплой: проверьте сайдкар \
-             `docker logs citadel-keysync` (издатель недоступен? admin/token-порт закрыт? \
-             разъехались часы?). Совмещённый: жив ли контейнер издателя и виден ли ему том keys/",
+            "[citadel-m1:server] ⚠ токен НЕ сошёлся с ключами эпохи {e}, хотя ключ на месте \
+             ({dir}/{}). Если так у ВСЕХ абонентов — ключ узла разошёлся с издателем: сверьте \
+             время (NTP) на машинах издателя и exit'а и посмотрите `docker logs citadel-keysync` \
+             на предмет строки о расхождении эпох; проверьте, что pin exit'а в ссылке абонента — \
+             от ЭТОГО узла ({}…)",
             citadel_token::exit_key_name(e),
-            citadel_token::epoch_key_name(e),
+            &hex::encode(exit_pin)[..12],
         );
     }
 
@@ -625,8 +646,16 @@ impl IssuerAuth {
                 .map(|n| (n, 0)),
             IssuerAuth::Epoch { dir, epoch_secs, exit_pin, unbound } => {
                 let e = citadel_token::current_epoch(*epoch_secs);
-                // current + prev (grace на границе эпохи / скью часов); старее — не принимаем.
-                let keys: Vec<citadel_token::EpochKey> = [e, e.wrapping_sub(1)]
+                // current + prev + next; старее — не принимаем.
+                //
+                // Grace симметричен намеренно. `prev` покрывает клиента, чья пачка взята до
+                // границы эпохи. `next` — узел, чьи часы ОТСТАЛИ от издателя: эпоху объявляет
+                // издатель (он чеканит), и пока наши часы не догнали границу, свежий ключ уже
+                // лежит на диске под СВОИМ (большим) номером — без этой строки exit отвергал бы
+                // токены ровно на величину расхождения часов, каждую эпоху. Ничего лишнего это не
+                // принимает: ключ будущей эпохи существует на диске только потому, что издатель в
+                // неё уже перешёл, — горизонт задаёт он, а не наши часы.
+                let keys: Vec<citadel_token::EpochKey> = [e, e.wrapping_sub(1), e.wrapping_add(1)]
                     .iter()
                     .flat_map(|ep| epoch_keys_for(dir, *ep, exit_pin, *unbound))
                     .collect();

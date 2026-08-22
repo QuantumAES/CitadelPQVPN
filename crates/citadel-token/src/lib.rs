@@ -275,6 +275,10 @@ fn connect_authenticated_issuer(
 /// привязка к сессии через EKM), а издатель сверяет его id с настроенным `Citadel_KEYSYNC_ID`.
 /// Подлинность ИЗДАТЕЛЯ проверяется как и раньше — иначе exit принял бы ключ подставного и стал бы
 /// верить чужим токенам.
+///
+/// **P1: ответ несёт НОМЕР ЭПОХИ**, для которой ключ выведен (см. [`encode_epoch_key_grant`]) —
+/// `Ok((ключ, Some(эпоха)))`. Старый издатель метки не знает и отдаёт голый скаляр:
+/// `Ok((ключ, None))`, и тогда звать эпоху приходится по своим часам, как раньше.
 pub fn fetch_epoch_key(
     issuer_addr: &str,
     issuer_pin: &[u8; 32],
@@ -286,7 +290,7 @@ pub fn fetch_epoch_key(
     exit_pin: &[u8; 32],
     retries: u32,
     obfs_psk: Option<[u8; 32]>,
-) -> Result<Vec<u8>> {
+) -> Result<(Vec<u8>, Option<u64>)> {
     // Exit ходит к издателю со своей машины — туннеля у него нет, маршрут всегда прямой.
     let (mut conn, ekm, challenge) = connect_authenticated_issuer(
         issuer_addr,
@@ -300,11 +304,38 @@ pub fn fetch_epoch_key(
         &mut conn,
         &pqid::build_keysync_request(keysync_seed, &challenge, &ekm, exit_pin)?,
     )?;
-    let key = read_frame(&mut conn)
+    let frame = read_frame(&mut conn)
         .context("издатель не отдал ключ эпохи (keysync-идентичность не принята?)")?;
+    let (key, epoch) = decode_epoch_key_grant(&frame)?;
     // Разбираем сразу: мусор/чужой формат должен упасть здесь, а не при первой проверке токена.
-    EpochKey::from_secret(&key).context("ключ эпохи от издателя")?;
-    Ok(key)
+    EpochKey::from_secret(key).context("ключ эпохи от издателя")?;
+    Ok((key.to_vec(), epoch))
+}
+
+/// P1: ответ издателя на keysync-запрос — `ключ(32)` либо `ключ(32) ‖ эпоха(8 BE)`.
+///
+/// Метка появляется только по просьбе запрашивающего (`ClientFrame::KeySync::want_epoch`), потому
+/// что издатель и exit при раздельном деплое обновляются порознь: 40-байтный кадр старый сайдкар
+/// не разобрал бы (`EpochKey::from_secret` требует ровно 32 Б) и остался бы вовсе без ключа.
+pub fn encode_epoch_key_grant(key: &[u8], epoch: Option<u64>) -> Vec<u8> {
+    let mut out = key.to_vec();
+    if let Some(e) = epoch {
+        out.extend_from_slice(&e.to_be_bytes());
+    }
+    out
+}
+
+/// Разбор ответа [`encode_epoch_key_grant`]. Длину проверяем строго: «ключ + хвост неизвестной
+/// длины» молча превратился бы в ключ не той эпохи — ровно та ошибка, ради которой метка и вводится.
+pub fn decode_epoch_key_grant(frame: &[u8]) -> Result<(&[u8], Option<u64>)> {
+    match frame.len() {
+        32 => Ok((frame, None)),
+        40 => {
+            let e = u64::from_be_bytes(frame[32..].try_into().expect("8 байт"));
+            Ok((&frame[..32], Some(e)))
+        }
+        n => bail!("ключ эпохи от издателя: ожидалось 32 или 40 Б, получено {n}"),
+    }
 }
 
 /// C5.3: клиентская сторона issuance по сети (sync). Проходит Layer-1 (`seed` доказывает владение
@@ -1132,6 +1163,43 @@ mod tests {
         }
     }
 
+    /// P1: ключ эпохи выводится ПОД ЕЁ НОМЕР — «тот же мастер, но соседняя эпоха» уже другой ключ,
+    /// и токен под ним не проверяется. Отсюда требование, ради которого введена метка: ключ обязан
+    /// ехать по проводу ВМЕСТЕ со своим номером. Пока он ехал голым, сайдкар подписывал файл
+    /// номером СВОИХ часов — и стоило издателю на секунду отстать (фоновая ротация ещё не
+    /// проснулась, часы машин разъехались), как ключ прошлой эпохи ложился под именем текущей:
+    /// exit отвергал токены всех абонентов до конца эпохи при «зелёных» логах keysync.
+    #[test]
+    fn epoch_key_grant_carries_the_epoch_it_was_derived_for() {
+        let master = EpochKey::generate().unwrap().secret_bytes();
+        let pin = [0x11u8; 32];
+        let k_now = EpochKey::derive_for_exit(&master, 100, &pin).unwrap();
+        let k_prev = EpochKey::derive_for_exit(&master, 99, &pin).unwrap();
+
+        // токен, выданный издателем в эпоху 100
+        let st = BlindState::new().unwrap();
+        let (ev, proof) = k_now.evaluate(&st.blinded_element()).unwrap();
+        let token = st.finalize(&k_now.public_bytes(), &ev, &proof).unwrap();
+        let ctx = redeem_context(b"exp");
+        let redeem = token.redeem(&ctx);
+        assert!(k_now.verify_redemption(&redeem, &ctx).is_some());
+        assert!(
+            k_prev.verify_redemption(&redeem, &ctx).is_none(),
+            "ключ соседней эпохи токен НЕ проверит — потому метка эпохи и обязательна"
+        );
+
+        let secret = k_now.secret_bytes();
+        let framed = encode_epoch_key_grant(&secret, Some(100));
+        let (key, epoch) = decode_epoch_key_grant(&framed).unwrap();
+        assert_eq!((key, epoch), (&secret[..], Some(100)));
+        // старый издатель метки не знает — кадр голый, эпоху зовём своими часами (как раньше)
+        let bare = encode_epoch_key_grant(&secret, None);
+        assert_eq!(decode_epoch_key_grant(&bare).unwrap(), (&secret[..], None));
+        // хвост неизвестной длины молча стал бы ключом не той эпохи — только отказ
+        assert!(decode_epoch_key_grant(&[0u8; 36]).is_err());
+        assert!(decode_epoch_key_grant(&[]).is_err());
+    }
+
     /// P1 (раздельный деплой): exit-узел на ДРУГОЙ машине забирает ключ эпохи, доказав СВОЮ
     /// keysync-идентичность (M-6: ключ стал секретом, безымянный запрос больше не проходит).
     #[test]
@@ -1161,19 +1229,20 @@ mod tests {
             let challenge = [0x31u8; 32];
             write_frame(&mut conn, &pq.hello(&challenge, &issuer_pin, &ekm).unwrap()).unwrap();
             let frame = read_frame(&mut conn).unwrap();
-            let pqid::ClientFrame::KeySync { auth, exit_pin: asked } =
+            let pqid::ClientFrame::KeySync { auth, exit_pin: asked, want_epoch } =
                 pqid::parse_client_frame(&frame).unwrap()
             else {
                 panic!("ожидался keysync-кадр");
             };
+            assert!(want_epoch, "P1: сайдкар просит ключ ВМЕСТЕ с номером эпохи");
             assert_eq!(asked, exit_pin.to_vec(), "узел просит ключ ДЛЯ СЕБЯ (B-1)");
             let bound = pqid::keysync_bound_challenge(&challenge, &exit_pin);
             let got = pqid::verify_hybrid(auth, pqid::DOMAIN_KEYSYNC, &bound, &ekm).unwrap();
             assert_eq!(got, keysync_id, "издатель узнаёт СВОЙ exit-узел");
-            write_frame(&mut conn, &secret).unwrap();
+            write_frame(&mut conn, &encode_epoch_key_grant(&secret, Some(7))).unwrap();
         });
 
-        let got = fetch_epoch_key(
+        let (got, epoch) = fetch_epoch_key(
             &addr,
             &issuer_pin,
             &issuer_mldsa,
@@ -1184,6 +1253,8 @@ mod tests {
         )
         .unwrap();
         srv.join().unwrap();
+        // P1: эпоху называет ИЗДАТЕЛЬ — под её номером сайдкар и положит файл ключа
+        assert_eq!(epoch, Some(7), "ключ приехал с меткой эпохи издателя");
         // и этим ключом exit действительно проверяет токены эпохи
         let restored = EpochKey::from_secret(&got).unwrap();
         let st = BlindState::new().unwrap();

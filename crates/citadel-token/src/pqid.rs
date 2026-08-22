@@ -245,6 +245,22 @@ pub enum ClientFrame {
         auth: HybridAuth,
         #[serde(with = "serde_bytes")]
         exit_pin: Vec<u8>,
+        /// P1: «пришли ключ ВМЕСТЕ С НОМЕРОМ ЭПОХИ, для которой он выведен».
+        ///
+        /// Эпоха входит в вывод ключа (`derive_for_exit`), но по проводу ехал голый скаляр, и
+        /// сайдкар подписывал файл `exit-<эпоха>.key` номером СВОИХ часов. Достаточно, чтобы
+        /// издатель был на секунду позади (его фоновая ротация просыпается раз в `epoch_secs/4`,
+        /// либо часы машин чуть разошлись) — и ключ прошлой эпохи ложился под именем текущей. У
+        /// сайдкара это выглядит как «ключ эпохи N обновлён», у exit'а — как исправный каталог с
+        /// ключами, а у всех абонентов подряд — «exit отверг анонимный токен» до конца эпохи.
+        ///
+        /// Флаг, а не безусловный формат ответа, потому что издатель и exit при раздельном деплое
+        /// стоят на РАЗНЫХ машинах и обновляются порознь: старый издатель это поле не разберёт и
+        /// молча пришлёт голый ключ (как раньше), новый — ответит с меткой только тому, кто её
+        /// попросил. Поле не под подписью: оно не влияет ни на выбор ключа, ни на права — только
+        /// на формат ответа, а канал и так PQ-TLS с пиннингом.
+        #[serde(default)]
+        want_epoch: bool,
     },
 }
 
@@ -270,9 +286,11 @@ pub fn build_keysync_request(
     let bound = keysync_bound_challenge(challenge, exit_pin);
     let raw = build_auth(seed, DOMAIN_KEYSYNC, &bound, ekm)?;
     match parse_client_frame(&raw)? {
-        ClientFrame::Auth(a) => {
-            to_cbor(&ClientFrame::KeySync { auth: a, exit_pin: exit_pin.to_vec() })
-        }
+        ClientFrame::Auth(a) => to_cbor(&ClientFrame::KeySync {
+            auth: a,
+            exit_pin: exit_pin.to_vec(),
+            want_epoch: true,
+        }),
         ClientFrame::KeySync { .. } => unreachable!("build_auth возвращает Auth"),
     }
 }
@@ -536,10 +554,24 @@ mod tests {
         let raw = build_keysync_request(&seed, &challenge, EKM, &pin).unwrap();
         assert!(verify_auth(&raw, DOMAIN_CLIENT, &bound, EKM).is_err());
         assert!(verify_auth(&raw, DOMAIN_ADMIN, &bound, EKM).is_err());
-        let ClientFrame::KeySync { auth, exit_pin } = parse_client_frame(&raw).unwrap() else {
+        let ClientFrame::KeySync { auth, exit_pin, want_epoch } = parse_client_frame(&raw).unwrap()
+        else {
             panic!("ожидался keysync-кадр");
         };
         assert_eq!(exit_pin, pin.to_vec(), "узел называет свой pin (B-1)");
+        assert!(want_epoch, "P1: сайдкар просит ключ вместе с номером эпохи, под который он выведен");
+        // Совместимость с издателем прежней версии: поле необязательное, кадр без него разбирается
+        // (и означает «метку не присылай») — иначе обновление одной машины из двух ломало бы связь.
+        let legacy = to_cbor(&ClientFrame::KeySync {
+            auth: auth.clone(),
+            exit_pin: pin.to_vec(),
+            want_epoch: false,
+        })
+        .unwrap();
+        assert!(matches!(
+            parse_client_frame(&legacy).unwrap(),
+            ClientFrame::KeySync { want_epoch: false, .. }
+        ));
         assert_eq!(
             verify_hybrid(auth.clone(), DOMAIN_KEYSYNC, &bound, EKM).unwrap(),
             id_from_seed(&seed).unwrap(),

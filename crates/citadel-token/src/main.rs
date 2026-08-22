@@ -942,6 +942,47 @@ fn main() -> Result<()> {
 /// «гаснут» к концу эпохи (отзыв по времени, M6).
 type EpochState = (u64, Arc<citadel_token::EpochKey>);
 
+/// P1: мастер эпохи **по часам вызывающего**: если стенные часы уже в следующей эпохе, а состояние
+/// ещё в прошлой — ротируем ЗДЕСЬ ЖЕ и только потом отвечаем.
+///
+/// Зачем не только фоновым потоком. Ключ выводится под номер эпохи (`derive_for_exit`), и этот
+/// номер должен быть один и тот же у трёх сторон: издателя (чеканит), сайдкара keysync (кладёт
+/// файл `exit-<эпоха>.key`) и exit'а (читает файл текущей эпохи). Пока ротацию делал только
+/// фоновый поток, сразу после границы эпохи издатель ещё отдавал ключ прошлой, а сайдкар —
+/// проснувшийся в ту же минуту по своим часам — записывал его как ключ наступившей. Дальше
+/// издатель ротировался, начинал чеканить токены под новым ключом, а на exit'е лежал старый под
+/// новым именем: отвергались ВСЕ токены до конца эпохи, при полностью «зелёных» логах keysync.
+/// Фазы обоих циклов (сон 60 с у сайдкара, `epoch_secs/4` у потока) постоянны, поэтому один раз
+/// попав в это окно, деплой оставался в нём каждую эпоху — «сначала всё работает, потом сервер
+/// недоступен».
+///
+/// Назад по эпохам не ходим (`ce > s.0`): скакнувшие назад часы не должны перевыпускать ключ и
+/// гасить уже выданные токены.
+fn epoch_key_now(
+    state: &Mutex<EpochState>,
+    dir: &str,
+    epoch_secs: u64,
+) -> (u64, Arc<citadel_token::EpochKey>) {
+    let mut s = state.lock().unwrap();
+    let ce = citadel_token::current_epoch(epoch_secs);
+    if ce > s.0 {
+        eprintln!("[issuer] эпоха сменилась → {ce}; ротация ключа…");
+        match citadel_token::EpochKey::generate() {
+            // Не опубликовали (диск) — состояние НЕ двигаем: иначе издатель чеканил бы под
+            // ключом, которого нет ни на одном exit'е, и отказ был бы тихим.
+            Ok(nk) => match publish_epoch_key(dir, ce, &nk.secret_bytes()) {
+                Ok(()) => {
+                    *s = (ce, Arc::new(nk));
+                    eprintln!("[issuer] эпоха {ce}: ключ ротирован и опубликован");
+                }
+                Err(err) => eprintln!("[issuer] ключ эпохи {ce} не опубликован: {err:#}"),
+            },
+            Err(err) => eprintln!("[issuer] генерация ключа при ротации не удалась: {err}"),
+        }
+    }
+    (s.0, s.1.clone())
+}
+
 /// S2.4/A6: счётчик выданных токенов `client_id → (эпоха, число)` (анти-фарминг, per-epoch).
 type QuotaMap = HashMap<[u8; 32], (u64, u32)>;
 
@@ -1343,25 +1384,17 @@ fn run_issuer() -> Result<()> {
     // Фоновая ротация: при смене эпохи генерим новый ключ и публикуем (прошлый ключ оставляем на
     // диске для grace на exit'е). В схеме v2 генерация — микросекунды (был RSA-keygen ~10 с), так
     // что отдельная забота «не держать лок во время keygen» больше не нужна.
+    //
+    // P1: поток только ПОДТАЛКИВАЕТ ротацию — решает её `epoch_key_now`, которую зовёт и каждое
+    // обслуживаемое соединение. Без этого между границей эпохи и пробуждением потока (до
+    // `epoch_secs/4`) издатель выдавал ключ ПРОШЛОЙ эпохи, а keysync подписывал его номером уже
+    // НАСТУПИВШЕЙ — и exit до конца эпохи отвергал токены всех абонентов подряд.
     {
         let state = state.clone();
         let dir = dir.clone();
         std::thread::spawn(move || loop {
             std::thread::sleep(std::time::Duration::from_secs((epoch_secs / 4).clamp(5, 30)));
-            let ce = citadel_token::current_epoch(epoch_secs);
-            if ce == state.lock().unwrap().0 {
-                continue;
-            }
-            eprintln!("[issuer] эпоха сменилась → {ce}; ротация ключа…");
-            match citadel_token::EpochKey::generate() {
-                Ok(nk) => {
-                    if publish_epoch_key(&dir, ce, &nk.secret_bytes()).is_ok() {
-                        *state.lock().unwrap() = (ce, Arc::new(nk));
-                        eprintln!("[issuer] эпоха {ce}: ключ ротирован и опубликован");
-                    }
-                }
-                Err(err) => eprintln!("[issuer] генерация ключа при ротации не удалась: {err}"),
-            }
+            epoch_key_now(&state, &dir, epoch_secs);
         });
     }
 
@@ -1503,7 +1536,7 @@ fn serve_client(
     // Первый кадр клиента типизирован: абонент аутентифицируется, exit-узел просит ключ эпохи.
     let frame = read_frame(&mut conn)?;
     let auth = match citadel_token::pqid::parse_client_frame(&frame)? {
-        citadel_token::pqid::ClientFrame::KeySync { auth, exit_pin } => {
+        citadel_token::pqid::ClientFrame::KeySync { auth, exit_pin, want_epoch } => {
             // Раздельный деплой (P1): exit на другой машине подтягивает ключ эпохи — общего тома
             // /shared у него нет. M-6: ключ СЕКРЕТЕН, поэтому здесь полноценная аутентификация, а
             // не «раз дошёл — держи»: доказательство владения keysync-seed'ом в своём домене плюс
@@ -1533,12 +1566,18 @@ fn serve_client(
             // B-1: наружу уходит ТОЛЬКО выведенный ключ этого узла. Мастер эпохи остаётся на
             // машине издателя: узел, получивший `k_exit`, не может ни восстановить мастер, ни
             // вывести ключи соседей — до этой правки по keysync ехал общий секрет эпохи.
-            let (epoch, master) = {
-                let s = state.lock().unwrap();
-                (s.0, s.1.secret_bytes())
-            };
-            let k_exit = citadel_token::EpochKey::derive_for_exit(&master, epoch, &exit_pin)?;
-            write_frame(&mut conn, &k_exit.secret_bytes())?;
+            let (epoch, master) = epoch_key_now(state, dir, epoch_secs);
+            let k_exit =
+                citadel_token::EpochKey::derive_for_exit(&master.secret_bytes(), epoch, &exit_pin)?;
+            // P1: с меткой эпохи — сайдкар положит файл под НОМЕРОМ ИЗДАТЕЛЯ, а не своих часов.
+            // `want_epoch=false` — сайдкар старой версии: отвечаем голым ключом, как раньше.
+            write_frame(
+                &mut conn,
+                &citadel_token::encode_epoch_key_grant(
+                    &k_exit.secret_bytes(),
+                    want_epoch.then_some(epoch),
+                ),
+            )?;
             citadel_token::dlog!(
                 "[issuer] отдан ключ эпохи {epoch} для exit'а {}… (keysync, per-exit)",
                 &hex::encode(exit_pin)[..12]
@@ -1609,8 +1648,8 @@ fn serve_client(
     // C5.3: отдаём клиенту публичный элемент K ТЕКУЩЕЙ эпохи — под ним он проверит DLEQ каждой
     // выдачи (и заметит, если издатель применит не тот ключ).
     let cur = {
-        let s = state.lock().unwrap();
-        citadel_token::EpochKey::derive_for_exit(&s.1.secret_bytes(), s.0, &exit_pin)?
+        let (e, master) = epoch_key_now(state, dir, epoch_secs);
+        citadel_token::EpochKey::derive_for_exit(&master.secret_bytes(), e, &exit_pin)?
     };
     write_frame(&mut conn, &cur.public_bytes())?;
     // H-3: следом — ключ L1-обфускации текущей эпохи. Он выводится из мастер-секрета, которого нет
@@ -1633,8 +1672,8 @@ fn serve_client(
         // B-1: ключ выводим на каждой итерации — эпоха могла смениться (фоновая ротация мастера),
         // и токен обязан быть под ключом ТОЙ эпохи, в которой он выдан.
         let (cur_epoch, key) = {
-            let s = state.lock().unwrap();
-            (s.0, citadel_token::EpochKey::derive_for_exit(&s.1.secret_bytes(), s.0, &exit_pin)?)
+            let (e, master) = epoch_key_now(state, dir, epoch_secs);
+            (e, citadel_token::EpochKey::derive_for_exit(&master.secret_bytes(), e, &exit_pin)?)
         };
         if !issuance.lock().unwrap().take_quota(client_id, cur_epoch, max_per_epoch) {
             citadel_token::dlog!(
@@ -1872,13 +1911,30 @@ fn run_keysync() -> Result<()> {
                 3,
                 obfs_psk,
             ) {
-                Ok(key) => {
-                    if let Err(e) = publish_exit_key(&dir, epoch, &key) {
-                        eprintln!("[keysync] ключ эпохи {epoch} получен, но не записан: {e:#}");
+                // P1: файл называем эпохой, КОТОРУЮ НАЗВАЛ ИЗДАТЕЛЬ, а не своими часами: ключ
+                // выведен под её номер, и exit ищет его именно под ним. Старый издатель метки не
+                // прислал — остаётся прежнее поведение (свои часы).
+                Ok((key, from_issuer)) => {
+                    let label = from_issuer.unwrap_or(epoch);
+                    if let Err(e) = publish_exit_key(&dir, label, &key) {
+                        eprintln!("[keysync] ключ эпохи {label} получен, но не записан: {e:#}");
                     } else {
                         // no-logs и гигиена секрета: длину ключа не печатаем, сам ключ — тем более.
-                        eprintln!("[keysync] ключ эпохи {epoch} обновлён");
-                        last = Some(epoch);
+                        eprintln!("[keysync] ключ эпохи {label} обновлён");
+                        // Помечаем ВЗЯТУЮ эпоху, а не свою: разошлись — на следующем круге
+                        // переспросим и подберём ключ новой, как только издатель до неё дойдёт.
+                        // Иначе (пометив свою) мы бы до конца эпохи сидели на чужом ключе.
+                        last = Some(label);
+                        if label != epoch {
+                            eprintln!(
+                                "[keysync] ⚠ часы разошлись с издателем: у него эпоха {label}, у \
+                                 нас {epoch} (разница {}с при длине эпохи {epoch_secs}с). Ключ \
+                                 записан под ЕГО номером; переспрошу через {interval}с. Если \
+                                 расхождение не уходит — сверьте время (NTP) на обеих машинах: \
+                                 exit отвергнет токены, выданные под ключом другой эпохи",
+                                (label as i64 - epoch as i64) * epoch_secs as i64,
+                            );
+                        }
                     }
                 }
                 // Издатель недоступен — не фатально: exit продолжает работать на ключе прошлой
@@ -2350,6 +2406,48 @@ mod tests {
     fn preauth_deadline_exceeds_socket_timeout() {
         assert!(super::PREAUTH_DEADLINE > super::PREAUTH_TIMEOUT);
         assert!(super::SESSION_TIMEOUT > super::PREAUTH_DEADLINE, "сессия живёт дольше хендшейка");
+    }
+
+    /// P1: ключ эпохи ротируется ПО ЧАСАМ ОБРАЩЕНИЯ, а не когда проснётся фоновый поток.
+    ///
+    /// Регрессия на «сначала всё работает, потом сервер недоступен» при раздельном деплое: сайдкар
+    /// keysync опрашивает издателя раз в минуту, фоновая ротация просыпалась раз в `epoch_secs/4`,
+    /// фазы у обоих циклов постоянные — попав однажды в окно «эпоха уже сменилась, издатель ещё
+    /// нет», деплой оставался в нём каждую эпоху и exit отвергал токены всех абонентов подряд.
+    #[test]
+    fn epoch_key_rotates_on_access_not_on_the_background_thread() {
+        use std::sync::{Arc, Mutex};
+        let dir = std::env::temp_dir().join(format!("citadel-rot-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let dir = dir.to_str().unwrap().to_string();
+        let epoch_secs = 3600;
+        let now = citadel_token::current_epoch(epoch_secs);
+
+        // состояние «издатель ещё в прошлой эпохе» — ровно то, в котором его заставал keysync
+        let stale = citadel_token::EpochKey::generate().unwrap();
+        let stale_secret = stale.secret_bytes();
+        let state: Mutex<super::EpochState> = Mutex::new((now - 1, Arc::new(stale)));
+
+        let (e, key) = super::epoch_key_now(&state, &dir, epoch_secs);
+        assert_eq!(e, now, "отдана ТЕКУЩАЯ эпоха, а не та, что лежала в состоянии");
+        assert_ne!(key.secret_bytes(), stale_secret, "ключ новой эпохи — новый");
+        // и он опубликован под своим номером: совмещённый деплой читает файл прямо с тома
+        let published =
+            std::fs::read(format!("{dir}/{}", citadel_token::epoch_key_name(now))).unwrap();
+        assert_eq!(published, key.secret_bytes().to_vec(), "на диске ключ ТОЙ ЖЕ эпохи");
+
+        // повторное обращение в ту же эпоху ключ не трогает (иначе выданные токены гасли бы)
+        let (e2, key2) = super::epoch_key_now(&state, &dir, epoch_secs);
+        assert_eq!((e2, key2.secret_bytes()), (e, key.secret_bytes()));
+
+        // часы скакнули назад — назад по эпохам не идём и ключ не перевыпускаем
+        let ahead = citadel_token::EpochKey::generate().unwrap();
+        let ahead_secret = ahead.secret_bytes();
+        *state.lock().unwrap() = (now + 5, Arc::new(ahead));
+        let (e3, key3) = super::epoch_key_now(&state, &dir, epoch_secs);
+        assert_eq!((e3, key3.secret_bytes()), (now + 5, ahead_secret));
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// valid_until: относительные формы и абсолют.
