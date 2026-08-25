@@ -9,8 +9,6 @@
 анти-DPI, анонимная аутентификация без учётных записей — и обычные клиенты под Android,
 Linux и Windows.
 
-[![CI](https://github.com/QuantumAES/CitadelPQVPN/actions/workflows/ci.yml/badge.svg)](https://github.com/QuantumAES/CitadelPQVPN/actions/workflows/ci.yml)
-[![windows](https://github.com/QuantumAES/CitadelPQVPN/actions/workflows/windows.yml/badge.svg)](https://github.com/QuantumAES/CitadelPQVPN/actions/workflows/windows.yml)
 [![release](https://img.shields.io/github/v/release/QuantumAES/CitadelPQVPN?include_prereleases&label=релиз)](https://github.com/QuantumAES/CitadelPQVPN/releases/latest)
 [![license](https://img.shields.io/badge/license-Apache--2.0-blue)](LICENSE)
 
@@ -18,23 +16,27 @@ Linux и Windows.
 
 > ### ⚠️ Публичная бета
 >
-> Это **первый публичный релиз**. Криптография собрана из проверенных библиотек (rustls/aws-lc-rs,
-> quinn, BLAKE3), протокол и клиенты покрыты тестами и четырьмя внутренними security-ревью — но
-> **независимого внешнего аудита не было**. Если от вашей приватности зависит свобода или
-> безопасность, не полагайтесь на этот проект как на единственную меру защиты.
+> Проект в публичной бете. Криптография собрана из проверенных библиотек (rustls/aws-lc-rs,
+> quinn, BLAKE3), протокол и клиенты покрыты тестами, фаззингом и четырьмя внутренними
+> security-ревью — но **независимого внешнего аудита не было**. Если от вашей приватности
+> зависит свобода или безопасность, не полагайтесь на этот проект как на единственную меру защиты.
 >
 > Известные ограничения релиза перечислены ниже, в разделе «[Чего пока нет](#чего-пока-нет)».
 
 ## Как это выглядит
 
-| Android | Linux | Windows |
+| Linux | Windows | Android |
 |:---:|:---:|:---:|
-| <img src="docs/screenshots/android-connected.png" width="200"> | <img src="docs/screenshots/linux-gui.png" width="320"> | <img src="docs/screenshots/windows-connected.png" width="320"> |
-| Туннель поднят | Графический клиент | Клиент и служба |
+| <img src="docs/screenshots/linux-gui.png" width="290"> | <img src="docs/screenshots/windows-connected.png" width="265"> | <img src="docs/screenshots/android-split.png" width="240"> |
+| Графический клиент | Клиент и служба, значок в трее | Раздельное туннелирование |
 
-| Раздельный туннель (Android) | Консольный клиент (Linux) |
-|:---:|:---:|
-| <img src="docs/screenshots/android-split.png" width="200"> | <img src="docs/screenshots/linux-cli.png" width="320"> |
+<div align="center">
+
+<img src="docs/screenshots/linux-cli.png" width="760">
+
+Консольный клиент `citadel-cli`: статус, профили, журнал сессии, состояние kill-switch.
+
+</div>
 
 ## Зачем это нужно
 
@@ -143,8 +145,8 @@ sha256sum -c sha256sums --ignore-missing
 сегодня оказалось свежим релизом, — плохая идея.
 
 ```bash
-curl -fsSLO https://github.com/QuantumAES/CitadelPQVPN/releases/download/v0.8.0/install-citadel-server.sh
-CITADEL_VERSION=v0.8.0 bash install-citadel-server.sh
+curl -fsSLO https://github.com/QuantumAES/CitadelPQVPN/releases/download/v0.10.0/install-citadel-server.sh
+CITADEL_VERSION=v0.10.0 bash install-citadel-server.sh
 ```
 
 Установщик проверяет подпись бинарей вшитым ключом, поднимает exit и издателя токенов,
@@ -158,7 +160,7 @@ CITADEL_VERSION=v0.8.0 bash install-citadel-server.sh
 Задать свои — явными флагами:
 
 ```bash
-bash install-citadel-server.sh v0.8.0 --udp-port 5443 --issuer-port 7300   # см. --help
+bash install-citadel-server.sh v0.10.0 --udp-port 5443 --issuer-port 7300   # см. --help
 ```
 
 Клиент берёт порты из ссылки, настраивать на устройствах ничего не нужно.
@@ -198,11 +200,13 @@ L0 транспорт   UDP (основной) / TCP:443 (обход блоки�
 `tools/setup-dev-env.sh`, подробности — [`docs/BUILD-INSTALL.md`](docs/BUILD-INSTALL.md).
 
 ```bash
-cargo test --workspace                     # юнит-тесты движка (200+)
+cargo test --workspace                     # юнит-тесты движка (350+)
 cargo clippy --workspace --all-targets -- -D warnings
 
 bash docker/run-demo.sh                    # e2e: настоящий туннель в контейнерах
 bash docker/run-cli-tests.sh               # e2e: консольный клиент, привилегии, kill-switch
+
+tools/fuzz.sh                              # cargo-fuzz по разборщикам недоверенного ввода
 ```
 
 Оба харнеса поднимают стенд (издатель + два exit'а + клиент), прогоняют сценарии — ping и HTTP
@@ -217,6 +221,7 @@ rate-limit, миграцию, TCP-fallback, failover, слепую выдачу 
 | Документ | О чём |
 |---|---|
 | [`docs/SPEC.md`](docs/SPEC.md) | протокол целиком: слои, капсулы, форматы, обоснования решений |
+| [`docs/AUTH-ALTERNATIVES.md`](docs/AUTH-ALTERNATIVES.md) | почему серверная аутентификация именно Ed25519 + ML-DSA-65 и чем платит handshake |
 | [`docs/THREAT-MODEL-STRIDE.md`](docs/THREAT-MODEL-STRIDE.md) | модель угроз и сопоставление находок с кодом |
 | [`docs/SECURITY-ROADMAP.md`](docs/SECURITY-ROADMAP.md) | security-трек и журнал внутренних ревью |
 | [`docs/PHASE0-OBFS.md`](docs/PHASE0-OBFS.md) | обфускация L1: формат, паддинг, анти-зондирование |
@@ -225,6 +230,7 @@ rate-limit, миграцию, TCP-fallback, failover, слепую выдачу 
 | [`docs/BUILD-INSTALL.md`](docs/BUILD-INSTALL.md) | сборка, окружение, подпись APK |
 | [`docs/RELEASE.md`](docs/RELEASE.md) | CI/CD, раннеры, секреты, выпуск релиза |
 | [`docs/BENCHMARKS.md`](docs/BENCHMARKS.md) | замеры криптографии и обфускации |
+| [`docs/SERVER-KEY-PROTECTION.md`](docs/SERVER-KEY-PROTECTION.md) | что лежит на сервере, что получает противник с диском и какие меры не театр |
 | [`docs/SECURITY-AUDIT-4-2026-08.md`](docs/SECURITY-AUDIT-4-2026-08.md) | последний внутренний аудит: находки, заходы исправлений, открытый бэклог (§20) |
 | [`docs/CWE-REVIEW-PLAN-2026-08.md`](docs/CWE-REVIEW-PLAN-2026-08.md) | программа системной проверки по CWE и проактивные меры |
 | [`docs/COVER-TRAFFIC-BATTERY-2026-08.md`](docs/COVER-TRAFFIC-BATTERY-2026-08.md) | маскировка трафика: цена в батарее и что с ней сделано |
@@ -232,7 +238,7 @@ rate-limit, миграцию, TCP-fallback, failover, слепую выдачу 
 ## Чего пока нет
 
 - **Внешнего аудита безопасности.** Внутренних ревью было четыре (последнее —
-  `docs/SECURITY-AUDIT-4-2026-08.md`, плюс пост-аудитные заходы до 2026-08-14), внешнего — ни одного.
+  `docs/SECURITY-AUDIT-4-2026-08.md`, плюс пост-аудитные заходы до 2026-08-19), внешнего — ни одного.
 - **Клиентов под iOS/iPadOS и macOS.** Архитектура выбрана (Apple Network Extension), работа
   не начата: сборка требует macOS и Xcode.
 - **Подписи Authenticode** у Windows-установщика и публикации в Google Play.

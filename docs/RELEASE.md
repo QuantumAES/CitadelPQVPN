@@ -97,7 +97,7 @@ base64 -w0 citadel-release.jks     # значение для секрета
 git switch main && git merge --ff-only dev
 
 # 2. Подписанный тег.
-git tag -s v0.8.0 -m "CitadelPQVPN v0.8.0"
+git tag -s v0.10.0 -m "CitadelPQVPN v0.10.0"
 git push origin main --follow-tags
 ```
 
@@ -121,10 +121,10 @@ git push origin main --follow-tags
 ### Собрать релиз вручную
 
 ```sh
-tools/mk-release.sh        v0.8.0 --no-sign
-cp CitadelPQVPN-Setup-0.8.0.exe dist/v0.8.0/     # если установщик уже собран
-tools/mk-client-release.sh v0.8.0                # клиенты + sha256sums + подпись
-tools/publish-release.sh   v0.8.0
+tools/mk-release.sh        v0.10.0 --no-sign
+cp CitadelPQVPN-Setup-0.10.0.exe dist/v0.10.0/     # если установщик уже собран
+tools/mk-client-release.sh v0.10.0                # клиенты + sha256sums + подпись
+tools/publish-release.sh   v0.10.0
 ```
 
 `publish-release.sh` идемпотентен: повторный запуск обновляет ассеты и notes существующего
