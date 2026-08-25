@@ -1,15 +1,37 @@
 [package]
 name = "citadel-token"
 version = "0.1.0"
+publish.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "CitadelPQVPN — анонимные токены (blind RSA, RFC 9474): per-user unlinkable аутентификация (Privacy Pass-стиль)"
+description = "CitadelPQVPN — анонимные токены (VOPRF 2HashDH, ristretto255): per-user unlinkable аутентификация с привязкой к сессии"
 
 [dependencies]
 anyhow = "1"
 rand = "0.8"
-blind-rsa-signatures = "0.15"
+libc = "0.2"                       # M-4: сброс привилегий издателя (setgroups/setgid/setuid)
+# M-6/M-10: Layer-2 v2 — VOPRF (2HashDH) вместо blind RSA. Уводит из дерева `rsa 0.8.2` с
+# незакрываемым RUSTSEC-2023-0071 (Marvin) и даёт привязку токена к сессии (остаток H-2).
+# 4.1.x, а не 5.0: 4.1.3 — зрелая, многократно проаудированная ветка (в ней же закрыт
+# RUSTSEC-2024-0344), 5.0.0 вышел месяц назад. Арифметика постоянного времени, чистый Rust
+# (собирается под android/windows-gnu без C-тулчейна).
+curve25519-dalek = { version = "4.1.3", features = ["zeroize"] }
 hex = "0.4"
+aws-lc-rs = { version = "1.17", features = ["unstable"] }  # Layer-1: Ed25519 + ML-DSA-65 (FIPS 204, unstable API) — тот же крипто-бэкенд, что в движке
+citadel-obfs = { path = "../citadel-obfs" }   # S2.1/A1 (остаток): obfs-обёртка issuer-канала (анти-DPI)
+citadel-protect = { path = "../citadel-protect" }   # анти-петля: канал к издателю мимо собственного туннеля (Android)
+# S2.1/A1: защищённый (PQ-TLS + pin) канал к издателю. rustls/rcgen/blake3 — те же версии, что в движке.
+rustls = { version = "0.23", default-features = false, features = ["aws_lc_rs", "std"] }
+# L-6: rcgen БЕЗ дефолтных фич — иначе он тянет второй крипто-бэкенд (`ring`) рядом с нашим
+# aws-lc-rs: два независимых набора примитивов в одном бинаре = двойная поверхность аудита и
+# обновлений. Бэкенд aws_lc_rs — ровно тот, на котором работают rustls/quinn и вся крипта проекта.
+rcgen = { version = "0.13", default-features = false, features = ["aws_lc_rs", "pem"] }
+blake3 = "1"
+# C7.1 admin-плоскость: CBOR-кадры команд (те же версии, что в citadel-client)
+serde = { version = "1", features = ["derive"] }
+zeroize = "1"                      # S1.3: затирание seed PQ-идентичности издателя в памяти
+serde_bytes = "0.11"               # PQ-кадры: byte-string вместо массива int (pub 1952 Б, подпись 3309 Б)
+ciborium = "0.2"
 
 [dev-dependencies]
 criterion = { version = "0.5", default-features = false, features = ["cargo_bench_support"] }

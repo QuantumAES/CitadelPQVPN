@@ -1,8 +1,14 @@
 #!/usr/bin/env python3
 """
-CitadelPQVPN — референс-реализация obfs-слоя (L1), Фаза 0, протокол v1.
+CitadelPQVPN — референс-реализация obfs-слоя (L1), Фаза 0, протокол v2.
 Назначение: КАНОНИЧЕСКИЙ генератор тест-векторов. Не для прод-использования
 (нет постоянной защиты от replay, нет управления сессиями — только формат пакета).
+
+Протокол v2 (M2-full, слом wire относительно v1):
+  - sid расширен 8→16 байт и служит 128-битной per-session СОЛЬЮ в k_sess
+    (закрывает nonce-reuse под общим PSK: коллизия 16-байтного sid = 2^-128).
+  - KDF-контексты подняты v1→v2 (старое/новое взаимно нерасшифровываемы).
+  - Заголовок: enc_header = (sid(16) ‖ packet_id(8,BE)) XOR KS_hdr[0:24]  → 24 байта.
 
 Самопроверка:
   1) ChaCha20 keystream против RFC 8439 §2.3.2 (подтверждает формат IV: counter(4 LE)||nonce(12)).
@@ -15,9 +21,13 @@ import blake3
 from cryptography.hazmat.primitives.ciphers import Cipher, algorithms
 from cryptography.hazmat.primitives.ciphers.aead import ChaCha20Poly1305
 
-# ---- доменно-разделённые контексты KDF (фиксированы протоколом) ----
-CTX_HDR     = "CitadelPQVPN/obfs/v1/header"
-CTX_SESSION = "CitadelPQVPN/obfs/v1/session"
+# ---- доменно-разделённые контексты KDF (фиксированы протоколом, v2) ----
+CTX_HDR     = "CitadelPQVPN/obfs/v2/header"
+CTX_SESSION = "CitadelPQVPN/obfs/v2/session"
+
+# ---- размеры (v2) ----
+SID_LEN     = 16     # session_id: 128-битная per-session соль (было 8)
+HDR_PT_LEN  = SID_LEN + 8   # sid(16) ‖ packet_id(8) = 24 байта
 
 # ---- типы пакетов ----
 TYPE_INIT_C = 0x01   # первый пакет клиента (несёт timestamp)
@@ -32,7 +42,7 @@ def k_hdr(psk: bytes) -> bytes:
     return derive_key(CTX_HDR, psk)
 
 def k_sess(psk: bytes, session_id: bytes) -> bytes:
-    assert len(session_id) == 8
+    assert len(session_id) == SID_LEN
     return derive_key(CTX_SESSION, psk + session_id)
 
 # ---- ChaCha20 «сырой» keystream (для шифрования заголовка) ----
@@ -53,7 +63,7 @@ def build_inner(ptype: int, *, timestamp: int | None, echo_csid: bytes | None,
         assert timestamp is not None
         out += timestamp.to_bytes(8, "big")
     if ptype == TYPE_INIT_S:
-        assert echo_csid is not None and len(echo_csid) == 8
+        assert echo_csid is not None and len(echo_csid) == SID_LEN
         out += echo_csid
     out += len(padding).to_bytes(2, "big") + padding
     out += quic_payload
@@ -62,11 +72,11 @@ def build_inner(ptype: int, *, timestamp: int | None, echo_csid: bytes | None,
 # ---- шифрование пакета ----
 def seal(psk: bytes, session_id: bytes, packet_id: int, nonce_pkt: bytes,
          inner: bytes) -> dict:
-    assert len(nonce_pkt) == 12 and len(session_id) == 8
-    ks = chacha20_keystream(k_hdr(psk), nonce_pkt, 0, 16)
-    hdr_pt = session_id + packet_id.to_bytes(8, "big")          # 16 байт
+    assert len(nonce_pkt) == 12 and len(session_id) == SID_LEN
+    ks = chacha20_keystream(k_hdr(psk), nonce_pkt, 0, HDR_PT_LEN)
+    hdr_pt = session_id + packet_id.to_bytes(8, "big")          # 24 байта
     enc_header = bytes(a ^ b for a, b in zip(hdr_pt, ks))       # XOR
-    aad = nonce_pkt + enc_header                                # 28 байт
+    aad = nonce_pkt + enc_header                                # 12 + 24 = 36 байт
     aead = ChaCha20Poly1305(k_sess(psk, session_id))
     aead_body = aead.encrypt(body_nonce(packet_id), inner, aad)
     packet = nonce_pkt + enc_header + aead_body
@@ -75,10 +85,11 @@ def seal(psk: bytes, session_id: bytes, packet_id: int, nonce_pkt: bytes,
 
 # ---- дешифрование (для round-trip проверки) ----
 def open_packet(psk: bytes, packet: bytes) -> tuple[bytes, int, bytes]:
-    nonce_pkt, enc_header, aead_body = packet[:12], packet[12:28], packet[28:]
-    ks = chacha20_keystream(k_hdr(psk), nonce_pkt, 0, 16)
+    hdr_end = 12 + HDR_PT_LEN                                    # 36
+    nonce_pkt, enc_header, aead_body = packet[:12], packet[12:hdr_end], packet[hdr_end:]
+    ks = chacha20_keystream(k_hdr(psk), nonce_pkt, 0, HDR_PT_LEN)
     hdr_pt = bytes(a ^ b for a, b in zip(enc_header, ks))
-    session_id, packet_id = hdr_pt[:8], int.from_bytes(hdr_pt[8:16], "big")
+    session_id, packet_id = hdr_pt[:SID_LEN], int.from_bytes(hdr_pt[SID_LEN:HDR_PT_LEN], "big")
     aad = nonce_pkt + enc_header
     inner = ChaCha20Poly1305(k_sess(psk, session_id)).decrypt(body_nonce(packet_id), aead_body, aad)
     return session_id, packet_id, inner
@@ -113,14 +124,14 @@ def dump(title, psk, sid, pid, nonce_pkt, inner, r):
     print(f"PSK_obf            ({len(psk):3}) = {h(psk)}")
     print(f"  K_hdr            ( 32) = {h(k_hdr(psk))}")
     print(f"  K_sess           ( 32) = {h(k_sess(psk, sid))}")
-    print(f"session_id         (  8) = {h(sid)}")
+    print(f"session_id         ( {SID_LEN}) = {h(sid)}")
     print(f"packet_id                = {pid}")
     print(f"nonce_pkt          ( 12) = {h(nonce_pkt)}")
-    print(f"  KS_hdr[0:16]     ( 16) = {h(r['ks_hdr'])}")
-    print(f"  hdr_pt(sid||pid) ( 16) = {h(r['hdr_pt'])}")
-    print(f"  enc_header       ( 16) = {h(r['enc_header'])}")
+    print(f"  KS_hdr[0:{HDR_PT_LEN}]    ( {HDR_PT_LEN}) = {h(r['ks_hdr'])}")
+    print(f"  hdr_pt(sid||pid) ( {HDR_PT_LEN}) = {h(r['hdr_pt'])}")
+    print(f"  enc_header       ( {HDR_PT_LEN}) = {h(r['enc_header'])}")
     print(f"body_nonce         ( 12) = {h(r['body_nonce'])}")
-    print(f"aad(npkt||enchdr)  ( 28) = {h(r['aad'])}")
+    print(f"aad(npkt||enchdr)  ( {12 + HDR_PT_LEN}) = {h(r['aad'])}")
     print(f"inner_plaintext    ({len(inner):3}) = {h(inner)}")
     print(f"aead_body(ct||tag) ({len(r['aead_body']):3}) = {h(r['aead_body'])}")
     print(f">> PACKET on wire  ({len(r['packet']):3}) = {h(r['packet'])}")
@@ -129,8 +140,9 @@ def main():
     selftest_rfc8439()
 
     PSK = bytes(range(32))                     # 000102...1f — фиксировано для вектора
-    csid = bytes.fromhex("a1a2a3a4a5a6a7a8")
-    ssid = bytes.fromhex("b1b2b3b4b5b6b7b8")
+    # session_id v2 — 16 байт (было 8). Каждое направление свой sid.
+    csid = bytes.fromhex("a1a2a3a4a5a6a7a8a9aaabacadaeafb0")
+    ssid = bytes.fromhex("b1b2b3b4b5b6b7b8b9babbbcbdbebfc0")
 
     # --- Вектор 1: INIT_C (клиент → сервер, первый пакет) ---
     npkt1 = bytes.fromhex("000102030405060708090a0b")

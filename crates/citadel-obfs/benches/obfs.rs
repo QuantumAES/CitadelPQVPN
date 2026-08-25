@@ -7,7 +7,7 @@ use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criteri
 fn psk() -> [u8; 32] {
     [0x42; 32]
 }
-const SID: [u8; 8] = [1, 2, 3, 4, 5, 6, 7, 8];
+const SID: [u8; SID_LEN] = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16];
 const NONCE: [u8; 12] = [7; 12];
 
 fn bench_kdf(c: &mut Criterion) {

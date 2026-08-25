@@ -3,6 +3,9 @@
 **/*.rs.bk
 *.pdb
 
+# --- Артефакты релиза (tools/mk-release.sh) ---
+/dist
+
 # --- Python (.venv для tools/obfs_ref.py + cmake под aws-lc-rs) ---
 .venv/
 __pycache__/
@@ -13,6 +16,11 @@ __pycache__/
 docker/citadel-m1
 docker/citadel-token
 docker/citadel-m0
+# бинари клиента трека L, копируются в docker/ прогоном run-cli-tests.sh
+docker/citadel-vpnd
+docker/citadel-engine
+docker/citadel-cli
+docker/citadel-linkgen
 docker/veil-*
 docker/.env
 
@@ -25,9 +33,18 @@ issuer.key
 /tokens
 docker/tokens
 
+# --- Релизный minisign-ключ подписи: СЕКРЕТ никогда не в git (коммитим только *.pub) ---
+citadel-release.key
+packaging/release/*.key
+.citadel/
+
 # --- ОС / редакторы ---
 .DS_Store
 *.swp
 *~
 .idea/
 .vscode/
+
+# --- Временные/мусорные ---
+*.tmp
+*.kate-swp

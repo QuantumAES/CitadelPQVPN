@@ -1,0 +1,8 @@
+# Артефакты cargo-fuzz.
+target/
+artifacts/
+coverage/
+
+# Рабочий корпус: растёт кампанией до сотен мегабайт и в репозиторий не едет.
+# В репозитории живёт fuzz/seeds/<цель>/ — выжимка (см. tools/fuzz.sh, docs/CWE-REVIEW-PLAN §5 Ф1).
+corpus/

@@ -1,0 +1,5 @@
+# Python-эталон obfs L1 (tools/obfs_ref.py) + cmake для сборки aws-lc-rs.
+# Версии зафиксированы под текущее рабочее окружение (.venv, Python 3.13).
+blake3==1.0.8
+cryptography==49.0.0
+cmake==4.3.2

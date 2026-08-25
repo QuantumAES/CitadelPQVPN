@@ -1,0 +1,49 @@
+[package]
+name = "citadel-winsvc"
+version.workspace = true
+publish.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "CitadelPQVPN — привилегированная Windows-служба citadel-svc (модель W2): WinTUN + WFP kill-switch + маршруты/DNS, packet-pump ↔ named pipe приложения"
+
+[[bin]]
+name = "citadel-svc"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1"
+# Ядро W2 (кадры пайпа, WFP-план, маршруты) — общее с провайдером; БЕЗ движка (меньше attack surface).
+citadel-winnet = { path = "../citadel-winnet" }
+
+# П.1: version-ресурс (VERSIONINFO) citadel-svc.exe — свойства/Подробно как у app.exe. Плейн
+# build-dep (компилится на любом хосте); build.rs использует только при target_os=windows.
+[build-dependencies]
+winresource = "0.1"
+
+# Windows-only WinAPI. windows-sys 0.60 уже в Cargo.lock (транзитивно) → без новых версий.
+# Pipe-сервер (CreateNamedPipeW/ConnectNamedPipe/ReadFile/WriteFile). WinTUN-адаптер (крейт wintun),
+# WFP и SCM (windows-service) добавятся в 3b/3c — сейчас исполнители-заглушки за TODO.
+[target.'cfg(windows)'.dependencies]
+wintun = "0.5"              # WinTUN-адаптер (грузит wintun.dll от WireGuard рантаймом)
+windows-service = "0.8"     # SCM: регистрация/установка службы + control-handler (Stop/Shutdown)
+windows-sys = { version = "0.60", features = [
+    "Win32_Foundation",
+    "Win32_System_Pipes",
+    "Win32_Storage_FileSystem",
+    "Win32_System_IO",              # OVERLAPPED — ReadFile/WriteFile/ConnectNamedPipe + CancelIoEx
+    "Win32_Security",               # SECURITY_ATTRIBUTES/PSECURITY_DESCRIPTOR (ACL пайпа)
+    "Win32_Security_Authorization", # ConvertStringSecurityDescriptorToSecurityDescriptorW (SDDL)
+    "Win32_System_Console",         # SetStdHandle/STD_ERROR_HANDLE — файловый лог службы (log.rs)
+    "Win32_System_SystemInformation", # GetLocalTime + GetSystemTimeAsFileTime (L-9: анти-PID-reuse)
+    "Win32_System_Threading",       # CreateEventW/ResetEvent — overlapped-I/O пайпа (packet-pump)
+    "Win32_Security_WinTrust",      # L-9: WinVerifyTrust — подпись образа клиента пайпа
+    "Win32_Security_Cryptography",  # L-9: издатель из встроенной PKCS#7 (CryptQueryObject/CertGetNameStringW)
+    "Win32_NetworkManagement_IpHelper", # GetBestInterface — индекс физ.интерфейса для bypass-route
+] }
+# WFP kill-switch (FWPM) — windows-rs 0.62 (уже в lock): Result-обёртки безопаснее сырого FFI.
+windows = { version = "0.62", features = [
+    "Win32_Foundation",
+    "Win32_NetworkManagement_WindowsFilteringPlatform",
+    "Win32_Security",       # FWPM-структуры (FWPM_SESSION0/FILTER0/…) гейтятся этой фичей
+    "Win32_System_Rpc",     # RPC_C_AUTHN_WINNT + FwpmEngineOpen0
+] }

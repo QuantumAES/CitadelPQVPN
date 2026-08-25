@@ -1,0 +1,18 @@
+# Образ для e2e-проверки консольного Linux-клиента (трек L): демон + движок + CLI.
+# Отдельный от демо-образа, чтобы не тянуть новые крейты в прогон M1-демо.
+# S1.5: тот же digest-pin базового образа (воспроизводимость + supply-chain).
+FROM debian:trixie-slim@sha256:28de0877c2189802884ccd20f15ee41c203573bd87bb6b883f5f46362d24c5c2
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        iproute2 iptables iputils-ping curl ca-certificates dnsutils procps passwd \
+    && rm -rf /var/lib/apt/lists/*
+
+# Раскладка ровно как у установщика tools/install-cli.sh: привилегированные компоненты в
+# /usr/lib/citadel-pqvpn (root:root, без setuid), пользовательский CLI — в /usr/bin.
+RUN install -d -m 755 /usr/lib/citadel-pqvpn
+COPY citadel-vpnd citadel-engine /usr/lib/citadel-pqvpn/
+COPY citadel-cli citadel-linkgen citadel-token /usr/bin/
+COPY entrypoint-client-cli.sh /usr/local/bin/
+RUN chmod 755 /usr/lib/citadel-pqvpn/citadel-vpnd /usr/lib/citadel-pqvpn/citadel-engine \
+              /usr/bin/citadel-cli /usr/bin/citadel-linkgen /usr/bin/citadel-token \
+              /usr/local/bin/entrypoint-client-cli.sh

@@ -1,0 +1,590 @@
+//! C7.3 — клиентское ядро admin-плоскости: управление реестром абонентов ПО ТУННЕЛЮ и локальная
+//! выдача клиентских ссылок. Async-обёртка (spawn_blocking) над sync-протоколом
+//! `citadel_token::admin` — работает на ВСЕХ платформах (в отличие от SSH-пути C5.5: russh не
+//! собирался в мобильный APK).
+//!
+//! Модель (см. SECURITY-ROADMAP §C7):
+//!   - параметры admin-канала (адрес/pin/seed) выводятся из МАСТЕР-ссылки: `admin_seed` +
+//!     `issuer_pin` (тот же pin PQ-TLS, что для token-fetch) + `admin_port`; хост фиксирован —
+//!     [`ADMIN_VIP`] (шлюз туннеля), поэтому канал достижим только из-под поднятого туннеля;
+//!   - выдача нового абонента идёт ЦЕЛИКОМ на устройстве админа: свежий `client_seed` (CSPRNG) →
+//!     регистрация ТОЛЬКО pub (client_id) по admin-каналу → клиентская ссылка собирается локально
+//!     (мастер-бандл минус admin-поля, с новым seed). Issuer seed не видит (модель C5.4b).
+//!
+//! Каждая операция самодостаточна: `connect → op → close` (как `fetch_tokens`/бывший SSH-путь) —
+//! состояние TLS-сессии между вызовами не удерживается (admin-операции редкие, человеко-инициируемые).
+
+use anyhow::{anyhow, Context, Result};
+use zeroize::Zeroize;
+
+use citadel_token::admin::{AdminClient, RegistryEntry, ADMIN_VIP};
+
+use crate::creds::CredentialLink;
+
+/// Запись реестra абонентов для UI (client_id в hex; `active` — удобный флаг).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SubscriberEntry {
+    pub client_id_hex: String,
+    pub valid_until_unix: i64,
+    pub status: String,
+    pub active: bool,
+    /// M-9: устройство, в которое активирована эта (первичная) ссылка — hex или пусто.
+    /// Нужно, чтобы UI показал ОДНУ строку на абонента: после активации в реестре их две
+    /// (ссылка `consumed` + запись устройства), и метка админа привязана к первой, а доступ
+    /// даёт вторая.
+    pub device_hex: String,
+    /// Под каким client_id искать локальную метку админа: для устройственной записи это id
+    /// ССЫЛКИ (метка сохранялась при выдаче), для обычной — она сама. Проставляет
+    /// [`fold_activated`].
+    pub label_id_hex: String,
+}
+
+impl From<RegistryEntry> for SubscriberEntry {
+    fn from(e: RegistryEntry) -> Self {
+        let client_id_hex = hex::encode(e.client_id);
+        Self {
+            active: e.status == "active",
+            label_id_hex: client_id_hex.clone(),
+            client_id_hex,
+            valid_until_unix: e.valid_until as i64,
+            status: e.status,
+            device_hex: e.device.map(hex::encode).unwrap_or_default(),
+        }
+    }
+}
+
+/// Результат выдачи нового абонента: его client_id (hex), готовая клиентская `citadel://`-ссылка,
+/// код сверки и срок, до которого её нужно активировать (M-9).
+#[derive(Clone, Debug)]
+pub struct IssuedLink {
+    pub client_id_hex: String,
+    /// Клиентская ссылка (БЕЗ admin-полей) — раздать абоненту (QR/копирование).
+    pub uri: String,
+    /// M-9: код сверки — короткий отпечаток ссылки. Админ называет его абоненту по ДРУГОМУ каналу
+    /// (голосом, при встрече), абонент видит тот же код при импорте. Ловит подмену ссылки при
+    /// доставке — то, что не ловит никакая проверка внутри самой ссылки.
+    pub verify_code: String,
+    /// M-9: до какого момента (unix) ссылку можно активировать; после — она мертва.
+    pub activate_until: u64,
+}
+
+/// Свежий client-seed из CSPRNG (aws-lc-rs, тот же бэкенд, что vault/движок).
+fn random_seed() -> Result<[u8; 32]> {
+    use aws_lc_rs::rand::{SecureRandom, SystemRandom};
+    let mut s = [0u8; 32];
+    SystemRandom::new().fill(&mut s).map_err(|_| anyhow!("CSPRNG"))?;
+    Ok(s)
+}
+
+/// Параметры аутентификации admin-канала: `(issuer_pin, issuer_mldsa, admin_seed, obfs_psk)`.
+type AdminAuth = ([u8; 32], [u8; 32], [u8; 32], Option<[u8; 32]>);
+
+/// `(pin, issuer_mldsa, admin_seed, obfs_psk)` из мастер-ссылки. Ошибка, если ссылка не мастер (нет
+/// admin-seed), в ней нет issuer_pin (без него PQ-TLS канал был бы MITM-открыт) или нет
+/// PQ-обязательства издателя (без него подлинность сервера держалась бы на классической подписи).
+/// `obfs_psk` (S2.1/A1-остаток) — тот же, что у туннеля/token-fetch: `Some` → admin-канал обёрнут в
+/// obfs (probe-resistance), совпадает с серверной обёрткой; `None` (ссылка без obfs) → голый TLS.
+fn admin_auth(master_uri: &str) -> Result<AdminAuth> {
+    let link = CredentialLink::from_uri(master_uri).context("разбор мастер-ссылки")?;
+    let seed = link
+        .admin_seed
+        .ok_or_else(|| anyhow!("ссылка не мастер (нет admin-seed) — admin-операции недоступны"))?;
+    let pin = link.issuer_pin.ok_or_else(|| {
+        anyhow!("в ссылке нет issuer_pin — небезопасный канал к admin-плоскости (A1)")
+    })?;
+    let mldsa = link.issuer_mldsa.ok_or_else(|| {
+        anyhow!("в ссылке нет PQ-обязательства издателя — перевыпустите мастер-ссылку")
+    })?;
+    Ok((pin, mldsa, seed, link.obfs_psk))
+}
+
+/// Адрес admin-канала (host:port) для мастер-ссылки: хост фиксирован [`ADMIN_VIP`] (доступ только
+/// из туннеля), порт — из ссылки.
+fn admin_addr(master_uri: &str) -> Result<String> {
+    let port = CredentialLink::from_uri(master_uri).context("разбор мастер-ссылки")?.admin_port();
+    Ok(format!("{ADMIN_VIP}:{port}"))
+}
+
+/// Цель диагностической admin-пробы: `(ADMIN_VIP, admin_port)` для МАСТЕР-ссылки. `None` —
+/// ссылка клиентская (admin-полей нет) или не парсится, тогда шаг диагностики просто пропускается.
+/// Проба (см. `citadel_quic::diag`) шлёт TCP-SYN на этот адрес прямо в туннель, мимо ОС-роутинга.
+pub fn admin_probe_dst(master_uri: &str) -> Option<([u8; 4], u16)> {
+    let link = CredentialLink::from_uri(master_uri).ok()?;
+    link.admin_seed?; // не мастер (нет admin-seed) — admin-канала нет
+    let vip: std::net::Ipv4Addr = ADMIN_VIP.parse().ok()?;
+    Some((vip.octets(), link.admin_port().parse().ok()?))
+}
+
+/// Разобрать client_id (64 hex) в 32 байта.
+pub fn parse_client_id(hexstr: &str) -> Result<[u8; 32]> {
+    hex::decode(hexstr.trim())
+        .ok()
+        .and_then(|v| v.try_into().ok())
+        .ok_or_else(|| anyhow!("client_id должен быть 64 hex (32 байта)"))
+}
+
+/// `valid_until` для UI → абсолютные unix-секунды. Пусто → `0` (серверный дефолт +365д);
+/// `+<N>d`/`+<N>h`/`+<секунды>` — относительно `now`; иначе абсолютные unix-секунды.
+pub fn parse_valid_until(s: &str, now: u64) -> Result<u64> {
+    let s = s.trim();
+    if s.is_empty() {
+        return Ok(0); // сигнал «серверный дефолт»
+    }
+    if let Some(rest) = s.strip_prefix('+') {
+        let (num, mult) = match rest.chars().last() {
+            Some('d') => (&rest[..rest.len() - 1], 24 * 3600),
+            Some('h') => (&rest[..rest.len() - 1], 3600),
+            _ => (rest, 1),
+        };
+        let n: u64 = num.parse().context("срок: ожидалось +<N>d | +<N>h | +<секунды> | unix")?;
+        Ok(now + n * mult)
+    } else {
+        s.parse().context("срок: unix-секунды или относительное +<N>d")
+    }
+}
+
+/// Собрать КЛИЕНТСКУЮ ссылку из мастер-ссылки: тот же exit/pin/obfs/issuer, но со СВЕЖИМ
+/// `client_seed` и БЕЗ admin-полей (абонент не получает admin-прав). Чистая функция (без сети).
+///
+/// M-9: ссылка выпускается **первичной** — с окном активации `activate_until` (unix) и признаком
+/// `enroll`. Многоразовых бессрочных ссылок клиентский путь больше не выпускает: именно
+/// бессрочность и предъявительский характер аудит назвал сутью находки.
+pub fn build_subscriber_link(
+    master_uri: &str,
+    client_seed: &[u8; 32],
+    activate_until: u64,
+) -> Result<String> {
+    build_subscriber_link_full(master_uri, client_seed, activate_until)?.to_uri()
+}
+
+/// То же, но возвращает саму ссылку — из неё считаются отпечаток и код сверки (M-9).
+fn build_subscriber_link_full(
+    master_uri: &str,
+    client_seed: &[u8; 32],
+    activate_until: u64,
+) -> Result<CredentialLink> {
+    let mut link = CredentialLink::from_uri(master_uri).context("разбор мастер-ссылки")?;
+    // затираем admin-seed мастера в этой копии ДО сброса поля (не оставляем секрет в памяти)
+    if let Some(mut s) = link.admin_seed.take() {
+        s.zeroize();
+    }
+    link.admin_port = None;
+    link.client_seed = Some(*client_seed);
+    link.exp = Some(activate_until);
+    link.enroll = true;
+    Ok(link)
+}
+
+// ─────────────────────────── async-операции (spawn_blocking) ───────────────────────────
+// Внутренние `*_at` берут явный `addr` (тестируемы против in-process issuer); публичные выводят
+// адрес из мастер-ссылки ([`ADMIN_VIP`]).
+
+/// Дополнить отказ admin-операции тем, что движок знает о САМОМ туннеле.
+///
+/// Канал «Абоненты» живёт ВНУТРИ туннеля, поэтому «список не грузится» — обычно не про admin-канал
+/// вовсе, а про то, что туннель поднят, но данные по нему не ходят. Без этой приписки экран
+/// показывал «admin-канал 10.7.0.1:7001 недоступен (туннель поднят?)» — вопрос, на который у
+/// человека нет способа ответить, хотя движок ответ уже знает (см. `dataplane::data_path`).
+/// Отказать СРАЗУ, если движок уже знает, что канал не работает.
+///
+/// Admin-канал идёт к ADMIN_VIP внутри туннеля, и его SYN в мёртвый туннель тонет молча до
+/// `CONNECT_TIMEOUT` (10с). Пока он тонет, движок успевает диагностировать путь и переподключиться
+/// другим транспортом — то есть эти 10с человек ждёт впустую, а потом ещё и получает отказ. Если
+/// вердикт уже вынесен, честнее сказать это мгновенно: повтор через несколько секунд попадёт на
+/// живую сессию.
+fn refuse_if_path_dead() -> Result<()> {
+    if citadel_quic::dataplane::data_path() == citadel_quic::dataplane::DataPath::UplinkDead {
+        anyhow::bail!(
+            "туннель поднят, но наши пакеты не доходят до узла — движок сейчас переподключается \
+             другим транспортом; повторите через несколько секунд"
+        );
+    }
+    Ok(())
+}
+
+fn explain_path(e: anyhow::Error) -> anyhow::Error {
+    use citadel_quic::dataplane::{data_path, DataPath};
+    match data_path() {
+        DataPath::UplinkDead => e.context(
+            "туннель поднят, но наши пакеты не доходят до узла (потери / узкий MTU пути) — \
+             admin-канал идёт ВНУТРИ туннеля, поэтому и он молчит; движок переподключится другим \
+             транспортом",
+        ),
+        DataPath::ExitSilent => e.context(
+            "туннель поднят, до узла пакеты доходят, а обратного трафика нет — молчит сам узел \
+             (admin-канал идёт ВНУТРИ туннеля)",
+        ),
+        DataPath::Ok | DataPath::Unknown => e,
+    }
+}
+
+async fn list_at(
+    addr: String,
+    pin: [u8; 32],
+    mldsa: [u8; 32],
+    seed: [u8; 32],
+    obfs_psk: Option<[u8; 32]>,
+) -> Result<Vec<SubscriberEntry>> {
+    refuse_if_path_dead()?;
+    tokio::task::spawn_blocking(move || -> Result<Vec<SubscriberEntry>> {
+        let mut c = AdminClient::connect(&addr, &pin, &mldsa, &seed, obfs_psk)?;
+        Ok(c.list()?.into_iter().map(SubscriberEntry::from).collect())
+    })
+    .await
+    .context("admin-list задача паникнула")?
+    .map_err(explain_path)
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn add_at(
+    addr: String,
+    pin: [u8; 32],
+    mldsa: [u8; 32],
+    seed: [u8; 32],
+    obfs_psk: Option<[u8; 32]>,
+    client_id: [u8; 32],
+    valid_until: u64,
+    // M-9: `Some((окно активации, отпечаток ссылки))` — запись становится одноразовой и заверенной.
+    enroll: Option<(u64, [u8; 32])>,
+) -> Result<()> {
+    refuse_if_path_dead()?;
+    tokio::task::spawn_blocking(move || -> Result<()> {
+        let mut c = AdminClient::connect(&addr, &pin, &mldsa, &seed, obfs_psk)?;
+        match enroll {
+            Some((until, hash)) => c.add_enrollable(client_id, valid_until, until, hash),
+            None => c.add(client_id, valid_until),
+        }
+    })
+    .await
+    .context("admin-add задача паникнула")?
+    .map_err(explain_path)
+}
+
+async fn revoke_at(
+    addr: String,
+    pin: [u8; 32],
+    mldsa: [u8; 32],
+    seed: [u8; 32],
+    obfs_psk: Option<[u8; 32]>,
+    client_id: [u8; 32],
+) -> Result<()> {
+    refuse_if_path_dead()?;
+    tokio::task::spawn_blocking(move || -> Result<()> {
+        let mut c = AdminClient::connect(&addr, &pin, &mldsa, &seed, obfs_psk)?;
+        c.revoke(client_id)
+    })
+    .await
+    .context("admin-revoke задача паникнула")?
+    .map_err(explain_path)
+}
+
+/// Список абонентов реестра (по admin-каналу через туннель).
+pub async fn admin_list(master_uri: String) -> Result<Vec<SubscriberEntry>> {
+    let (pin, mldsa, seed, obfs_psk) = admin_auth(&master_uri)?;
+    Ok(fold_activated(list_at(admin_addr(&master_uri)?, pin, mldsa, seed, obfs_psk).await?))
+}
+
+/// M-9: свернуть пару строк «ссылка + устройство» в ОДНУ строку абонента.
+///
+/// После активации в реестре два ряда: первичная ссылка (`consumed`, `dev=<id>`) и запись
+/// устройства — доступ даёт вторая. Админ же узнаёт абонента по метке, а метка сохранена под
+/// client_id ССЫЛКИ. Показ обеих строк и был той путаницей, из-за которой отзыв выглядел
+/// неработающим: гасили запись с меткой, а пускала соседняя.
+///
+/// Правило: строку ссылки прячем, если её устройство действительно есть в списке; у оставшейся
+/// (устройственной) в [`SubscriberEntry::label_id_hex`] проставляем id ссылки — по нему UI найдёт
+/// метку. Битый/поправленный руками реестр (устройства нет) ничего не прячет — иначе абонент
+/// исчез бы из списка совсем и его нельзя было бы даже отозвать.
+pub fn fold_activated(entries: Vec<SubscriberEntry>) -> Vec<SubscriberEntry> {
+    let ids: std::collections::HashSet<String> =
+        entries.iter().map(|e| e.client_id_hex.clone()).collect();
+    // устройство → ссылка, из которой оно выросло
+    let link_of: std::collections::HashMap<String, String> = entries
+        .iter()
+        .filter(|e| !e.device_hex.is_empty())
+        .map(|e| (e.device_hex.clone(), e.client_id_hex.clone()))
+        .collect();
+    entries
+        .iter()
+        .filter(|e| e.device_hex.is_empty() || !ids.contains(&e.device_hex))
+        .map(|e| SubscriberEntry {
+            label_id_hex: link_of.get(&e.client_id_hex).cloned().unwrap_or_else(|| e.client_id_hex.clone()),
+            ..e.clone()
+        })
+        .collect()
+}
+
+/// Отозвать абонента по client_id (hex). Отзыв админом собственного client_id сервер отклонит (R6).
+pub async fn admin_revoke(master_uri: String, client_id_hex: String) -> Result<()> {
+    let (pin, mldsa, seed, obfs_psk) = admin_auth(&master_uri)?;
+    let cid = parse_client_id(&client_id_hex)?;
+    revoke_at(admin_addr(&master_uri)?, pin, mldsa, seed, obfs_psk, cid).await
+}
+
+/// Выдать доступ новому абоненту: свежий seed → регистрация pub по admin-каналу → клиентская ссылка
+/// (локально). `valid_until == 0` → серверный дефолт. Возвращает client_id + ссылку для раздачи.
+/// Ссылка строится ДО регистрации (валидация мастер-ссылки) — при ошибке сборки в реестр ничего
+/// не пишем.
+pub async fn admin_issue(master_uri: String, valid_until: u64) -> Result<IssuedLink> {
+    admin_issue_until(master_uri, valid_until, 0).await
+}
+
+/// M-9: выдача с явным окном активации. `activate_secs == 0` → [`DEFAULT_ACTIVATION_SECS`] (24 ч).
+///
+/// Порядок шагов важен: ссылка и её отпечаток считаются ЛОКАЛЬНО, и только потом запись уходит в
+/// реестр — вместе с отпечатком. Так издатель заверяет ровно то, что админ действительно выдал, и
+/// при активации ловит подменённую по дороге ссылку. Ошибка сборки ссылки — в реестр ничего не
+/// пишем (иначе остались бы «висячие» записи без выданной ссылки).
+pub async fn admin_issue_until(
+    master_uri: String,
+    valid_until: u64,
+    activate_secs: u64,
+) -> Result<IssuedLink> {
+    let (pin, mldsa, seed, obfs_psk) = admin_auth(&master_uri)?;
+    let addr = admin_addr(&master_uri)?;
+    let mut client_seed = random_seed()?;
+    // PQ: client_id — идентификатор ГИБРИДНОЙ идентичности (BLAKE3(ed_pub‖mldsa_pub)), тот же,
+    // что выведет издатель из auth-кадра абонента. Регистрируем именно его.
+    let client_id = citadel_token::pqid::id_from_seed(&client_seed)?;
+    let secs = if activate_secs == 0 { crate::creds::DEFAULT_ACTIVATION_SECS } else { activate_secs };
+    let activate_until = now_unix() + secs;
+    let built = build_subscriber_link_full(&master_uri, &client_seed, activate_until);
+    client_seed.zeroize(); // seed уже в ссылке; локальную копию затираем
+    let link = built?;
+    let uri = link.to_uri()?;
+    let link_hash = link.link_hash().ok_or_else(|| anyhow!("не посчитать отпечаток ссылки"))?;
+    let verify_code = link.verify_code().unwrap_or_default();
+    add_at(
+        addr,
+        pin,
+        mldsa,
+        seed,
+        obfs_psk,
+        client_id,
+        valid_until,
+        Some((activate_until, link_hash)),
+    )
+    .await?;
+    Ok(IssuedLink { client_id_hex: hex::encode(client_id), uri, verify_code, activate_until })
+}
+
+fn now_unix() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::creds::{CredentialBundle, BUNDLE_VERSION};
+    use citadel_token::admin::AdminServer;
+    use citadel_token::pqtls;
+    use std::net::TcpListener;
+
+    fn entry(id: &str, status: &str, dev: &str) -> SubscriberEntry {
+        SubscriberEntry {
+            client_id_hex: id.into(),
+            valid_until_unix: 1_000,
+            status: status.into(),
+            active: status == "active",
+            device_hex: dev.into(),
+            label_id_hex: id.into(),
+        }
+    }
+
+    /// M-9: активированная ссылка и её устройство — ОДИН абонент, одна строка. Показываем ту, что
+    /// даёт доступ (устройственную), а метку ищем по id ссылки: именно под ним админ её сохранил.
+    /// Пока обе строки висели рядом, отзыв выглядел неработающим — гасили запись с меткой, а
+    /// пускала соседняя.
+    #[test]
+    fn activated_link_and_device_fold_into_one_row() {
+        let rows = fold_activated(vec![
+            entry("aa", "consumed", "bb"), // ссылка, активированная в устройство bb
+            entry("bb", "active", ""),     // само устройство — живой доступ
+            entry("cc", "active", ""),     // обычный абонент
+        ]);
+        let ids: Vec<&str> = rows.iter().map(|e| e.client_id_hex.as_str()).collect();
+        assert_eq!(ids, vec!["bb", "cc"], "строка ссылки скрыта, устройство и обычный остались");
+        let dev = rows.iter().find(|e| e.client_id_hex == "bb").unwrap();
+        assert_eq!(dev.label_id_hex, "aa", "метку ищем по id ссылки");
+        assert!(dev.active);
+        let plain = rows.iter().find(|e| e.client_id_hex == "cc").unwrap();
+        assert_eq!(plain.label_id_hex, "cc", "у обычной записи метка своя");
+    }
+
+    /// Невыданное устройство (реестр поправлен руками / обрыв на активации) НЕ должно прятать
+    /// абонента: иначе он исчезает из списка, и его нельзя даже отозвать.
+    #[test]
+    fn dangling_device_reference_hides_nothing() {
+        let rows = fold_activated(vec![entry("aa", "consumed", "zz")]);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].client_id_hex, "aa");
+        assert_eq!(rows[0].label_id_hex, "aa");
+    }
+
+    /// Мастер-бандл: exit/pin/issuer/obfs + admin (seed фиксирован для детерминизма теста).
+    fn master_bundle(admin_seed: [u8; 32]) -> CredentialBundle {
+        CredentialBundle {
+            version: BUNDLE_VERSION,
+            servers: vec!["exit.example:4433".into()],
+            server_name: "citadel.exit".into(),
+            kx_suite: "pq".into(),
+            cert_pin: Some([1u8; 32]),
+            mldsa_pub: Some(vec![2u8; 1952]),
+            obfs_psk: Some([3u8; 32]),
+            tcp_port: Some("443".into()),
+            issuer: Some("exit.example:7000".into()),
+            issuer_pub: Some(vec![4u8; 270]),
+            issuer_pin: Some([5u8; 32]),
+            issuer_mldsa: Some([9u8; 32]),
+            client_seed: Some([6u8; 32]),
+            admin_seed: Some(admin_seed),
+            admin_port: Some("7001".into()),
+            routes: "0.0.0.0/0".into(),
+            dns: Some("1.1.1.1".into()),
+            exp: None,
+            enroll: false,
+        }
+    }
+
+    fn master_uri(admin_seed: [u8; 32]) -> String {
+        CredentialLink::from_bundle(&master_bundle(admin_seed)).to_uri().unwrap()
+    }
+
+    /// build_subscriber_link: клиентская ссылка теряет admin-поля, получает НОВЫЙ seed, сохраняет
+    /// exit/pin/obfs/issuer; parse видит её как не-мастер.
+    #[test]
+    fn subscriber_link_strips_admin_and_swaps_seed() {
+        let uri = master_uri([0x77; 32]);
+        let new_seed = [0xAB; 32];
+        let until = now_unix() + crate::creds::DEFAULT_ACTIVATION_SECS;
+        let client_uri = build_subscriber_link(&uri, &new_seed, until).unwrap();
+        let client = CredentialLink::from_uri(&client_uri).unwrap();
+        assert!(!client.is_admin(), "клиентская ссылка без admin-прав");
+        assert_eq!(client.admin_seed, None);
+        assert_eq!(client.admin_port, None);
+        assert_eq!(client.client_seed, Some(new_seed), "свежий client-seed");
+        // унаследованное от мастера — на месте
+        assert_eq!(client.cert_pin, Some([1u8; 32]));
+        assert_eq!(client.obfs_psk, Some([3u8; 32]));
+        assert_eq!(client.issuer_pin, Some([5u8; 32]));
+        assert_eq!(client.servers, vec!["exit.example:4433".to_string()]);
+    }
+
+    /// admin_addr / admin_auth выводятся из мастер-ссылки; на не-мастер (клиентской) — ошибка.
+    #[test]
+    fn conn_params_derived_and_reject_non_master() {
+        let uri = master_uri([0x51; 32]);
+        assert_eq!(admin_addr(&uri).unwrap(), format!("{ADMIN_VIP}:7001"));
+        let (pin, _mldsa, seed, obfs) = admin_auth(&uri).unwrap();
+        assert_eq!(pin, [5u8; 32]);
+        assert_eq!(seed, [0x51; 32]);
+        assert_eq!(obfs, Some([3u8; 32]), "obfs_psk наследуется из мастер-ссылки (A1-остаток)");
+        // клиентская ссылка (без admin) → admin_auth отказывает
+        let client_uri = build_subscriber_link(&uri, &[9u8; 32], now_unix() + 3600).unwrap();
+        assert!(admin_auth(&client_uri).is_err());
+    }
+
+    #[test]
+    fn valid_until_parsing() {
+        let now = 1_000_000u64;
+        assert_eq!(parse_valid_until("", now).unwrap(), 0); // дефолт
+        assert_eq!(parse_valid_until("1700000000", now).unwrap(), 1_700_000_000);
+        assert_eq!(parse_valid_until("+2d", now).unwrap(), now + 2 * 24 * 3600);
+        assert_eq!(parse_valid_until("+3h", now).unwrap(), now + 3 * 3600);
+        assert!(parse_valid_until("+bad", now).is_err());
+    }
+
+    // ── e2e против in-process issuer admin-сервера (тот же путь, что реальный, минус туннель) ──
+
+    /// Возвращает (addr, cert_pin, обязательство PQ-идентичности издателя, handle).
+    fn spawn_admin(
+        dir: &str,
+        conns: usize,
+    ) -> (String, [u8; 32], [u8; 32], std::thread::JoinHandle<()>) {
+        let id = pqtls::IssuerIdentity::load_or_generate(dir).unwrap();
+        let pin = id.pin;
+        let scfg = id.server_config().unwrap();
+        let pq = std::sync::Arc::new(
+            citadel_token::pqid::IssuerPqIdentity::load_or_generate(dir).unwrap(),
+        );
+        let commitment = pq.commitment();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        let dir = dir.to_string();
+        let h = std::thread::spawn(move || {
+            for _ in 0..conns {
+                let (tcp, _) = listener.accept().unwrap();
+                let srv = AdminServer { dir: dir.clone() };
+                if let Ok(tls) = pqtls::accept_tls(tcp, scfg.clone(), None) {
+                    let _ = srv.serve_conn(tls, &pq, &pin, || {});
+                }
+            }
+        });
+        (addr, pin, commitment, h)
+    }
+
+    fn tmp_dir(tag: &str) -> String {
+        let d = std::env::temp_dir().join(format!("citadel-cliadmin-{tag}-{}", std::process::id()));
+        std::fs::create_dir_all(&d).unwrap();
+        d.to_str().unwrap().to_string()
+    }
+
+    /// Полный клиентский цикл: issue (свежий seed → регистрация → ссылка) → list видит абонента
+    /// active → revoke → list видит revoked. Идёт через реальный async-путь (`*_at`), но с явным
+    /// 127.0.0.1-адресом вместо ADMIN_VIP (туннель в юните недоступен).
+    #[tokio::test]
+    async fn e2e_issue_list_revoke_via_admin_channel() {
+        let dir = tmp_dir("e2e");
+        let admin_seed = [0x33u8; 32];
+        let admin_id = citadel_token::pqid::id_from_seed(&admin_seed).unwrap();
+        std::fs::write(format!("{dir}/admin_id"), hex::encode(admin_id)).unwrap();
+        std::fs::write(format!("{dir}/registry"), "").unwrap();
+        let (addr, pin, mldsa, h) = spawn_admin(&dir, 4); // add + list + revoke + list = 4 коннекта
+
+        let uri = master_uri(admin_seed);
+        // issue: сгенерить seed, собрать ссылку, зарегистрировать client_id
+        let mut client_seed = random_seed().unwrap();
+        let client_id = citadel_token::pqid::id_from_seed(&client_seed).unwrap();
+        let until = now_unix() + 3600;
+        let client_uri = build_subscriber_link(&uri, &client_seed, until).unwrap();
+        client_seed.zeroize();
+        let hash = CredentialLink::from_uri(&client_uri).unwrap().link_hash().unwrap();
+        add_at(addr.clone(), pin, mldsa, admin_seed, None, client_id, 0, Some((until, hash)))
+            .await
+            .unwrap();
+        assert!(CredentialLink::from_uri(&client_uri).unwrap().client_seed.is_some());
+
+        // list: абонент active с дефолтным сроком (+365д)
+        let list = list_at(addr.clone(), pin, mldsa, admin_seed, None).await.unwrap();
+        let e = list.iter().find(|e| e.client_id_hex == hex::encode(client_id)).expect("в реестре");
+        assert!(e.active && e.status == "active");
+        assert!(e.valid_until_unix > 0);
+
+        // revoke → status revoked
+        revoke_at(addr.clone(), pin, mldsa, admin_seed, None, client_id).await.unwrap();
+        let after = list_at(addr, pin, mldsa, admin_seed, None).await.unwrap();
+        assert_eq!(
+            after.iter().find(|e| e.client_id_hex == hex::encode(client_id)).unwrap().status,
+            "revoked"
+        );
+        h.join().unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Чужой admin-seed (не тот, что записан в admin_id на сервере) → connect отклонён.
+    #[tokio::test]
+    async fn admin_channel_rejects_wrong_seed() {
+        let dir = tmp_dir("wrong");
+        let real_admin = citadel_token::pqid::id_from_seed(&[0x40u8; 32]).unwrap();
+        std::fs::write(format!("{dir}/admin_id"), hex::encode(real_admin)).unwrap();
+        std::fs::write(format!("{dir}/registry"), "").unwrap();
+        let (addr, pin, mldsa, h) = spawn_admin(&dir, 1);
+        // клиент подписывает ДРУГИМ seed → сервер не пускает
+        assert!(list_at(addr, pin, mldsa, [0x41u8; 32], None).await.is_err());
+        h.join().unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}

@@ -1,0 +1,71 @@
+# Стенд для e2e-проверки консольного Linux-клиента (трек L): настоящие issuer + exit
+# из демо-стека и клиент, собранный по новой модели (citadel-vpnd + citadel-engine + citadel-cli).
+name: citadel-pq-cli
+
+# П.2 «порты первым классом»: стенд намеренно поднят на НЕСТАНДАРТНЫХ портах (не 4433/443/7000/7001).
+# Все 48 e2e-проверок ходят через них, поэтому любая захардкоженная «подпись Citadel» на пути
+# клиента (ссылка, фетч токенов, obfs-fallback, admin-канал по туннелю) ломает прогон сразу.
+x-ports: &ports
+  CITADEL_UDP_PORT: "5443"
+  CITADEL_TCP_PORT: "8443"
+  CITADEL_ISSUER_PORT: "7300"
+  CITADEL_ADMIN_PORT: "7301"
+
+services:
+  issuer:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: citadel-pq:latest
+    container_name: citadel-cli-issuer
+    entrypoint: ["/usr/local/bin/entrypoint-issuer.sh"]
+    environment: *ports
+    # M-6: работает с группой exit'а — ключ эпохи (секрет, 0640) иначе не прочитается тем, кто
+    # сбросил привилегии до nobody. См. пояснение в docker/compose.yml.
+    user: "0:65534"
+    volumes: ["clishare:/shared"]
+    networks: ["clinet"]
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "test -f /shared/issuer.key"]
+      interval: 2s
+      timeout: 2s
+      retries: 30
+      start_period: 5s
+
+  exit:
+    image: citadel-pq:latest
+    container_name: citadel-cli-exit
+    depends_on:
+      issuer: { condition: service_healthy }
+    entrypoint: ["/usr/local/bin/entrypoint-exit.sh"]
+    environment: *ports
+    cap_add: ["NET_ADMIN"]
+    devices: ["/dev/net/tun:/dev/net/tun"]
+    sysctls: ["net.ipv4.ip_forward=1"]
+    volumes: ["clishare:/shared"]
+    networks: ["clinet"]
+
+  # Клиент новой модели: внутри контейнера поднимается citadel-vpnd (как systemd-юнит),
+  # он запускает citadel-engine под отдельным uid, а citadel-cli играет роль человека.
+  client-cli:
+    build:
+      context: .
+      dockerfile: Dockerfile.cli
+    image: citadel-pq-cli:latest
+    container_name: citadel-cli-client
+    depends_on:
+      issuer: { condition: service_healthy }
+    entrypoint: ["/usr/local/bin/entrypoint-client-cli.sh"]
+    environment: *ports
+    cap_add: ["NET_ADMIN"]
+    devices: ["/dev/net/tun:/dev/net/tun"]
+    volumes: ["clishare:/shared"]
+    networks: ["clinet"]
+
+volumes:
+  clishare:
+
+networks:
+  clinet:
+    driver: bridge

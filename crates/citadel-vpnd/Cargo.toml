@@ -1,0 +1,29 @@
+[package]
+name = "citadel-vpnd"
+version.workspace = true
+publish.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "CitadelPQVPN — системный демон Linux-клиента (systemd): привилегированный плумбинг TUN/маршрутов/kill-switch + супервизор непривилегированного движка"
+
+# Библиотека — ТОЛЬКО нейтральные части (протокол IPC, валидация недоверенного ввода, генерация
+# правил). Их линкуют и citadel-cli (юзер), и citadel-engine (без прав) — общий контракт, как
+# citadel-winnet между приложением и службой на Windows. Привилегированное исполнение живёт в bin.
+[lib]
+name = "citadel_vpnd"
+path = "src/lib.rs"
+
+# Демон: НЕ линкует движок (quinn/rustls/aws-lc) и tokio — недоверенный сетевой ввод разбирает
+# citadel-engine под отдельным юзером. Здесь только std + libc + CBOR-кадры (L13).
+[[bin]]
+name = "citadel-vpnd"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1"
+libc = "0.2"
+serde = { version = "1", features = ["derive"] }
+ciborium = "0.2"          # кадры IPC (тот же CBOR, что у кред — без нового формата/парсера)
+sendfd = "0.4"            # передача TUN-fd движку (SCM_RIGHTS), как citadel-helper → GUI
+zeroize = "1"             # L6: затирать citadel://-ссылку (bearer-креды) в памяти демона
+citadel-tun = { path = "../citadel-tun" }

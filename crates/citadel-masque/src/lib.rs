@@ -76,6 +76,19 @@ pub mod datagram {
 
     pub const CTX_RAW_IP: u64 = 0;
 
+    /// M-8/аудит-4: собственный keep-alive туннеля. Полезной нагрузки не несёт, приёмник его
+    /// молча отбрасывает (он не `CTX_RAW_IP` ⇒ в TUN не попадает), но для QUIC это обычный
+    /// ack-eliciting пакет — то есть он держит и NAT-биндинг, и idle-таймер.
+    ///
+    /// Зачем свой, если у quinn есть `keep_alive_interval`: тот шлёт PING строго периодически
+    /// (5,000 с), и в простое туннель превращается в идеальный маяк — период снимается
+    /// автокорреляцией по десятку интервалов, независимо от того, что размеры пакетов уже
+    /// замаскированы паддингом L1. Свой keep-alive шлётся со случайным интервалом и со случайной
+    /// длиной, а `keep_alive_interval` quinn остаётся страховкой на случай, если задача умрёт.
+    /// Контекст 1 из «приватного» диапазона: RFC 9484 присваивает context id динамически, наш
+    /// профиль фиксирует только 0 = сырой IP, так что коллизии с чужим ПО тут быть не может.
+    pub const CTX_KEEPALIVE: u64 = 1;
+
     pub fn encode(context_id: u64, ip_packet: &[u8]) -> Vec<u8> {
         let mut o = varint::to_vec(context_id);
         o.extend_from_slice(ip_packet);
@@ -155,7 +168,22 @@ pub mod capsule {
         }
         let mut addr = [0u8; 4];
         addr.copy_from_slice(&rest[1..5]);
-        Some(AssignedV4 { request_id: rid, addr, prefix: rest[5] })
+        let prefix = rest[5];
+        // Ф1 (цель `capsule_address`, найдено фаззером 2026-08-16): длина IPv4-префикса больше 32
+        // не существует ни при каком корректном пире — это не «странное значение», а невозможное
+        // состояние, и разбор не имеет права выпускать его наружу. Политику («какой префикс
+        // разумно принять от exit'а») по-прежнему решает вызывающий: клиент требует /12../30
+        // (`client::validate_assignment`, H-4), демон границы привилегий — 1..=32
+        // (`vpnd::valid`). Здесь — только физическая невозможность.
+        //
+        // `prefix == 0` остаётся законным: клиент шлёт им ADDRESS_REQUEST («префикс не указан»).
+        //
+        // Живой уязвимости на момент находки не было — оба потребителя проверяют диапазон сами;
+        // это снятие класса, а не заплатка на дыру.
+        if prefix > 32 {
+            return None;
+        }
+        Some(AssignedV4 { request_id: rid, addr, prefix })
     }
 
     pub fn encode_address_assign_v4(a: &AssignedV4) -> Vec<u8> {
@@ -166,6 +194,44 @@ pub mod capsule {
     }
     pub fn decode_assigned_v4(value: &[u8]) -> Option<AssignedV4> {
         decode_v4_body(value)
+    }
+
+    /// **П5 (батарея): необязательный хвост тела капсулы — `varint(max_idle_timeout в мс)`.**
+    ///
+    /// Зачем на проводе: эффективный idle-таймаут QUIC равен МИНИМУМУ из объявленных сторонами
+    /// (RFC 9000 §10.1), а редкий keep-alive (единственное, что даёт модему уйти в idle между
+    /// маячками) безопасен, только если этот минимум заведомо больше интервала маячка. Своё
+    /// значение сторона знает, чужое — нет: quinn негоциированный таймаут наружу не отдаёт.
+    /// Поэтому каждая сторона называет своё прямо в control-обмене, а редкий режим включается,
+    /// лишь если названное пиром значение достаточно велико (см. `dataplane::keepalive_delay`).
+    ///
+    /// Обратная совместимость в обе стороны: старый пир хвоста не шлёт — новый видит `None` и
+    /// остаётся на частом маячке; старый пир хвост игнорирует ([`decode_v4_body`] читает ровно
+    /// свои 6 байт и не смотрит дальше), поэтому добавление поля не ломает провод.
+    pub fn encode_address_assign_v4_hint(a: &AssignedV4, idle_ms: Option<u64>) -> Vec<u8> {
+        encode(ADDRESS_ASSIGN, &encode_v4_body_hint(a, idle_ms))
+    }
+    pub fn encode_address_request_v4_hint(a: &AssignedV4, idle_ms: Option<u64>) -> Vec<u8> {
+        encode(ADDRESS_REQUEST, &encode_v4_body_hint(a, idle_ms))
+    }
+
+    fn encode_v4_body_hint(a: &AssignedV4, idle_ms: Option<u64>) -> Vec<u8> {
+        let mut v = encode_v4_body(a);
+        if let Some(ms) = idle_ms {
+            v.extend_from_slice(&varint::to_vec(ms));
+        }
+        v
+    }
+
+    /// Прочитать хвост-подсказку из тела капсулы. `None` — пир её не прислал (старая версия)
+    /// либо тело битое.
+    pub fn decode_idle_hint(value: &[u8]) -> Option<u64> {
+        let (_, n) = varint::decode(value)?;
+        let rest = value.get(n..)?;
+        if rest.len() < 6 || rest[0] != 4 {
+            return None;
+        }
+        varint::decode(rest.get(6..)?).map(|(ms, _)| ms)
     }
 
     #[cfg(test)]
@@ -181,6 +247,50 @@ pub mod capsule {
             assert_eq!(t, ADDRESS_ASSIGN);
             assert_eq!(used, cap.len());
             assert_eq!(decode_assigned_v4(val).unwrap(), a);
+        }
+
+        /// Ф1 (регрессия по находке фаззера, цель `capsule_address`, 2026-08-16): тело капсулы с
+        /// префиксом больше 32 не разбирается вовсе.
+        ///
+        /// Вход `33 04 00 00 00 00 4b 24` — ровно тот, что нашёл libFuzzer: `varint(0x33)`, версия
+        /// 4, адрес `0.0.0.0`, префикс `0x4b` = 75. Раньше он выходил из разбора «валидной»
+        /// структурой, и правильность держалась на том, что оба потребителя проверяют диапазон
+        /// сами. Держится и сейчас — но невозможное состояние больше не создаётся.
+        ///
+        /// `prefix == 0` обязан остаться разбираемым: им клиент шлёт ADDRESS_REQUEST.
+        #[test]
+        fn prefix_above_32_is_not_a_capsule() {
+            let bad = [0x33u8, 0x04, 0, 0, 0, 0, 0x4b, 0x24];
+            assert!(decode_assigned_v4(&bad).is_none(), "префикс /75 не существует");
+            let _ = decode_idle_hint(&bad); // соседний разбор того же тела не паникует
+
+            let req = AssignedV4 { request_id: 1, addr: [0, 0, 0, 0], prefix: 0 };
+            let cap = encode_address_request_v4(&req);
+            let (_, val, _) = decode(&cap).unwrap();
+            assert_eq!(decode_assigned_v4(val).unwrap(), req, "/0 в запросе законен");
+
+            let edge = AssignedV4 { request_id: 1, addr: [10, 0, 0, 1], prefix: 32 };
+            let cap = encode_address_assign_v4(&edge);
+            let (_, val, _) = decode(&cap).unwrap();
+            assert_eq!(decode_assigned_v4(val).unwrap(), edge, "/32 — граница, она внутри");
+        }
+
+        /// П5: хвост-подсказка читается новым пиром и НЕ мешает старому — тот разбирает те же
+        /// адрес и префикс, просто не смотрит дальше своих шести байт. Это и есть условие, при
+        /// котором редкий keep-alive можно катить, не ломая связь с прежними версиями.
+        #[test]
+        fn idle_hint_is_backward_compatible() {
+            let a = AssignedV4 { request_id: 1, addr: [10, 7, 0, 9], prefix: 24 };
+            let cap = encode_address_assign_v4_hint(&a, Some(90_000));
+            let (t, val, used) = decode(&cap).unwrap();
+            assert_eq!(t, ADDRESS_ASSIGN);
+            assert_eq!(used, cap.len());
+            assert_eq!(decode_assigned_v4(val).unwrap(), a, "старый разбор тела не сломан");
+            assert_eq!(decode_idle_hint(val), Some(90_000));
+            // без хвоста — None (пир прежней версии): режим маячка останется частым
+            let plain = encode_address_assign_v4(&a);
+            let (_, val, _) = decode(&plain).unwrap();
+            assert_eq!(decode_idle_hint(val), None);
         }
     }
 }
@@ -253,8 +363,39 @@ pub mod ip {
         Some(Ipv4View { ihl, proto: pkt[9], src, dst, payload: &pkt[ihl..end] })
     }
 
+    /// Порт назначения TCP-сегмента внутри IPv4-пакета (`None`, если это не TCP или заголовок
+    /// усечён). C7.2: exit по нему точечно разрешает admin-VIP:порт мимо egress-фильтра.
+    pub fn tcp_dport(v: &Ipv4View<'_>) -> Option<u16> {
+        if v.proto != 6 || v.payload.len() < 4 {
+            return None;
+        }
+        Some(u16::from_be_bytes([v.payload[2], v.payload[3]]))
+    }
+
+    /// Порт назначения TCP **или UDP** внутри IPv4-пакета (`None` для прочих протоколов и
+    /// усечённого заголовка). В отличие от [`tcp_dport`], который отвечает на вопрос exit'а «пустить
+    /// ли этот TCP мимо egress-фильтра», здесь нужен порт как таковой: клиентский детектор петли
+    /// сверяет его с портом СВОЕГО транспорта, а тот бывает и UDP (PQ-QUIC), и TCP (obfs-fallback).
+    pub fn l4_dport(v: &Ipv4View<'_>) -> Option<u16> {
+        // 6 = TCP, 17 = UDP; у обоих порт назначения лежит в байтах 2..4 заголовка L4.
+        if !matches!(v.proto, 6 | 17) || v.payload.len() < 4 {
+            return None;
+        }
+        Some(u16::from_be_bytes([v.payload[2], v.payload[3]]))
+    }
+
     /// Назначение, которое exit НЕ должен форвардить (анти-пивот во внутреннюю сеть):
-    /// приватные/loopback/link-local(incl. 169.254.169.254 metadata)/CGNAT/multicast/reserved.
+    /// приватные/loopback/link-local(incl. 169.254.169.254 metadata)/CGNAT/multicast/reserved
+    /// плюс IANA special-purpose (RFC 6890) и облачные metadata-адреса вне link-local.
+    ///
+    /// **L-1/аудит-4.** Одного 169.254.169.254 недостаточно: у Azure «wireserver» живёт на
+    /// **168.63.129.16** — это адрес из ГЛОБАЛЬНО маршрутизируемого диапазона, поэтому прежний
+    /// фильтр его пропускал, и абонент дотягивался из туннеля до metadata-плоскости хостера
+    /// (в т.ч. до agent'а расширений, т.е. до потенциального RCE на самом VPS). Заодно закрыты
+    /// диапазоны, которых в интернете быть не может, но которые ядро/приложения трактуют
+    /// по-особому: `192.0.0.0/24` (IETF protocol assignments, DS-Lite `192.0.0.0/29`),
+    /// TEST-NET-1/2/3, `198.18.0.0/15` (benchmarking — на роутерах часто заведён локально),
+    /// `192.88.99.0/24` (6to4-relay anycast).
     pub fn is_blocked_dst(a: [u8; 4]) -> bool {
         match a {
             [0, ..] => true,                       // 0.0.0.0/8 «this host»
@@ -264,6 +405,13 @@ pub mod ip {
             [172, b, ..] if (16..=31).contains(&b) => true, // 172.16/12 private (docker!)
             [192, 168, ..] => true,                // 192.168.0.0/16 private
             [100, b, ..] if (64..=127).contains(&b) => true, // 100.64/10 CGNAT
+            [168, 63, 129, 16] => true,            // L-1: Azure IMDS/wireserver (публичный диапазон!)
+            [192, 0, 0, ..] => true,               // 192.0.0.0/24 IETF protocol assignments (DS-Lite)
+            [192, 0, 2, ..] => true,               // TEST-NET-1
+            [198, 51, 100, ..] => true,            // TEST-NET-2
+            [203, 0, 113, ..] => true,             // TEST-NET-3
+            [198, b, ..] if (18..=19).contains(&b) => true, // 198.18.0.0/15 benchmarking
+            [192, 88, 99, ..] => true,             // 192.88.99.0/24 6to4-relay anycast (deprecated)
             [b, ..] if b >= 224 => true,           // 224/4 multicast + 240/4 reserved + 255.. broadcast
             _ => false,                            // публичный — разрешаем
         }
@@ -379,6 +527,93 @@ pub mod ip {
         })
     }
 
+    // ---- минимальный TCP (для admin-пробы по туннелю) ----
+    pub const TCP_FIN: u8 = 0x01;
+    pub const TCP_SYN: u8 = 0x02;
+    pub const TCP_RST: u8 = 0x04;
+    pub const TCP_ACK: u8 = 0x10;
+
+    /// Контрольная сумма TCP — тот же алгоритм, что у UDP, но `proto=6` в псевдозаголовке
+    /// и длина = длина сегмента (у TCP нет собственного поля длины).
+    fn tcp_checksum(src: [u8; 4], dst: [u8; 4], seg: &[u8]) -> u16 {
+        let mut sum: u32 = 0;
+        for chunk in [&src[..], &dst[..]] {
+            sum += u16::from_be_bytes([chunk[0], chunk[1]]) as u32;
+            sum += u16::from_be_bytes([chunk[2], chunk[3]]) as u32;
+        }
+        sum += 6; // zero || protocol (TCP)
+        sum += seg.len() as u32;
+        let mut i = 0;
+        while i + 1 < seg.len() {
+            sum += u16::from_be_bytes([seg[i], seg[i + 1]]) as u32;
+            i += 2;
+        }
+        if i < seg.len() {
+            sum += (seg[i] as u32) << 8;
+        }
+        while sum >> 16 != 0 {
+            sum = (sum & 0xffff) + (sum >> 16);
+        }
+        !(sum as u16)
+    }
+
+    /// Минимальный TCP-сегмент без опций и без данных (data offset = 5) в IPv4-пакете.
+    /// Нужен диагностической admin-пробе: SYN к `ADMIN_VIP:порт` прямо в туннель (мимо ОС-роутинга)
+    /// и RST для закрытия полуоткрытого соединения на issuer'е.
+    #[allow(clippy::too_many_arguments)] // ровно поля TCP-заголовка: группировать не во что
+    pub fn build_tcp4(
+        src: [u8; 4],
+        sport: u16,
+        dst: [u8; 4],
+        dport: u16,
+        seq: u32,
+        ack: u32,
+        flags: u8,
+        window: u16,
+    ) -> Vec<u8> {
+        let mut seg = Vec::with_capacity(20);
+        seg.extend_from_slice(&sport.to_be_bytes());
+        seg.extend_from_slice(&dport.to_be_bytes());
+        seg.extend_from_slice(&seq.to_be_bytes());
+        seg.extend_from_slice(&ack.to_be_bytes());
+        seg.push(5 << 4); // data offset = 5 слов (20 б), reserved = 0
+        seg.push(flags);
+        seg.extend_from_slice(&window.to_be_bytes());
+        seg.extend_from_slice(&[0, 0]); // checksum (placeholder)
+        seg.extend_from_slice(&[0, 0]); // urgent pointer
+        let c = tcp_checksum(src, dst, &seg);
+        seg[16..18].copy_from_slice(&c.to_be_bytes());
+        build_ipv4(6, src, dst, &seg)
+    }
+
+    pub struct Tcp4 {
+        pub src: [u8; 4],
+        pub dst: [u8; 4],
+        pub sport: u16,
+        pub dport: u16,
+        pub seq: u32,
+        pub ack: u32,
+        pub flags: u8,
+    }
+
+    /// Разбор TCP-заголовка внутри IPv4-пакета (`None` — не TCP/обрезан).
+    pub fn parse_tcp4(pkt: &[u8]) -> Option<Tcp4> {
+        let v = parse_ipv4(pkt)?;
+        if v.proto != 6 || v.payload.len() < 20 {
+            return None;
+        }
+        let p = v.payload;
+        Some(Tcp4 {
+            src: v.src,
+            dst: v.dst,
+            sport: u16::from_be_bytes([p[0], p[1]]),
+            dport: u16::from_be_bytes([p[2], p[3]]),
+            seq: u32::from_be_bytes([p[4], p[5], p[6], p[7]]),
+            ack: u32::from_be_bytes([p[8], p[9], p[10], p[11]]),
+            flags: p[13],
+        })
+    }
+
     // ---- минимальный DNS ----
     pub fn build_dns_query(id: u16, qname: &str, qtype: u16) -> Vec<u8> {
         let mut m = Vec::new();
@@ -449,6 +684,30 @@ pub mod ip {
     mod tests {
         use super::*;
 
+        /// `l4_dport` читает порт назначения и у TCP, и у UDP — и молчит на всём остальном.
+        /// Клиентский детектор петли сверяет по нему порт СВОЕГО транспорта, поэтому «не тот
+        /// протокол» и «усечённый заголовок» обязаны давать `None`, а не случайное число:
+        /// ложное совпадение здесь — это ложное обвинение `VpnService.protect`.
+        #[test]
+        fn l4_dport_reads_tcp_and_udp_only() {
+            let l4 = |dport: u16| {
+                let mut p = vec![0x30, 0x39]; // sport 12345
+                p.extend_from_slice(&dport.to_be_bytes());
+                p.extend_from_slice(&[0u8; 4]);
+                p
+            };
+            let tcp = build_ipv4(6, [10, 7, 0, 2], [1, 2, 3, 4], &l4(443));
+            assert_eq!(l4_dport(&parse_ipv4(&tcp).unwrap()), Some(443));
+            let udp = build_ipv4(17, [10, 7, 0, 2], [1, 2, 3, 4], &l4(15388));
+            assert_eq!(l4_dport(&parse_ipv4(&udp).unwrap()), Some(15388));
+            // ICMP порта не имеет
+            let icmp = build_ipv4(1, [10, 7, 0, 2], [1, 2, 3, 4], &l4(443));
+            assert_eq!(l4_dport(&parse_ipv4(&icmp).unwrap()), None);
+            // усечённый L4-заголовок (фрагмент/битый пакет) — не гадаем
+            let short = build_ipv4(6, [10, 7, 0, 2], [1, 2, 3, 4], &[0, 0, 1]);
+            assert_eq!(l4_dport(&parse_ipv4(&short).unwrap()), None);
+        }
+
         #[test]
         fn icmp_echo_roundtrip_and_checksums() {
             let req = build_icmp_echo_request([10, 7, 0, 2], [10, 7, 0, 1], 0x1234, 7, b"Citadel");
@@ -476,6 +735,26 @@ pub mod ip {
             assert_eq!(u.dst, [1, 1, 1, 1]);
             assert_eq!(u.payload, b"hello-dns");
             assert_eq!(inet_checksum(&pkt[..20]), 0); // IP ок
+        }
+
+        /// TCP-хелпер admin-пробы: собранный SYN парсится обратно, контрольные суммы IP и TCP
+        /// сходятся (полная сумма сегмента с псевдозаголовком == 0), флаги/порты на месте.
+        #[test]
+        fn tcp_syn_roundtrip_and_checksum() {
+            let src = [10, 7, 0, 9];
+            let dst = [10, 7, 0, 1];
+            let pkt = build_tcp4(src, 41000, dst, 7001, 0xdead_beef, 0, TCP_SYN, 64240);
+            assert_eq!(inet_checksum(&pkt[..20]), 0); // IP-заголовок валиден
+            let t = parse_tcp4(&pkt).unwrap();
+            assert_eq!((t.sport, t.dport), (41000, 7001));
+            assert_eq!((t.src, t.dst), (src, dst));
+            assert_eq!(t.seq, 0xdead_beef);
+            assert_eq!(t.flags, TCP_SYN);
+            // TCP-сумма: пересчёт по полученному сегменту (вместе с записанной суммой) даёт 0
+            let v = parse_ipv4(&pkt).unwrap();
+            assert_eq!(tcp_checksum(src, dst, v.payload), 0);
+            // не-TCP (UDP) через tcp-парсер — None (default-deny, не паника)
+            assert!(parse_tcp4(&build_udp4(src, 1, dst, 2, b"x")).is_none());
         }
 
         #[test]
@@ -516,11 +795,27 @@ pub mod ip {
                 [100, 64, 0, 1],      // CGNAT
                 [224, 0, 0, 1],       // multicast
                 [0, 0, 0, 0],
+                // L-1: metadata вне link-local + IANA special-purpose
+                [168, 63, 129, 16],  // Azure wireserver — публичный диапазон, но metadata
+                [192, 0, 0, 8],      // IETF protocol assignments
+                [192, 0, 2, 5],      // TEST-NET-1
+                [198, 51, 100, 5],   // TEST-NET-2
+                [203, 0, 113, 5],    // TEST-NET-3
+                [198, 18, 0, 1],     // benchmarking
+                [198, 19, 255, 254], // benchmarking (верхняя граница /15)
+                [192, 88, 99, 1],    // 6to4-relay anycast
             ] {
                 assert!(is_blocked_dst(a), "{a:?} должен быть заблокирован");
             }
             assert!(!is_blocked_dst([172, 15, 0, 1])); // вне 172.16/12 — публичный
             assert!(!is_blocked_dst([172, 32, 0, 1]));
+            // соседние адреса заблокированных диапазонов остаются публичными (нет over-block)
+            assert!(!is_blocked_dst([168, 63, 129, 17]));
+            assert!(!is_blocked_dst([168, 63, 128, 16]));
+            assert!(!is_blocked_dst([192, 0, 1, 1])); // между 192.0.0/24 и TEST-NET-1
+            assert!(!is_blocked_dst([198, 20, 0, 1])); // сразу за 198.18/15
+            assert!(!is_blocked_dst([198, 17, 255, 254]));
+            assert!(!is_blocked_dst([203, 0, 114, 1]));
         }
     }
 }
@@ -549,7 +844,7 @@ mod fuzz {
             let len = (xs(&mut s) % 1500) as usize;
             let mut b: Vec<u8> = (0..len).map(|_| (xs(&mut s) >> 33) as u8).collect();
             // иногда «похоже на IPv4» (version=4, ihl=5) — чтобы парсеры шли глубже
-            if !b.is_empty() && xs(&mut s) % 2 == 0 {
+            if !b.is_empty() && xs(&mut s).is_multiple_of(2) {
                 b[0] = 0x45;
             }
             let _ = varint::decode(&b);
@@ -560,6 +855,7 @@ mod fuzz {
             let _ = ip::icmp_echo_kind(&b);
             let _ = ip::build_icmp_echo_reply(&b);
             let _ = ip::parse_udp4(&b);
+            let _ = ip::parse_tcp4(&b);
             let _ = ip::parse_dns_response(&b);
         }
     }

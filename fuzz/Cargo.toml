@@ -1,0 +1,142 @@
+[package]
+name = "citadel-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+license = "Apache-2.0"
+
+# Ф1 (docs/CWE-REVIEW-PLAN-2026-08.md §5): фаззинг разборщиков недоверенного ввода.
+#
+# Отдельный воркспейс намеренно: цели собираются nightly с санитайзером и линкуют libFuzzer, а
+# движковый воркспейс обязан оставаться собираемым stable-тулчейном без нестабильных флагов.
+# `cargo fuzz` вызывается из корня репозитория (`cargo +nightly fuzz run <цель>`), список целей —
+# `tools/fuzz.sh` и Приложение A плана.
+[workspace]
+members = ["."]
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+# CBOR — тот же разборщик, что стоит на admin-канале издателя (цель admin_request).
+ciborium = "0.2"
+
+citadel-obfs = { path = "../crates/citadel-obfs" }
+citadel-masque = { path = "../crates/citadel-masque" }
+citadel-token = { path = "../crates/citadel-token" }
+citadel-client = { path = "../crates/citadel-client" }
+citadel-winnet = { path = "../crates/citadel-winnet" }
+citadel-vpnd = { path = "../crates/citadel-vpnd" }
+
+# Цели. `test/doc/bench = false` — обязательное требование cargo-fuzz: бинарь целиком принадлежит
+# libFuzzer, обычный тестовый харнесс в нём не запускается.
+
+# ── A. Провод: подаёт кто угодно в сети И скомпрометированный exit ──
+[[bin]]
+name = "obfs_open"
+path = "fuzz_targets/obfs_open.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "capsule_decode"
+path = "fuzz_targets/capsule_decode.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "capsule_address"
+path = "fuzz_targets/capsule_address.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "ip_parse"
+path = "fuzz_targets/ip_parse.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "varint_decode"
+path = "fuzz_targets/varint_decode.rs"
+test = false
+doc = false
+bench = false
+
+# ── B. Канал издателя: подаёт скомпрометированный (или чужой) КЛИЕНТ ──
+[[bin]]
+name = "token_client_frame"
+path = "fuzz_targets/token_client_frame.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "gate_frame"
+path = "fuzz_targets/gate_frame.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "registry_parse"
+path = "fuzz_targets/registry_parse.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "admin_request"
+path = "fuzz_targets/admin_request.rs"
+test = false
+doc = false
+bench = false
+
+# ── C. В сторону клиента: подаёт скомпрометированный ИЗДАТЕЛЬ либо автор ссылки ──
+[[bin]]
+name = "issuer_hello"
+path = "fuzz_targets/issuer_hello.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "link_from_uri"
+path = "fuzz_targets/link_from_uri.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "masterlink_unwrap"
+path = "fuzz_targets/masterlink_unwrap.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "vault_header"
+path = "fuzz_targets/vault_header.rs"
+test = false
+doc = false
+bench = false
+
+# ── D. Границы привилегий: подаёт локальный непривилегированный пользователь (высший приоритет) ──
+[[bin]]
+name = "vpnd_frame"
+path = "fuzz_targets/vpnd_frame.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "winnet_decode"
+path = "fuzz_targets/winnet_decode.rs"
+test = false
+doc = false
+bench = false

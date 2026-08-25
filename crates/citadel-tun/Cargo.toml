@@ -1,9 +1,10 @@
 [package]
 name = "citadel-tun"
 version = "0.1.0"
+publish.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "CitadelPQVPN — TUN-устройство (Linux, /dev/net/tun via TUNSETIFF). Привилегированный путь data plane."
+description = "CitadelPQVPN — TUN I/O (Linux /dev/net/tun via TUNSETIFF; Android — fd от VpnService)."
 
-[target.'cfg(target_os = "linux")'.dependencies]
+[target.'cfg(any(target_os = "linux", target_os = "android"))'.dependencies]
 libc = "0.2"

@@ -1,0 +1,649 @@
+package com.quantumaes.citadelpqvpn
+
+import android.app.Notification
+import android.app.NotificationChannel
+import android.app.NotificationManager
+import android.app.PendingIntent
+import android.content.Intent
+import android.content.pm.ServiceInfo
+import android.net.ConnectivityManager
+import android.net.Network
+import android.net.NetworkCapabilities
+import android.net.NetworkRequest
+import android.net.VpnService
+import android.os.Build
+import android.os.ParcelFileDescriptor
+
+/**
+ * Тонкий VpnService для CitadelPQVPN (трек C3.2). Привилегированную сеть/крипту делает
+ * Rust-движок в изоляте Flutter; этот сервис лишь: (1) строит TUN по назначенным движком
+ * параметрам и отдаёт fd в Rust; (2) держит foreground-нотификацию; (3) (C3.3) protect()
+ * исходящих сокетов движка от заворачивания в туннель.
+ *
+ * fd передаётся через detachFd(): владельцем становится Rust (Tun::from_raw_fd), он же закрывает
+ * его при остановке/реконнекте нативного connect-loop (vpn_disconnect → loop завершается → tun
+ * дропается → fd закрывается; на реконнекте старый fd дропается перед новым establishTun). Поэтому
+ * сервис fd НЕ закрывает (иначе double-close).
+ */
+class CitadelVpnService : VpnService() {
+
+    companion object {
+        @Volatile
+        var instance: CitadelVpnService? = null
+
+        /** Колбэк готовности (после nativeRegister) — startService ждёт его, чтобы протектор
+         *  встал ДО establish (иначе первый сокет движка не защищён → петля). */
+        @Volatile
+        var onServiceReady: (() -> Unit)? = null
+
+        /**
+         * Экземпляр получил stopSelf() и ждёт onDestroy.
+         *
+         * `instance` обнуляется только в onDestroy, а тот приходит асинхронно — поэтому «Отключить,
+         * затем сразу Подключить» заставало `instance != null` у УМИРАЮЩЕГО сервиса. startService
+         * отвечал «уже запущен», интент не слал, сессия стартовала — и тут приходил onDestroy,
+         * снимая протектор из-под уже работающего движка. Первый транспортный сокет уходил
+         * незащищённым, то есть в собственный туннель; в журнале это выглядит как «UDP не пускают».
+         */
+        @Volatile
+        var stopping = false
+
+        /** Готов ли сервис принять сессию: жив и не в процессе остановки. */
+        fun ready(): Boolean = instance != null && !stopping
+
+        const val CHANNEL_ID = "citadel_vpn"
+        const val NOTIF_ID = 1
+
+        // S2.2/A2: чем кончилась попытка захватить IPv6 в туннель (см. establishTun). Ядро
+        // спрашивает это ПОСЛЕ каждого establish (`ipv6State`) и, если v6 уходит мимо туннеля,
+        // говорит об этом человеку: молчаливый фолбэк оставлял нативный IPv6 мимо туннеля, а на
+        // экране по-прежнему горело «Защищено» (находка N-1 сверки 2026-08-14).
+        const val IPV6_CAPTURED = 0 // blackhole поставлен: весь v6 уходит в туннель
+        const val IPV6_FALLBACK = 1 // blackhole не встал И v6 реально уходит мимо туннеля — УТЕЧКА
+        const val IPV6_SPLIT = 2 // не full-tunnel (split-include): v6 идёт напрямую ПО ВЫБОРУ человека
+        // blackhole не встал, но у приложений под VPN нет НИ ОДНОГО пути наружу по IPv6 (проверено
+        // пробой ниже). Цель S2.2/A2 — «нативный IPv6 не уходит с устройства мимо туннеля» — при
+        // этом достигнута, поэтому предупреждать не о чем и строгий режим обязан пропускать такой
+        // туннель. Ровно этот исход даёт сам Android: увидев конфиг VpnService без единого
+        // IPv6-адреса и маршрута, он кладёт в таблицу VPN-сети `unreachable ::/0`.
+        const val IPV6_BLOCKED = 3
+
+        /** Минимальный MTU IPv6 (RFC 8200 §5). Ниже него ядро не поднимает IPv6 на интерфейсе
+         *  вовсе (`ipv6_add_dev()` → EINVAL), поэтому blackhole на таком TUN недостижим. */
+        const val IPV6_MIN_MTU = 1280
+
+        // Тексты постоянной нотификации по состоянию сессии. Она — единственное, что видно о VPN
+        // при закрытом окне, поэтому «туннель активен» в ней должно означать ровно то, что сказано:
+        // при пропаже сети движок уходит в переподключение, и нотификация обязана это показать.
+        //
+        // Язык берём из ПРИЛОЖЕНИЯ, а не из системной локали: язык интерфейса выбирает пользователь
+        // (настройка хранится ядром), и нотификация — часть того же интерфейса; ресурсы `values-xx`
+        // здесь дали бы расхождение «в приложении один язык, в шторке другой». Dart присылает
+        // переводы через MethodChannel (`setNotifStrings`) при старте и при смене языка; значения по
+        // умолчанию — русские, они же используются, если сервис поднялся раньше Dart.
+        @Volatile
+        var STATUS_UP = "Постквантовый туннель активен"
+        @Volatile
+        var STATUS_CONNECTING = "Подключение…"
+        @Volatile
+        var STATUS_RECONNECTING = "Нет соединения — восстанавливаю"
+        @Volatile
+        var STATUS_DOWN = "Туннель не активен"
+
+        /** Обновить тексты нотификации (Dart → MethodChannel) и перерисовать её, если сервис жив. */
+        fun setNotifStrings(up: String, connecting: String, reconnecting: String, down: String) {
+            STATUS_UP = up
+            STATUS_CONNECTING = connecting
+            STATUS_RECONNECTING = reconnecting
+            STATUS_DOWN = down
+            instance?.refreshNotif()
+        }
+
+        init {
+            // та же .so, что грузит Flutter/frb; нужна, чтобы резолвились JNI-методы native*
+            System.loadLibrary("rust_lib_app")
+        }
+    }
+
+    // JNI (C3.3): регистрируем сервис протектором сокетов движка (Rust → VpnService.protect)
+    private external fun nativeRegister()
+    private external fun nativeUnregister()
+
+    // JNI (S2): смена underlying-сети → разбудить нативный connect-loop (Rust notify_network_changed)
+    private external fun nativeNetworkChanged()
+
+    // JNI: жива ли нативная сессия движка в ЭТОМ процессе (Rust `has_active_session`). Нужен на
+    // воскрешении сервиса системой: у свежего процесса сессии нет, и это надо отличать от штатного
+    // старта, где сессию поднимет приложение сразу после `startService` (см. onStartCommand).
+    private external fun nativeHasSession(): Boolean
+
+    // Мониторинг underlying-сети (WiFi/LTE) живёт в СЕРВИСЕ (переживает Activity → сигнал доходит и
+    // при закрытом окне; в S1 он был в MainActivity и умирал с окном).
+    private var netCallback: ConnectivityManager.NetworkCallback? = null
+    private var currentNetworkId: Long = -1L
+    // Была ли уже underlying-сеть: отличает ПЕРВЫЙ onAvailable (туннель поднимается — реконнект не
+    // нужен) от возврата сети после onLost (toggle WiFi — реконнект НУЖЕН).
+    private var hadNetwork: Boolean = false
+    // Живые underlying-сети (только те, что прошли фильтр NetworkRequest: WiFi/LTE с интернетом).
+    // Нужны, чтобы при потере ТЕКУЩЕЙ сети сразу перейти на оставшуюся: onAvailable по ней уже
+    // прошёл и второй раз не придёт, а спрашивать ConnectivityManager при поднятом VPN бесполезно —
+    // activeNetwork вернёт саму VPN-сеть. Трогается только из потока NetworkCallback.
+    private val liveNetworks = LinkedHashMap<Long, Network>()
+    // Текст последней foreground-нотификации — чтобы не дёргать NotificationManager вхолостую.
+    @Volatile
+    private var statusText: String = STATUS_CONNECTING
+    // Последнее состояние движка (не текст): по нему пересобираем нотификацию при смене языка.
+    @Volatile
+    private var lastState: String = "connecting"
+
+    override fun onCreate() {
+        super.onCreate()
+        instance = this
+        stopping = false // новый экземпляр — прошлая остановка к нему не относится
+        nativeRegister() // движок теперь может protect() свои исходящие сокеты
+        registerNetCallback() // мониторим underlying-сеть на всю жизнь сервиса
+        onServiceReady?.invoke()
+        onServiceReady = null
+    }
+
+    override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+        startForegroundNotif()
+        // Новый интент ОТМЕНЯЕТ ожидающую остановку: система в этом случае не уничтожает сервис, а
+        // доставляет команду существующему экземпляру — onCreate не вызывается. Значит, и снять
+        // флаг, и позвать колбэк готовности обязаны здесь, иначе `startService` из Dart ждал бы
+        // onCreate, которого не будет, и подключение не начиналось бы вовсе.
+        stopping = false
+        onServiceReady?.invoke()
+        onServiceReady = null
+        // `intent == null` — сервис ВОСКРЕШЁН системой по START_STICKY после того, как процесс был
+        // убит (нехватка памяти, чистка «недавних» на OEM-прошивках — на устройствах эпохи
+        // Android 9 это рядовое событие). Восстановить сессию мы при этом не можем по построению:
+        // ссылка профиля лежит в зашифрованном хранилище и без мастер-пароля недоступна.
+        //
+        // Значит, туннеля нет — и постоянная нотификация вместе с системной иконкой ключа в
+        // статус-баре сейчас утверждали бы обратное. Это худший из возможных исходов: человек
+        // считает трафик защищённым, а он идёт открытым. Гасим сервис — отсутствие защиты должно
+        // быть видно; сессию поднимет приложение при следующем подключении.
+        if (intent == null && !nativeHasSession()) {
+            android.util.Log.w(
+                "CitadelVpn",
+                "сервис воскрешён без нативной сессии (процесс был убит) — гашу, чтобы не показывать защиту, которой нет"
+            )
+            stopTun()
+            return START_NOT_STICKY
+        }
+        return START_STICKY
+    }
+
+    /**
+     * Пользователь закрыл приложение (смахнул из «недавних»). Туннель обязан остаться: окно — лишь
+     * пульт, сессию держит нативный движок в этом же процессе, а сервис — его foreground-якорь.
+     *
+     * Базовая реализация `Service.onTaskRemoved` пуста, и метод переопределён ради двух вещей:
+     * (а) зафиксировать намерение «сессию НЕ трогаем» рядом с `android:stopWithTask="false"` в
+     * манифесте; (б) переподтвердить foreground-нотификацию — часть прошивок в этот момент снимает
+     * её, и процесс из «perceptible» проваливается в кэш, откуда его убивают первым (после чего
+     * сервис воскресает уже без сессии — см. onStartCommand).
+     */
+    override fun onTaskRemoved(rootIntent: Intent?) {
+        android.util.Log.d("CitadelVpn", "onTaskRemoved: окно закрыто, сессию держим")
+        startForegroundNotif()
+    }
+
+    /** Итог последней попытки захватить IPv6 (одна из `IPV6_*`). Читает ядро сразу после
+     *  establishTun по JNI. `@Volatile`: пишет поток нативного connect-loop, читает он же, но
+     *  через границу JNI — видимость обязана быть явной. */
+    @Volatile
+    private var ipv6State: Int = IPV6_SPLIT
+
+    /** JNI-геттер для ядра (см. [ipv6State]). */
+    fun ipv6State(): Int = ipv6State
+
+    /** Построить TUN по параметрам, назначенным движком, вернуть detached fd для Rust. Зовётся из
+     *  Rust через JNI (`AndroidTunProvider::configure` в нативном connect-loop) на КАЖДЫЙ (ре)коннект,
+     *  НЕ из Dart. routes/dns приходят строкой через пробел (Rust шлёт TunParams как есть, без массивов).
+     *
+     *  `requireV6` — строгий режим (настройка «Не подключаться без захвата IPv6»): туннель не
+     *  поднимается, если v6 РЕАЛЬНО уходит мимо него. Туннель без blackhole, но и без единого
+     *  v6-пути наружу (IPV6_BLOCKED) строгий режим пропускает: цель настройки — отсутствие утечки,
+     *  а не наличие адреса на интерфейсе. */
+    fun establishTun(
+        addr: String, prefix: Int, routes: String, dns: String, mtu: Int,
+        appMode: String, apps: String, destMode: String, destRoutes: String,
+        requireV6: Boolean,
+    ): Int {
+        val linkRoutes = routes.split(" ").filter { it.isNotEmpty() }
+        val appList = apps.split(" ").filter { it.isNotEmpty() }
+        val destList = destRoutes.split(" ").filter { it.isNotEmpty() }
+        val dnsList = dns.split(" ").filter { it.isNotEmpty() }
+        // Подсеть туннеля (назначенный addr/prefix). В ней живёт шлюз exit'а = ADMIN_VIP (C7.2),
+        // т.е. admin-канал «Абоненты». На Linux/Windows маршрут в неё появляется САМ (адрес на
+        // интерфейсе → on-link), а у VPN-сети Android маршрутов ровно столько, сколько добавлено
+        // здесь. Поэтому подсеть туннеля добавляем ЯВНО и ВСЕГДА — иначе split (dest-include без
+        // неё, dest-exclude поверх неё, app-фильтр без нас самих) уносит её мимо VPN, и connect()
+        // к 10.7.0.1 падает в EHOSTUNREACH «No route to host» (для UID под VPN Android ставит
+        // fallthrough-правило unreachable). prefix 0 не трогаем — это и есть 0.0.0.0/0.
+        val tunNet = if (prefix in 1..32) networkOf(addr, prefix) else null
+        // C8.3 назначения: include → только они в туннель (остальное, вкл. IPv6, напрямую);
+        //                  exclude → full-tunnel минус они (excludeRoute, Android 13+/API33).
+        // Из exclude-списка вырезаем всё, что накрывает подсеть туннеля (инвариант выше).
+        val destInclude = destMode == "include" && destList.isNotEmpty()
+        val excludeList = if (destMode == "exclude") destList.filter { d ->
+            val s = splitCidr(d)
+            val clash = tunNet != null && prefixesOverlap(s.first, s.second, tunNet, prefix)
+            if (clash) {
+                android.util.Log.w("CitadelVpn", "C8.3 split-dest: $d накрывает подсеть туннеля $tunNet/$prefix — НЕ исключаю (иначе теряется admin-канал)")
+            }
+            !clash
+        } else emptyList()
+        val destExclude = excludeList.isNotEmpty()
+        val tunnelRoutes = if (destInclude) destList else linkRoutes
+        // full-tunnel (→ IPv6-blackhole применим) только когда НЕ селективный include и маршруты полны
+        val fullTunnel = !destInclude && (tunnelRoutes.isEmpty() || tunnelRoutes.any { it == "0.0.0.0/0" })
+
+        // C8.3 приложения: include → только выбранные пакеты в туннель; exclude → все, кроме них.
+        // Фильтр активен, только если список непуст (режим без списка = «не ограничивать», как
+        // SplitTunnel::is_active в ядре) — иначе include с пустым списком запер бы в туннель всё.
+        // addAllowed/DisallowedApplication взаимоисключающи; несуществующий пакет бросает — ловим
+        // пер-пакет, чтобы один удалённый пакет не завалил establish целиком.
+        fun applyAppFilter(b: Builder) {
+            if (appList.isEmpty()) return
+            // САМИ мы всегда в туннеле: admin-канал идёт к ADMIN_VIP (адрес внутри туннеля) из
+            // этого же процесса, а сокеты движка к exit'у и так исключены protect() (C3.3).
+            // include → добавляем себя в разрешённые; exclude → никогда не исключаем себя.
+            if (appMode == "include") {
+                try {
+                    b.addAllowedApplication(packageName)
+                } catch (e: Exception) {
+                    android.util.Log.w("CitadelVpn", "C8.3 split-app: не добавил себя ($packageName): ${e.message}")
+                }
+            }
+            for (pkg in appList) {
+                if (pkg == packageName) continue // см. выше: себя не исключаем и не дублируем
+                try {
+                    when (appMode) {
+                        "include" -> b.addAllowedApplication(pkg)
+                        "exclude" -> b.addDisallowedApplication(pkg)
+                    }
+                } catch (e: Exception) {
+                    android.util.Log.w("CitadelVpn", "C8.3 split-app: пакет пропущен ($pkg): ${e.message}")
+                }
+            }
+        }
+
+        // Собрать VpnService.Builder. `withV6Blackhole` — захватить весь IPv6 в туннель (S2.2/A2):
+        // туннель IPv4-only, поэтому нативный IPv6 иначе утекает мимо него (деанон на dual-stack).
+        // Dummy ULA + ::/0 (как WireGuard) → v6-пакеты уходят в tun, движок форвардит их exit'у, тот
+        // дропает (S0.2 default-deny не-IPv4) — открытого IPv6 на проводе нет.
+        fun build(withV6Blackhole: Boolean): android.os.ParcelFileDescriptor? {
+            val b = Builder()
+                .setSession("CitadelPQVPN")
+                .setMtu(mtu)
+                .addAddress(addr, prefix)
+            applyAppFilter(b)
+            for (r in tunnelRoutes) {
+                val s = splitCidr(r)
+                b.addRoute(s.first, s.second)
+            }
+            for (d in dnsList) b.addDnsServer(d)
+            if (tunnelRoutes.isEmpty()) b.addRoute("0.0.0.0", 0) // нет split-маршрутов → full-tunnel
+            // Инвариант «резолвер туннеля ходит ЧЕРЕЗ туннель» — то же, что host-route на DNS в
+            // citadel-vpnd (plan::tunnel_route_cmds). Без него при dest-include (в туннель только
+            // выбранные адреса) или при exclude, накрывающем резолвер, DNS-сервер оказывается вне
+            // туннеля: приложения под VPN не резолвят ничего вовсе. /32 специфичнее любого
+            // exclude-префикса, поэтому исключения его не отменяют.
+            for (d in dnsList) {
+                if (d.contains(':')) continue // туннель IPv4-only, v6-резолвер не маршрутизируем
+                try {
+                    b.addRoute(d, 32)
+                } catch (e: Exception) {
+                    android.util.Log.w("CitadelVpn", "маршрут к резолверу $d не добавлен: ${e.message}")
+                }
+            }
+            // Инвариант: подсеть туннеля (шлюз = ADMIN_VIP, admin-канал) всегда через туннель —
+            // при любом split-конфиге. Дубль с 0.0.0.0/0 безвреден (более специфичный префикс).
+            if (tunNet != null) b.addRoute(tunNet, prefix)
+            // C8.3 exclude: вырезать выбранные назначения из full-tunnel (Android 13+/API33)
+            if (destExclude) {
+                if (Build.VERSION.SDK_INT >= 33) {
+                    for (d in excludeList) {
+                        val s = splitCidr(d)
+                        b.excludeRoute(android.net.IpPrefix(java.net.InetAddress.getByName(s.first), s.second))
+                    }
+                } else {
+                    android.util.Log.w("CitadelVpn", "C8.3 split-dest exclude требует Android 13+ (API33); назначения НЕ исключены (остаются в туннеле)")
+                }
+            }
+            if (withV6Blackhole) {
+                b.addAddress("fd00:cade:1::1", 128)
+                b.addRoute("::", 0)
+            }
+            return b.establish()
+        }
+
+        // Пробуем с IPv6-blackhole — но только там, где он в принципе достижим.
+        //
+        // MTU < 1280 делает blackhole НЕВОЗМОЖНЫМ: ядро Linux не создаёт inet6_dev на интерфейсе с
+        // MTU ниже IPv6-минимума (`ipv6_add_dev()` → EINVAL), поэтому VpnService отвечает на
+        // addAddress("fd00:…") ровно «Cannot set address». А наш TUN ужимается под бюджет
+        // QUIC-датаграммы (citadel_quic::INNER_MTU = 1161 б, см. `clamp_tun_mtu`) — то есть на живом
+        // транспорте это НЕ «особенность устройства», а гарантированный исход на любом Android.
+        // Пробовать его значит каждый раз ловить исключение и валить вину на устройство.
+        //
+        // Поставить один только маршрут `::/0` без адреса — не выход, а ухудшение: ядру для
+        // device-route тоже нужен inet6_dev (`fib6_nh_init` → `in6_dev_get` → ENODEV), маршрут не
+        // встанет, но Android, увидев в конфиге IPv6, УЖЕ НЕ добавит свой `unreachable ::/0` — и
+        // v6 уйдёт мимо туннеля по-настоящему.
+        //
+        // N-1: важен не сам blackhole, а его цель — чтобы нативный IPv6 не уходил с устройства мимо
+        // туннеля. Поэтому после фолбэка проверяем цель НАПРЯМУЮ (`ipv6EscapesTunnel`), а не по
+        // косвенному признаку «получилось ли поставить адрес».
+        val v6Reachable = fullTunnel && mtu >= IPV6_MIN_MTU
+        ipv6State = if (fullTunnel) IPV6_FALLBACK else IPV6_SPLIT
+        var why = "MTU туннеля $mtu < $IPV6_MIN_MTU — ядро не поднимает IPv6 на таком интерфейсе"
+        if (v6Reachable) {
+            why = "establish с IPv6-blackhole вернул null"
+            try {
+                val fd = build(true)
+                if (fd != null) {
+                    ipv6State = IPV6_CAPTURED
+                    return fd.detachFd()
+                }
+            } catch (e: Exception) {
+                why = "IPv6-blackhole отвергнут устройством (${e.message})"
+            }
+        }
+        if (fullTunnel) android.util.Log.w("CitadelVpn", "S2.2/A2: blackhole не поставлен — $why")
+
+        val fd = build(false) ?: throw IllegalStateException("VpnService.establish() == null (нет разрешения VPN?)")
+        if (fullTunnel) {
+            val escapes = ipv6EscapesTunnel()
+            ipv6State = if (escapes) IPV6_FALLBACK else IPV6_BLOCKED
+            android.util.Log.i(
+                "CitadelVpn",
+                if (escapes) "S2.2/A2: IPv6 УХОДИТ мимо туннеля (у приложения под VPN есть v6-маршрут наружу)"
+                else "S2.2/A2: IPv6 в туннель не захвачен, но и наружу не уходит — путей по v6 нет (unreachable ::/0)"
+            )
+            if (requireV6 && escapes) {
+                // Строгий режим: лучше отсутствие туннеля, чем туннель с утечкой v6 мимо него.
+                // fd ещё НАШ (detachFd не звали) — закрываем, иначе TUN остался бы висеть без
+                // владельца, а система показывала бы ключ VPN над несуществующей сессией.
+                // Текст уезжает в ядро как причина отказа и доходит до экрана — см. `_classify`.
+                //
+                // Цена честной проверки: ответ на «уходит ли v6 мимо туннеля» существует только
+                // ПОСЛЕ establish (до него таблица маршрутов ещё доVPN'ная), поэтому строгий режим
+                // теперь поднимает туннель и рвёт его через ~секунду. Окно узкое и не хуже
+                // нестрогого режима: v4 в эту секунду уже в туннеле, наружу может уйти только v6 —
+                // ровно то, из-за чего мы и отказываемся.
+                fd.close()
+                throw IllegalStateException("IPv6 уходит мимо туннеля, строгий режим: $why")
+            }
+        }
+        return fd.detachFd() // владение переходит в Rust
+    }
+
+    /**
+     * Есть ли у приложения ПОД VPN хоть какой-то путь наружу по IPv6.
+     *
+     * Проверка по существу, а не по конфигу: [ipv6RouteExists] зовёт `connect()` на UDP-сокете —
+     * пакетов это НЕ шлёт, это только выбор маршрута ядром в той самой таблице, которой пользуются
+     * приложения под VPN. Наш процесс всегда внутри туннеля (`applyAppFilter`: себя не исключаем),
+     * и сокет намеренно не протектится — нас интересует ровно то, что видят обычные приложения.
+     *
+     * «Пути нет» — ответ окончательный и мгновенный: это штатный исход на Android, где Android сам
+     * кладёт `unreachable ::/0` в таблицу VPN-сети для конфига без единого v6-адреса и маршрута.
+     * Ждать имеет смысл только в обратном случае: правила VPN-сети ConnectivityService ставит уже
+     * ПОСЛЕ возврата из establish(), поэтому «путь есть» может означать, что мы ещё смотрим в
+     * доVPN'ную таблицу. Так задержку платит только «плохая» ветка, а не каждый реконнект.
+     */
+    private fun ipv6EscapesTunnel(): Boolean {
+        val cm = getSystemService(ConnectivityManager::class.java)
+        var waited = 0
+        while (ipv6RouteExists()) {
+            val caps = cm?.activeNetwork?.let { cm.getNetworkCapabilities(it) }
+            // VPN-сеть уже активна для нас, а путь по v6 всё равно есть — это настоящая утечка.
+            if (caps?.hasTransport(NetworkCapabilities.TRANSPORT_VPN) == true) return true
+            if (waited >= 1000) {
+                android.util.Log.w("CitadelVpn", "VPN-сеть не стала активной за ${waited}мс — считаю худшее (v6 мимо туннеля)")
+                return true
+            }
+            try {
+                Thread.sleep(100)
+            } catch (e: InterruptedException) {
+                Thread.currentThread().interrupt()
+                android.util.Log.w("CitadelVpn", "проба IPv6 прервана: ${e.message}")
+                return true // прервали — не выдаём «утечки нет» на непроверенном
+            }
+            waited += 100
+        }
+        return false
+    }
+
+    /** Находит ли ядро маршрут наружу по IPv6 для сокета этого процесса (см. [ipv6EscapesTunnel]). */
+    private fun ipv6RouteExists(): Boolean {
+        // Литералы, а не имена: getByName на литерале в DNS не ходит. Два разных префикса — чтобы
+        // единичная blackhole-запись у провайдера не выглядела как «v6 никуда не уходит».
+        for (probe in arrayOf("2001:4860:4860::8888", "2606:4700:4700::1111")) {
+            try {
+                java.nio.channels.DatagramChannel.open(java.net.StandardProtocolFamily.INET6).use { ch ->
+                    ch.connect(java.net.InetSocketAddress(java.net.InetAddress.getByName(probe), 53))
+                    return true // маршрут нашёлся → путь наружу по v6 есть
+                }
+            } catch (e: Exception) {
+                // ENETUNREACH/EHOSTUNREACH — маршрута нет, это и есть «заблокировано». Любая другая
+                // ошибка тоже означает, что v6-путь отсюда не открылся; следующий префикс проверим.
+                android.util.Log.d("CitadelVpn", "v6-проба $probe: пути нет (${e.message})")
+            }
+        }
+        return false
+    }
+
+    /** C3.3: исключить сокет движка из туннеля (анти-петля). Зовётся из Rust через JNI. */
+    fun protectFd(fd: Int): Boolean = protect(fd)
+
+    fun stopTun() {
+        // Пометить ДО stopSelf: с этого момента сервис «есть», но принимать новую сессию не может —
+        // иначе следующее «Подключить» стартует поверх умирающего экземпляра (см. `stopping`).
+        stopping = true
+        stopForeground(STOP_FOREGROUND_REMOVE)
+        stopSelf()
+    }
+
+    override fun onDestroy() {
+        unregisterNetCallback()
+        nativeUnregister()
+        instance = null
+        super.onDestroy()
+    }
+
+    /** Следить за underlying-сетями (WiFi/LTE, не VPN). При смене — обновить setUnderlyingNetworks
+     *  (protected-сокет движка маршрутизируется на новую сеть) и разбудить нативный connect-loop
+     *  (`nativeNetworkChanged`) переустановить сессию. Идемпотентно. */
+    private fun registerNetCallback() {
+        if (netCallback != null) return
+        val cm = getSystemService(ConnectivityManager::class.java) ?: return
+        val req = NetworkRequest.Builder()
+            .addCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)
+            .addTransportType(NetworkCapabilities.TRANSPORT_WIFI)
+            .addTransportType(NetworkCapabilities.TRANSPORT_CELLULAR)
+            .build()
+        val cb = object : ConnectivityManager.NetworkCallback() {
+            override fun onAvailable(network: Network) {
+                val id = network.networkHandle
+                liveNetworks[id] = network
+                // Реконнект нужен, если сеть сменилась ЛИБО вернулась после потери текущей (onLost
+                // обнулил currentNetworkId в -1). Пропускаем только САМЫЙ первый onAvailable
+                // (hadNetwork=false — туннель и так поднимается над этой сетью).
+                val changed = hadNetwork && currentNetworkId != id
+                currentNetworkId = id
+                hadNetwork = true
+                // сказать VPN'у, поверх какой реальной сети он идёт (маршрутизация protected-сокета)
+                setUnderlyingNetworks(arrayOf(network))
+                android.util.Log.d("CitadelNet", "onAvailable id=$id changed=$changed")
+                if (changed) nativeNetworkChanged() // разбудить нативный connect-loop
+            }
+
+            override fun onLost(network: Network) {
+                val id = network.networkHandle
+                liveNetworks.remove(id)
+                android.util.Log.d("CitadelNet", "onLost id=$id cur=$currentNetworkId live=${liveNetworks.size}")
+                if (id != currentNetworkId) return // упала не та сеть, поверх которой идёт туннель
+                // Потеряли сеть, которая несла туннель. Молчать нельзя: пакеты уходят в никуда, а
+                // движок этого не видит (обратного трафика нет и при простое, watchdog срабатывает
+                // только под нагрузкой, quinn ждёт idle-timeout) — и приложение продолжает
+                // показывать «Защищено» при отсутствии интернета. Будим connect-loop: он оборвёт
+                // мёртвый pump и уйдёт в переподключение.
+                val alt = liveNetworks.values.lastOrNull()
+                if (alt != null) {
+                    // Осталась другая сеть (выключили WiFi при живом LTE) — переезжаем на неё сразу;
+                    // её onAvailable уже был и повторно не придёт.
+                    currentNetworkId = alt.networkHandle
+                    setUnderlyingNetworks(arrayOf(alt))
+                } else {
+                    // Сети нет вовсе. Снимаем указание на мёртвую underlying-сеть (null = «как у
+                    // системы»), иначе система считает VPN идущим поверх того, чего больше нет.
+                    currentNetworkId = -1L
+                    setUnderlyingNetworks(null)
+                }
+                nativeNetworkChanged()
+            }
+        }
+        netCallback = cb
+        try {
+            cm.registerNetworkCallback(req, cb)
+            android.util.Log.d("CitadelNet", "NetworkCallback зарегистрирован (сервис)")
+        } catch (e: Exception) {
+            netCallback = null
+            android.util.Log.d("CitadelNet", "registerNetworkCallback FAILED: ${e.message}")
+        }
+    }
+
+    private fun unregisterNetCallback() {
+        val cb = netCallback ?: return
+        try {
+            getSystemService(ConnectivityManager::class.java)?.unregisterNetworkCallback(cb)
+        } catch (_: Exception) {
+        }
+        netCallback = null
+        currentNetworkId = -1L
+        hadNetwork = false
+        liveNetworks.clear()
+    }
+
+    private fun splitCidr(cidr: String): Pair<String, Int> {
+        val i = cidr.indexOf('/')
+        return if (i < 0) Pair(cidr, 32) else Pair(cidr.substring(0, i), cidr.substring(i + 1).toInt())
+    }
+
+    // ── IPv4-хелперы для маршрутной арифметики split'а (Kotlin-Int знаковый → считаем в Long) ──
+
+    /** "a.b.c.d" → беззнаковый u32 в Long; `-1` — не IPv4-литерал. */
+    private fun ipv4ToLong(ip: String): Long {
+        val parts = ip.split(".")
+        if (parts.size != 4) return -1L
+        var v = 0L
+        for (p in parts) {
+            val n = p.toIntOrNull() ?: return -1L
+            if (n !in 0..255) return -1L
+            v = (v shl 8) or n.toLong()
+        }
+        return v
+    }
+
+    /** Маска префикса как u32-в-Long (`/0` → 0). */
+    private fun maskOf(prefix: Int): Long =
+        if (prefix <= 0) 0L else (0xFFFFFFFFL shl (32 - prefix.coerceAtMost(32))) and 0xFFFFFFFFL
+
+    /** Сетевой адрес `ip/prefix` строкой (кривой ip → сам ip: маршрут добавится как есть). */
+    private fun networkOf(ip: String, prefix: Int): String {
+        val v = ipv4ToLong(ip)
+        if (v < 0) return ip
+        val n = v and maskOf(prefix)
+        return "${(n shr 24) and 0xff}.${(n shr 16) and 0xff}.${(n shr 8) and 0xff}.${n and 0xff}"
+    }
+
+    /** Пересекаются ли префиксы (один содержит другой) — сравнение по более короткому. */
+    private fun prefixesOverlap(a: String, ap: Int, b: String, bp: Int): Boolean {
+        val av = ipv4ToLong(a)
+        val bv = ipv4ToLong(b)
+        if (av < 0 || bv < 0) return false
+        val m = maskOf(minOf(ap, bp))
+        return (av and m) == (bv and m)
+    }
+
+    private fun startForegroundNotif() {
+        if (Build.VERSION.SDK_INT >= 26) {
+            val nm = getSystemService(NotificationManager::class.java)
+            nm.createNotificationChannel(
+                NotificationChannel(CHANNEL_ID, "CitadelPQVPN", NotificationManager.IMPORTANCE_LOW)
+            )
+        }
+        val n = buildNotif(statusText)
+        if (Build.VERSION.SDK_INT >= 34) {
+            startForeground(NOTIF_ID, n, ServiceInfo.FOREGROUND_SERVICE_TYPE_SYSTEM_EXEMPTED)
+        } else {
+            startForeground(NOTIF_ID, n)
+        }
+    }
+
+    private fun buildNotif(text: String): Notification =
+        Notification.Builder(this, CHANNEL_ID)
+            .setContentTitle("CitadelPQVPN")
+            .setContentText(text)
+            .setSmallIcon(android.R.drawable.ic_lock_lock)
+            .setOngoing(true)
+            .setContentIntent(openAppIntent()) // тап → окно приложения
+            .build()
+
+    /**
+     * «Открыть приложение» по тапу на постоянной нотификации. При закрытом окне она — единственное,
+     * что видно о сессии, и до сих пор была мёртвой: вернуться к управлению можно было только через
+     * лаунчер. `ACTION_MAIN`+`CATEGORY_LAUNCHER` с явным компонентом поднимают СУЩЕСТВУЮЩУЮ задачу,
+     * а не создают вторую поверх (иначе новый экземпляр Activity перерисовал бы состояние с нуля).
+     *
+     * `FLAG_IMMUTABLE` обязателен с API 31 и доступен с API 23 (у нас minSdk 24) — ставим всегда:
+     * менять этот intent извне некому.
+     */
+    private fun openAppIntent(): PendingIntent {
+        val i = Intent(this, MainActivity::class.java)
+            .setAction(Intent.ACTION_MAIN)
+            .addCategory(Intent.CATEGORY_LAUNCHER)
+            .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_RESET_TASK_IF_NEEDED)
+        return PendingIntent.getActivity(
+            this, 0, i, PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+        )
+    }
+
+    /**
+     * Отразить состояние сессии в постоянной нотификации. Зовётся из Rust через JNI на каждую смену
+     * состояния движка (`idle|connecting|up|migrating|down`) — в том числе когда окна приложения
+     * нет вовсе: тогда нотификация — единственный индикатор, и она не должна утверждать, что
+     * туннель активен, пока движок переподключается (например, при пропавшей сети).
+     * NotificationManager потокобезопасен, поэтому вызов из tokio-потока движка допустим.
+     */
+    fun setStatus(state: String) {
+        lastState = state
+        val text = when (state) {
+            "up" -> STATUS_UP
+            "connecting" -> STATUS_CONNECTING
+            "migrating" -> STATUS_RECONNECTING
+            else -> STATUS_DOWN // down|idle
+        }
+        if (text == statusText) return
+        statusText = text
+        try {
+            getSystemService(NotificationManager::class.java)?.notify(NOTIF_ID, buildNotif(text))
+        } catch (e: Exception) {
+            android.util.Log.w("CitadelVpn", "не обновить нотификацию: ${e.message}")
+        }
+    }
+
+    /**
+     * Перерисовать нотификацию тем же состоянием, но новыми текстами (смена языка приложения).
+     * Состояние помним отдельно от текста: иначе после смены языка в шторке остался бы прежний.
+     */
+    fun refreshNotif() {
+        statusText = "" // сбросить дедупликацию: текст изменился, состояние — нет
+        setStatus(lastState)
+    }
+}

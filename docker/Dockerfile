@@ -1,6 +1,7 @@
 # Runtime-образ для PQ-туннеля. Бинарь citadel-m1 собирается на хосте и копируется внутрь
 # (aws-lc слинкован статически; нужен только glibc — debian trixie = glibc 2.41, как на хосте).
-FROM debian:trixie-slim
+# S1.5: digest-pin базового образа (OCI index, мульти-арч) — воспроизводимость + supply-chain.
+FROM debian:trixie-slim@sha256:28de0877c2189802884ccd20f15ee41c203573bd87bb6b883f5f46362d24c5c2
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
         iproute2 iptables iputils-ping curl ca-certificates dnsutils \

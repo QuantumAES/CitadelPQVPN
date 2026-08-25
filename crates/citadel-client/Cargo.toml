@@ -1,0 +1,68 @@
+[package]
+name = "citadel-client"
+version.workspace = true
+publish.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "CitadelPQVPN — встраиваемое клиентское ядро (FFI-вуаль поверх citadel-quic) для GUI"
+
+# cdylib — для Android (.so, JNI/flutter_rust_bridge); staticlib — для iOS; rlib — для тестов/Rust.
+[lib]
+crate-type = ["cdylib", "staticlib", "rlib"]
+
+[dependencies]
+citadel-quic = { path = "../citadel-quic" }
+citadel-token = { path = "../citadel-token" }   # C5.3: TokenAgent — добыча Layer-1 epoch-токенов у issuer
+citadel-winnet = { path = "../citadel-winnet" } # C3-Windows: ядро W2 (IPC/WFP/маршруты), общее со службой
+anyhow = "1"
+serde = { version = "1", features = ["derive"] }
+serde_bytes = "0.11"        # CBOR byte-string для ключей/хэшей (компактный QR, иначе [u8;32]→массив int)
+ciborium = "0.2"            # CBOR (чистый Rust, serde) — формат бандла кред
+base64 = "0.22"             # URL_SAFE_NO_PAD для citadel://-ссылки
+hex = "0.4"                 # C7.3: client_id ↔ hex для admin-плоскости
+sha2 = "0.10"               # SHA-256 обязательства к публичным ключам (§9.3)
+aws-lc-rs = "1.17"          # vault: AES-256-GCM + legacy PBKDF2 (чтение старых v1-файлов)
+argon2 = "0.5"              # C1/аудит-3: memory-hard KDF мастер-пароля vault (анти-GPU/ASIC-перебор)
+zeroize = "1"               # S1.3/M7: затирание секретов (vault-ключ, plaintext профилей, PSK, seed)
+qrcode = { version = "0.14", default-features = false, features = ["svg"] }  # генерация QR (без image-crate)
+citadel-tun = { path = "../citadel-tun" }   # GuiTunProvider: Tun::from_raw_fd (Linux-desktop)
+# token_agent::fetch_tokens гоняет sync-issuance в spawn_blocking → tokio(rt) нужен на ВСЕХ платформах,
+# включая Android (token_agent зовётся из do_android_establish, C5.4). Desktop-таргет ниже добирает
+# rt-multi-thread+macros союзом фич (для citadel-diag/#[tokio::main]). Без этого android-сборка ломалась
+# «cannot find crate tokio» (латентно с C5.3 — под android не собирали).
+# §7.1 (заход 7): кошелёк токенов держит фоновую дозаправку → нужны time (разброс задержки) и
+# sync (подписка на события контроллера, из неё видно «туннель поднят»).
+tokio = { version = "1", features = ["rt", "time", "sync"] }
+
+# SCM_RIGHTS для GuiTunProvider (Linux-desktop). На Android gui_tun компилируется, но не
+# используется (TUN даёт VpnService) — dep нужен, чтобы frb_generated.rs собрался под android.
+[target.'cfg(any(target_os = "linux", target_os = "android"))'.dependencies]
+sendfd = "0.4"
+
+# WindowsTunProvider: CancelIoEx (прервать блокирующий recv на named pipe при реконнекте/disconnect).
+[target.'cfg(windows)'.dependencies]
+# WindowsTunProvider: overlapped-I/O named pipe к службе citadel-svc (CreateFileW+OVERLAPPED, чтобы
+# конкурентные recv/send не сериализовались ядром — иначе packet-pump встаёт). CancelIoEx — отмена
+# reader'а на реконнекте. Win32_Security — тип SECURITY_ATTRIBUTES в сигнатуре CreateFileW.
+windows-sys = { version = "0.60", features = [
+    "Win32_Foundation",
+    "Win32_Security",               # W4: IsWellKnownSid + well-known SID-типы (владелец пайпа службы)
+    "Win32_Security_Authorization", # W4: GetSecurityInfo — прочитать владельца серверного пайпа
+    "Win32_Storage_FileSystem",
+    "Win32_System_IO",
+    "Win32_System_Pipes",           # WaitNamedPipeW — ждать свободный инстанс при ERROR_PIPE_BUSY
+    "Win32_System_Services",        # п.2: SCM — поднять службу citadel-svc, если приложение её погасило
+    "Win32_System_Threading",
+] }
+
+# L-7 (аудит-4): `russh 0.61` УДАЛЁН вместе с мёртвым модулем `deploy` (SSH-деплой C4/C5.5). Он
+# тянул pre-release крейты в релизный бинарь: `ssh-key 0.7.0-rc.10`, `argon2 0.6.0-rc.8` — то есть
+# крипто-зависимости без стабильного релиза и вне поля зрения cargo-audit по версии. Админский путь
+# теперь один — in-band admin-плоскость по туннелю (`citadel_client::admin`).
+# citadel-diag (CLI-прогон диагностики) — desktop/server-only, чтобы tokio-main не тянулся в APK.
+[target.'cfg(not(any(target_os = "android", target_os = "ios")))'.dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
+
+[dev-dependencies]
+libc = "0.2"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "time"] }

@@ -1,0 +1,5 @@
+# Артефакты сборки инсталлятора (генерятся build-windows.ps1) — не коммитим.
+payload/
+Output/
+# WinTUN — бинарь от WireGuard, скачивается при сборке (не redistribute в репо).
+wintun.dll

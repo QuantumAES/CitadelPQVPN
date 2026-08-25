@@ -1,0 +1,49 @@
+[package]
+name = "rust_lib_app"
+version = "0.1.0"
+edition = "2021"
+# L-6: лицензия и запрет публикации указаны явно — supply-chain гейт (cargo-deny) обязан видеть
+# лицензию КАЖДОГО крейта в дереве, включая наш собственный FRB-мост, иначе проверка лицензий
+# падает на нём же. app/rust — отдельный воркспейс, `[workspace.package]` движка сюда не достаёт.
+license = "Apache-2.0"
+publish = false
+
+[lib]
+crate-type = ["cdylib", "staticlib"]
+
+[dependencies]
+flutter_rust_bridge = "=2.12.0"
+citadel-client = { path = "../../crates/citadel-client" }
+anyhow = "1"
+# tokio-runtime для движка (quinn/TLS); "sync" — для broadcast-шины debug-логов (api::diag).
+tokio = { version = "1", features = ["rt-multi-thread", "sync"] }
+
+# api::diag — захват process-stderr (dup2/pipe) для debug-логов в UI. Unix-only (Linux+Android).
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+# api::diag — захват process-stderr на Windows (SetStdHandle+CreatePipe): eprintln! ядра → лог-панель.
+# windows-sys 0.60 уже в Cargo.lock (тянет citadel-winsvc) → без новых версий.
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.60", features = [
+    "Win32_Foundation",
+    "Win32_Security",               # SECURITY_ATTRIBUTES — в сигнатуре CreatePipe
+    "Win32_System_Console",         # GetStdHandle/SetStdHandle/STD_ERROR_HANDLE
+    "Win32_System_Pipes",           # CreatePipe
+    "Win32_Storage_FileSystem",     # WriteFile (тираж в исходный stderr)
+    "Win32_System_Threading",       # TerminateProcess — немедленный выход (desktop_exit_now)
+] }
+
+# Android: JNI-мост Rust→VpnService.protect() (анти-петля, C3.3).
+[target.'cfg(target_os = "android")'.dependencies]
+jni = "0.21"
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(frb_expand)'] }
+
+# Ф0.2 (docs/CWE-REVIEW-PLAN-2026-08.md §5, CWE-190/191) — то же, что в корневом Cargo.toml, и
+# ЗДЕСЬ отдельно: app/rust — свой воркспейс, профили движка сюда не достают. Именно эта сборка
+# уезжает в APK/десктопное приложение, то есть в руки людей; профиль релиза у неё задаёт cargokit,
+# а `overflow-checks` он не выставляет.
+[profile.release]
+overflow-checks = true

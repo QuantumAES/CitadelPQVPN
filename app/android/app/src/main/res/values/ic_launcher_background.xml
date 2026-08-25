@@ -1,0 +1,8 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Фон adaptive-иконки: цвет фона мастер-арта (app_icons/Android/playstore-icon.png).
+     Кромка маски обязана сливаться с картинкой — иначе вокруг иконки светится чужой
+     цвет (так когда-то вылез белый круг legacy-обработки).
+     Файл генерируется: tools/sync-app-icons.py -->
+<resources>
+    <color name="ic_launcher_background">#FFFFFF</color>
+</resources>

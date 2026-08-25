@@ -1,0 +1,260 @@
+import 'dart:async';
+
+import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
+
+import 'package:app/l10n/strings.dart';
+import 'package:app/src/rust/api/diag.dart';
+import 'package:app/window_visibility.dart';
+
+/// Живой журнал ядра (stderr движка захвачен в Rust — см. api::diag). Приминг снимком +
+/// подписка на хвост. Используется в debug-режиме на главном экране.
+class DebugLogPanel extends StatefulWidget {
+  const DebugLogPanel({super.key});
+
+  @override
+  State<DebugLogPanel> createState() => _DebugLogPanelState();
+}
+
+class _DebugLogPanelState extends State<DebugLogPanel> {
+  final List<String> _lines = [];
+  StreamSubscription<String>? _sub;
+
+  @override
+  void initState() {
+    super.initState();
+    _lines.addAll(debugLogSnapshot());
+    _sub = debugLogStream().listen((l) {
+      if (!mounted) return;
+      _lines.add(l);
+      if (_lines.length > 4000) {
+        _lines.removeRange(0, _lines.length - 4000);
+      }
+      // Строки копим всегда, а перестраиваем панель — только когда окно видно. У свёрнутого в
+      // трей приложения журнал во время реконнекта идёт плотным потоком, и каждый `setState`
+      // стоил кадра, которого никто не увидит (см. window_visibility.dart).
+      if (windowVisible.value) setState(() {});
+    });
+    // Вернули окно — показываем накопленное одним обновлением.
+    windowVisible.addListener(_onVisibility);
+  }
+
+  void _onVisibility() {
+    if (mounted && windowVisible.value) setState(() {});
+  }
+
+  @override
+  void dispose() {
+    windowVisible.removeListener(_onVisibility);
+    _sub?.cancel();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return MonoLogView(
+      title: Strings.of(context)('log_core_title'),
+      icon: Icons.terminal,
+      lines: _lines,
+      onClear: () {
+        debugLogClear();
+        setState(() => _lines.clear());
+      },
+    );
+  }
+}
+
+/// Переиспользуемое поле лога: моноширинные строки, автоскролл вниз, копирование, опц. очистка.
+/// Подсвечивает предупреждения/ошибки по эвристике (WARN/недоступен/таймаут/ошибка/false/MITM).
+class MonoLogView extends StatefulWidget {
+  const MonoLogView({
+    super.key,
+    required this.title,
+    required this.icon,
+    required this.lines,
+    this.onClear,
+    this.height = 240,
+    this.trailing,
+  });
+
+  final String title;
+  final IconData icon;
+  final List<String> lines;
+  final VoidCallback? onClear;
+  final double height;
+  final Widget? trailing;
+
+  @override
+  State<MonoLogView> createState() => _MonoLogViewState();
+}
+
+class _MonoLogViewState extends State<MonoLogView> {
+  final _scroll = ScrollController();
+  bool _autoscroll = true;
+
+  /// Сколько строк уже показано. Именно счётчик, а не сравнение `old.lines` с `widget.lines`:
+  /// список приезжает ОДНИМ И ТЕМ ЖЕ объектом (панель мутирует его на месте), поэтому у старого
+  /// и нового виджета длина всегда одинаковая, и сравнение по нему ничего бы не заметило.
+  int _shownLen = -1;
+  bool _jumpScheduled = false;
+
+  @override
+  void initState() {
+    super.initState();
+    _scheduleJump(); // панель примингуется снимком журнала — показываем хвост, а не начало
+  }
+
+  @override
+  void didUpdateWidget(covariant MonoLogView old) {
+    super.didUpdateWidget(old);
+    _scheduleJump();
+  }
+
+  /// Прокрутить к последней строке — но ТОЛЬКО когда строк реально прибавилось.
+  ///
+  /// Раньше это вызывалось из `build` безусловно, и получался вечный двигатель: кадр → post-frame
+  /// `jumpTo` → `jumpTo` планирует следующий кадр (goIdle/goBallistic уведомляют слушателей
+  /// позиции, а Scrollbar на них перестраивается) → снова `build` → снова `jumpTo`. Приложение
+  /// рисовало кадры без остановки, независимо от того, идёт ли трафик и поднят ли туннель, — и
+  /// тем дороже, чем длиннее журнал. Отсюда и «процессор занят, хотя туннель выключен».
+  void _scheduleJump() {
+    final len = widget.lines.length;
+    if (!_autoscroll || len == _shownLen || _jumpScheduled) return;
+    _shownLen = len;
+    _jumpScheduled = true;
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      _jumpScheduled = false;
+      if (!mounted || !_scroll.hasClients) return;
+      final max = _scroll.position.maxScrollExtent;
+      // Уже внизу — не трогаем позицию вовсе: лишний jumpTo здесь и запускал следующий кадр.
+      if ((_scroll.position.pixels - max).abs() > 0.5) _scroll.jumpTo(max);
+    });
+  }
+
+  @override
+  void dispose() {
+    _scroll.dispose();
+    super.dispose();
+  }
+
+  Color? _lineColor(BuildContext context, String l) {
+    final cs = Theme.of(context).colorScheme;
+    final low = l.toLowerCase();
+    // Успех (движок явно метит ✔/✓) — зелёный, ПЕРВЫМ: иначе подстрока красит успех в ошибку
+    // (напр. "commitment" содержит "mitm" → строка "PQ-auth ✔ commitment-fetch" краснела).
+    if (low.contains('✔') || low.contains('✓')) {
+      return Colors.green.shade600;
+    }
+    if (low.contains(' mitm') || // с границей слова — "commitment" больше не ложно-красный
+        low.contains('ошибка') ||
+        low.contains('недоступен') ||
+        low.contains('failed') ||
+        low.contains('✗')) {
+      return cs.error;
+    }
+    if (low.contains('warn') ||
+        low.contains('таймаут') ||
+        low.contains('false')) {
+      return Colors.amber.shade700;
+    }
+    return null;
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final cs = Theme.of(context).colorScheme;
+    final t = Strings.of(context);
+    // Прокрутка планируется в `didUpdateWidget` (и при включении автоскролла), а не здесь:
+    // побочный эффект в `build`, планирующий следующий кадр, — это и есть бесконечный рендер.
+    return Container(
+      decoration: BoxDecoration(
+        color: cs.surfaceContainerHighest,
+        borderRadius: BorderRadius.circular(14),
+        border: Border.all(color: cs.outlineVariant),
+      ),
+      clipBehavior: Clip.antiAlias,
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.stretch,
+        children: [
+          Padding(
+            padding: const EdgeInsets.fromLTRB(12, 6, 4, 6),
+            child: Row(
+              children: [
+                Icon(widget.icon, size: 16, color: cs.onSurfaceVariant),
+                const SizedBox(width: 8),
+                Expanded(
+                  child: Text(widget.title,
+                      style: Theme.of(context).textTheme.labelLarge),
+                ),
+                if (widget.trailing != null) widget.trailing!,
+                IconButton(
+                  visualDensity: VisualDensity.compact,
+                  tooltip: t(_autoscroll ? 'log_autoscroll_on' : 'log_autoscroll_off'),
+                  icon: Icon(_autoscroll
+                      ? Icons.vertical_align_bottom
+                      : Icons.pause_circle_outline),
+                  onPressed: () => setState(() {
+                    _autoscroll = !_autoscroll;
+                    if (_autoscroll) {
+                      _shownLen = -1; // включили — догнать хвост и без новых строк
+                      _scheduleJump();
+                    }
+                  }),
+                ),
+                IconButton(
+                  visualDensity: VisualDensity.compact,
+                  tooltip: t('log_copy'),
+                  icon: const Icon(Icons.copy_all_outlined),
+                  onPressed: () {
+                    Clipboard.setData(
+                        ClipboardData(text: widget.lines.join('\n')));
+                    ScaffoldMessenger.of(context).showSnackBar(
+                      SnackBar(content: Text(t('log_copied'))),
+                    );
+                  },
+                ),
+                if (widget.onClear != null)
+                  IconButton(
+                    visualDensity: VisualDensity.compact,
+                    tooltip: t('log_clear'),
+                    icon: const Icon(Icons.delete_outline),
+                    onPressed: widget.onClear,
+                  ),
+              ],
+            ),
+          ),
+          const Divider(height: 1),
+          SizedBox(
+            height: widget.height,
+            child: widget.lines.isEmpty
+                ? Center(
+                    child: Text(t('log_empty'),
+                        style: TextStyle(color: cs.outline)),
+                  )
+                : Scrollbar(
+                    controller: _scroll,
+                    child: ListView.builder(
+                      controller: _scroll,
+                      padding: const EdgeInsets.symmetric(
+                          horizontal: 12, vertical: 8),
+                      itemCount: widget.lines.length,
+                      itemBuilder: (_, i) {
+                        final l = widget.lines[i];
+                        return Text(
+                          l,
+                          style: TextStyle(
+                            fontFamily: 'monospace',
+                            fontSize: 11.5,
+                            height: 1.35,
+                            color: _lineColor(context, l) ?? cs.onSurface,
+                          ),
+                        );
+                      },
+                    ),
+                  ),
+          ),
+        ],
+      ),
+    );
+  }
+}

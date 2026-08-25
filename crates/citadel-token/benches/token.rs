@@ -1,26 +1,47 @@
-//! Бенчмарки анонимных токенов (M6): стоимость blind-RSA операций issuance/verify (control-path).
-//! RSA-2048 медленный → малый sample_size. Запуск: `cargo bench -p citadel-token`.
+//! Бенчмарки анонимных токенов Layer-2 (M6/M-6): стоимость операций issuance/verify на
+//! control-path. Схема v2 — VOPRF над ristretto255; каждая операция это 1–2 скалярных умножения,
+//! то есть десятки микросекунд вместо миллисекунд blind-RSA (и генерация ключа эпохи —
+//! микросекунды вместо ~10 с RSA-keygen, что и делало ротацию эпох заметной операцией).
+//!
+//! Запуск: `cargo bench -p citadel-token`.
 
 use citadel_token::*;
 use criterion::{black_box, criterion_group, criterion_main, Criterion};
 
 fn bench_token(c: &mut Criterion) {
-    let (pk, sk) = issuer_keypair(2048).unwrap();
-    let (blind_msg, st) = client_blind(&pk).unwrap();
-    let blind_sig = issuer_blind_sign(&sk, &blind_msg).unwrap();
-    let token = client_finalize(&pk, &blind_sig, &st).unwrap();
+    let key = EpochKey::generate().unwrap();
+    let public = key.public_bytes();
+    let st = BlindState::new().unwrap();
+    let blinded = st.blinded_element();
+    let (evaluated, proof) = key.evaluate(&blinded).unwrap();
+    let token = BlindState::new()
+        .and_then(|s| {
+            let (e, p) = key.evaluate(&s.blinded_element())?;
+            s.finalize(&public, &e, &p)
+        })
+        .unwrap();
+    // Контекст предъявления — как в реальном обмене (TLS-exporter сессии).
+    let ctx = redeem_context(&[0x22u8; 32]);
+    let redeem = token.redeem(&ctx);
 
     let mut g = c.benchmark_group("token");
-    g.sample_size(20); // RSA-2048 медленный — иначе бенч идёт минуты
-    g.bench_function("client_blind", |b| b.iter(|| client_blind(black_box(&pk))));
-    g.bench_function("issuer_blind_sign", |b| {
-        b.iter(|| issuer_blind_sign(black_box(&sk), black_box(&blind_msg)))
+    g.bench_function("epoch_keygen", |b| b.iter(EpochKey::generate));
+    g.bench_function("client_blind", |b| b.iter(BlindState::new));
+    g.bench_function("issuer_evaluate", |b| b.iter(|| key.evaluate(black_box(&blinded))));
+    // finalize потребляет своё состояние ослепления и обязан получить ответ ИМЕННО на него
+    // (иначе меряли бы отказ DLEQ), поэтому меряем всю выдачу целиком — это и есть то, что
+    // клиент платит за один токен.
+    g.bench_function("issuance_roundtrip", |b| {
+        b.iter(|| {
+            let s = BlindState::new().unwrap();
+            let (e, p) = key.evaluate(&s.blinded_element()).unwrap();
+            s.finalize(black_box(&public), &e, &p).unwrap()
+        })
     });
-    g.bench_function("client_finalize", |b| {
-        b.iter(|| client_finalize(black_box(&pk), black_box(&blind_sig), black_box(&st)))
-    });
-    g.bench_function("verify_token", |b| {
-        b.iter(|| verify_token(black_box(&pk), black_box(&token)))
+    let _ = (&evaluated, &proof);
+    g.bench_function("token_redeem", |b| b.iter(|| token.redeem(black_box(&ctx))));
+    g.bench_function("verify_redemption", |b| {
+        b.iter(|| key.verify_redemption(black_box(&redeem), black_box(&ctx)))
     });
     g.finish();
 }

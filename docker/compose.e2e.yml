@@ -1,0 +1,28 @@
+# Token-less exit с ПУБЛИКАЦИЕЙ ПОРТОВ на хост — чтобы десктоп-клиент из QEMU-VM
+# (user-net: хост виден как 10.0.2.2) мог подключиться. Поднимать через docker/run-e2e-exit.sh
+# (он соберёт бинарь, поднимет exit и напечатает citadel://-ссылку).
+name: citadel-e2e
+
+services:
+  exit:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: citadel-pq:latest
+    container_name: citadel-e2e-exit
+    entrypoint: ["/usr/local/bin/entrypoint-exit-e2e.sh"]
+    cap_add: ["NET_ADMIN"]
+    devices: ["/dev/net/tun:/dev/net/tun"]
+    sysctls: ["net.ipv4.ip_forward=1"]
+    environment:
+      Citadel_OBFS_PSK: "e2e0000000000000000000000000000000000000000000000000000000000000"   # M-7: только 64 hex (стенд, не секрет)
+    ports:
+      - "4433:4433/udp"       # PQ-QUIC
+      - "443:443/tcp"         # obfs-over-TCP fallback (M4)
+    volumes:
+      - "e2eshare:/shared"
+      # entrypoint-exit-e2e.sh нет в образе — монтируем (не пересобирая Dockerfile):
+      - "./entrypoint-exit-e2e.sh:/usr/local/bin/entrypoint-exit-e2e.sh:ro"
+
+volumes:
+  e2eshare:

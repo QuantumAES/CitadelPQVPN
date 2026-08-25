@@ -1,0 +1,119 @@
+#!/usr/bin/env bash
+
+set -e
+
+# CitadelPQVPN patch: гарантируем rustup-тулчейн. Gradle-сборка неинтерактивна → ~/.bashrc НЕ
+# добавляет ~/.cargo/bin в PATH, и cargo резолвится в системный rustc 1.85 (слишком старый для
+# зависимостей). Префиксуем rustup-cargo (1.96 + cargo-ndk) явно.
+export PATH="$HOME/.cargo/bin:$PATH"
+
+BASEDIR=$(dirname "$0")
+
+mkdir -p "$CARGOKIT_TOOL_TEMP_DIR"
+
+cd "$CARGOKIT_TOOL_TEMP_DIR"
+
+# Write a very simple bin package in temp folder that depends on build_tool package
+# from Cargokit. This is done to ensure that we don't pollute Cargokit folder
+# with .dart_tool contents.
+
+BUILD_TOOL_PKG_DIR="$BASEDIR/build_tool"
+
+if [[ -z $FLUTTER_ROOT ]]; then # not defined
+  DART=dart
+else
+  DART="$FLUTTER_ROOT/bin/cache/dart-sdk/bin/dart"
+fi
+
+# CitadelPQVPN patch: `dart pub get` здесь ходит в сеть (резолв + advisories с pub.dev) на КАЖДОЙ
+# сборке, где нет .package_hash. Кратковременный сбой DNS в середине 10-минутной сборки APK ронял
+# весь gradle-таск с кодом 69 (EX_UNAVAILABLE). Все зависимости build_tool запинены в его
+# pubspec.yaml и лежат в ~/.pub-cache, поэтому при недоступности pub.dev откатываемся на --offline
+# (резолв строго из локального кэша) вместо падения релизной сборки.
+pub_get() {
+  "$DART" pub get --no-precompile && return 0
+  echo "run_build_tool.sh: pub.dev недоступен, пробуем резолв из локального pub-cache (--offline)" >&2
+  "$DART" pub get --no-precompile --offline
+}
+
+cat << EOF > "pubspec.yaml"
+name: build_tool_runner
+version: 1.0.0
+publish_to: none
+
+environment:
+  sdk: '>=3.0.0 <4.0.0'
+
+dependencies:
+  build_tool:
+    path: "$BUILD_TOOL_PKG_DIR"
+EOF
+
+mkdir -p "bin"
+
+cat << EOF > "bin/build_tool_runner.dart"
+import 'package:build_tool/build_tool.dart' as build_tool;
+void main(List<String> args) {
+  build_tool.runMain(args);
+}
+EOF
+
+# Create alias for `shasum` if it does not exist and `sha1sum` exists
+if ! [ -x "$(command -v shasum)" ] && [ -x "$(command -v sha1sum)" ]; then
+  shopt -s expand_aliases
+  alias shasum="sha1sum"
+fi
+
+# Dart run will not cache any package that has a path dependency, which
+# is the case for our build_tool_runner. So instead we precompile the package
+# ourselves.
+# To invalidate the cached kernel we use the hash of ls -LR of the build_tool
+# package directory. This should be good enough, as the build_tool package
+# itself is not meant to have any path dependencies.
+
+# CitadelPQVPN patch: листинг снимаем ИЗНУТРИ пакета (`cd … && ls -lR .`). В апстриме путь
+# передаётся аргументом и потому попадает в заголовки строк ls → в хэш. Gradle зовёт скрипт как
+# «…/cargokit/gradle/../run_build_tool.sh», CMake — нормализованным путём, Android Studio — своим:
+# .package_hash инвалидируется на ровном месте, и каждая такая сборка снова идёт в сеть за pub get.
+if [[ "$OSTYPE" == "darwin"* ]]; then
+  PACKAGE_HASH=$(cd "$BUILD_TOOL_PKG_DIR" && ls -lTR . | shasum)
+else
+  PACKAGE_HASH=$(cd "$BUILD_TOOL_PKG_DIR" && ls -lR --full-time . | shasum)
+fi
+
+PACKAGE_HASH_FILE=".package_hash"
+
+if [ -f "$PACKAGE_HASH_FILE" ]; then
+    EXISTING_HASH=$(cat "$PACKAGE_HASH_FILE")
+    if [ "$PACKAGE_HASH" != "$EXISTING_HASH" ]; then
+        rm "$PACKAGE_HASH_FILE"
+    fi
+fi
+
+# Run pub get if needed.
+if [ ! -f "$PACKAGE_HASH_FILE" ]; then
+    pub_get
+    "$DART" compile kernel bin/build_tool_runner.dart
+    echo "$PACKAGE_HASH" > "$PACKAGE_HASH_FILE"
+fi
+
+# Rebuild the tool if it was deleted by Android Studio
+if [ ! -f "bin/build_tool_runner.dill" ]; then
+  "$DART" compile kernel bin/build_tool_runner.dart
+fi
+
+set +e
+
+"$DART" bin/build_tool_runner.dill "$@"
+
+exit_code=$?
+
+# 253 means invalid snapshot version.
+if [ $exit_code == 253 ]; then
+  pub_get
+  "$DART" compile kernel bin/build_tool_runner.dart
+  "$DART" bin/build_tool_runner.dill "$@"
+  exit_code=$?
+fi
+
+exit $exit_code

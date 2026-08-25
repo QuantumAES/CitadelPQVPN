@@ -1,0 +1,246 @@
+name: CI
+
+# Gate 0 (docs/SECURITY-ROADMAP.md §2): страховка security-трека. Воркспейс-тесты,
+# clippy -D warnings и docker-харнесы прогоняются на каждый push/PR. Без зелёного CI
+# security-фиксы не мёржатся — регрессии в 200+ юнит и 70+ e2e-тестах иначе неизбежны.
+#
+# ПРОГОН НА SELF-HOSTED РАННЕРЕ. Отсюда два следствия, которые важнее скорости:
+#
+#   1. Раннер — это чья-то настоящая машина, а job на ней выполняет код из репозитория.
+#      Поэтому job'ы НЕ запускаются для pull request'ов из форков (см. `if:` ниже): иначе
+#      любой посторонний, открывший PR, исполнял бы свой скрипт на этом хосте с правами
+#      раннера. Для форков нужен GitHub-hosted прогон или ручное одобрение мейнтейнером
+#      (Settings → Actions → Fork pull request workflows).
+#   2. Workflow НИЧЕГО не устанавливает на машину и не меняет её глобально: ни rustup,
+#      ни apt, ни Flutter. Он проверяет, что нужное есть, и внятно падает, если нет.
+#      Состав инструментов раннера — docs/BUILD-INSTALL.md, ставится tools/setup-dev-env.sh.
+
+on:
+  push:
+    branches: [main, dev]
+  pull_request:
+  workflow_dispatch:
+
+# Пушнули дважды подряд — старый прогон незачем доводить до конца: раннер один, очередь общая.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # ── Обязательный гейт: движковый воркспейс (crates/*) собирается, линтуется, проходит тесты.
+  # app/rust (FRB-мост) — отдельный крейт вне воркспейса, он в job'е `app` ниже.
+  rust:
+    name: воркспейс — clippy + тесты
+    runs-on: [self-hosted, linux, x64]
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: PATH раннера
+        run: |
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+          echo "$HOME/flutter/bin" >> "$GITHUB_PATH"
+
+      - name: проверка инструментов
+        run: |
+          set -u
+          rc=0
+          need() { command -v "$1" >/dev/null 2>&1 || { echo "::error::на раннере нет $1 ($2)"; rc=1; }; }
+          need cargo   "rustup stable 1.96+, см. tools/setup-dev-env.sh"
+          need cmake   "нужен aws-lc-rs"
+          need clang   "нужен aws-lc-rs"
+          # Ровно та ошибка, на которую легко потратить полдня: системный cargo 1.85 не собирает
+          # зависимости этого проекта, а сообщение об этом приходит откуда-то из глубины сборки.
+          ver="$(cargo --version | awk '{print $2}')"
+          if [ "$(printf '%s\n1.96.0\n' "$ver" | sort -V | head -1)" != "1.96.0" ]; then
+            echo "::error::cargo $ver старее 1.96 (вероятно, системный /bin/cargo вместо rustup)"; rc=1
+          fi
+          cargo --version; rustc --version
+          exit $rc
+
+      - name: clippy (-D warnings)
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+
+      - name: тесты воркспейса
+        run: cargo test --workspace --locked
+
+  # ── Клиентское приложение: анализатор Dart, кросс-компиляция под Windows и инварианты,
+  # которые не ловятся ни сборкой, ни тестами (иконки, JNI-символы).
+  app:
+    name: приложение — analyze, windows-gnu, инварианты
+    runs-on: [self-hosted, linux, x64]
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: PATH раннера
+        run: |
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+          echo "$HOME/flutter/bin" >> "$GITHUB_PATH"
+
+      - name: проверка инструментов
+        run: |
+          set -u
+          rc=0
+          need() { command -v "$1" >/dev/null 2>&1 || { echo "::error::на раннере нет $1 ($2)"; rc=1; }; }
+          need flutter "stable 3.44+, см. docs/BUILD-INSTALL.md"
+          need cargo   "rustup stable 1.96+"
+          need python3 "нужен для проверок инвариантов"
+          exit $rc
+
+      # Связывание JNI происходит в рантайме: разъехавшиеся имя пакета и символ Java_… дают
+      # собравшийся APK, который падает при старте VpnService. Проверка стоит миллисекунды.
+      - name: JNI-мост Kotlin ↔ Rust
+        run: python3 tools/check-android-jni.py
+
+      # Незакавыченный heredoc в установщике раскрывает и обратные апострофы: ` в русском
+      # комментарии исполняется ПРИ ГЕНЕРАЦИИ, `set -e` этого не ловит, и оператор видит на живом
+      # сервере поток «command not found» вместо установки (заход 14).
+      - name: heredoc'и shell-скриптов не исполняют комментарии
+        run: python3 tools/check-shell-heredocs.py
+
+      # Иконки в дереве проекта обязаны соответствовать мастер-набору app_icons/. Разошлись —
+      # значит арт поменяли, а разложить забыли, и релиз уедет со старой иконкой.
+      - name: иконки соответствуют app_icons/
+        run: python3 tools/sync-app-icons.py --check
+
+      - name: flutter pub get
+        working-directory: app
+        run: flutter pub get
+
+      - name: flutter analyze
+        working-directory: app
+        run: flutter analyze
+
+      # Windows-специфичный код (winnet/winsvc/win_tun) под MSVC проверяется в windows.yml на
+      # настоящей Windows. Здесь — дешёвый кросс-чек windows-gnu: ломающая правка в общем коде
+      # видна сразу, не дожидаясь windows-раннера.
+      - name: кросс-чек x86_64-pc-windows-gnu
+        run: |
+          if ! rustup target list --installed | grep -qx x86_64-pc-windows-gnu; then
+            echo "::warning::нет таргета x86_64-pc-windows-gnu — кросс-чек пропущен"
+            echo "  поставить: rustup target add x86_64-pc-windows-gnu"
+            exit 0
+          fi
+          cargo check --target x86_64-pc-windows-gnu \
+            -p citadel-winnet -p citadel-winsvc -p citadel-client --locked
+
+  # ── Supply-chain гейт (L-6/аудит-4). До него ответ на «есть ли в дереве известная уязвимость»
+  # был «неизвестно»: ~270 крейтов, среди них вся крипта и парсеры недоверенного ввода. Проверяются
+  # ОБА воркспейса — движковый и app/rust (у него свой Cargo.lock, иначе он вне поля зрения).
+  # Политика — deny.toml (advisories/bans/licenses/sources); исключения там обязаны нести причину.
+  supply-chain:
+    name: зависимости — cargo-deny (CVE, yanked, лицензии, источники)
+    runs-on: [self-hosted, linux, x64]
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: PATH раннера
+        run: echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+
+      - name: проверка инструментов
+        run: |
+          set -u
+          command -v cargo-deny >/dev/null 2>&1 || {
+            echo "::error::на раннере нет cargo-deny (cargo install --locked cargo-deny; ставится tools/setup-dev-env.sh)"
+            exit 1
+          }
+          cargo deny --version
+
+      # Advisory-база тянется из сети. Сеть отвалилась — это НЕ «зелёный прогон»: гейт обязан
+      # падать, иначе он тихо превращается в декорацию.
+      - name: движковый воркспейс
+        run: cargo deny --workspace check
+
+      - name: app/rust (FRB-мост)
+        working-directory: app/rust
+        run: cargo deny --config ../../deny.toml check
+
+  # ── Ф1 (docs/CWE-REVIEW-PLAN-2026-08.md §5): фаззинг разборщиков недоверенного ввода.
+  #
+  # Гейт намеренно короткий (60 с на цель): он ловит не «глубокие» находки, а регрессию — правку,
+  # после которой разборщик начинает падать на входе из репозиторного корпуса. Настоящая кампания
+  # (по 10+ минут на цель, §5 Ф6) гоняется локально и ежемесячно, а найденное переезжает
+  # в обычные тесты крейтов, чтобы ловиться и без nightly.
+  fuzz-smoke:
+    name: фаззинг — smoke по корпусу (nightly)
+    runs-on: [self-hosted, linux, x64]
+    needs: rust
+    if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: PATH раннера
+        run: echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+
+      - name: проверка инструментов
+        run: |
+          set -u
+          rc=0
+          rustup toolchain list | grep -q '^nightly' || {
+            echo "::error::на раннере нет nightly (rustup toolchain install nightly; tools/setup-dev-env.sh)"; rc=1; }
+          command -v cargo-fuzz >/dev/null 2>&1 || {
+            echo "::error::на раннере нет cargo-fuzz (cargo install --locked cargo-fuzz)"; rc=1; }
+          exit $rc
+
+      # Падение цели = красный job. Вход, на котором она упала, лежит в fuzz/artifacts/<цель>/ и
+      # обязан переехать в fuzz/corpus/<цель>/ вместе с обычным тестом крейта.
+      - name: smoke по всем целям
+        run: bash tools/fuzz.sh 60
+
+      - name: артефакты падений
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-artifacts
+          path: fuzz/artifacts/
+          if-no-files-found: ignore
+
+  # ── Тяжёлые e2e в контейнерах: настоящий туннель, настоящие iptables/TUN.
+  # Не на каждый PR — на push и по кнопке.
+  e2e:
+    name: docker e2e — туннель + консольный клиент
+    runs-on: [self-hosted, linux, x64]
+    needs: rust
+    if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: PATH раннера
+        run: echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+
+      - name: проверка окружения
+        run: |
+          set -u
+          rc=0
+          command -v docker >/dev/null || { echo "::error::на раннере нет docker"; rc=1; }
+          docker compose version >/dev/null 2>&1 || { echo "::error::нет docker compose v2"; rc=1; }
+          # Стенд создаёт реальные TUN-устройства: без /dev/net/tun контейнеры поднимутся, а
+          # туннель молча не встанет — лучше сказать об этом здесь.
+          [ -c /dev/net/tun ] || { echo "::error::нет /dev/net/tun (нужен modprobe tun на раннере)"; rc=1; }
+          exit $rc
+
+      # Оба харнеса гасят свои стенды сами (в т.ч. при провале) и возвращают код: провал
+      # сценария = красный job, а не «зелёный прогон с грустными логами».
+      - name: харнес туннеля (docker/run-demo.sh)
+        run: bash docker/run-demo.sh
+
+      - name: харнес консольного клиента (docker/run-cli-tests.sh)
+        run: bash docker/run-cli-tests.sh
+
+      # Стенды гасятся внутри скриптов; здесь — страховка на случай отмены job'а посреди
+      # прогона: брошенные контейнеры держат сети и iptables-правила следующего прогона.
+      - name: подчистить стенды
+        if: always()
+        run: |
+          docker compose -f docker/compose.yml down -v --remove-orphans 2>/dev/null || true
+          docker compose -f docker/compose.cli.yml down -v --remove-orphans 2>/dev/null || true

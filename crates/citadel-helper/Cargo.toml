@@ -1,0 +1,17 @@
+[package]
+name = "citadel-helper"
+version.workspace = true
+publish.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "CitadelPQVPN — привилегированный TUN-хелпер desktop-GUI (polkit/pkexec): создаёт TUN + сеть, отдаёт fd по SCM_RIGHTS"
+
+[[bin]]
+name = "citadel-helper"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1"
+libc = "0.2"
+sendfd = "0.4"                       # передача fd между процессами (SCM_RIGHTS) — чистая обёртка
+citadel-tun = { path = "../citadel-tun" }
