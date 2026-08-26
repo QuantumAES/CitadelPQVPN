@@ -17,6 +17,7 @@ use citadel_tun::TunIo;
 
 use crate::client::{establish_session, run_data_plane};
 use crate::config::{is_cidr, ClientConfig, SplitMode};
+use crate::deadline::Deadline;
 
 /// Стартовый интервал backoff между попытками восстановления соединения.
 const RECONNECT_BACKOFF_START: Duration = Duration::from_secs(1);
@@ -38,11 +39,15 @@ const UDP_VERDICT_TTL: Duration = Duration::from_secs(15 * 60);
 /// Глобально на процесс, а не поле контроллера, СПЕЦИАЛЬНО: приложение создаёт НОВЫЙ
 /// `VpnController` на каждое нажатие «Подключить» (см. `app/rust/src/api/citadel.rs`), и вердикт,
 /// живущий в структуре, умирал бы вместе с ней — вместе с ним умирал бы и весь смысл.
-static UDP_UNUSABLE: Mutex<Option<std::time::Instant>> = Mutex::new(None);
+///
+/// Хранится [`Deadline`], а не `Instant`: монотонные часы стоят, пока телефон спит, и вердикт,
+/// отмеренный только по ним, переживал ночь в кармане — наутро подключение начиналось с obfs-TCP
+/// по решению, принятому в другой сети (см. `crate::deadline`).
+static UDP_UNUSABLE: Mutex<Option<Deadline>> = Mutex::new(None);
 
 /// Отметить: QUIC/UDP в текущей сети не работает (не поднялся либо не несёт трафик).
 fn note_udp_unusable() {
-    *UDP_UNUSABLE.lock().unwrap() = Some(std::time::Instant::now());
+    *UDP_UNUSABLE.lock().unwrap() = Some(Deadline::after(UDP_VERDICT_TTL));
 }
 
 /// Забыть вердикт (сменилась сеть / obfs-TCP оказался не лучше — судить QUIC не за что).
@@ -52,7 +57,7 @@ fn clear_udp_verdict() {
 
 /// Свеж ли вердикт «QUIC/UDP здесь не работает» (в пределах [`UDP_VERDICT_TTL`]).
 fn udp_unusable_recent() -> bool {
-    matches!(*UDP_UNUSABLE.lock().unwrap(), Some(at) if at.elapsed() < UDP_VERDICT_TTL)
+    matches!(*UDP_UNUSABLE.lock().unwrap(), Some(d) if !d.passed())
 }
 
 /// Состояние VPN-сессии.
@@ -165,13 +170,52 @@ pub struct SessionGrant {
     pub token: Vec<u8>,
     /// `None` — ротация L1 не настроена (сервер отдаёт данные под бутстрапным PSK из ссылки).
     pub data_psk: Option<[u8; 32]>,
+    /// Под какую эпоху выведен `data_psk`. Нужен не транспорту, а диагностике: без него отказ
+    /// «оба транспорта недоступны» неотличим от закрытого порта (см. [`l1_silent_hint`]).
+    pub psk_epoch: Option<EpochStamp>,
 }
 
-/// Асинхронный добытчик свежего Layer-1 токена: зовётся перед КАЖДЫМ establish (в т.ч. реконнект),
-/// чтобы не переиспользовать потраченный токен (exit ловит double-spend, M4/M5). `None` из замыкания —
-/// токен не обновляем (token-less exit / нет Layer-1). Ставится приложением ([`VpnController::set_token_refresher`]).
+/// Возраст ключа L1: номер эпохи, под который он выведен, и её длина.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct EpochStamp {
+    pub epoch: u64,
+    pub epoch_secs: u64,
+}
+
+impl EpochStamp {
+    /// На сколько эпох ключ отстал от текущей. `0` — свежий; `1` — ещё принимается (exit держит
+    /// current±prev); `2` и больше — exit молча отбрасывает всё, чем мы говорим, и на проводе это
+    /// выглядит ровно как закрытый порт.
+    pub fn epochs_behind(&self) -> u64 {
+        citadel_token::current_epoch(self.epoch_secs).saturating_sub(self.epoch)
+    }
+}
+
+/// Что нужно от добытчика на этой попытке establish.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum GrantNeed {
+    /// Полный набор: свежий токен Layer-2 + ключ L1 текущей эпохи.
+    Token,
+    /// **Только ключ L1, без траты токена.** Попытка, не доехавшая до control-обмена, токен не
+    /// потратила — брать новый значило бы жечь квоту эпохи абонента (A6) на каждый ретрай. Но
+    /// ключ эпохи, пока мы ретраим, смениться МОГ, и тогда держаться за старый — это ретраить в
+    /// пустоту до перезапуска процесса.
+    EpochKeyOnly,
+}
+
+/// Асинхронный добытчик Layer-1: зовётся перед КАЖДЫМ establish (в т.ч. реконнектом). Что именно
+/// нужно — говорит [`GrantNeed`]; `None` из замыкания означает «просимого нет»:
+///
+///  * на [`GrantNeed::Token`] — токена взять негде (нет сети / выбрана квота / token-less деплой),
+///    решает вызывающий;
+///  * на [`GrantNeed::EpochKeyOnly`] — пачка протухла целиком, и отложенный токен вместе с ней
+///    (он скоупен на ту же эпоху): цикл обязан пойти за полным набором.
+///
+/// Ставится приложением ([`VpnController::set_token_refresher`]).
 pub type TokenRefresher = Arc<
-    dyn Fn() -> std::pin::Pin<Box<dyn std::future::Future<Output = Option<SessionGrant>> + Send>>
+    dyn Fn(
+            GrantNeed,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Option<SessionGrant>> + Send>>
         + Send
         + Sync,
 >;
@@ -283,6 +327,14 @@ impl VpnController {
         // итерации без токена мы идём к exit'у как есть — чтобы человек увидел настоящий отказ
         // token-required exit'а, а не молчаливое ожидание.
         let mut attempted = false;
+        // Сколько попыток подряд не доехали даже до предъявления токена. Одна такая — обычное
+        // дело (сеть моргнула); серия означает, что нас не слышат ВООБЩЕ, а так выглядит и
+        // закрытый порт, и просроченный ключ L1 при ротации H-3 — различить их по сообщению
+        // «оба транспорта недоступны» человек не может. См. [`l1_silent_hint`].
+        let mut silent_streak: u32 = 0;
+        // Под какую эпоху выведен ключ L1, которым мы сейчас говорим (`None` — ключ не от
+        // издателя: бутстрапный PSK или значение из конфига, возраст неизвестен).
+        let mut psk_stamp: Option<EpochStamp> = None;
         // Идти ли сразу obfs-TCP. Ставится, когда QUIC/UDP в этой сети уже показал себя негодным:
         // либо не поднялся вовсе (порт фильтруется), либо сессия оказалась ОДНОСТОРОННЕЙ (наши
         // датаграммы не доезжают — см. `dataplane::PumpExit`). Повтор тем же транспортом упирается
@@ -328,7 +380,7 @@ impl VpnController {
             if let (Some(f), false) = (&refresher, have_unspent_token) {
                 // Фаза может тянуться (издатель недоступен → таймауты+ретраи), а пользователь
                 // вправе нажать «Отключить» прямо в ней: ждём токен, но не дольше, чем до отмены.
-                let Some(fetched) = self.until_stop(f()).await else {
+                let Some(fetched) = self.until_stop(f(GrantNeed::Token)).await else {
                     return self.finish_stopped();
                 };
                 match fetched {
@@ -342,6 +394,7 @@ impl VpnController {
                         // обновления сервера «теряла» бы ключ на ровном месте.
                         if g.data_psk.is_some() {
                             cfg.data_psk = g.data_psk;
+                            psk_stamp = g.psk_epoch;
                         }
                     }
                     // Свежего токена нет. Причину знает добытчик и печатает её строкой `[token]`
@@ -362,6 +415,39 @@ impl VpnController {
                         continue;
                     }
                     None => {} // первый заход: пусть exit сам скажет, что требует токен
+                }
+            } else if let Some(f) = &refresher {
+                // Непредъявленный токен у нас на руках — за новым не идём (квота A6). Но ключ L1
+                // обновить ОБЯЗАНЫ: эпоха живёт час, а серия ретраев легко её переживает, и
+                // exit, принимающий только current±prev, после этого молча дропает всё, чем мы
+                // говорим. Это и был бесконечный «QUIC/UDP и obfs-TCP недоступны», из которого
+                // выводил только перезапуск процесса.
+                let Some(fetched) = self.until_stop(f(GrantNeed::EpochKeyOnly)).await else {
+                    return self.finish_stopped();
+                };
+                match fetched {
+                    Some(g) => {
+                        if g.data_psk.is_some() {
+                            cfg.data_psk = g.data_psk;
+                            psk_stamp = g.psk_epoch;
+                        }
+                    }
+                    // Пачка протухла целиком. Отложенный токен скоупен на ту же эпоху, что и
+                    // ключ, — exit его уже не примет; держаться за него не за чем. Отпускаем и
+                    // идём на второй круг за полным набором: сети мы здесь не касались, поэтому
+                    // без backoff'а (иначе смена эпохи стоила бы абоненту лишних 30 секунд).
+                    None => {
+                        eprintln!(
+                            "[vpn] пачка Layer-1 протухла, пока шли ретраи (сменилась эпоха) — \
+                             беру свежие токен и ключ L1"
+                        );
+                        have_unspent_token = false;
+                        // И сам токен: он скоупен на ту же эпоху. Оставить его в `cfg` значило бы
+                        // на следующем провале снова записать себе «непредъявленный токен» и
+                        // ходить кругами «ключ / токен» вместо прямого пути к издателю.
+                        cfg.token.clear();
+                        continue;
+                    }
                 }
             }
             attempted = true;
@@ -400,7 +486,7 @@ impl VpnController {
                     // лишней единицы квоты (это ровно то, что жгло её на мобильной сети).
                     let mut replaced = false;
                     if let (Some(f), true) = (&refresher, quic_spent) {
-                        let Some(fresh) = self.until_stop(f()).await else {
+                        let Some(fresh) = self.until_stop(f(GrantNeed::Token)).await else {
                             return self.finish_stopped();
                         };
                         if let Some(g) = fresh {
@@ -408,6 +494,7 @@ impl VpnController {
                             replaced = true;
                             if g.data_psk.is_some() {
                                 cfg.data_psk = g.data_psk; // H-3: ключ мог смениться на границе эпохи
+                                psk_stamp = g.psk_epoch;
                             }
                         }
                     }
@@ -428,6 +515,7 @@ impl VpnController {
             let session = match established {
                 Ok(s) => {
                     have_unspent_token = false; // токен предъявлен и принят — реконнекту нужен новый
+                    silent_streak = 0;
                     s
                 }
                 Err(e) => {
@@ -444,6 +532,10 @@ impl VpnController {
                     // появления сети, из-за этого не поднималось и после её появления; лечило
                     // только ручное «Отключить/Подключить» (новый `connect` считает флаг заново).
                     have_unspent_token = !e.token_presented && !cfg.token.is_empty();
+                    // Отказ, не доехавший до control-обмена: нас либо не слышат, либо не
+                    // разбирают. Считаем такие подряд — на серии сообщение получает приписку,
+                    // называющую вторую из этих причин (её иначе не видно).
+                    silent_streak = if e.token_presented { 0 } else { silent_streak + 1 };
                     // Принудительный obfs-TCP не поднялся (порт 443 закрыт/фильтруется) — снимаем
                     // предпочтение, иначе застряли бы на заведомо мёртвом транспорте навсегда.
                     // Обычный порядок сам попробует QUIC, а при его недоступности — тот же TCP.
@@ -459,8 +551,9 @@ impl VpnController {
                     // старте (подключились до появления сети) — по восстановлении следующая попытка
                     // возьмёт свежий токен и поднимется. Причину показываем (Error), но не сдаёмся до
                     // disconnect (стандартное поведение VPN «connecting…»). Пользователь остановит сам.
-                    self.emit(VpnEvent::Error(format!("{e:#}")));
-                    eprintln!("[vpn] establish не удался: {e:#} — ретрай через {:?}", backoff);
+                    let hint = l1_silent_hint(silent_streak, psk_stamp, &cfg);
+                    self.emit(VpnEvent::Error(format!("{e:#}{hint}")));
+                    eprintln!("[vpn] establish не удался: {e:#}{hint} — ретрай через {backoff:?}");
                     self.set_state(if ever_up { VpnState::Migrating } else { VpnState::Connecting });
                     match self.backoff_wait(backoff).await {
                         Some(next) => backoff = next,
@@ -740,6 +833,43 @@ fn next_backoff(cur: Duration) -> Duration {
     (cur * 2).min(RECONNECT_BACKOFF_MAX)
 }
 
+/// С какой серии молчаливых отказов подряд к причине приписывается разбор про L1. Порог, а не
+/// каждая попытка: одиночный таймаут — обычная жизнь мобильной сети, и приписка к нему была бы
+/// шумом, за которым перестают читать саму причину.
+const L1_SILENT_HINT_AFTER: u32 = 3;
+
+/// Приписка к «оба транспорта недоступны», когда подряд идут отказы, не доехавшие даже до
+/// предъявления токена.
+///
+/// Такой отказ выглядит одинаково при закрытом порте и при мёртвом ключе L1: exit с ротацией H-3
+/// пакет под чужим ключом эпохи не разбирает и молча отбрасывает, ICMP не шлёт — на проводе это
+/// неотличимо от firewall'а. Человек уходит чинить порты, а чинить надо выдачу. Поэтому в
+/// сообщение попадает то, чего со стороны не видно: сколько попыток подряд нас не слышат и на
+/// сколько эпох отстал ключ, которым мы говорим.
+fn l1_silent_hint(streak: u32, stamp: Option<EpochStamp>, cfg: &ClientConfig) -> String {
+    if streak < L1_SILENT_HINT_AFTER {
+        return String::new();
+    }
+    // Обфускации нет вовсе — L1-гейта, о котором стоило бы предупреждать, тоже нет.
+    if cfg.transport_psk().is_none() {
+        return format!(" [{streak} попыток подряд без ответа на хендшейк]");
+    }
+    let l1 = match stamp {
+        Some(s) => match s.epochs_behind() {
+            0 => "ключ L1 — текущей эпохи, причина не в нём".to_string(),
+            n => format!(
+                "ключ L1 отстал на {n} эпох(и): exit принимает только current±prev и молча \
+                 отбрасывает остальное — обновляю"
+            ),
+        },
+        None if cfg.data_psk.is_none() => "ключа L1 эпохи нет, идём под бутстрапным PSK — при \
+             включённой на сервере ротации H-3 это выглядит ровно как закрытый порт"
+            .to_string(),
+        None => "ключ L1 задан конфигом, возраст неизвестен".to_string(),
+    };
+    format!(" [{streak} попыток подряд без ответа на хендшейк; {l1}]")
+}
+
 /// Стоит ли после неудачи QUIC-establish эскалировать на obfs-TCP. Эскалация лечит РОВНО один класс
 /// отказов: транспорт поднялся, а крупный control-обмен (ML-DSA pub+sig, ~5 КБ) не прошёл — на
 /// мобильном/NAT64-пути его чёрнодырит по MTU, и TCP решает это сегментацией.
@@ -816,7 +946,7 @@ mod tests {
         let c = Arc::new(VpnController::new());
         let n = calls.clone();
         // Издатель недоступен (сети нет) — как и в поле: кошелёк пуст, отдать нечего.
-        c.set_token_refresher(Arc::new(move || {
+        c.set_token_refresher(Arc::new(move |_need| {
             n.fetch_add(1, Ordering::SeqCst);
             Box::pin(async { None })
         }));
@@ -839,6 +969,126 @@ mod tests {
         );
     }
 
+    /// **Регрессия на «сначала всё работало, потом бесконечные ретраи, помогает перезапуск».**
+    ///
+    /// Держа непредъявленный токен, цикл к добытчику не обращался ВООБЩЕ — берёг квоту эпохи
+    /// (A6). Но вместе с токеном замораживался и ключ L1: эпоха живёт час, серия ретраев её
+    /// переживает, а exit принимает только current±prev и всё остальное молча отбрасывает. Оба
+    /// транспорта умирали одновременно, в журнале это выглядело как закрытый порт, и выводил из
+    /// этого только перезапуск процесса. Теперь ключ обновляется на каждой попытке — и по-прежнему
+    /// без траты токена.
+    #[tokio::test]
+    async fn epoch_key_is_refreshed_while_we_hold_an_unspent_token() {
+        struct NoTun;
+        impl TunProvider for NoTun {
+            fn configure(&self, _p: &TunParams) -> Result<Arc<dyn TunIo>> {
+                unreachable!("до туннеля дело не доходит: exit'ов в конфиге нет")
+            }
+        }
+
+        let asked: Arc<Mutex<Vec<GrantNeed>>> = Arc::new(Mutex::new(Vec::new()));
+        let seen = asked.clone();
+        let c = Arc::new(VpnController::new());
+        c.set_token_refresher(Arc::new(move |need| {
+            seen.lock().unwrap().push(need);
+            Box::pin(async move {
+                Some(SessionGrant {
+                    token: b"fresh".to_vec(),
+                    data_psk: Some([1u8; 32]),
+                    psk_epoch: None,
+                })
+            })
+        }));
+
+        let mut cfg = test_cfg();
+        cfg.token = b"unspent".to_vec(); // на руках непредъявленный токен — за новым не идём
+        let c2 = c.clone();
+        let h = tokio::spawn(async move {
+            let _ = c2.connect(cfg, Arc::new(NoTun)).await;
+        });
+        tokio::time::sleep(Duration::from_millis(2500)).await;
+        c.disconnect();
+        let _ = tokio::time::timeout(Duration::from_secs(5), h).await;
+
+        let asked = asked.lock().unwrap();
+        assert!(
+            asked.len() >= 2,
+            "за ключом L1 не сходили ни разу ({} обращений) — попытки идут под замороженным \
+             ключом, и после смены эпохи это ретрай в пустоту навсегда",
+            asked.len()
+        );
+        assert!(
+            asked.iter().all(|n| *n == GrantNeed::EpochKeyOnly),
+            "непредъявленный токен на руках — новый брать нельзя (квота A6), спрашиваем только \
+             ключ: {asked:?}"
+        );
+    }
+
+    /// А если пачка протухла целиком, отложенный токен мёртв вместе с ней (он скоупен на ту же
+    /// эпоху). Цикл обязан это заметить по `None` и пойти за полным набором, а не беречь труп.
+    #[tokio::test]
+    async fn expired_pouch_makes_the_loop_let_go_of_its_stale_token() {
+        struct NoTun;
+        impl TunProvider for NoTun {
+            fn configure(&self, _p: &TunParams) -> Result<Arc<dyn TunIo>> {
+                unreachable!("до туннеля дело не доходит: exit'ов в конфиге нет")
+            }
+        }
+
+        let asked: Arc<Mutex<Vec<GrantNeed>>> = Arc::new(Mutex::new(Vec::new()));
+        let seen = asked.clone();
+        let c = Arc::new(VpnController::new());
+        // Кошелёк протух: ключа нет, и токенов тоже (издатель при этом недоступен).
+        c.set_token_refresher(Arc::new(move |need| {
+            seen.lock().unwrap().push(need);
+            Box::pin(async { None })
+        }));
+
+        let mut cfg = test_cfg();
+        cfg.token = b"stale".to_vec();
+        let c2 = c.clone();
+        let h = tokio::spawn(async move {
+            let _ = c2.connect(cfg, Arc::new(NoTun)).await;
+        });
+        tokio::time::sleep(Duration::from_millis(2500)).await;
+        c.disconnect();
+        let _ = tokio::time::timeout(Duration::from_secs(5), h).await;
+
+        let asked = asked.lock().unwrap();
+        assert!(
+            asked.contains(&GrantNeed::Token),
+            "цикл так и не пошёл за полным набором ({asked:?}) — он вечно ретраит с мёртвыми \
+             токеном и ключом L1"
+        );
+    }
+
+    /// Приписка про L1 появляется только на СЕРИИ молчаливых отказов и называет возраст ключа —
+    /// то единственное, чего в «оба транспорта недоступны» не видно, а именно оно и есть причина.
+    #[test]
+    fn l1_hint_names_the_stale_key_only_after_a_streak() {
+        let cur = citadel_token::current_epoch(3600);
+        let mut cfg = test_cfg();
+        cfg.obfs_psk = Some([2u8; 32]); // обфускация включена ⇒ L1-гейт есть
+
+        let stale = Some(EpochStamp { epoch: cur - 3, epoch_secs: 3600 });
+        assert_eq!(l1_silent_hint(1, stale, &cfg), "", "одиночный таймаут — обычная жизнь сети");
+        let hint = l1_silent_hint(L1_SILENT_HINT_AFTER, stale, &cfg);
+        assert!(hint.contains("отстал на 3"), "возраст ключа обязан быть назван: {hint}");
+        assert!(hint.contains("попыток подряд"), "и число молчаливых попыток тоже: {hint}");
+
+        // Ключ свежий — причина не в нём, и говорить обратное значит увести диагноз в сторону.
+        let fresh = Some(EpochStamp { epoch: cur, epoch_secs: 3600 });
+        assert!(l1_silent_hint(9, fresh, &cfg).contains("причина не в нём"));
+
+        // Ключа эпохи нет вовсе — идём под бутстрапным PSK (это и есть первый подозреваемый).
+        assert!(l1_silent_hint(9, None, &cfg).contains("бутстрапным PSK"));
+
+        // Обфускации нет — L1-гейта, о котором стоило бы предупреждать, тоже нет.
+        cfg.obfs_psk = None;
+        let plain = l1_silent_hint(9, None, &cfg);
+        assert!(plain.contains("попыток подряд") && !plain.contains("L1"), "{plain}");
+    }
+
     /// Вердикт «QUIC/UDP здесь односторонний» живёт ДОЛЬШЕ контроллера (приложение создаёт новый
     /// на каждое подключение) — иначе каждое нажатие «Подключить» снова начиналось бы с четырёх
     /// секунд мёртвого туннеля и второго токена из кошелька. Но не вечно и не поперёк смены сети.
@@ -852,9 +1102,15 @@ mod tests {
         clear_udp_verdict();
         assert!(!udp_unusable_recent(), "вердикт снят — обычный порядок транспортов");
         // Протухание: вердикт старше TTL не считается (сеть могла и починиться).
-        *UDP_UNUSABLE.lock().unwrap() =
-            std::time::Instant::now().checked_sub(UDP_VERDICT_TTL + Duration::from_secs(1));
+        *UDP_UNUSABLE.lock().unwrap() = Some(Deadline::after(Duration::ZERO));
         assert!(!udp_unusable_recent(), "вердикт протух — пробуем QUIC заново");
+        // И то же самое, если TTL истёк, пока телефон спал: монотонные часы в suspend стоят, и
+        // вердикт, отмеренный только по ним, переживал бы ночь в кармане — а сеть наутро другая.
+        *UDP_UNUSABLE.lock().unwrap() = Some(Deadline::from_parts(
+            std::time::Instant::now() + UDP_VERDICT_TTL,
+            std::time::SystemTime::now().checked_sub(Duration::from_secs(1)),
+        ));
+        assert!(!udp_unusable_recent(), "вердикт проспан — судить QUIC по нему больше нельзя");
         clear_udp_verdict();
     }
 
@@ -1004,7 +1260,7 @@ mod tests {
         let c = Arc::new(VpnController::new());
         let configured = Arc::new(AtomicBool::new(false));
         // Издатель «не отвечает никогда» — цикл стоит в фазе добычи токена, пока не придёт отмена.
-        c.set_token_refresher(Arc::new(|| {
+        c.set_token_refresher(Arc::new(|_need| {
             Box::pin(async {
                 std::future::pending::<()>().await;
                 None

@@ -27,10 +27,13 @@
 use anyhow::{Context, Result};
 use citadel_quic::protect::Route; // маршрут сокета к издателю: мимо туннеля / сквозь него
 use citadel_quic::config::ClientConfig;
-use citadel_quic::vpn::{SessionGrant, TokenRefresher, VpnController, VpnEvent, VpnState};
+use citadel_quic::deadline::Deadline;
+use citadel_quic::vpn::{
+    EpochStamp, GrantNeed, SessionGrant, TokenRefresher, VpnController, VpnEvent, VpnState,
+};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 /// Сколько токенов брать за один заход к издателю. Верхняя граница осмысленности — квота издателя
 /// на эпоху (`Citadel_TOKEN_QUOTA`, дефолт 64): пачка должна перекрывать разумное число
@@ -111,34 +114,49 @@ pub struct TokenPouch {
 struct Purse {
     tokens: Vec<Vec<u8>>,
     data_psk: Option<[u8; 32]>,
-    /// Монотонный дедлайн годности пачки. `None` — кошелёк пуст.
-    deadline: Option<Instant>,
+    /// Дедлайн годности пачки. `None` — кошелёк пуст.
+    ///
+    /// [`Deadline`], а не `Instant`, и это принципиально: монотонные часы стоят, пока телефон
+    /// спит, а годность пачки — величина НАСТЕННАЯ (exit судит эпоху по своим часам). Пока
+    /// дедлайн был чисто монотонным, телефон после долгого сна — авиарежим, ночь в кармане —
+    /// считал пачку свежей и предъявлял ключ L1 позапрошлой эпохи. Exit такие пакеты молча
+    /// отбрасывает, поэтому QUIC/UDP и obfs-TCP умирали одновременно и выглядело это как
+    /// закрытый порт; лечил только перезапуск процесса.
+    deadline: Option<Deadline>,
+    /// Номер эпохи издателя, под который выданы токены и выведен `data_psk` — для диагностики
+    /// возраста ключа ([`EpochStamp`]).
+    epoch: Option<u64>,
     /// Длина эпохи издателя (сек) — из неё считается и дедлайн, и разброс фоновой дозаправки.
     epoch_secs: u64,
     /// До какого момента ходить к издателю бессмысленно: квота эпохи (A6) уже выбрана, и он не
     /// отдаст ни одного токена до её конца ([`citadel_token::QuotaExhausted`]). Без этой отметки
     /// цикл реконнекта поднимал PQ-TLS-сессию к издателю каждые несколько секунд до конца эпохи —
     /// сотня бесполезных хендшейков вместо одного честного «ждём столько-то».
-    quota_block: Option<Instant>,
+    quota_block: Option<Deadline>,
 }
 
 impl Purse {
-    /// Не просрочена ли пачка. Дедлайн монотонный: перевод системных часов (в т.ч. злонамеренный)
-    /// не продлевает жизнь токенов.
+    /// Не просрочена ли пачка. Срок считается вышедшим по любой из двух шкал: монотонная не даёт
+    /// продлить его переводом системных часов назад, настенная — сном устройства.
     fn fresh(&self) -> bool {
-        matches!(self.deadline, Some(d) if Instant::now() < d)
+        matches!(&self.deadline, Some(d) if !d.passed())
     }
 
     fn clear(&mut self) {
         self.tokens.clear();
         self.data_psk = None;
         self.deadline = None;
+        self.epoch = None;
+    }
+
+    /// Возраст ключа L1 в пачке (для диагностики в цикле реконнекта).
+    fn stamp(&self) -> Option<EpochStamp> {
+        Some(EpochStamp { epoch: self.epoch?, epoch_secs: self.epoch_secs })
     }
 
     /// Сколько ещё ждать до снятия блокировки по квоте (`None` — идти можно).
     fn quota_wait(&self) -> Option<Duration> {
-        let until = self.quota_block?;
-        until.checked_duration_since(Instant::now())
+        self.quota_block.as_ref()?.remaining()
     }
 }
 
@@ -189,7 +207,7 @@ impl TokenPouch {
             return None;
         }
         let token = p.tokens.pop()?;
-        Some(SessionGrant { token, data_psk: p.data_psk })
+        Some(SessionGrant { token, data_psk: p.data_psk, psk_epoch: p.stamp() })
     }
 
     /// Сколько токенов осталось (для фоновой дозаправки и тестов).
@@ -215,7 +233,7 @@ impl TokenPouch {
                 // молчим до него (см. `Purse::quota_block`).
                 if let Some(q) = e.downcast_ref::<citadel_token::QuotaExhausted>() {
                     let wait = q.retry_after();
-                    self.st.lock().unwrap().quota_block = Some(Instant::now() + wait);
+                    self.st.lock().unwrap().quota_block = Some(Deadline::after(wait));
                     eprintln!(
                         "[token] {q} — к издателю не хожу ещё {} мин",
                         wait.as_secs().div_ceil(60)
@@ -256,8 +274,9 @@ impl TokenPouch {
             p.tokens = grant.tokens;
         }
         p.data_psk = grant.data_psk;
+        p.epoch = Some(grant.epoch);
         p.epoch_secs = grant.epoch_secs;
-        p.deadline = Some(Instant::now() + pouch_lifetime(grant.epoch, grant.epoch_secs));
+        p.deadline = Some(Deadline::after(pouch_lifetime(grant.epoch, grant.epoch_secs)));
         Ok(n)
     }
 
@@ -265,8 +284,14 @@ impl TokenPouch {
     /// издателю МИМО туннеля (его в этот момент нет). Это единственное место, где обращение к
     /// издателю остаётся привязанным ко времени подключения; фоновая дозаправка существует ровно
     /// затем, чтобы сюда попадали как можно реже (холодный старт, конец эпохи в офлайне).
-    async fn take_or_fetch(self: &Arc<Self>) -> Option<SessionGrant> {
+    ///
+    /// Всё сказанное — про [`GrantNeed::Token`]. [`GrantNeed::EpochKeyOnly`] к издателю не ходит
+    /// никогда и обслуживается [`Self::epoch_key_only`].
+    async fn take_or_fetch(self: &Arc<Self>, need: GrantNeed) -> Option<SessionGrant> {
         self.ensure_topup();
+        if need == GrantNeed::EpochKeyOnly {
+            return self.epoch_key_only();
+        }
         if let Some(g) = self.take_cached() {
             return Some(g);
         }
@@ -295,12 +320,28 @@ impl TokenPouch {
         }
     }
 
+    /// [`GrantNeed::EpochKeyOnly`]: ключ L1 текущей эпохи БЕЗ траты токена. К издателю не ходим
+    /// вовсе — спрашивающий держит непредъявленный токен, и поход стоил бы единицы квоты (A6) на
+    /// каждом ретрае, ровно того, от чего эта ветка и защищает.
+    ///
+    /// `None` — пачки больше нет. Это ответ по существу, а не отказ: токен, отложенный
+    /// спрашивающим, скоупен на ту же эпоху, что и ключ, и мёртв вместе с ней — цикл обязан
+    /// узнать об этом и пойти за полным набором.
+    fn epoch_key_only(&self) -> Option<SessionGrant> {
+        let mut p = self.st.lock().unwrap();
+        if !p.fresh() {
+            p.clear();
+            return None;
+        }
+        Some(SessionGrant { token: Vec::new(), data_psk: p.data_psk, psk_epoch: p.stamp() })
+    }
+
     /// Замыкание для [`VpnController::set_token_refresher`].
     pub fn refresher(self: &Arc<Self>) -> TokenRefresher {
         let me = self.clone();
-        Arc::new(move || {
+        Arc::new(move |need| {
             let me = me.clone();
-            Box::pin(async move { me.take_or_fetch().await })
+            Box::pin(async move { me.take_or_fetch(need).await })
                 as std::pin::Pin<Box<dyn std::future::Future<Output = Option<SessionGrant>> + Send>>
         })
     }
@@ -453,6 +494,9 @@ fn batch_size() -> usize {
 /// Часы клиента могут расходиться с издателем — номер эпохи он прислал. Считаем остаток эпохи по
 /// СВОИМ часам и, если номера разошлись, берём консервативную половину эпохи: рассинхрон в нашу
 /// пользу не должен превращать «кэш на эпоху» в «кэш навсегда».
+///
+/// Возвращается длительность; на обе временны́е шкалы её раскладывает [`Deadline`] в
+/// [`Purse::deadline`] — иначе сон устройства продлевал бы пачку ровно на время сна.
 fn pouch_lifetime(issuer_epoch: u64, epoch_secs: u64) -> Duration {
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -646,6 +690,7 @@ pub async fn with_token(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::{Instant, SystemTime};
 
     fn pouch() -> Arc<TokenPouch> {
         Arc::new(TokenPouch::new(
@@ -720,9 +765,9 @@ mod tests {
     #[tokio::test]
     async fn quota_block_stops_pointless_issuer_visits() {
         let p = pouch();
-        p.st.lock().unwrap().quota_block = Some(Instant::now() + Duration::from_secs(600));
+        p.st.lock().unwrap().quota_block = Some(Deadline::after(Duration::from_secs(600)));
         let t0 = Instant::now();
-        assert!(p.take_or_fetch().await.is_none(), "токенов нет и взять негде");
+        assert!(p.take_or_fetch(GrantNeed::Token).await.is_none(), "токенов нет и взять негде");
         assert!(t0.elapsed() < Duration::from_millis(200), "к издателю ходить не должны");
     }
 
@@ -735,16 +780,18 @@ mod tests {
             let mut st = p.st.lock().unwrap();
             st.tokens = vec![vec![1], vec![2], vec![3]];
             st.data_psk = Some([9u8; 32]);
+            st.epoch = Some(citadel_token::current_epoch(3600));
             st.epoch_secs = 3600;
-            st.deadline = Some(Instant::now() + Duration::from_secs(60));
+            st.deadline = Some(Deadline::after(Duration::from_secs(60)));
         }
         for _ in 0..3 {
-            let g = p.take_or_fetch().await.expect("токен из кошелька");
+            let g = p.take_or_fetch(GrantNeed::Token).await.expect("токен из кошелька");
             assert_eq!(g.data_psk, Some([9u8; 32]), "ключ L1 эпохи едет вместе с токеном");
+            assert_eq!(g.psk_epoch.map(|e| e.epochs_behind()), Some(0), "ключ текущей эпохи");
         }
         assert_eq!(p.left(), 0);
         // Кошелёк пуст → идём к издателю (127.0.0.1:9 закрыт) → None, а не паника/зависание.
-        assert!(p.take_or_fetch().await.is_none());
+        assert!(p.take_or_fetch(GrantNeed::Token).await.is_none());
     }
 
     /// Главный тест §7.1: **одна пачка = одно обращение к издателю на много establish'ей.**
@@ -818,7 +865,7 @@ mod tests {
         assert_eq!(p.batch, DEFAULT_BATCH, "по умолчанию берём пачку, а не один токен");
         let mut tokens = Vec::new();
         for i in 0..DEFAULT_BATCH {
-            let g = p.take_or_fetch().await.unwrap_or_else(|| panic!("грант {i}"));
+            let g = p.take_or_fetch(GrantNeed::Token).await.unwrap_or_else(|| panic!("грант {i}"));
             assert_eq!(g.data_psk, Some(citadel_obfs_psk_epoch([7u8; 32])), "ключ L1 эпохи (H-3)");
             tokens.push(g.token);
         }
@@ -827,7 +874,7 @@ mod tests {
         tokens.dedup();
         assert_eq!(tokens.len(), DEFAULT_BATCH, "токены в пачке разные (не копия одного)");
         // Пачка кончилась → следующий грант стоит второго захода (и он тоже один на пачку).
-        assert!(p.take_or_fetch().await.is_some());
+        assert!(p.take_or_fetch(GrantNeed::Token).await.is_some());
         assert_eq!(visits.load(Ordering::SeqCst), 2);
         drop(p);
         let _ = srv.join();
@@ -848,13 +895,117 @@ mod tests {
             let mut st = p.st.lock().unwrap();
             st.tokens = vec![vec![1], vec![2]];
             st.data_psk = Some([9u8; 32]);
+            st.epoch = Some(citadel_token::current_epoch(3600));
             st.epoch_secs = 3600;
-            st.deadline = Some(Instant::now() - Duration::from_secs(1)); // уже протухла
+            st.deadline = Some(Deadline::after(Duration::ZERO)); // уже протухла
         }
         assert_eq!(p.left(), 0, "просроченная пачка не считается за токены");
         assert!(p.take_cached().is_none());
         let st = p.st.lock().unwrap();
         assert!(st.tokens.is_empty() && st.data_psk.is_none(), "просрочка вычищена целиком");
+    }
+
+    /// **Регрессия на «после долгого авиарежима туннель ретраит вечно».**
+    ///
+    /// Годность пачки мерилась только `Instant` — монотонными часами, которые на Android стоят,
+    /// пока устройство в suspend. Телефон, проспавший час-другой, считал пачку свежей и
+    /// предъявлял ключ L1 позапрошлой эпохи; exit с ротацией H-3 такие пакеты молча отбрасывает,
+    /// поэтому QUIC/UDP и obfs-TCP переставали отвечать ОДНОВРЕМЕННО и выглядело это как закрытый
+    /// порт. Лечил только перезапуск процесса — кошелёк живёт в памяти.
+    ///
+    /// Здесь сон моделируется явно: монотонная половина дедлайна ещё далеко впереди, настенная
+    /// уже позади. Пачка обязана считаться протухшей.
+    #[tokio::test]
+    async fn pouch_expires_when_the_device_slept_through_the_epoch() {
+        let p = pouch();
+        {
+            let mut st = p.st.lock().unwrap();
+            st.tokens = vec![vec![1], vec![2]];
+            st.data_psk = Some([9u8; 32]);
+            st.epoch = Some(citadel_token::current_epoch(3600) - 2);
+            st.epoch_secs = 3600;
+            // Час монотонного времени «не прошёл» (спали), настенный дедлайн — позади.
+            st.deadline = Some(Deadline::from_parts(
+                Instant::now() + Duration::from_secs(3600),
+                SystemTime::now().checked_sub(Duration::from_secs(1)),
+            ));
+            assert!(!st.fresh(), "проспанная пачка не свежая, как бы ни стояли монотонные часы");
+        }
+        assert_eq!(p.left(), 0);
+        assert!(p.take_cached().is_none(), "ключ мёртвой эпохи предъявлять нельзя");
+        let st = p.st.lock().unwrap();
+        assert!(
+            st.tokens.is_empty() && st.data_psk.is_none() && st.epoch.is_none(),
+            "просрочка вычищена целиком — следующий establish пойдёт к издателю"
+        );
+    }
+
+    /// Обратная половина того же инварианта: перевод системных часов НАЗАД пачку не продлевает —
+    /// монотонная шкала отработает сама. Её нельзя было потерять, вводя настенную.
+    #[test]
+    fn pouch_expiry_survives_wall_clock_rollback() {
+        let p = pouch();
+        let mut st = p.st.lock().unwrap();
+        st.tokens = vec![vec![1]];
+        st.deadline = Some(Deadline::from_parts(
+            Instant::now() - Duration::from_secs(1),
+            SystemTime::now().checked_add(Duration::from_secs(86_400)),
+        ));
+        assert!(!st.fresh(), "перевод часов назад не должен воскрешать пачку");
+    }
+
+    /// [`GrantNeed::EpochKeyOnly`] отдаёт ключ L1, НЕ трогая токены: реконнект, у которого на
+    /// руках остался непредъявленный токен, обязан обновлять ключ на каждой попытке, но платить
+    /// за это квотой эпохи (A6) — нет.
+    #[tokio::test]
+    async fn epoch_key_only_refreshes_the_key_without_spending_a_token() {
+        let p = pouch();
+        {
+            let mut st = p.st.lock().unwrap();
+            st.tokens = vec![vec![1], vec![2]];
+            st.data_psk = Some([9u8; 32]);
+            st.epoch = Some(citadel_token::current_epoch(3600));
+            st.epoch_secs = 3600;
+            st.deadline = Some(Deadline::after(Duration::from_secs(60)));
+        }
+        for _ in 0..5 {
+            let g = p.take_or_fetch(GrantNeed::EpochKeyOnly).await.expect("ключ из кошелька");
+            assert_eq!(g.data_psk, Some([9u8; 32]));
+            assert!(g.token.is_empty(), "токен не выдаётся: спрашивали только ключ");
+            assert_eq!(g.psk_epoch.map(|e| e.epochs_behind()), Some(0));
+        }
+        assert_eq!(p.left(), 2, "пачка не тронута — квота эпохи не сожжена ретраями");
+    }
+
+    /// А когда пачка протухла, `EpochKeyOnly` обязан ответить `None`. Это не «нет ключа», а
+    /// «нет и токена тоже»: он скоупен на ту же эпоху. Цикл реконнекта по этому `None` отпускает
+    /// отложенный токен и идёт за полным набором — без этого он ретраил бы под мёртвым L1 вечно.
+    #[tokio::test]
+    async fn epoch_key_only_reports_expiry_so_the_loop_drops_its_stale_token() {
+        let p = pouch();
+        {
+            let mut st = p.st.lock().unwrap();
+            st.tokens = vec![vec![1]];
+            st.data_psk = Some([9u8; 32]);
+            st.epoch = Some(citadel_token::current_epoch(3600) - 2);
+            st.epoch_secs = 3600;
+            st.deadline = Some(Deadline::after(Duration::ZERO));
+        }
+        assert!(p.take_or_fetch(GrantNeed::EpochKeyOnly).await.is_none());
+        assert!(p.st.lock().unwrap().data_psk.is_none(), "мёртвый ключ не остаётся в кошельке");
+    }
+
+    /// Штамп эпохи считает возраст ключа так же, как его судит exit: 0 и 1 — принимаются
+    /// (current±prev), 2 и больше — уже нет, и это ровно тот случай, о котором цикл обязан
+    /// сказать вслух.
+    #[test]
+    fn epoch_stamp_measures_age_the_way_the_exit_does() {
+        let cur = citadel_token::current_epoch(3600);
+        assert_eq!(EpochStamp { epoch: cur, epoch_secs: 3600 }.epochs_behind(), 0);
+        assert_eq!(EpochStamp { epoch: cur - 1, epoch_secs: 3600 }.epochs_behind(), 1);
+        assert_eq!(EpochStamp { epoch: cur - 5, epoch_secs: 3600 }.epochs_behind(), 5);
+        // Часы клиента убежали вперёд относительно выданного номера — не отрицательный возраст.
+        assert_eq!(EpochStamp { epoch: cur + 3, epoch_secs: 3600 }.epochs_behind(), 0);
     }
 
     /// Фоновая задача обязана умирать вместе с контроллером: иначе каждая новая сессия оставляла

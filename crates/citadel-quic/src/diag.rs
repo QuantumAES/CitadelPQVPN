@@ -12,17 +12,30 @@ use std::time::{Duration, Instant};
 use crate::client::{establish_session, host_of, try_quic_connect};
 use crate::config::ClientConfig;
 
-/// H-3: приписка к «порт недоступен», когда транспорт идёт под БУТСТРАПНЫМ PSK, а ключа L1
-/// текущей эпохи у нас нет. Exit с включённой ротацией такой пакет даже не разбирает и молча
-/// отбрасывает — на проводе это неотличимо от закрытого порта, и человек уходит чинить firewall
-/// вместо выдачи токенов. Пустая строка, когда ключ эпохи есть (или obfs не используется вовсе).
+/// H-3: приписка к «порт недоступен», когда пакеты идут под ключом L1, которого exit может не
+/// принять. Exit с включённой ротацией такой пакет даже не разбирает и молча отбрасывает — на
+/// проводе это неотличимо от закрытого порта, и человек уходит чинить firewall вместо выдачи
+/// токенов. Пустая строка, когда obfs не используется вовсе.
+///
+/// Случая два, и подозреваемые у них разные:
+///  * ключа эпохи нет вовсе — идём под БУТСТРАПНЫМ PSK (обычно провалившийся шаг «Токен»);
+///  * ключ есть, но он мог протухнуть. Exit держит ровно `current±prev`, эпоха по умолчанию час,
+///    а приложение, провисевшее ночь в фоне, легко переживает две. Возраст ключа отсюда не виден
+///    (диагностика смотрит на конфиг, а не в кошелёк) — поэтому не утверждаем, а называем
+///    проверку: переподключиться дешевле, чем разбирать firewall.
 fn missing_epoch_key_hint(cfg: &ClientConfig) -> &'static str {
-    if cfg.data_psk.is_none() && cfg.obfs_psk.is_some() {
-        ". NB: ключ L1 текущей эпохи не получен (идём под бутстрапным PSK) — при включённой на \
-         сервере ротации H-3 exit молча отбрасывает такие пакеты, и это выглядит ровно как \
-         закрытый порт. Сперва разберись с шагом «Токен»"
-    } else {
-        ""
+    match (cfg.data_psk.is_some(), cfg.obfs_psk.is_some()) {
+        (false, true) => {
+            ". NB: ключ L1 текущей эпохи не получен (идём под бутстрапным PSK) — при включённой на \
+             сервере ротации H-3 exit молча отбрасывает такие пакеты, и это выглядит ровно как \
+             закрытый порт. Сперва разберись с шагом «Токен»"
+        }
+        (true, _) => {
+            ". NB: под ротацией H-3 exit принимает ключ L1 только текущей и прошлой эпохи, а \
+             остальное молча отбрасывает — просроченный ключ выглядит ровно как закрытый порт. \
+             Если приложение долго висело в фоне, переподключись прежде, чем чинить firewall"
+        }
+        (false, false) => "",
     }
 }
 
@@ -223,4 +236,45 @@ pub async fn run_diagnostics(
     // ── 8. teardown ──
     drop(session);
     emit(DiagStep::ok("Готово", "сессия закрыта"));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Приписка про L1 обязана появляться в ОБОИХ случаях, когда exit может молча отбрасывать
+    /// наши пакеты, и не появляться там, где обфускации нет вовсе: без неё «UDP недоступен»
+    /// отправляет человека чинить firewall при живом порте и мёртвом ключе эпохи.
+    #[test]
+    fn epoch_key_hint_covers_both_missing_and_possibly_stale_key() {
+        let mut cfg = crate::config::ClientConfig {
+            servers: vec![],
+            server_name: "x".into(),
+            obfs_psk: None,
+            kx_suite: String::new(),
+            tcp_port: "443".into(),
+            routes: String::new(),
+            dns: None,
+            mtu: "1280".into(),
+            token: vec![],
+            data_psk: None,
+            pin: crate::config::PinSource::None,
+            mldsa: crate::config::MldsaSource::None,
+            allow_insecure_no_pin: false,
+            allow_classical_kx: false,
+            require_pq_auth: false,
+            killswitch: false,
+            split: Default::default(),
+            pacing: None,
+        };
+        assert_eq!(missing_epoch_key_hint(&cfg), "", "obfs не используется — L1-гейта нет");
+
+        cfg.obfs_psk = Some([1u8; 32]);
+        assert!(missing_epoch_key_hint(&cfg).contains("бутстрапным PSK"));
+
+        cfg.data_psk = Some([2u8; 32]);
+        let stale = missing_epoch_key_hint(&cfg);
+        assert!(stale.contains("текущей и прошлой эпохи"), "{stale}");
+        assert!(stale.contains("переподключись"), "нужна проверка, а не только объяснение");
+    }
 }

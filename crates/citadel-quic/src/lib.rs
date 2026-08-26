@@ -19,6 +19,7 @@ pub mod client;
 pub mod clientfw;
 pub mod config;
 pub mod dataplane;
+pub mod deadline;
 pub mod diag;
 pub mod pqauth;
 pub mod protect;
